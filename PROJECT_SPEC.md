@@ -45,6 +45,7 @@
 
 ### Live data (Tradier)
 - **Option chain snapshots** (REST): SPX options chain for each target expiration (3/5/7 DTE as available) with Greeks/IV as provided by Tradier.
+  - Optional: range-based capture (e.g., 0–10 DTE) for broader research coverage.
 - **Macro/context inputs** (REST where possible):
   - VIX and VIX9D quotes (if available via Tradier symbols)
   - Optional additional proxies (rates, etc.) only if reliable
@@ -155,6 +156,7 @@
   - entry_slot (10/11/12)
   - delta_target (0.10 or 0.20)
   - chosen_legs_json (symbols/qty/sides)
+  - strategy_params_json (strategy-specific inputs)
   - model_version / ruleset_version
   - score
   - decision (TRADE / SKIP) + reason
@@ -190,6 +192,11 @@
   - side (STO/BTO/STC/BTC)
   - qty
   - entry_price, exit_price
+
+### ML + strategy versioning (phase 2)
+- `strategy_versions`, `model_versions`, `training_runs`
+- `feature_snapshots`, `trade_candidates`, `model_predictions`
+- `strategy_recommendations`, `backtest_runs`
 
 ---
 
@@ -229,6 +236,14 @@
 - DuckDB-backed replay using Databento `CBBO-1m`.
 - Re-uses the same strategy selection + management rules.
 - Produces the same `trades`/`trade_legs` shape as live for training parity.
+
+---
+
+## ML approach (phase 2)
+- Build features strictly from data available at decision time (no leakage).
+- Use **walk-forward evaluation** and keep true out-of-sample windows.
+- ML ranks candidate trades; risk rules remain authoritative.
+- Strategy adjustments are gated by policy + paper-trade shadow mode.
 
 ---
 

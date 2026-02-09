@@ -12,8 +12,10 @@ This document expands `PROJECT_SPEC.md` into an implementation-level reference: 
 - **Backend** (`backend/spx_backend/`)
   - FastAPI service with:
     - DB schema initialization on startup (statement-by-statement)
-    - Snapshot scheduler (every N minutes; default 5)
+    - Snapshot scheduler (options chains)
+    - Quote-only scheduler (SPX/VIX/VIX9D/SPY)
     - Snapshot ingestion from Tradier option chain REST API
+    - Underlying quote capture from Tradier `get quotes`
     - Minimal API to list stored snapshots
     - Admin endpoints to force a snapshot and inspect expirations
 - **Frontend** (`frontend/`)
@@ -22,12 +24,16 @@ This document expands `PROJECT_SPEC.md` into an implementation-level reference: 
     - Trigger “Run snapshot now” and display the result
 
 ### Not implemented yet (planned)
-- Strategy selection for vertical spreads (delta targeting)
+- Strategy selection for vertical spreads (delta targeting for live)
 - Decision engine at 10/11/12 ET writing `trade_decisions`
 - Tradier sandbox multi-leg order placement + fill ingestion into `orders`/`fills`
 - Trades normalization (`trades`, `trade_legs`) and PnL tracking
-- Backtester (Databento OPRA.PILLAR SPX CBBO-1m)
 - ML model training pipeline (meta-labeler)
+
+### Partially implemented
+- **Backtest engine** (Databento OPRA.PILLAR SPX CBBO-1m)
+  - Implemented baseline backtest (minute-by-minute, strike-distance spread selection, TP/SL exits)
+  - Delta-based selection and IV/Greeks are not implemented yet
 
 ---
 
@@ -107,6 +113,9 @@ spx_tools/
       db.py                  # async SQLAlchemy engine/session
       db_init.py             # executes db_schema.sql on startup
       db_schema.sql          # MVP schema
+      backtest/
+        engine.py            # minimal backtest engine (DuckDB + Parquet)
+        run_backtest.py      # CLI runner example
       ingestion/
         tradier_client.py    # REST client (expirations/chains/quotes)
       jobs/
@@ -159,18 +168,56 @@ Backend configuration is loaded via `pydantic-settings` from `.env` (repo root) 
   - Default: `SPX`
 - **`SNAPSHOT_DTE_TARGETS`**
   - Default: `3,5,7`
+- **`SNAPSHOT_DTE_MODE`**
+  - Default: `range` (use `targets` to honor `SNAPSHOT_DTE_TARGETS`)
+- **`SNAPSHOT_DTE_MIN_DAYS`**
+  - Default: `0`
+- **`SNAPSHOT_DTE_MAX_DAYS`**
+  - Default: `10`
 - **`SNAPSHOT_DTE_TOLERANCE_DAYS`**
   - Default: `1`
   - Used when selecting an expiration for a target DTE.
+- **`SNAPSHOT_STRIKES_EACH_SIDE`**
+  - Default: `100` (store strikes near spot; 100 below, 100 above)
+- **`QUOTE_SYMBOLS`**
+  - Default: `SPX,VIX,VIX9D,SPY`
+  - Symbols fetched via Tradier `get quotes` each snapshot.
+- **`QUOTE_INTERVAL_MINUTES`**
+  - Default: `5`
+  - Quote-only scheduler interval.
+- **`GEX_ENABLED`**
+  - Default: `true`
+- **`GEX_INTERVAL_MINUTES`**
+  - Default: `5`
+- **`GEX_STORE_BY_EXPIRY`**
+  - Default: `true`
+- **`GEX_SPOT_MAX_AGE_SECONDS`**
+  - Default: `600`
+- **`GEX_CONTRACT_MULTIPLIER`**
+  - Default: `100`
+- **`GEX_PUTS_NEGATIVE`**
+  - Default: `true`
+- **`GEX_SNAPSHOT_BATCH_LIMIT`**
+  - Default: `5`
+- **`GEX_STRIKE_LIMIT`**
+  - Default: `150`
+- **`GEX_MAX_DTE_DAYS`**
+  - Default: `10`
 
 ### Dev/ops controls
 - **`ALLOW_SNAPSHOT_OUTSIDE_RTH`**
   - Default: `false`
   - If false, scheduled snapshots only run during RTH.
   - Manual “force run” ignores RTH regardless.
+- **`ALLOW_QUOTES_OUTSIDE_RTH`**
+  - Default: `false`
+  - Controls quote-only scheduler gating.
 - **`ADMIN_API_KEY`**
   - Default: unset
   - If set, admin endpoints require `X-API-Key` header.
+- **`MARKET_CLOCK_CACHE_SECONDS`**
+  - Default: `300`
+  - Cache TTL for Tradier market clock responses.
 - **`CORS_ORIGINS`**
   - Default: `http://localhost:5173`
   - Comma-separated list of allowed origins.
@@ -185,11 +232,15 @@ Backend configuration is loaded via `pydantic-settings` from `.env` (repo root) 
   - `now_et` in response payload (for operator visibility)
   - `ts` stored in DB as UTC `TIMESTAMPTZ`
 
+### Quote cadence
+- Default schedule: every **5 minutes**
+- Uses Tradier market clock (cached) to skip closed markets
+
 ### RTH definition (MVP)
 - Monday–Friday
 - 09:30–16:00 America/New_York
 
-**Note**: Options market structure has holidays and early closes. We’ll add a trading calendar later; for MVP, the simple weekday/time gate is sufficient.
+**Note**: The scheduler now uses Tradier’s market clock for holiday-aware open/close checks and falls back to RTH logic if the clock call fails.
 
 ---
 
@@ -204,6 +255,13 @@ For each configured `target_dte`:
 1) Compute `target_date = today + target_dte`
 2) Find expirations within ±`SNAPSHOT_DTE_TOLERANCE_DAYS`
 3) Choose closest by absolute day difference
+
+**Range mode**: when `SNAPSHOT_DTE_MODE=range`, the job selects **all expirations** whose DTE is within `SNAPSHOT_DTE_MIN_DAYS..SNAPSHOT_DTE_MAX_DAYS` (inclusive).
+
+### Strike filtering (storage optimization)
+To reduce storage, the job can filter `option_chain_rows` to strikes near spot:
+- Keep `SNAPSHOT_STRIKES_EACH_SIDE` below and above spot (e.g., 100/100)
+- Raw `chain_snapshots` are still stored for reproducibility
 
 #### Force-mode fallback (for testing)
 Manual runs call `run_once(force=True)`.
@@ -242,18 +300,52 @@ Columns:
 - `payload_json` (JSONB): raw Tradier response
 - `checksum` (TEXT): SHA-256 hash of the JSON (stable serialization)
 
+### `option_chain_rows`
+Stores per-option fields extracted from chain snapshots, including **open interest** and Greeks (when available).
+
 Indexes:
 - `idx_chain_snapshots_ts` on `(ts desc)`
 - `idx_chain_snapshots_exp` on `(expiration, ts desc)`
 
 ### `context_snapshots` (planned)
-Stores derived context signals aligned to timestamps (VIX9D, term structure, GEX approximation, etc.).
+Stores derived context signals aligned to timestamps (SPX/ SPY price, VIX9D, term structure, GEX approximation, etc.).
+
+### `underlying_quotes`
+Stores raw quote snapshots for underlying indices/ETFs (SPX, VIX, VIX9D, SPY).
+
+### `market_clock_audit`
+Stores raw Tradier market clock responses for holiday/audit visibility.
+
+### `gex_snapshots` / `gex_by_strike` / `gex_by_expiry_strike`
+Stores GEX aggregates computed from option_chain_rows using open_interest × gamma × spot².
+
+### ML + strategy versioning (new)
+- `strategy_versions`
+  - Versioned strategy definitions + parameters (reproducible live/backtest)
+- `model_versions`
+  - ML model registry (feature spec, training windows, metrics, artifact URI)
+- `training_runs`
+  - Training job history + metrics for auditability
+- `feature_snapshots`
+  - Decision-time features used for ML (with optional labels)
+- `trade_candidates`
+  - Candidate legs/params scored by rules/ML
+- `model_predictions`
+  - Model scores per candidate (traceable by model version)
+- `strategy_recommendations`
+  - Proposed parameter changes + approval state
+- `backtest_runs`
+  - Backtest run metadata + config + aggregate stats
 
 ### `trade_decisions` (planned)
 Stores discrete decision events (TRADE/SKIP), with references to snapshots.
+Includes optional `strategy_params_json` to support future strategies beyond delta-based verticals.
 
 ### `orders` + `fills` (planned)
 Stores broker orders and execution fills (paper sandbox initially).
+
+### `trades` + `trade_legs`
+Normalized multi-leg trades (supports verticals, condors, butterflies).
 
 ---
 
@@ -281,6 +373,16 @@ Admin endpoints are optionally protected by `ADMIN_API_KEY` via `X-API-Key` head
       - `expiration`
       - `actual_dte_days`
       - `checksum`
+
+- `POST /api/admin/run-quotes`
+  - Forces a quote-only run (SPX/VIX/VIX9D/SPY).
+  - Returns:
+    - `skipped`, `reason`, `now_et`, `quotes_inserted`
+
+- `POST /api/admin/run-gex`
+  - Forces a GEX computation run.
+  - Returns:
+    - `skipped`, `reason`, `computed_snapshots`
 
 - `GET /api/admin/expirations?symbol=SPX`
   - Returns a list of expirations from Tradier for debugging DTE selection.
@@ -349,13 +451,21 @@ Using NBBO mid with conservative slippage:
 - Schema: **CBBO-1m**
 - Also include instrument definitions; optionally trades later.
 
-### Backtest engine goals
-- Replay minute-by-minute
-- Construct spreads using the same delta targeting rules (requires a way to derive delta; options:
-  - use vendor greeks if included (unlikely in OPRA)
-  - compute IV/Greeks locally from NBBO (later phase))
-- Evaluate PnL and management rules identically to live
-- Produce tables compatible with live schema for ML training
+### Backtest engine behavior (current)
+- Replay minute-by-minute using CBBO-1m
+- **Construct spreads by strike distance** (not delta) using spot price
+- Evaluate PnL and management rules (TP/SL) identical to live
+- Outputs a list of trades (future: persist into Postgres)
+
+### Backtest engine goals (next iteration)
+- **As-of quote joins** (use last known quote <= timestamp, no exact-match gaps)
+- **Cash-settled expiration handling** for SPX (settlement rules at expiration)
+- **Fees + slippage model** (commissions, contract fees, realistic spread impact)
+- **Leakage guardrails** (features strictly from data available at decision time)
+- **Walk-forward evaluation** (rolling train/validate/out-of-sample windows)
+- Delta-based selection (requires IV/Greeks)
+- Optional use of vendor greeks if available, or local IV calculation
+- Persist backtest trades into Postgres for UI/ML parity
 
 ---
 
@@ -378,6 +488,16 @@ Record at decision time:
 ### Model lifecycle
 - Start with rules-only gating
 - Add XGBoost classifier once consistent data collection exists (100s–1000s of labeled trades)
+- Train with **walk-forward splits** and reserve true out-of-sample windows
+- Use ML to **rank candidates**, not to bypass risk controls
+- Require a **policy gate** before any strategy change is activated
+
+### Decision flow (recommended)
+1) Generate candidates → store `trade_candidates`
+2) Build features → store `feature_snapshots`
+3) Score candidates → store `model_predictions`
+4) Choose decision → store `trade_decisions`
+5) Evaluate outcomes → update labels/metrics
 
 ---
 
@@ -414,9 +534,10 @@ Recommended: deploy separately as a static site (or later serve built assets fro
 - Normalize `trades` + `trade_legs`
 - Mark-to-market snapshots and TP/SL closes
 
-### Milestone 5 — Backtesting
-- Databento download tooling + DuckDB loader
-- Backtest engine producing identical trade records
+### Milestone 5 — Backtesting (baseline done)
+- Databento download tooling + DuckDB loader (partial)
+- Baseline backtest engine implemented (strike-distance selection)
+- Remaining: delta-based selection + DB persistence
 
 ### Milestone 6 — ML
 - Feature/label pipeline

@@ -9,6 +9,7 @@ Current MVP capabilities:
 Planned next steps (per `PROJECT_SPEC.md`):
 - Entry logic (3/5/7 DTE, 10/11/12 ET), trade decision tracking, and Tradier sandbox multi-leg order placement.
 - Backtesting pipeline (Databento `OPRA.PILLAR` SPX, `CBBO-1m`) with live/backtest parity.
+- ML pipeline: feature snapshots, model versioning, and walk-forward evaluation.
 
 ---
 
@@ -33,6 +34,26 @@ Create a `.env` in the repo root (copy `.env.example`) and fill in:
   - `SNAPSHOT_INTERVAL_MINUTES` (default 5)
   - `SNAPSHOT_UNDERLYING` (default SPX)
   - `SNAPSHOT_DTE_TARGETS` (default `3,5,7`)
+  - `SNAPSHOT_DTE_MODE` (default `range`, use `targets` for list mode)
+  - `SNAPSHOT_DTE_MIN_DAYS` (default `0`)
+  - `SNAPSHOT_DTE_MAX_DAYS` (default `10`)
+  - `SNAPSHOT_DTE_TOLERANCE_DAYS` (default `1`)
+  - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
+  - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
+  - `QUOTE_INTERVAL_MINUTES` (default `5`)
+  - `GEX_ENABLED` (default `true`)
+  - `GEX_INTERVAL_MINUTES` (default `5`)
+  - `GEX_STORE_BY_EXPIRY` (default `true`)
+  - `GEX_SPOT_MAX_AGE_SECONDS` (default `600`)
+  - `GEX_CONTRACT_MULTIPLIER` (default `100`)
+  - `GEX_PUTS_NEGATIVE` (default `true`)
+  - `GEX_SNAPSHOT_BATCH_LIMIT` (default `5`)
+  - `GEX_STRIKE_LIMIT` (default `150`)
+  - `GEX_MAX_DTE_DAYS` (default `10`)
+  - `ALLOW_SNAPSHOT_OUTSIDE_RTH` (default `false`)
+  - `ALLOW_QUOTES_OUTSIDE_RTH` (default `false`)
+  - `MARKET_CLOCK_CACHE_SECONDS` (default `300`)
+  - `ADMIN_API_KEY` (optional admin auth)
   - `CORS_ORIGINS` (default `http://localhost:5173`)
 
 ---
@@ -80,7 +101,11 @@ Backend endpoints:
 - `GET http://localhost:8000/api/chain-snapshots?limit=50`
 
 Notes:
-- The snapshot job runs **during regular market hours only** and stores raw chain JSON into `chain_snapshots.payload_json`.
+- The scheduler runs two jobs:
+  - **Snapshot job**: stores option chain snapshots.
+  - **Quote job**: stores SPX/VIX/VIX9D/SPY quotes every `QUOTE_INTERVAL_MINUTES`.
+- Market open/close checks use Tradier market clock with a short cache to reduce calls.
+- Market clock responses are stored in `market_clock_audit` for audit/debug.
 
 ### Frontend (React)
 In a second terminal:

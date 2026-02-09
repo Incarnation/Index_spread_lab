@@ -46,6 +46,14 @@ class TradierClient:
             r.raise_for_status()
             return r.json()
 
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=0.5, min=0.5, max=8))
+    async def get_market_clock(self) -> dict[str, Any]:
+        url = f"{self.base_url}/markets/clock"
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=self._headers)
+            r.raise_for_status()
+            return r.json()
+
 
 def get_tradier_client() -> TradierClient:
     return TradierClient(base_url=settings.tradier_base_url, token=settings.tradier_access_token)
