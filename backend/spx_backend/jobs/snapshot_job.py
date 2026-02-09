@@ -17,11 +17,13 @@ from spx_backend.market_clock import MarketClockCache, is_rth
 
 
 def _checksum(payload: object) -> str:
+    """Compute a stable checksum for the snapshot payload."""
     b = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(b).hexdigest()
 
 
 def _parse_expirations(resp: dict) -> list[date]:
+    """Parse Tradier expirations response into sorted dates."""
     # Tradier often returns { "expirations": { "date": ["2026-02-06", ...] } }
     dates = resp.get("expirations", {}).get("date", [])
     out: list[date] = []
@@ -34,6 +36,7 @@ def _parse_expirations(resp: dict) -> list[date]:
 
 
 def _choose_expiration_for_dte(expirations: list[date], target_dte: int, now_et: datetime, tolerance: int = 1) -> date | None:
+    """Pick an expiration within a DTE tolerance window."""
     # DTE computed in calendar days (good enough for the MVP).
     target_date = now_et.date() + timedelta(days=target_dte)
     candidates = [e for e in expirations if abs((e - target_date).days) <= tolerance]
@@ -43,12 +46,14 @@ def _choose_expiration_for_dte(expirations: list[date], target_dte: int, now_et:
 
 
 def _closest_expiration(expirations: list[date], target_dte: int, now_et: datetime) -> date | None:
+    """Pick the closest expiration to a target DTE."""
     if not expirations:
         return None
     target_date = now_et.date() + timedelta(days=target_dte)
     return min(expirations, key=lambda e: abs((e - target_date).days))
 
 def _parse_chain_options(chain: dict) -> list[dict]:
+    """Normalize Tradier chain options payload to a list."""
     options = chain.get("options", {}).get("option")
     if options is None:
         return []
@@ -58,6 +63,7 @@ def _parse_chain_options(chain: dict) -> list[dict]:
 
 
 def _normalize_option_right(opt: dict) -> str | None:
+    """Normalize option right to 'C' or 'P'."""
     val = opt.get("option_type") or opt.get("put_call") or opt.get("right")
     if isinstance(val, str):
         v = val.strip().upper()
@@ -69,6 +75,7 @@ def _normalize_option_right(opt: dict) -> str | None:
 
 
 def _to_int(value: object) -> int | None:
+    """Convert value to int when possible."""
     try:
         if value is None:
             return None
@@ -78,6 +85,7 @@ def _to_int(value: object) -> int | None:
 
 
 def _to_float(value: object) -> float | None:
+    """Convert value to float when possible."""
     try:
         if value is None:
             return None
@@ -87,6 +95,7 @@ def _to_float(value: object) -> float | None:
 
 
 def _select_strikes_near_spot(options: list[dict], spot: float, each_side: int) -> set[float]:
+    """Return strike set around spot with N strikes on each side."""
     strikes: list[float] = []
     for opt in options:
         strike_val = _to_float(opt.get("strike"))
@@ -103,15 +112,18 @@ def _select_strikes_near_spot(options: list[dict], spot: float, each_side: int) 
 
 @dataclass(frozen=True)
 class SnapshotJob:
+    """Periodic Tradier chain snapshot job."""
     tradier: TradierClient
     clock_cache: MarketClockCache | None = None
 
     async def _market_open(self, now_et: datetime) -> bool:
+        """Check if market is open using cache or RTH fallback."""
         if self.clock_cache:
             return await self.clock_cache.is_open(now_et)
         return is_rth(now_et)
 
     async def run_once(self, *, force: bool = False) -> dict:
+        """Run one snapshot cycle and store chains."""
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
         logger.info("snapshot_job: start force={} now_et={}", force, now_et.isoformat())
@@ -310,6 +322,7 @@ class SnapshotJob:
         }
 
     async def _get_spot_price(self, session, ts: datetime, underlying: str) -> float | None:
+        """Fetch latest spot price at or before ts."""
         row = await session.execute(
             text(
                 """
@@ -332,6 +345,7 @@ class SnapshotJob:
 
 
 def build_snapshot_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> SnapshotJob:
+    """Factory helper for SnapshotJob."""
     client = tradier or get_tradier_client()
     return SnapshotJob(tradier=client, clock_cache=clock_cache)
 

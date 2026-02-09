@@ -26,6 +26,10 @@ FastAPI backend for the SPX options platform. This service:
    - Scheduler checks Tradier market clock and skips when the market is closed.
    - Falls back to simple RTH logic if the market clock call fails.
 
+4) **Decision engine (rules‑based)**
+   - At `DECISION_ENTRY_TIMES`, evaluates the latest snapshots to decide TRADE/SKIP.
+   - Writes decisions into `trade_decisions` (no order placement yet).
+
 ---
 
 ## Configuration (.env)
@@ -50,6 +54,18 @@ Optional:
 - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
 - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
 - `QUOTE_INTERVAL_MINUTES` (default `5`)
+- `DECISION_ENTRY_TIMES` (default `10:00,11:00,12:00`)
+- `DECISION_DTE_TARGETS` (default `3,5,7`)
+- `DECISION_DTE_TOLERANCE_DAYS` (default `1`)
+- `DECISION_DELTA_TARGETS` (default `0.10,0.20`)
+- `DECISION_SPREAD_SIDE` (default `put`)
+- `DECISION_SPREAD_WIDTH_POINTS` (default `25`)
+- `DECISION_CONTRACTS` (default `1`)
+- `DECISION_SNAPSHOT_MAX_AGE_MINUTES` (default `15`)
+- `DECISION_MAX_TRADES_PER_DAY` (default `1`)
+- `DECISION_MAX_OPEN_TRADES` (default `1`)
+- `DECISION_RULESET_VERSION` (default `rules_v1`)
+- `DECISION_ALLOW_OUTSIDE_RTH` (default `false`)
 - `GEX_ENABLED` (default `true`)
 - `GEX_INTERVAL_MINUTES` (default `5`)
 - `GEX_STORE_BY_EXPIRY` (default `true`)
@@ -112,6 +128,12 @@ curl -X POST http://localhost:8000/api/admin/run-quotes
 
 ```bash
 curl -X POST http://localhost:8000/api/admin/run-gex
+```
+
+## Trigger decision engine manually
+
+```bash
+curl -X POST http://localhost:8000/api/admin/run-decision
 ```
 
 To see which expirations Tradier is returning:

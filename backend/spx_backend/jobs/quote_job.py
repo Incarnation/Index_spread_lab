@@ -15,6 +15,7 @@ from spx_backend.market_clock import MarketClockCache, is_rth
 
 
 def _parse_quotes(resp: dict) -> list[dict]:
+    """Normalize Tradier quotes payload to a list."""
     quotes = resp.get("quotes", {}).get("quote")
     if quotes is None:
         return []
@@ -24,6 +25,7 @@ def _parse_quotes(resp: dict) -> list[dict]:
 
 
 def _quotes_by_symbol(quotes: list[dict]) -> dict[str, dict]:
+    """Index quote objects by symbol."""
     out: dict[str, dict] = {}
     for q in quotes:
         sym = q.get("symbol")
@@ -34,15 +36,18 @@ def _quotes_by_symbol(quotes: list[dict]) -> dict[str, dict]:
 
 @dataclass(frozen=True)
 class QuoteJob:
+    """Periodic underlying quote capture job."""
     tradier: TradierClient
     clock_cache: MarketClockCache | None = None
 
     async def _market_open(self, now_et: datetime) -> bool:
+        """Check if market is open using cache or RTH fallback."""
         if self.clock_cache:
             return await self.clock_cache.is_open(now_et)
         return is_rth(now_et)
 
     async def run_once(self, *, force: bool = False) -> dict:
+        """Run one quote capture cycle and store context."""
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
         logger.info("quote_job: start force={} now_et={}", force, now_et.isoformat())
@@ -145,5 +150,6 @@ class QuoteJob:
 
 
 def build_quote_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> QuoteJob:
+    """Factory helper for QuoteJob."""
     client = tradier or get_tradier_client()
     return QuoteJob(tradier=client, clock_cache=clock_cache)

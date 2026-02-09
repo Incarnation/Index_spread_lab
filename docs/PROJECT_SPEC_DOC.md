@@ -25,7 +25,6 @@ This document expands `PROJECT_SPEC.md` into an implementation-level reference: 
 
 ### Not implemented yet (planned)
 - Strategy selection for vertical spreads (delta targeting for live)
-- Decision engine at 10/11/12 ET writing `trade_decisions`
 - Tradier sandbox multi-leg order placement + fill ingestion into `orders`/`fills`
 - Trades normalization (`trades`, `trade_legs`) and PnL tracking
 - ML model training pipeline (meta-labeler)
@@ -34,6 +33,9 @@ This document expands `PROJECT_SPEC.md` into an implementation-level reference: 
 - **Backtest engine** (Databento OPRA.PILLAR SPX CBBO-1m)
   - Implemented baseline backtest (minute-by-minute, strike-distance spread selection, TP/SL exits)
   - Delta-based selection and IV/Greeks are not implemented yet
+- **Decision engine (rules-only)**
+  - Scheduled at 10/11/12 ET
+  - Writes `trade_decisions` (no order placement yet)
 
 ---
 

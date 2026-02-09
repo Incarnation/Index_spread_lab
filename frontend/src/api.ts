@@ -51,6 +51,23 @@ export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
   return (await r.json()) as RunQuotesResult;
 }
 
+export type RunDecisionResult = {
+  skipped: boolean;
+  reason?: string | null;
+  now_et: string;
+  decision?: string;
+  chosen?: Record<string, unknown>;
+};
+
+export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
+  const r = await fetch(`/api/admin/run-decision`, {
+    method: "POST",
+    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as RunDecisionResult;
+}
+
 export type GexSnapshot = {
   snapshot_id: number;
   ts: string;
@@ -92,5 +109,28 @@ export async function fetchGexCurve(snapshotId: number, dteDays?: number): Promi
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { points: GexCurvePoint[] };
   return data.points;
+}
+
+export type TradeDecision = {
+  decision_id: number;
+  ts: string;
+  target_dte: number;
+  entry_slot: number;
+  delta_target: number;
+  decision: string;
+  reason: string | null;
+  score: number | null;
+  chain_snapshot_id: number | null;
+  decision_source: string;
+  ruleset_version: string;
+  chosen_legs_json: Record<string, unknown> | null;
+  strategy_params_json: Record<string, unknown> | null;
+};
+
+export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
+  const r = await fetch(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = (await r.json()) as { items: TradeDecision[] };
+  return data.items;
 }
 

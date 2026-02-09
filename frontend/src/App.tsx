@@ -4,13 +4,17 @@ import {
   fetchGexCurve,
   fetchGexDtes,
   fetchGexSnapshots,
+  fetchTradeDecisions,
+  runDecisionNow,
   runQuotesNow,
   runSnapshotNow,
   type ChainSnapshot,
   type GexCurvePoint,
   type GexSnapshot,
+  type RunDecisionResult,
   type RunQuotesResult,
   type RunSnapshotResult,
+  type TradeDecision,
 } from "./api";
 import {
   Alert,
@@ -20,6 +24,7 @@ import {
   Card,
   Code,
   Container,
+  Drawer,
   Group,
   Loader,
   ScrollArea,
@@ -31,8 +36,22 @@ import {
 } from "@mantine/core";
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
+// Shorten strings for compact table display.
 function truncate(s: string, n: number) {
   return s.length <= n ? s : `${s.slice(0, n)}…`;
+}
+
+// Parse JSON payloads that may be stored as strings or objects.
+function parseJsonRecord(value: Record<string, unknown> | string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  return value;
 }
 
 export function App() {
@@ -42,12 +61,17 @@ export function App() {
   const [adminKey, setAdminKey] = React.useState<string>("");
   const [runResult, setRunResult] = React.useState<RunSnapshotResult | null>(null);
   const [runQuotesResult, setRunQuotesResult] = React.useState<RunQuotesResult | null>(null);
+  const [runDecisionResult, setRunDecisionResult] = React.useState<RunDecisionResult | null>(null);
   const [gexSnapshots, setGexSnapshots] = React.useState<GexSnapshot[]>([]);
   const [selectedGexSnapshot, setSelectedGexSnapshot] = React.useState<GexSnapshot | null>(null);
   const [gexDtes, setGexDtes] = React.useState<number[]>([]);
   const [selectedDte, setSelectedDte] = React.useState<string>("all");
   const [gexCurve, setGexCurve] = React.useState<GexCurvePoint[]>([]);
   const [gexLoading, setGexLoading] = React.useState<boolean>(false);
+  const [decisions, setDecisions] = React.useState<TradeDecision[]>([]);
+  const [decisionsLoading, setDecisionsLoading] = React.useState<boolean>(true);
+  const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
+  const [drawerDecision, setDrawerDecision] = React.useState<TradeDecision | null>(null);
 
   const gexSnapshotOptions = React.useMemo(
     () =>
@@ -65,15 +89,54 @@ export function App() {
   const refresh = React.useCallback(() => {
     setError(null);
     setLoading(true);
-    fetchChainSnapshots(50)
-      .then((rows) => setItems(rows))
+    setDecisionsLoading(true);
+    Promise.all([fetchChainSnapshots(50), fetchTradeDecisions(50)])
+      .then(([snapshotRows, decisionRows]) => {
+        setItems(snapshotRows);
+        setDecisions(decisionRows);
+      })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        setLoading(false);
+        setDecisionsLoading(false);
+      });
   }, []);
 
   React.useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Extract compact summary fields from chosen_legs_json.
+  const decisionSummary = React.useCallback((row: TradeDecision) => {
+    const data = parseJsonRecord(row.chosen_legs_json as Record<string, unknown> | string | null);
+    if (!data) return null;
+    const short = data["short"] as Record<string, unknown> | undefined;
+    const long = data["long"] as Record<string, unknown> | undefined;
+    const credit = data["credit"] as number | undefined;
+    const context = data["context"] as Record<string, unknown> | undefined;
+    if (!short || !long) return null;
+    return {
+      shortStrike: short["strike"] as number | undefined,
+      longStrike: long["strike"] as number | undefined,
+      credit: typeof credit === "number" ? credit : undefined,
+      gexNet: typeof context?.["gex_net"] === "number" ? (context["gex_net"] as number) : undefined,
+      zeroGamma:
+        typeof context?.["zero_gamma_level"] === "number" ? (context["zero_gamma_level"] as number) : undefined,
+      vix: typeof context?.["vix"] === "number" ? (context["vix"] as number) : undefined,
+    };
+  }, []);
+
+  const drawerPayload = React.useMemo(
+    () => (drawerDecision ? parseJsonRecord(drawerDecision.chosen_legs_json as Record<string, unknown> | string | null) : null),
+    [drawerDecision],
+  );
+  const drawerStrategyParams = React.useMemo(
+    () =>
+      drawerDecision
+        ? parseJsonRecord(drawerDecision.strategy_params_json as Record<string, unknown> | string | null)
+        : null,
+    [drawerDecision],
+  );
 
   React.useEffect(() => {
     let cancelled = false;
@@ -140,6 +203,7 @@ export function App() {
     setError(null);
     setRunResult(null);
     setRunQuotesResult(null);
+    setRunDecisionResult(null);
     try {
       const result = await runSnapshotNow(adminKey.trim() ? adminKey.trim() : undefined);
       setRunResult(result);
@@ -152,6 +216,7 @@ export function App() {
   const runQuotes = React.useCallback(async () => {
     setError(null);
     setRunQuotesResult(null);
+    setRunDecisionResult(null);
     try {
       const result = await runQuotesNow(adminKey.trim() ? adminKey.trim() : undefined);
       setRunQuotesResult(result);
@@ -160,9 +225,58 @@ export function App() {
     }
   }, [adminKey]);
 
+  const runDecision = React.useCallback(async () => {
+    setError(null);
+    setRunDecisionResult(null);
+    try {
+      const result = await runDecisionNow(adminKey.trim() ? adminKey.trim() : undefined);
+      setRunDecisionResult(result);
+      refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [adminKey, refresh]);
+
   return (
     <Box bg="gray.0" mih="100vh" py="xl">
       <Container size="lg">
+        <Drawer
+          opened={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+          position="right"
+          size="lg"
+          title={drawerDecision ? `Decision #${drawerDecision.decision_id}` : "Decision details"}
+        >
+          {!drawerDecision && <Text c="dimmed">No decision selected.</Text>}
+          {drawerDecision && (
+            <Box>
+              <Text size="sm" c="dimmed">
+                Time: {drawerDecision.ts}
+              </Text>
+              <Text size="sm" c="dimmed">
+                Decision: {drawerDecision.decision} · DTE {drawerDecision.target_dte} · Δ {drawerDecision.delta_target}
+              </Text>
+              <Text size="sm" c="dimmed">
+                Source: {drawerDecision.decision_source} · Ruleset {drawerDecision.ruleset_version}
+              </Text>
+
+              <Text fw={600} mt="md" mb="xs">
+                Chosen legs JSON
+              </Text>
+              <ScrollArea h={240} type="auto">
+                <Code block>{drawerPayload ? JSON.stringify(drawerPayload, null, 2) : "—"}</Code>
+              </ScrollArea>
+
+              <Text fw={600} mt="md" mb="xs">
+                Strategy params JSON
+              </Text>
+              <ScrollArea h={160} type="auto">
+                <Code block>{drawerStrategyParams ? JSON.stringify(drawerStrategyParams, null, 2) : "—"}</Code>
+              </ScrollArea>
+            </Box>
+          )}
+        </Drawer>
+
         <Group justify="space-between" align="flex-end">
           <div>
             <Title order={2}>SPX Tools</Title>
@@ -182,6 +296,9 @@ export function App() {
               <Button onClick={runSnapshot}>Run snapshot now</Button>
               <Button onClick={runQuotes} variant="outline">
                 Run quotes now
+              </Button>
+              <Button onClick={runDecision} variant="outline">
+                Run decision now
               </Button>
             </Group>
             <TextInput
@@ -225,6 +342,18 @@ export function App() {
               </Badge>
             </Group>
             <Code block>{JSON.stringify(runQuotesResult, null, 2)}</Code>
+          </Card>
+        )}
+
+        {runDecisionResult && (
+          <Card withBorder radius="md" mt="md" p="md">
+            <Group justify="space-between" mb="xs">
+              <Text fw={600}>Decision run result</Text>
+              <Badge variant="light" color={runDecisionResult.skipped ? "yellow" : "green"}>
+                {runDecisionResult.skipped ? "Skipped" : "Inserted"}
+              </Badge>
+            </Group>
+            <Code block>{JSON.stringify(runDecisionResult, null, 2)}</Code>
           </Card>
         )}
 
@@ -293,6 +422,92 @@ export function App() {
               </ResponsiveContainer>
             </div>
           )}
+        </Card>
+
+        <Card withBorder radius="md" mt="lg" p="md">
+          <Group justify="space-between" align="center" mb="sm">
+            <Text fw={600}>Trade decisions</Text>
+            {decisionsLoading ? (
+              <Group gap="xs">
+                <Loader size="sm" />
+                <Text c="dimmed" size="sm">
+                  Loading…
+                </Text>
+              </Group>
+            ) : (
+              <Text c="dimmed" size="sm">
+                {decisions.length} rows
+              </Text>
+            )}
+          </Group>
+
+          <ScrollArea type="auto">
+            <Table striped highlightOnHover withTableBorder withColumnBorders>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>ID</Table.Th>
+                  <Table.Th>Time (UTC)</Table.Th>
+                  <Table.Th>Decision</Table.Th>
+                  <Table.Th>DTE</Table.Th>
+                  <Table.Th>Delta</Table.Th>
+                  <Table.Th>Legs</Table.Th>
+                  <Table.Th>Credit</Table.Th>
+                  <Table.Th>Score</Table.Th>
+                  <Table.Th>GEX</Table.Th>
+                  <Table.Th>Zero Gamma</Table.Th>
+                  <Table.Th>VIX</Table.Th>
+                  <Table.Th>Reason</Table.Th>
+                  <Table.Th>Details</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {decisions.map((d) => {
+                  const summary = decisionSummary(d);
+                  return (
+                    <Table.Tr key={d.decision_id}>
+                      <Table.Td>{d.decision_id}</Table.Td>
+                      <Table.Td>{d.ts}</Table.Td>
+                      <Table.Td>
+                        <Badge variant="light" color={d.decision === "TRADE" ? "green" : "gray"}>
+                          {d.decision}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td>{d.target_dte}</Table.Td>
+                      <Table.Td>{d.delta_target}</Table.Td>
+                      <Table.Td>
+                        {summary ? `${summary.shortStrike} / ${summary.longStrike}` : "—"}
+                      </Table.Td>
+                      <Table.Td>{summary?.credit?.toFixed(2) ?? "—"}</Table.Td>
+                      <Table.Td>{typeof d.score === "number" ? d.score.toFixed(3) : "—"}</Table.Td>
+                      <Table.Td>{summary?.gexNet?.toFixed(0) ?? "—"}</Table.Td>
+                      <Table.Td>{summary?.zeroGamma?.toFixed(2) ?? "—"}</Table.Td>
+                      <Table.Td>{summary?.vix?.toFixed(2) ?? "—"}</Table.Td>
+                      <Table.Td>{d.reason ?? "—"}</Table.Td>
+                      <Table.Td>
+                        <Button
+                          size="xs"
+                          variant="light"
+                          onClick={() => {
+                            setDrawerDecision(d);
+                            setDrawerOpen(true);
+                          }}
+                        >
+                          View
+                        </Button>
+                      </Table.Td>
+                    </Table.Tr>
+                  );
+                })}
+                {decisions.length === 0 && !decisionsLoading && !error && (
+                  <Table.Tr>
+                    <Table.Td colSpan={13}>
+                      <Text c="dimmed">No decisions yet. Run the decision job to populate.</Text>
+                    </Table.Td>
+                  </Table.Tr>
+                )}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea>
         </Card>
 
         <Card withBorder radius="md" mt="lg" p="md">

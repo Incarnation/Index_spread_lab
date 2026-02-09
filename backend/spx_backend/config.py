@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
 
+    decision_entry_times: str = "10:00,11:00,12:00"
+    decision_dte_targets: str = "3,5,7"
+    decision_dte_tolerance_days: int = 1
+    decision_delta_targets: str = "0.10,0.20"
+    decision_spread_side: str = "put"
+    decision_spread_width_points: float = 25.0
+    decision_contracts: int = 1
+    decision_snapshot_max_age_minutes: int = 15
+    decision_max_trades_per_day: int = 1
+    decision_max_open_trades: int = 1
+    decision_ruleset_version: str = "rules_v1"
+    decision_allow_outside_rth: bool = False
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls
@@ -56,6 +69,27 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         parts = [p.strip() for p in self.cors_origins.split(",") if p.strip()]
         return parts
+
+    def decision_entry_times_list(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for part in self.decision_entry_times.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                h_str, m_str = p.split(":")
+                out.append((int(h_str), int(m_str)))
+            except Exception:
+                continue
+        return out
+
+    def decision_dte_targets_list(self) -> list[int]:
+        parts = [p.strip() for p in self.decision_dte_targets.split(",") if p.strip()]
+        return [int(p) for p in parts]
+
+    def decision_delta_targets_list(self) -> list[float]:
+        parts = [p.strip() for p in self.decision_delta_targets.split(",") if p.strip()]
+        return [float(p) for p in parts]
 
 
 settings = Settings()

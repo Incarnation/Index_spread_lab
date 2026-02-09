@@ -10,6 +10,7 @@ import pandas as pd
 
 @dataclass
 class BacktestConfig:
+    """Configuration for the DuckDB-based backtest engine."""
     # Data locations (Parquet). These should be pre-downloaded from Databento.
     cbbo_parquet_glob: str
     definitions_parquet_glob: str
@@ -54,6 +55,7 @@ class BacktestConfig:
 
 @dataclass
 class TradeLeg:
+    """Single trade leg representation for backtest results."""
     symbol: str
     side: str  # "SHORT" or "LONG"
     qty: int
@@ -63,6 +65,7 @@ class TradeLeg:
 
 @dataclass
 class Trade:
+    """Trade-level result for backtest output."""
     entry_ts: datetime
     exit_ts: datetime | None
     expiration: date
@@ -74,6 +77,7 @@ class Trade:
 
 @dataclass
 class BacktestResult:
+    """Container for backtest results."""
     trades: list[Trade]
 
 
@@ -87,17 +91,20 @@ class BacktestEngine:
     """
 
     def __init__(self, config: BacktestConfig) -> None:
+        """Initialize engine and DuckDB connection."""
         self.config = config
         self.tz = ZoneInfo(config.tz)
         self.conn = duckdb.connect()
 
     def _load_views(self) -> None:
+        """Load Parquet datasets into DuckDB views."""
         cfg = self.config
         self.conn.execute(f"CREATE OR REPLACE VIEW cbbo AS SELECT * FROM read_parquet('{cfg.cbbo_parquet_glob}')")
         self.conn.execute(f"CREATE OR REPLACE VIEW defs AS SELECT * FROM read_parquet('{cfg.definitions_parquet_glob}')")
         self.conn.execute(f"CREATE OR REPLACE VIEW underlying AS SELECT * FROM read_parquet('{cfg.underlying_parquet_glob}')")
 
     def _get_expirations(self) -> list[date]:
+        """Get distinct expirations from the definitions file."""
         cfg = self.config
         q = f"""
         SELECT DISTINCT {cfg.def_expiration_col} AS exp
@@ -109,6 +116,7 @@ class BacktestEngine:
         return [r[0] for r in rows if r and r[0] is not None]
 
     def _choose_expiration(self, expirations: list[date], target_dte: int, now_et: datetime) -> date | None:
+        """Choose an expiration within the DTE tolerance window."""
         target_date = now_et.date() + timedelta(days=target_dte)
         candidates = [e for e in expirations if abs((e - target_date).days) <= self.config.dte_tolerance_days]
         if not candidates:
@@ -116,6 +124,7 @@ class BacktestEngine:
         return min(candidates, key=lambda e: abs((e - target_date).days))
 
     def _get_leg_mid(self, ts: datetime, symbol: str) -> float | None:
+        """Fetch mid price for a symbol at a timestamp."""
         cfg = self.config
         q = f"""
         SELECT {cfg.cbbo_bid_col} AS bid, {cfg.cbbo_ask_col} AS ask
@@ -132,6 +141,7 @@ class BacktestEngine:
         return (bid + ask) / 2.0
 
     def _find_spread_legs(self, ts: datetime, expiration: date, spot: float) -> tuple[str, str] | None:
+        """Select short and long leg symbols based on strike distance."""
         """
         Select short and long leg symbols based on nearest strikes.
         Uses strike distance rather than delta (delta requires IV computation).
@@ -167,11 +177,13 @@ class BacktestEngine:
         return short[0], long[0]
 
     def _entry_credit(self, short_mid: float, long_mid: float) -> float:
+        """Apply slippage model to compute entry credit."""
         spread_mid = short_mid - long_mid
         slippage = abs(spread_mid) * self.config.slippage_fraction
         return spread_mid - slippage
 
     def run(self) -> BacktestResult:
+        """Run the backtest and return trade results."""
         cfg = self.config
         self._load_views()
 

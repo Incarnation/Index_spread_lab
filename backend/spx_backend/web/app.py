@@ -13,6 +13,7 @@ from spx_backend.config import settings
 from spx_backend.db import get_db_session
 from spx_backend.db_init import init_db
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
+from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
@@ -21,6 +22,7 @@ from spx_backend.market_clock import MarketClockCache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Initialize DB, scheduler, and background jobs."""
     # Initialize DB schema and start scheduler.
     await init_db()
 
@@ -33,6 +35,7 @@ async def lifespan(app: FastAPI):
     snapshot_job = SnapshotJob(tradier=tradier, clock_cache=clock_cache)
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob()
+    decision_job = DecisionJob(clock_cache=clock_cache)
 
     scheduler.add_job(
         snapshot_job.run_once,
@@ -55,6 +58,15 @@ async def lifespan(app: FastAPI):
         id="gex_job",
         replace_existing=True,
     )
+    for hour, minute in settings.decision_entry_times_list():
+        scheduler.add_job(
+            decision_job.run_once,
+            "cron",
+            hour=hour,
+            minute=minute,
+            id=f"decision_job_{hour:02d}{minute:02d}",
+            replace_existing=True,
+        )
     scheduler.start()
 
     app.state.scheduler = scheduler
@@ -63,6 +75,7 @@ async def lifespan(app: FastAPI):
     app.state.snapshot_job = snapshot_job
     app.state.quote_job = quote_job
     app.state.gex_job = gex_job
+    app.state.decision_job = decision_job
 
     # Run once immediately on boot (useful for confirming wiring).
     try:
@@ -95,11 +108,13 @@ app.add_middleware(
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Simple health check."""
     return {"status": "ok"}
 
 
 @app.get("/api/chain-snapshots")
 async def list_chain_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return recent chain snapshot metadata."""
     limit = max(1, min(limit, 500))
     r = await db.execute(
         text(
@@ -128,8 +143,49 @@ async def list_chain_snapshots(limit: int = 50, db: AsyncSession = Depends(get_d
     }
 
 
+@app.get("/api/trade-decisions")
+async def list_trade_decisions(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return recent trade decisions."""
+    limit = max(1, min(limit, 500))
+    r = await db.execute(
+        text(
+            """
+            SELECT decision_id, ts, target_dte, entry_slot, delta_target,
+                   decision, reason, score, chain_snapshot_id, decision_source,
+                   ruleset_version, chosen_legs_json, strategy_params_json
+            FROM trade_decisions
+            ORDER BY ts DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = r.fetchall()
+    return {
+        "items": [
+            {
+                "decision_id": row.decision_id,
+                "ts": row.ts.isoformat(),
+                "target_dte": row.target_dte,
+                "entry_slot": row.entry_slot,
+                "delta_target": row.delta_target,
+                "decision": row.decision,
+                "reason": row.reason,
+                "score": row.score,
+                "chain_snapshot_id": row.chain_snapshot_id,
+                "decision_source": row.decision_source,
+                "ruleset_version": row.ruleset_version,
+                "chosen_legs_json": row.chosen_legs_json,
+                "strategy_params_json": row.strategy_params_json,
+            }
+            for row in rows
+        ]
+    }
+
+
 @app.get("/api/gex/snapshots")
 async def list_gex_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return recent GEX snapshot aggregates."""
     limit = max(1, min(limit, 500))
     r = await db.execute(
         text(
@@ -164,6 +220,7 @@ async def list_gex_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_
 
 @app.get("/api/gex/dtes")
 async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return available DTEs for a GEX snapshot."""
     r = await db.execute(
         text(
             """
@@ -181,6 +238,7 @@ async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_sess
 
 @app.get("/api/gex/curve")
 async def get_gex_curve(snapshot_id: int, dte_days: int | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return GEX curve by strike (optional DTE filter)."""
     if dte_days is None:
         r = await db.execute(
             text(
@@ -222,6 +280,7 @@ async def get_gex_curve(snapshot_id: int, dte_days: int | None = None, db: Async
 
 
 def _require_admin(x_api_key: str | None = Header(default=None)) -> None:
+    """Enforce admin API key if configured."""
     # If ADMIN_API_KEY is not set, allow local/dev usage without auth.
     if settings.admin_api_key:
         if not x_api_key or x_api_key != settings.admin_api_key:
@@ -230,6 +289,7 @@ def _require_admin(x_api_key: str | None = Header(default=None)) -> None:
 
 @app.post("/api/admin/run-snapshot")
 async def admin_run_snapshot(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a snapshot run immediately."""
     # Force run once even outside RTH (useful for testing).
     job: SnapshotJob = getattr(request.app.state, "snapshot_job", build_snapshot_job())
     result = await job.run_once(force=True)
@@ -238,6 +298,7 @@ async def admin_run_snapshot(request: Request, _: None = Depends(_require_admin)
 
 @app.post("/api/admin/run-quotes")
 async def admin_run_quotes(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a quote run immediately."""
     job: QuoteJob = getattr(request.app.state, "quote_job", build_quote_job())
     result = await job.run_once(force=True)
     return result
@@ -245,13 +306,23 @@ async def admin_run_quotes(request: Request, _: None = Depends(_require_admin)) 
 
 @app.post("/api/admin/run-gex")
 async def admin_run_gex(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a GEX run immediately."""
     job: GexJob = getattr(request.app.state, "gex_job", GexJob())
     result = await job.run_once()
     return result
 
 
+@app.post("/api/admin/run-decision")
+async def admin_run_decision(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a decision run immediately."""
+    job: DecisionJob = getattr(request.app.state, "decision_job", build_decision_job())
+    result = await job.run_once(force=True)
+    return result
+
+
 @app.get("/api/admin/expirations")
 async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None = Depends(_require_admin)) -> dict:
+    """List expirations from Tradier for debugging."""
     client: TradierClient = getattr(request.app.state, "tradier", get_tradier_client())
     resp = await client.get_option_expirations(symbol)
     exps = _parse_expirations(resp)
@@ -260,6 +331,7 @@ async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(db: AsyncSession = Depends(get_db_session)) -> HTMLResponse:
+    """Small HTML page listing recent snapshots."""
     r = await db.execute(
         text(
             """

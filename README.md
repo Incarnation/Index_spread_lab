@@ -7,7 +7,7 @@ Current MVP capabilities:
 - **Frontend**: React (Vite) dashboard that reads from the backend API.
 
 Planned next steps (per `PROJECT_SPEC.md`):
-- Entry logic (3/5/7 DTE, 10/11/12 ET), trade decision tracking, and Tradier sandbox multi-leg order placement.
+- Decision engine (rules-only) is wired; next is broker order placement and fills.
 - Backtesting pipeline (Databento `OPRA.PILLAR` SPX, `CBBO-1m`) with live/backtest parity.
 - ML pipeline: feature snapshots, model versioning, and walk-forward evaluation.
 
@@ -41,6 +41,18 @@ Create a `.env` in the repo root (copy `.env.example`) and fill in:
   - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
   - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
   - `QUOTE_INTERVAL_MINUTES` (default `5`)
+  - `DECISION_ENTRY_TIMES` (default `10:00,11:00,12:00`)
+  - `DECISION_DTE_TARGETS` (default `3,5,7`)
+  - `DECISION_DTE_TOLERANCE_DAYS` (default `1`)
+  - `DECISION_DELTA_TARGETS` (default `0.10,0.20`)
+  - `DECISION_SPREAD_SIDE` (default `put`)
+  - `DECISION_SPREAD_WIDTH_POINTS` (default `25`)
+  - `DECISION_CONTRACTS` (default `1`)
+  - `DECISION_SNAPSHOT_MAX_AGE_MINUTES` (default `15`)
+  - `DECISION_MAX_TRADES_PER_DAY` (default `1`)
+  - `DECISION_MAX_OPEN_TRADES` (default `1`)
+  - `DECISION_RULESET_VERSION` (default `rules_v1`)
+  - `DECISION_ALLOW_OUTSIDE_RTH` (default `false`)
   - `GEX_ENABLED` (default `true`)
   - `GEX_INTERVAL_MINUTES` (default `5`)
   - `GEX_STORE_BY_EXPIRY` (default `true`)

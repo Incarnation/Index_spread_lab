@@ -13,7 +13,9 @@ from spx_backend.db import SessionLocal
 
 @dataclass(frozen=True)
 class GexJob:
+    """Compute and persist GEX aggregates for new snapshots."""
     async def run_once(self) -> dict:
+        """Compute GEX for snapshots that are missing results."""
         if not settings.gex_enabled:
             return {"skipped": True, "reason": "gex_disabled"}
 
@@ -235,6 +237,7 @@ class GexJob:
         return {"skipped": False, "computed_snapshots": computed, "now_et": now_et.isoformat()}
 
     async def _get_spot_price(self, session, ts, underlying: str) -> float | None:
+        """Fetch latest spot price at or before ts with staleness guard."""
         # Find the most recent quote <= snapshot time.
         row = await session.execute(
             text(
@@ -261,6 +264,7 @@ class GexJob:
         return float(last)
 
     def _zero_gamma_level(self, per_strike: dict) -> float | None:
+        """Estimate zero gamma level from cumulative net GEX by strike."""
         if not per_strike:
             return None
         strikes = sorted(per_strike.keys())
