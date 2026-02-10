@@ -1,3 +1,9 @@
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
+
+function apiUrl(path: string): string {
+  return `${API_BASE}${path}`;
+}
+
 export type ChainSnapshot = {
   snapshot_id: number;
   ts: string;
@@ -8,7 +14,7 @@ export type ChainSnapshot = {
 };
 
 export async function fetchChainSnapshots(limit = 50): Promise<ChainSnapshot[]> {
-  const r = await fetch(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`);
+  const r = await fetch(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: ChainSnapshot[] };
   return data.items;
@@ -27,7 +33,7 @@ export type RunSnapshotResult = {
 };
 
 export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult> {
-  const r = await fetch(`/api/admin/run-snapshot`, {
+  const r = await fetch(apiUrl(`/api/admin/run-snapshot`), {
     method: "POST",
     headers: apiKey ? { "X-API-Key": apiKey } : undefined,
   });
@@ -43,7 +49,7 @@ export type RunQuotesResult = {
 };
 
 export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
-  const r = await fetch(`/api/admin/run-quotes`, {
+  const r = await fetch(apiUrl(`/api/admin/run-quotes`), {
     method: "POST",
     headers: apiKey ? { "X-API-Key": apiKey } : undefined,
   });
@@ -60,7 +66,7 @@ export type RunDecisionResult = {
 };
 
 export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
-  const r = await fetch(`/api/admin/run-decision`, {
+  const r = await fetch(apiUrl(`/api/admin/run-decision`), {
     method: "POST",
     headers: apiKey ? { "X-API-Key": apiKey } : undefined,
   });
@@ -89,14 +95,14 @@ export type GexCurvePoint = {
 };
 
 export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
-  const r = await fetch(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`);
+  const r = await fetch(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: GexSnapshot[] };
   return data.items;
 }
 
 export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
-  const r = await fetch(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`);
+  const r = await fetch(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { dte_days: number[] };
   return data.dte_days;
@@ -105,7 +111,7 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
 export async function fetchGexCurve(snapshotId: number, dteDays?: number): Promise<GexCurvePoint[]> {
   const params = new URLSearchParams({ snapshot_id: String(snapshotId) });
   if (typeof dteDays === "number") params.set("dte_days", String(dteDays));
-  const r = await fetch(`/api/gex/curve?${params.toString()}`);
+  const r = await fetch(apiUrl(`/api/gex/curve?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { points: GexCurvePoint[] };
   return data.points;
@@ -128,7 +134,7 @@ export type TradeDecision = {
 };
 
 export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
-  const r = await fetch(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`);
+  const r = await fetch(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: TradeDecision[] };
   return data.items;

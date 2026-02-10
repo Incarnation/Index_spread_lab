@@ -173,6 +173,10 @@ Two options:
 - **Separate service**: deploy `frontend/` as a static site (recommended when you want CDN/static hosting).
 - **Single service**: later we can configure the backend to serve the built React assets (good for “one container” simplicity).
 
+If frontend is deployed as a separate domain/service, set:
+- `VITE_API_BASE_URL=https://<your-backend-domain>`
+So frontend requests target backend APIs directly.
+
 ---
 
 ## Troubleshooting
