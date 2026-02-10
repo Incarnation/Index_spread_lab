@@ -320,6 +320,26 @@ async def admin_run_decision(request: Request, _: None = Depends(_require_admin)
     return result
 
 
+@app.delete("/api/admin/trade-decisions/{decision_id}")
+async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+    """Delete one trade decision row by ID."""
+    r = await db.execute(
+        text(
+            """
+            DELETE FROM trade_decisions
+            WHERE decision_id = :decision_id
+            RETURNING decision_id
+            """
+        ),
+        {"decision_id": decision_id},
+    )
+    row = r.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="trade_decision_not_found")
+    await db.commit()
+    return {"deleted": True, "decision_id": row.decision_id}
+
+
 @app.get("/api/admin/expirations")
 async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None = Depends(_require_admin)) -> dict:
     """List expirations from Tradier for debugging."""

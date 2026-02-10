@@ -140,3 +140,12 @@ export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> 
   return data.items;
 }
 
+export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
+  const r = await fetch(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
+    method: "DELETE",
+    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as { deleted: boolean; decision_id: number };
+}
+

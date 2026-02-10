@@ -1,6 +1,7 @@
 import React from "react";
 import {
   fetchChainSnapshots,
+  deleteTradeDecision,
   fetchGexCurve,
   fetchGexDtes,
   fetchGexSnapshots,
@@ -41,6 +42,20 @@ function truncate(s: string, n: number) {
   return s.length <= n ? s : `${s.slice(0, n)}…`;
 }
 
+function formatTs(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(d);
+}
+
 // Parse JSON payloads that may be stored as strings or objects.
 function parseJsonRecord(value: Record<string, unknown> | string | null): Record<string, unknown> | null {
   if (!value) return null;
@@ -57,6 +72,7 @@ function parseJsonRecord(value: Record<string, unknown> | string | null): Record
 export function App() {
   const [items, setItems] = React.useState<ChainSnapshot[]>([]);
   const [error, setError] = React.useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState<boolean>(true);
   const [adminKey, setAdminKey] = React.useState<string>("");
   const [runResult, setRunResult] = React.useState<RunSnapshotResult | null>(null);
@@ -70,6 +86,7 @@ export function App() {
   const [gexLoading, setGexLoading] = React.useState<boolean>(false);
   const [decisions, setDecisions] = React.useState<TradeDecision[]>([]);
   const [decisionsLoading, setDecisionsLoading] = React.useState<boolean>(true);
+  const [deletingDecisionId, setDeletingDecisionId] = React.useState<number | null>(null);
   const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
   const [drawerDecision, setDrawerDecision] = React.useState<TradeDecision | null>(null);
 
@@ -77,7 +94,7 @@ export function App() {
     () =>
       gexSnapshots.map((s) => ({
         value: String(s.snapshot_id),
-        label: `#${s.snapshot_id} · ${s.ts}`,
+        label: `#${s.snapshot_id} · ${formatTs(s.ts)}`,
       })),
     [gexSnapshots],
   );
@@ -237,6 +254,32 @@ export function App() {
     }
   }, [adminKey, refresh]);
 
+  const deleteDecision = React.useCallback(
+    async (decisionId: number) => {
+      const ok = window.confirm(`Delete trade decision #${decisionId}?`);
+      if (!ok) return;
+      setError(null);
+      setDeletingDecisionId(decisionId);
+      try {
+        await deleteTradeDecision(decisionId, adminKey.trim() ? adminKey.trim() : undefined);
+        if (drawerDecision?.decision_id === decisionId) {
+          setDrawerOpen(false);
+          setDrawerDecision(null);
+        }
+        setSuccessMessage(`Decision #${decisionId} deleted.`);
+        window.setTimeout(() => {
+          setSuccessMessage((prev) => (prev === `Decision #${decisionId} deleted.` ? null : prev));
+        }, 3000);
+        refresh();
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setDeletingDecisionId(null);
+      }
+    },
+    [adminKey, drawerDecision, refresh],
+  );
+
   return (
     <Box bg="gray.0" mih="100vh" py="xl">
       <Container size="lg">
@@ -251,7 +294,7 @@ export function App() {
           {drawerDecision && (
             <Box>
               <Text size="sm" c="dimmed">
-                Time: {drawerDecision.ts}
+                Time: {formatTs(drawerDecision.ts)}
               </Text>
               <Text size="sm" c="dimmed">
                 Decision: {drawerDecision.decision} · DTE {drawerDecision.target_dte} · Δ {drawerDecision.delta_target}
@@ -316,6 +359,12 @@ export function App() {
             <Text>
               {error} <Text span c="dimmed">(Is the backend running on port 8000?)</Text>
             </Text>
+          </Alert>
+        )}
+
+        {successMessage && (
+          <Alert mt="md" color="green" title="Success">
+            <Text>{successMessage}</Text>
           </Alert>
         )}
 
@@ -446,7 +495,7 @@ export function App() {
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>ID</Table.Th>
-                  <Table.Th>Time (UTC)</Table.Th>
+                  <Table.Th>Time</Table.Th>
                   <Table.Th>Decision</Table.Th>
                   <Table.Th>DTE</Table.Th>
                   <Table.Th>Delta</Table.Th>
@@ -457,7 +506,7 @@ export function App() {
                   <Table.Th>Zero Gamma</Table.Th>
                   <Table.Th>VIX</Table.Th>
                   <Table.Th>Reason</Table.Th>
-                  <Table.Th>Details</Table.Th>
+                  <Table.Th>Actions</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -466,7 +515,7 @@ export function App() {
                   return (
                     <Table.Tr key={d.decision_id}>
                       <Table.Td>{d.decision_id}</Table.Td>
-                      <Table.Td>{d.ts}</Table.Td>
+                      <Table.Td>{formatTs(d.ts)}</Table.Td>
                       <Table.Td>
                         <Badge variant="light" color={d.decision === "TRADE" ? "green" : "gray"}>
                           {d.decision}
@@ -484,16 +533,27 @@ export function App() {
                       <Table.Td>{summary?.vix?.toFixed(2) ?? "—"}</Table.Td>
                       <Table.Td>{d.reason ?? "—"}</Table.Td>
                       <Table.Td>
-                        <Button
-                          size="xs"
-                          variant="light"
-                          onClick={() => {
-                            setDrawerDecision(d);
-                            setDrawerOpen(true);
-                          }}
-                        >
-                          View
-                        </Button>
+                        <Group gap="xs">
+                          <Button
+                            size="xs"
+                            variant="light"
+                            onClick={() => {
+                              setDrawerDecision(d);
+                              setDrawerOpen(true);
+                            }}
+                          >
+                            View
+                          </Button>
+                          <Button
+                            size="xs"
+                            color="red"
+                            variant="outline"
+                            loading={deletingDecisionId === d.decision_id}
+                            onClick={() => void deleteDecision(d.decision_id)}
+                          >
+                            Delete
+                          </Button>
+                        </Group>
                       </Table.Td>
                     </Table.Tr>
                   );
@@ -532,7 +592,7 @@ export function App() {
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>ID</Table.Th>
-                  <Table.Th>Time (UTC)</Table.Th>
+                  <Table.Th>Time</Table.Th>
                   <Table.Th>Underlying</Table.Th>
                   <Table.Th>DTE</Table.Th>
                   <Table.Th>Expiration</Table.Th>
@@ -543,7 +603,7 @@ export function App() {
                 {items.map((x) => (
                   <Table.Tr key={x.snapshot_id}>
                     <Table.Td>{x.snapshot_id}</Table.Td>
-                    <Table.Td>{x.ts}</Table.Td>
+                    <Table.Td>{formatTs(x.ts)}</Table.Td>
                     <Table.Td>
                       <Badge variant="light">{x.underlying}</Badge>
                     </Table.Td>
