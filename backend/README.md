@@ -50,6 +50,8 @@ Optional:
 - `SNAPSHOT_DTE_MODE` (default `range`, use `targets` for list mode)
 - `SNAPSHOT_DTE_MIN_DAYS` (default `0`)
 - `SNAPSHOT_DTE_MAX_DAYS` (default `10`)
+- `SNAPSHOT_RANGE_FALLBACK_ENABLED` (default `false`)
+- `SNAPSHOT_RANGE_FALLBACK_COUNT` (default `3`)
 - `SNAPSHOT_DTE_TOLERANCE_DAYS` (default `1`)
 - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
 - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
@@ -141,6 +143,29 @@ To see which expirations Tradier is returning:
 ```bash
 curl "http://localhost:8000/api/admin/expirations?symbol=SPX"
 ```
+
+## Preflight health summary
+
+```bash
+curl "http://localhost:8000/api/admin/preflight"
+```
+
+Returns one-call pipeline health: counts and latest timestamps for quotes, snapshots, GEX, and decisions.
+
+---
+
+## Railway deployment checklist
+
+- Set `APP_ENV=production`
+- Set `ADMIN_API_KEY` to protect admin endpoints
+- Set `CORS_ORIGINS` to your deployed frontend URL
+- Choose `TRADIER_BASE_URL` intentionally:
+  - sandbox: `https://sandbox.tradier.com/v1`
+  - live: `https://api.tradier.com/v1`
+- Use strict range mode in production:
+  - `SNAPSHOT_RANGE_FALLBACK_ENABLED=false`
+
+The backend process reads Railway `PORT` automatically.
 
 ---
 

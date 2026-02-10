@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     snapshot_dte_mode: str = "range"  # "range" or "targets"
     snapshot_dte_min_days: int = 0
     snapshot_dte_max_days: int = 10
+    snapshot_range_fallback_enabled: bool = False
+    snapshot_range_fallback_count: int = 3
     snapshot_dte_tolerance_days: int = 1
     snapshot_strikes_each_side: int = 100
     quote_symbols: str = "SPX,VIX,VIX9D,SPY"

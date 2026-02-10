@@ -176,6 +176,12 @@ Backend configuration is loaded via `pydantic-settings` from `.env` (repo root) 
   - Default: `0`
 - **`SNAPSHOT_DTE_MAX_DAYS`**
   - Default: `10`
+- **`SNAPSHOT_RANGE_FALLBACK_ENABLED`**
+  - Default: `false`
+  - If true, selects closest expirations when no expirations fall within the configured DTE range.
+- **`SNAPSHOT_RANGE_FALLBACK_COUNT`**
+  - Default: `3`
+  - Number of closest expirations to select when range fallback is used.
 - **`SNAPSHOT_DTE_TOLERANCE_DAYS`**
   - Default: `1`
   - Used when selecting an expiration for a target DTE.
@@ -258,7 +264,7 @@ For each configured `target_dte`:
 2) Find expirations within ±`SNAPSHOT_DTE_TOLERANCE_DAYS`
 3) Choose closest by absolute day difference
 
-**Range mode**: when `SNAPSHOT_DTE_MODE=range`, the job selects **all expirations** whose DTE is within `SNAPSHOT_DTE_MIN_DAYS..SNAPSHOT_DTE_MAX_DAYS` (inclusive).
+**Range mode**: when `SNAPSHOT_DTE_MODE=range`, the job selects **all expirations** whose DTE is within `SNAPSHOT_DTE_MIN_DAYS..SNAPSHOT_DTE_MAX_DAYS` (inclusive). If none are found and `SNAPSHOT_RANGE_FALLBACK_ENABLED=true`, it selects the closest expirations (up to `SNAPSHOT_RANGE_FALLBACK_COUNT`).
 
 ### Strike filtering (storage optimization)
 To reduce storage, the job can filter `option_chain_rows` to strikes near spot:
@@ -456,6 +462,9 @@ Using NBBO mid with conservative slippage:
 ### Backtest engine behavior (current)
 - Replay minute-by-minute using CBBO-1m
 - **Construct spreads by strike distance** (not delta) using spot price
+- **As-of quote joins** (last known bid/ask <= timestamp)
+- **Fees + spread-width slippage** applied on entry/exit
+- **Cash-settled expiration handling** (close at settlement time)
 - Evaluate PnL and management rules (TP/SL) identical to live
 - Outputs a list of trades (future: persist into Postgres)
 

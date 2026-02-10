@@ -94,6 +94,18 @@ def _to_float(value: object) -> float | None:
         return None
 
 
+def _to_date(value: object) -> date | None:
+    """Convert ISO date string/object to date when possible."""
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except Exception:
+            return None
+    return None
+
+
 def _select_strikes_near_spot(options: list[dict], spot: float, each_side: int) -> set[float]:
     """Return strike set around spot with N strikes on each side."""
     strikes: list[float] = []
@@ -151,6 +163,7 @@ class SnapshotJob:
                     "now_et": now_et.isoformat(),
                     "inserted": [],
                     "chain_rows_inserted": 0,
+                    "fallback_used": False,
                 }
 
             spot = await self._get_spot_price(session, now_et, underlying)
@@ -158,6 +171,7 @@ class SnapshotJob:
                 logger.warning("snapshot_job: no spot price for {}; storing full chains", underlying)
 
             selected: list[tuple[int, date]] = []
+            fallback_used = False
             seen_exp: set[date] = set()
             if dte_mode == "range":
                 min_dte = min(settings.snapshot_dte_min_days, settings.snapshot_dte_max_days)
@@ -167,15 +181,34 @@ class SnapshotJob:
                     if min_dte <= dte <= max_dte:
                         selected.append((dte, exp))
                 if not selected:
-                    logger.warning("snapshot_job: no expirations in dte range {}-{}", min_dte, max_dte)
-                    await session.commit()
-                    return {
-                        "skipped": True,
-                        "reason": "no_expirations_in_range",
-                        "now_et": now_et.isoformat(),
-                        "inserted": [],
-                        "chain_rows_inserted": 0,
-                    }
+                    if settings.snapshot_range_fallback_enabled:
+                        fallback_count = max(1, settings.snapshot_range_fallback_count)
+                        center = (min_dte + max_dte) / 2.0
+                        future_exps = [exp for exp in expirations if (exp - now_et.date()).days >= 0]
+                        ranked = sorted(
+                            future_exps if future_exps else expirations,
+                            key=lambda exp: abs(((exp - now_et.date()).days) - center),
+                        )
+                        fallback_exps = ranked[:fallback_count]
+                        selected = [((exp - now_et.date()).days, exp) for exp in fallback_exps]
+                        fallback_used = True
+                        logger.warning(
+                            "snapshot_job: no expirations in dte range {}-{}; fallback enabled, selected {} closest expirations",
+                            min_dte,
+                            max_dte,
+                            len(selected),
+                        )
+                    else:
+                        logger.warning("snapshot_job: no expirations in dte range {}-{}", min_dte, max_dte)
+                        await session.commit()
+                        return {
+                            "skipped": True,
+                            "reason": "no_expirations_in_range",
+                            "now_et": now_et.isoformat(),
+                            "inserted": [],
+                            "chain_rows_inserted": 0,
+                            "fallback_used": False,
+                        }
             else:
                 dte_targets = settings.dte_targets_list()
                 for target_dte in dte_targets:
@@ -280,7 +313,7 @@ class SnapshotJob:
                             "snapshot_id": snapshot_id,
                             "option_symbol": symbol,
                             "underlying": opt.get("underlying") or underlying,
-                            "expiration": (opt.get("expiration_date") or exp),
+                            "expiration": (_to_date(opt.get("expiration_date")) or exp),
                             "strike": strike_val,
                             "option_right": _normalize_option_right(opt),
                             "bid": _to_float(opt.get("bid")),
@@ -308,6 +341,7 @@ class SnapshotJob:
                         "expiration": exp.isoformat(),
                         "actual_dte_days": (exp - now_et.date()).days,
                         "checksum": chk,
+                        "fallback_used": fallback_used,
                     }
                 )
 
@@ -319,6 +353,7 @@ class SnapshotJob:
             "now_et": now_et.isoformat(),
             "inserted": inserted,
             "chain_rows_inserted": chain_rows_inserted,
+            "fallback_used": fallback_used,
         }
 
     async def _get_spot_price(self, session, ts: datetime, underlying: str) -> float | None:

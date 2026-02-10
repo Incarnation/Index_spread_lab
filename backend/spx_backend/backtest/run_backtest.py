@@ -17,6 +17,10 @@ def main() -> None:
     result = engine.run()
 
     print(f"trades: {len(result.trades)}")
+    if result.summary:
+        print("summary:")
+        for key, value in result.summary.items():
+            print(f"  {key}: {value}")
     for t in result.trades[:5]:
         print(
             f"entry={t.entry_ts} exit={t.exit_ts} exp={t.expiration} credit={t.entry_credit:.2f} "

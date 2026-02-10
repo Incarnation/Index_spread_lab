@@ -174,6 +174,26 @@ class DecisionJob:
             },
         )
         result = row.fetchone()
+        used_fallback = False
+        if (not result) and settings.snapshot_range_fallback_enabled:
+            # In sandbox/range-fallback mode we may not have near-term DTE snapshots.
+            row = await session.execute(
+                text(
+                    """
+                    SELECT snapshot_id, ts, expiration, target_dte
+                    FROM chain_snapshots
+                    WHERE underlying = :underlying
+                    ORDER BY ABS(target_dte - :target_dte) ASC, ts DESC, snapshot_id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "underlying": settings.snapshot_underlying,
+                    "target_dte": target_dte,
+                },
+            )
+            result = row.fetchone()
+            used_fallback = result is not None
         if not result:
             return None
         snapshot_id, ts, expiration, actual_dte = result
@@ -182,6 +202,12 @@ class DecisionJob:
             if age > settings.decision_snapshot_max_age_minutes:
                 logger.warning("decision_job: stale snapshot target_dte={} age_min={}", target_dte, round(age, 2))
                 return None
+        if used_fallback:
+            logger.warning(
+                "decision_job: no snapshot in tolerance for target_dte={}; using closest snapshot target_dte={}",
+                target_dte,
+                actual_dte,
+            )
         return {"snapshot_id": snapshot_id, "ts": ts, "expiration": expiration, "target_dte": actual_dte}
 
     async def _get_option_rows(self, session, snapshot_id: int) -> list[dict]:

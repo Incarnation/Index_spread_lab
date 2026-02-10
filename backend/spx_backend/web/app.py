@@ -329,6 +329,154 @@ async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None 
     return {"symbol": symbol, "expirations": [e.isoformat() for e in exps]}
 
 
+@app.get("/api/admin/preflight")
+async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+    """Return one-call pipeline health summary."""
+
+    def _iso(ts) -> str | None:
+        return ts.isoformat() if ts is not None else None
+
+    r = await db.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM underlying_quotes) AS quotes_count,
+              (SELECT COUNT(*) FROM chain_snapshots) AS snapshots_count,
+              (SELECT COUNT(*) FROM option_chain_rows) AS chain_rows_count,
+              (SELECT COUNT(*) FROM gex_snapshots) AS gex_snapshots_count,
+              (SELECT COUNT(*) FROM trade_decisions) AS decisions_count,
+              (SELECT MAX(ts) FROM underlying_quotes) AS latest_quote_ts,
+              (SELECT MAX(ts) FROM chain_snapshots) AS latest_snapshot_ts,
+              (SELECT MAX(ts) FROM gex_snapshots) AS latest_gex_ts,
+              (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
+              (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
+            """
+        )
+    )
+    summary = r.fetchone()
+
+    latest_snapshot_row = (
+        await db.execute(
+            text(
+                """
+                SELECT snapshot_id, ts, target_dte, expiration
+                FROM chain_snapshots
+                ORDER BY ts DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_gex_row = (
+        await db.execute(
+            text(
+                """
+                SELECT snapshot_id, ts, gex_net, zero_gamma_level, method
+                FROM gex_snapshots
+                ORDER BY ts DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_decision_row = (
+        await db.execute(
+            text(
+                """
+                SELECT decision_id, ts, decision, reason, score, target_dte, delta_target, chain_snapshot_id, decision_source
+                FROM trade_decisions
+                ORDER BY ts DESC, decision_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_quotes = (
+        await db.execute(
+            text(
+                """
+                SELECT DISTINCT ON (symbol) symbol, ts, last
+                FROM underlying_quotes
+                ORDER BY symbol, ts DESC
+                """
+            )
+        )
+    ).fetchall()
+
+    counts = {
+        "underlying_quotes": int(summary.quotes_count or 0),
+        "chain_snapshots": int(summary.snapshots_count or 0),
+        "option_chain_rows": int(summary.chain_rows_count or 0),
+        "gex_snapshots": int(summary.gex_snapshots_count or 0),
+        "trade_decisions": int(summary.decisions_count or 0),
+    }
+    latest = {
+        "quote_ts": _iso(summary.latest_quote_ts),
+        "snapshot_ts": _iso(summary.latest_snapshot_ts),
+        "gex_ts": _iso(summary.latest_gex_ts),
+        "decision_ts": _iso(summary.latest_decision_ts),
+        "market_clock_ts": _iso(summary.latest_market_clock_ts),
+    }
+
+    warnings: list[str] = []
+    if counts["chain_snapshots"] == 0:
+        warnings.append("no_chain_snapshots")
+    if counts["gex_snapshots"] == 0:
+        warnings.append("no_gex_snapshots")
+    if counts["trade_decisions"] == 0:
+        warnings.append("no_trade_decisions")
+
+    return {
+        "now_utc": f"{datetime.utcnow().isoformat()}Z",
+        "counts": counts,
+        "latest": latest,
+        "latest_snapshot": (
+            None
+            if latest_snapshot_row is None
+            else {
+                "snapshot_id": latest_snapshot_row.snapshot_id,
+                "ts": _iso(latest_snapshot_row.ts),
+                "target_dte": latest_snapshot_row.target_dte,
+                "expiration": str(latest_snapshot_row.expiration),
+            }
+        ),
+        "latest_gex": (
+            None
+            if latest_gex_row is None
+            else {
+                "snapshot_id": latest_gex_row.snapshot_id,
+                "ts": _iso(latest_gex_row.ts),
+                "gex_net": latest_gex_row.gex_net,
+                "zero_gamma_level": latest_gex_row.zero_gamma_level,
+                "method": latest_gex_row.method,
+            }
+        ),
+        "latest_decision": (
+            None
+            if latest_decision_row is None
+            else {
+                "decision_id": latest_decision_row.decision_id,
+                "ts": _iso(latest_decision_row.ts),
+                "decision": latest_decision_row.decision,
+                "reason": latest_decision_row.reason,
+                "score": latest_decision_row.score,
+                "target_dte": latest_decision_row.target_dte,
+                "delta_target": latest_decision_row.delta_target,
+                "chain_snapshot_id": latest_decision_row.chain_snapshot_id,
+                "decision_source": latest_decision_row.decision_source,
+            }
+        ),
+        "latest_quotes_by_symbol": [
+            {"symbol": row.symbol, "ts": _iso(row.ts), "last": row.last}
+            for row in latest_quotes
+        ],
+        "warnings": warnings,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(db: AsyncSession = Depends(get_db_session)) -> HTMLResponse:
     """Small HTML page listing recent snapshots."""

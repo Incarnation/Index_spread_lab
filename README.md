@@ -3,11 +3,11 @@
 A research + paper execution platform for **SPX index options** with a focus on **0–14 DTE credit spreads**.
 
 Current MVP capabilities:
-- **Backend**: FastAPI service that initializes a Postgres schema on startup and runs a scheduled job to snapshot the SPX option chain from Tradier.
-- **Frontend**: React (Vite) dashboard that reads from the backend API.
+- **Backend**: FastAPI service that initializes Postgres, runs snapshot/quote/GEX jobs, and a rules‑based decision engine that writes `trade_decisions`.
+- **Frontend**: React (Vite) dashboard to run jobs, view snapshots, GEX charts, and trade decisions.
 
 Planned next steps (per `PROJECT_SPEC.md`):
-- Decision engine (rules-only) is wired; next is broker order placement and fills.
+- Broker order placement + fills (paper sandbox).
 - Backtesting pipeline (Databento `OPRA.PILLAR` SPX, `CBBO-1m`) with live/backtest parity.
 - ML pipeline: feature snapshots, model versioning, and walk-forward evaluation.
 
@@ -37,6 +37,8 @@ Create a `.env` in the repo root (copy `.env.example`) and fill in:
   - `SNAPSHOT_DTE_MODE` (default `range`, use `targets` for list mode)
   - `SNAPSHOT_DTE_MIN_DAYS` (default `0`)
   - `SNAPSHOT_DTE_MAX_DAYS` (default `10`)
+  - `SNAPSHOT_RANGE_FALLBACK_ENABLED` (default `false`)
+  - `SNAPSHOT_RANGE_FALLBACK_COUNT` (default `3`)
   - `SNAPSHOT_DTE_TOLERANCE_DAYS` (default `1`)
   - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
   - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
@@ -111,11 +113,21 @@ python -m spx_backend.main
 Backend endpoints:
 - `GET http://localhost:8000/health`
 - `GET http://localhost:8000/api/chain-snapshots?limit=50`
+- `GET http://localhost:8000/api/gex/snapshots?limit=50`
+- `GET http://localhost:8000/api/gex/curve?snapshot_id=...`
+- `GET http://localhost:8000/api/trade-decisions?limit=50`
+- `GET http://localhost:8000/api/admin/preflight`
+- `POST http://localhost:8000/api/admin/run-snapshot`
+- `POST http://localhost:8000/api/admin/run-quotes`
+- `POST http://localhost:8000/api/admin/run-gex`
+- `POST http://localhost:8000/api/admin/run-decision`
 
 Notes:
-- The scheduler runs two jobs:
+- The scheduler runs four jobs:
   - **Snapshot job**: stores option chain snapshots.
   - **Quote job**: stores SPX/VIX/VIX9D/SPY quotes every `QUOTE_INTERVAL_MINUTES`.
+  - **GEX job**: computes gamma exposure aggregates.
+  - **Decision job**: writes `trade_decisions` at entry times (rules-only).
 - Market open/close checks use Tradier market clock with a short cache to reduce calls.
 - Market clock responses are stored in `market_clock_audit` for audit/debug.
 
@@ -142,6 +154,19 @@ This repo includes a `Dockerfile` that starts the backend. Typical Railway setup
 - Create a service from this repo
 - Set environment variables (same as `.env`)
 - Ensure a Postgres plugin/service is attached and `DATABASE_URL` is set appropriately
+
+Recommended env values before deploy:
+- `APP_ENV=production`
+- `ADMIN_API_KEY=<strong-random-key>`
+- `CORS_ORIGINS=https://<your-frontend-domain>`
+- `SNAPSHOT_RANGE_FALLBACK_ENABLED=false` (strict mode in production)
+- `TRADIER_BASE_URL`:
+  - paper/sandbox: `https://sandbox.tradier.com/v1`
+  - live: `https://api.tradier.com/v1`
+
+Notes:
+- The app now honors Railway `PORT` automatically.
+- Keep tokens/keys only in Railway Variables (not in repo files).
 
 ### Frontend
 Two options:
