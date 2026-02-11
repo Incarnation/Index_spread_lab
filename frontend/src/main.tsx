@@ -2,12 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
-import { App } from "./App";
+import { DashboardApp } from "./DashboardApp";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <MantineProvider defaultColorScheme="light">
-      <App />
+      <DashboardApp />
     </MantineProvider>
   </React.StrictMode>
 );

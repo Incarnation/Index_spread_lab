@@ -22,6 +22,7 @@ venv/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+*.tsbuildinfo
 
 # Data / DB artifacts (keep large data out of git)
 *.duckdb

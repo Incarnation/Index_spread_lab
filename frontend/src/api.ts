@@ -94,6 +94,11 @@ export type GexCurvePoint = {
   gex_puts: number | null;
 };
 
+export type GexExpirationItem = {
+  expiration: string;
+  dte_days: number | null;
+};
+
 export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
   const r = await fetch(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -108,9 +113,17 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
   return data.dte_days;
 }
 
-export async function fetchGexCurve(snapshotId: number, dteDays?: number): Promise<GexCurvePoint[]> {
+export async function fetchGexExpirations(snapshotId: number): Promise<GexExpirationItem[]> {
+  const r = await fetch(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = (await r.json()) as { items: GexExpirationItem[] };
+  return data.items;
+}
+
+export async function fetchGexCurve(snapshotId: number, dteDays?: number, expirations?: string[]): Promise<GexCurvePoint[]> {
   const params = new URLSearchParams({ snapshot_id: String(snapshotId) });
   if (typeof dteDays === "number") params.set("dte_days", String(dteDays));
+  if (expirations && expirations.length > 0) params.set("expirations_csv", expirations.join(","));
   const r = await fetch(apiUrl(`/api/gex/curve?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { points: GexCurvePoint[] };

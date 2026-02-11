@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
@@ -236,10 +236,73 @@ async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_sess
     return {"snapshot_id": snapshot_id, "dte_days": dtes}
 
 
+@app.get("/api/gex/expirations")
+async def list_gex_expirations(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return available expirations for a GEX snapshot."""
+    r = await db.execute(
+        text(
+            """
+            SELECT DISTINCT expiration, dte_days
+            FROM gex_by_expiry_strike
+            WHERE snapshot_id = :snapshot_id
+            ORDER BY expiration ASC
+            """
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    rows = r.fetchall()
+    return {
+        "snapshot_id": snapshot_id,
+        "items": [
+            {
+                "expiration": row.expiration.isoformat(),
+                "dte_days": row.dte_days,
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.get("/api/gex/curve")
-async def get_gex_curve(snapshot_id: int, dte_days: int | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
-    """Return GEX curve by strike (optional DTE filter)."""
-    if dte_days is None:
+async def get_gex_curve(
+    snapshot_id: int,
+    dte_days: int | None = None,
+    expirations_csv: str | None = None,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return GEX curve by strike (optional DTE or custom expirations filter)."""
+    selected_expirations: list[date] = []
+    if expirations_csv is not None:
+        for part in expirations_csv.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                selected_expirations.append(date.fromisoformat(p))
+            except ValueError:
+                continue
+        if not selected_expirations:
+            return {"snapshot_id": snapshot_id, "dte_days": dte_days, "expirations": [], "points": []}
+
+    if selected_expirations:
+        stmt = text(
+            """
+            SELECT strike,
+                   SUM(gex_net) AS gex_net,
+                   SUM(gex_calls) AS gex_calls,
+                   SUM(gex_puts) AS gex_puts
+            FROM gex_by_expiry_strike
+            WHERE snapshot_id = :snapshot_id
+              AND expiration IN :expirations
+            GROUP BY strike
+            ORDER BY strike ASC
+            """
+        ).bindparams(bindparam("expirations", expanding=True))
+        r = await db.execute(
+            stmt,
+            {"snapshot_id": snapshot_id, "expirations": selected_expirations},
+        )
+    elif dte_days is None:
         r = await db.execute(
             text(
                 """
@@ -267,6 +330,7 @@ async def get_gex_curve(snapshot_id: int, dte_days: int | None = None, db: Async
     return {
         "snapshot_id": snapshot_id,
         "dte_days": dte_days,
+        "expirations": [e.isoformat() for e in selected_expirations],
         "points": [
             {
                 "strike": row.strike,
