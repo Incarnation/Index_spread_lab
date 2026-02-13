@@ -12,11 +12,13 @@ It is built for observability and reproducibility:
 
 ## 1) Service Responsibilities
 
-The backend performs four continuous tasks:
+The backend performs six continuous tasks:
 - Quote ingestion (`underlying_quotes`, `context_snapshots`)
 - Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
 - GEX computation (`gex_snapshots`, strike/expiry detail tables)
 - Decision generation (`trade_decisions`)
+- Feature generation (`feature_snapshots`, `trade_candidates`)
+- Label resolution (`trade_candidates.label_*`, `realized_pnl`)
 
 And exposes APIs for:
 - dashboard data reads
@@ -31,7 +33,7 @@ Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/db_schema.sql`.
 3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/snapshot/gex/decision.
+4) Start APScheduler jobs for quote/snapshot/gex/decision/feature-builder/labeler.
 5) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
@@ -136,6 +138,26 @@ Why SKIP rows are stored:
 - They provide full auditability for why no trade occurred.
 - They are required to evaluate decision quality over time.
 
+### 4.5 Feature Builder Job
+
+Input:
+- Same live decision-time context (fresh snapshot + option rows + spot + context).
+
+Output:
+- One `feature_snapshots` row per target DTE.
+- Ranked candidate rows in `trade_candidates` with deterministic `candidate_hash`.
+
+### 4.6 Labeler Job
+
+Input:
+- Pending candidates from `trade_candidates`.
+- Forward option marks from later snapshots for the same expiration.
+
+Output:
+- Resolved labels in `trade_candidates.label_json`.
+- Status updates in `label_status`.
+- Scalar outcomes in `realized_pnl` and `hit_tp50_before_sl_or_expiry`.
+
 ---
 
 ## 5) Trading-Day DTE Semantics
@@ -187,6 +209,8 @@ Routes:
 - `POST /api/admin/run-quotes`
 - `POST /api/admin/run-gex`
 - `POST /api/admin/run-decision`
+- `POST /api/admin/run-feature-builder`
+- `POST /api/admin/run-labeler`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -223,6 +247,20 @@ High-impact settings:
   - `DECISION_SPREAD_SIDE`, `DECISION_SPREAD_WIDTH_POINTS`
   - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
   - `DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`
+- Feature Builder:
+  - `FEATURE_BUILDER_ENABLED`
+  - `FEATURE_BUILDER_ALLOW_OUTSIDE_RTH`
+  - `FEATURE_SCHEMA_VERSION`
+  - `CANDIDATE_SCHEMA_VERSION`
+- Labeler:
+  - `LABELER_ENABLED`
+  - `LABELER_INTERVAL_MINUTES`
+  - `LABELER_BATCH_LIMIT`
+  - `LABELER_MIN_AGE_MINUTES`
+  - `LABELER_MAX_WAIT_HOURS`
+  - `LABELER_TAKE_PROFIT_PCT`
+  - `LABEL_SCHEMA_VERSION`
+  - `LABEL_CONTRACT_MULTIPLIER`
 - GEX:
   - `GEX_ENABLED`, `GEX_INTERVAL_MINUTES`
   - `GEX_SNAPSHOT_BATCH_LIMIT` (default `20`)
@@ -277,6 +315,12 @@ ML/backtest scaffolding:
 Initialization behavior:
 - schema is idempotent (`IF NOT EXISTS`)
 - executed statement-by-statement for asyncpg compatibility
+- ML tables now include explicit schema-version and labeling fields to support feature/candidate/prediction lineage.
+
+Destructive ML reset:
+- reset SQL: `spx_backend/db_reset_ml_tables.sql`
+- CLI: `python -m spx_backend.reset_ml_schema`
+- This drops and recreates ML/decision/trade tables only (market-data ingestion tables are preserved).
 
 ---
 
@@ -292,6 +336,13 @@ cd backend
 python -m spx_backend.main
 ```
 
+Reset ML schema (destructive; keeps snapshots/quotes/GEX tables):
+
+```bash
+cd backend
+python -m spx_backend.reset_ml_schema
+```
+
 Smoke test:
 
 ```bash
@@ -305,6 +356,8 @@ Manual pipeline test:
 curl -X POST http://localhost:8000/api/admin/run-quotes
 curl -X POST http://localhost:8000/api/admin/run-snapshot
 curl -X POST http://localhost:8000/api/admin/run-gex
+curl -X POST http://localhost:8000/api/admin/run-feature-builder
+curl -X POST http://localhost:8000/api/admin/run-labeler
 curl -X POST http://localhost:8000/api/admin/run-decision
 curl http://localhost:8000/api/admin/preflight
 ```

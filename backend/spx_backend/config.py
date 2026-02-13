@@ -53,6 +53,22 @@ class Settings(BaseSettings):
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
 
+    # ML feature/candidate generation (step 1)
+    feature_builder_enabled: bool = True
+    feature_builder_allow_outside_rth: bool = False
+    feature_schema_version: str = "fs_v1"
+    candidate_schema_version: str = "cand_v1"
+
+    # ML label resolver (step 2)
+    labeler_enabled: bool = True
+    labeler_interval_minutes: int = 15
+    labeler_batch_limit: int = 200
+    labeler_min_age_minutes: int = 5
+    labeler_max_wait_hours: int = 336
+    labeler_take_profit_pct: float = 0.50
+    label_schema_version: str = "label_v1"
+    label_contract_multiplier: int = 100
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls

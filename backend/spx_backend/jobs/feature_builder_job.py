@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import hashlib
+import json
+import statistics
+from zoneinfo import ZoneInfo
+
+from loguru import logger
+from sqlalchemy import text
+
+from spx_backend.config import settings
+from spx_backend.db import SessionLocal
+from spx_backend.jobs.decision_job import DecisionJob
+from spx_backend.market_clock import MarketClockCache, is_rth
+
+
+def stable_json_hash(payload: dict) -> str:
+    """Return stable SHA-256 hash for deterministic JSON payloads."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_candidate_hash_payload(candidate_json: dict) -> dict:
+    """Build canonical fields used for candidate hashing."""
+    legs = candidate_json.get("legs") or {}
+    short_leg = legs.get("short") or {}
+    long_leg = legs.get("long") or {}
+    return {
+        "underlying": candidate_json.get("underlying"),
+        "snapshot_id": candidate_json.get("snapshot_id"),
+        "expiration": candidate_json.get("expiration"),
+        "target_dte": candidate_json.get("target_dte"),
+        "delta_target": candidate_json.get("delta_target"),
+        "spread_side": candidate_json.get("spread_side"),
+        "width_points": candidate_json.get("width_points"),
+        "contracts": candidate_json.get("contracts"),
+        "short_symbol": short_leg.get("symbol"),
+        "short_strike": short_leg.get("strike"),
+        "long_symbol": long_leg.get("symbol"),
+        "long_strike": long_leg.get("strike"),
+    }
+
+
+def build_candidate_hash(candidate_json: dict) -> str:
+    """Return deterministic candidate hash from canonical candidate fields."""
+    return stable_json_hash(build_candidate_hash_payload(candidate_json))
+
+
+def _to_json(value: dict | None) -> str | None:
+    """Serialize dict payloads for JSONB SQL inserts."""
+    if value is None:
+        return None
+    return json.dumps(value, default=str)
+
+
+def _iso_to_dt(value: str | None) -> datetime | None:
+    """Parse ISO datetime when available."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class FeatureBuilderJob:
+    """Generate feature snapshots and trade candidates at decision times."""
+
+    clock_cache: MarketClockCache | None = None
+
+    async def _market_open(self, now_et: datetime) -> bool:
+        """Check market state using cached clock, fallback to simple RTH."""
+        if self.clock_cache:
+            return await self.clock_cache.is_open(now_et)
+        return is_rth(now_et)
+
+    def _is_entry_time(self, now_et: datetime) -> bool:
+        """Return True if current ET hour/minute is configured for entries."""
+        return (now_et.hour, now_et.minute) in settings.decision_entry_times_list()
+
+    def _build_feature_payload(
+        self,
+        *,
+        now_et: datetime,
+        snapshot: dict,
+        options: list[dict],
+        spot: float | None,
+        context: dict | None,
+    ) -> dict:
+        """Build compact, reproducible market-state feature payload."""
+        spreads = [float(o["ask"]) - float(o["bid"]) for o in options]
+        mids = [(float(o["ask"]) + float(o["bid"])) / 2.0 for o in options]
+        deltas = [abs(float(o["delta"])) for o in options]
+        strikes = [float(o["strike"]) for o in options]
+
+        now_utc = now_et.astimezone(ZoneInfo("UTC"))
+        snapshot_ts = snapshot["ts"]
+        context_ts = _iso_to_dt(context.get("ts")) if context else None
+
+        snapshot_age_sec = (now_utc - snapshot_ts).total_seconds() if snapshot_ts else None
+        context_age_sec = (now_utc - context_ts).total_seconds() if context_ts else None
+
+        return {
+            "schema_version": settings.feature_schema_version,
+            "asof_ts_utc": now_utc.isoformat(),
+            "underlying": settings.snapshot_underlying,
+            "target_dte": snapshot["target_dte"],
+            "entry_slot": now_et.hour,
+            "snapshot_id": snapshot["snapshot_id"],
+            "expiration": str(snapshot["expiration"]),
+            "spot": {"spx_last": spot},
+            "vol_context": {
+                "vix": None if context is None else context.get("vix"),
+                "vix9d": None if context is None else context.get("vix9d"),
+                "term_structure": None if context is None else context.get("term_structure"),
+            },
+            "gex_context": {
+                "gex_net": None if context is None else context.get("gex_net"),
+                "zero_gamma_level": None if context is None else context.get("zero_gamma_level"),
+            },
+            "chain_quality": {
+                "rows_total": len(options),
+                "strike_min": min(strikes) if strikes else None,
+                "strike_max": max(strikes) if strikes else None,
+                "median_spread": statistics.median(spreads) if spreads else None,
+                "median_mid": statistics.median(mids) if mids else None,
+                "median_abs_delta": statistics.median(deltas) if deltas else None,
+            },
+            "staleness": {
+                "snapshot_age_sec": snapshot_age_sec,
+                "context_age_sec": context_age_sec,
+            },
+            "decision_config": {
+                "spread_side": settings.decision_spread_side.lower(),
+                "width_points": settings.decision_spread_width_points,
+                "contracts": settings.decision_contracts,
+                "delta_targets": settings.decision_delta_targets_list(),
+            },
+        }
+
+    def _build_candidate_json(self, candidate: dict) -> dict:
+        """Normalize candidate payload to a stable JSON document."""
+        chosen = candidate["chosen_legs_json"]
+        short_leg = chosen.get("short") or {}
+        long_leg = chosen.get("long") or {}
+        return {
+            "schema_version": settings.candidate_schema_version,
+            "underlying": settings.snapshot_underlying,
+            "snapshot_id": candidate["snapshot_id"],
+            "expiration": str(candidate["expiration"]),
+            "target_dte": candidate["target_dte"],
+            "delta_target": candidate["delta_target"],
+            "spread_side": settings.decision_spread_side.lower(),
+            "width_points": settings.decision_spread_width_points,
+            "contracts": settings.decision_contracts,
+            "entry_credit": candidate["credit"],
+            "score": candidate["score"],
+            "delta_diff": candidate["delta_diff"],
+            "context_score": candidate.get("context_score"),
+            "legs": {"short": short_leg, "long": long_leg},
+            "context": chosen.get("context"),
+            "context_flags": chosen.get("context_flags"),
+        }
+
+    async def run_once(self, *, force: bool = False) -> dict:
+        """Generate features and candidates for each target DTE."""
+        tz = ZoneInfo(settings.tz)
+        now_et = datetime.now(tz=tz)
+        entry_slot = now_et.hour
+        logger.info("feature_builder_job: start force={} now_et={}", force, now_et.isoformat())
+
+        if not settings.feature_builder_enabled:
+            return {"skipped": True, "reason": "feature_builder_disabled", "now_et": now_et.isoformat()}
+
+        if (not force) and (not self._is_entry_time(now_et)):
+            return {"skipped": True, "reason": "not_entry_time", "now_et": now_et.isoformat()}
+
+        if (not force) and (not settings.feature_builder_allow_outside_rth):
+            if not await self._market_open(now_et):
+                return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat()}
+
+        target_dtes = settings.decision_dte_targets_list()
+        delta_targets = settings.decision_delta_targets_list()
+        if not target_dtes or not delta_targets:
+            return {"skipped": True, "reason": "missing_targets", "now_et": now_et.isoformat()}
+
+        helper = DecisionJob(clock_cache=self.clock_cache)
+        features_inserted = 0
+        candidates_inserted = 0
+        built: list[dict] = []
+
+        async with SessionLocal() as session:
+            spot = await helper._get_spot_price(session, now_et, settings.snapshot_underlying)
+            context = await helper._get_latest_context(session, now_et)
+            context_ts = _iso_to_dt(context.get("ts")) if context else None
+
+            for target_dte in target_dtes:
+                snapshot = await helper._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                if snapshot is None:
+                    continue
+                options = await helper._get_option_rows(session, snapshot["snapshot_id"])
+                if not options:
+                    continue
+
+                feature_payload = self._build_feature_payload(
+                    now_et=now_et,
+                    snapshot=snapshot,
+                    options=options,
+                    spot=spot,
+                    context=context,
+                )
+                feature_hash = stable_json_hash(feature_payload)
+                feature_insert = await session.execute(
+                    text(
+                        """
+                        INSERT INTO feature_snapshots (
+                          ts, snapshot_id, context_ts, underlying, target_dte, entry_slot,
+                          strategy_version_id, data_source, feature_schema_version, feature_hash,
+                          source_job, source_run_id, features_json, label_status, label_horizon
+                        )
+                        VALUES (
+                          :ts, :snapshot_id, :context_ts, :underlying, :target_dte, :entry_slot,
+                          :strategy_version_id, :data_source, :feature_schema_version, :feature_hash,
+                          :source_job, :source_run_id, CAST(:features_json AS jsonb), :label_status, :label_horizon
+                        )
+                        RETURNING feature_snapshot_id
+                        """
+                    ),
+                    {
+                        "ts": now_et.astimezone(ZoneInfo("UTC")),
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "context_ts": context_ts,
+                        "underlying": settings.snapshot_underlying,
+                        "target_dte": snapshot["target_dte"],
+                        "entry_slot": entry_slot,
+                        "strategy_version_id": None,
+                        "data_source": "live",
+                        "feature_schema_version": settings.feature_schema_version,
+                        "feature_hash": feature_hash,
+                        "source_job": "feature_builder_job",
+                        "source_run_id": None,
+                        "features_json": _to_json(feature_payload),
+                        "label_status": "pending",
+                        "label_horizon": "to_expiration",
+                    },
+                )
+                feature_snapshot_id = feature_insert.scalar_one()
+                features_inserted += 1
+
+                candidates: list[dict] = []
+                for delta_target in delta_targets:
+                    candidate = helper._build_candidate(
+                        options=options,
+                        target_dte=snapshot["target_dte"],
+                        delta_target=delta_target,
+                        spread_side=settings.decision_spread_side,
+                        width_points=settings.decision_spread_width_points,
+                        snapshot_id=snapshot["snapshot_id"],
+                        expiration=snapshot["expiration"],
+                        spot=spot,
+                        context=context,
+                    )
+                    if candidate:
+                        candidates.append(candidate)
+
+                # Ranking is persisted to support model-vs-rules comparison later.
+                candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
+                for rank, candidate in enumerate(candidates, start=1):
+                    candidate_json = self._build_candidate_json(candidate)
+                    candidate_hash = build_candidate_hash(candidate_json)
+                    entry_credit = float(candidate["credit"])
+                    width_points = float(settings.decision_spread_width_points)
+                    max_loss = max(width_points - entry_credit, 0.0)
+                    credit_to_width = (entry_credit / width_points) if width_points > 0 else None
+                    constraints_json = {
+                        "credit_positive": entry_credit > 0,
+                        "width_points": width_points,
+                        "delta_target": candidate["delta_target"],
+                    }
+
+                    insert_candidate = await session.execute(
+                        text(
+                            """
+                            INSERT INTO trade_candidates (
+                              ts, feature_snapshot_id, snapshot_id, strategy_version_id,
+                              candidate_hash, candidate_schema_version, candidate_rank,
+                              entry_credit, max_loss, credit_to_width, candidate_json, constraints_json,
+                              label_status, label_horizon
+                            )
+                            VALUES (
+                              :ts, :feature_snapshot_id, :snapshot_id, :strategy_version_id,
+                              :candidate_hash, :candidate_schema_version, :candidate_rank,
+                              :entry_credit, :max_loss, :credit_to_width, CAST(:candidate_json AS jsonb), CAST(:constraints_json AS jsonb),
+                              :label_status, :label_horizon
+                            )
+                            ON CONFLICT (feature_snapshot_id, candidate_hash) DO NOTHING
+                            RETURNING candidate_id
+                            """
+                        ),
+                        {
+                            "ts": now_et.astimezone(ZoneInfo("UTC")),
+                            "feature_snapshot_id": feature_snapshot_id,
+                            "snapshot_id": candidate["snapshot_id"],
+                            "strategy_version_id": None,
+                            "candidate_hash": candidate_hash,
+                            "candidate_schema_version": settings.candidate_schema_version,
+                            "candidate_rank": rank,
+                            "entry_credit": entry_credit,
+                            "max_loss": max_loss,
+                            "credit_to_width": credit_to_width,
+                            "candidate_json": _to_json(candidate_json),
+                            "constraints_json": _to_json(constraints_json),
+                            "label_status": "pending",
+                            "label_horizon": "to_expiration",
+                        },
+                    )
+                    candidate_id = insert_candidate.scalar_one_or_none()
+                    if candidate_id is not None:
+                        candidates_inserted += 1
+
+                built.append(
+                    {
+                        "target_dte": snapshot["target_dte"],
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "feature_snapshot_id": feature_snapshot_id,
+                        "candidate_count": len(candidates),
+                    }
+                )
+
+            await session.commit()
+
+        return {
+            "skipped": False,
+            "reason": None,
+            "now_et": now_et.isoformat(),
+            "features_inserted": features_inserted,
+            "candidates_inserted": candidates_inserted,
+            "items": built,
+        }
+
+
+def build_feature_builder_job(clock_cache: MarketClockCache | None = None) -> FeatureBuilderJob:
+    """Factory helper for FeatureBuilderJob."""
+    return FeatureBuilderJob(clock_cache=clock_cache)

@@ -14,7 +14,9 @@ from spx_backend.db import get_db_session
 from spx_backend.db_init import init_db
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
+from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
 from spx_backend.jobs.gex_job import GexJob
+from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
 from spx_backend.market_clock import MarketClockCache
@@ -36,6 +38,8 @@ async def lifespan(app: FastAPI):
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob()
     decision_job = DecisionJob(clock_cache=clock_cache)
+    feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
+    labeler_job = LabelerJob()
 
     scheduler.add_job(
         snapshot_job.run_once,
@@ -59,12 +63,29 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     for hour, minute in settings.decision_entry_times_list():
+        if settings.feature_builder_enabled:
+            scheduler.add_job(
+                feature_builder_job.run_once,
+                "cron",
+                hour=hour,
+                minute=minute,
+                id=f"feature_builder_job_{hour:02d}{minute:02d}",
+                replace_existing=True,
+            )
         scheduler.add_job(
             decision_job.run_once,
             "cron",
             hour=hour,
             minute=minute,
             id=f"decision_job_{hour:02d}{minute:02d}",
+            replace_existing=True,
+        )
+    if settings.labeler_enabled:
+        scheduler.add_job(
+            labeler_job.run_once,
+            "interval",
+            minutes=settings.labeler_interval_minutes,
+            id="labeler_job",
             replace_existing=True,
         )
     scheduler.start()
@@ -76,6 +97,8 @@ async def lifespan(app: FastAPI):
     app.state.quote_job = quote_job
     app.state.gex_job = gex_job
     app.state.decision_job = decision_job
+    app.state.feature_builder_job = feature_builder_job
+    app.state.labeler_job = labeler_job
 
     # Run once immediately on boot (useful for confirming wiring).
     try:
@@ -458,6 +481,22 @@ async def admin_run_decision(request: Request, _: None = Depends(_require_admin)
     return result
 
 
+@app.post("/api/admin/run-feature-builder")
+async def admin_run_feature_builder(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force feature builder run immediately."""
+    job: FeatureBuilderJob = getattr(request.app.state, "feature_builder_job", build_feature_builder_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@app.post("/api/admin/run-labeler")
+async def admin_run_labeler(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force labeler run immediately."""
+    job: LabelerJob = getattr(request.app.state, "labeler_job", build_labeler_job())
+    result = await job.run_once(force=True)
+    return result
+
+
 @app.delete("/api/admin/trade-decisions/{decision_id}")
 async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
     """Delete one trade decision row by ID."""
@@ -503,10 +542,15 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
               (SELECT COUNT(*) FROM option_chain_rows) AS chain_rows_count,
               (SELECT COUNT(*) FROM gex_snapshots) AS gex_snapshots_count,
               (SELECT COUNT(*) FROM trade_decisions) AS decisions_count,
+              (SELECT COUNT(*) FROM feature_snapshots) AS feature_snapshots_count,
+              (SELECT COUNT(*) FROM trade_candidates) AS trade_candidates_count,
+              (SELECT COUNT(*) FROM trade_candidates WHERE label_status = 'resolved') AS labeled_candidates_count,
               (SELECT MAX(ts) FROM underlying_quotes) AS latest_quote_ts,
               (SELECT MAX(ts) FROM chain_snapshots) AS latest_snapshot_ts,
               (SELECT MAX(ts) FROM gex_snapshots) AS latest_gex_ts,
               (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
+              (SELECT MAX(ts) FROM feature_snapshots) AS latest_feature_ts,
+              (SELECT MAX(ts) FROM trade_candidates) AS latest_candidate_ts,
               (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
             """
         )
@@ -570,12 +614,17 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "option_chain_rows": int(summary.chain_rows_count or 0),
         "gex_snapshots": int(summary.gex_snapshots_count or 0),
         "trade_decisions": int(summary.decisions_count or 0),
+        "feature_snapshots": int(summary.feature_snapshots_count or 0),
+        "trade_candidates": int(summary.trade_candidates_count or 0),
+        "labeled_candidates": int(summary.labeled_candidates_count or 0),
     }
     latest = {
         "quote_ts": _iso(summary.latest_quote_ts),
         "snapshot_ts": _iso(summary.latest_snapshot_ts),
         "gex_ts": _iso(summary.latest_gex_ts),
         "decision_ts": _iso(summary.latest_decision_ts),
+        "feature_ts": _iso(summary.latest_feature_ts),
+        "candidate_ts": _iso(summary.latest_candidate_ts),
         "market_clock_ts": _iso(summary.latest_market_clock_ts),
     }
 
@@ -586,6 +635,10 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         warnings.append("no_gex_snapshots")
     if counts["trade_decisions"] == 0:
         warnings.append("no_trade_decisions")
+    if counts["feature_snapshots"] == 0:
+        warnings.append("no_feature_snapshots")
+    if counts["trade_candidates"] == 0:
+        warnings.append("no_trade_candidates")
 
     return {
         "now_utc": f"{datetime.utcnow().isoformat()}Z",

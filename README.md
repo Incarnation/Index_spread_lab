@@ -124,6 +124,16 @@ Primary knobs:
   - `DECISION_DELTA_TARGETS`
   - `DECISION_SPREAD_WIDTH_POINTS`
   - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
+- ML (feature + label pipeline):
+  - `FEATURE_BUILDER_ENABLED`
+  - `FEATURE_BUILDER_ALLOW_OUTSIDE_RTH`
+  - `FEATURE_SCHEMA_VERSION`
+  - `CANDIDATE_SCHEMA_VERSION`
+  - `LABELER_ENABLED`
+  - `LABELER_INTERVAL_MINUTES`
+  - `LABELER_BATCH_LIMIT`
+  - `LABELER_TAKE_PROFIT_PCT`
+  - `LABEL_SCHEMA_VERSION`
 - GEX:
   - `GEX_ENABLED=true`
   - `GEX_MAX_DTE_DAYS`
@@ -186,6 +196,8 @@ Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
 - `POST /api/admin/run-quotes`
 - `POST /api/admin/run-gex`
 - `POST /api/admin/run-decision`
+- `POST /api/admin/run-feature-builder`
+- `POST /api/admin/run-labeler`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -214,6 +226,14 @@ ML/backtest scaffolding:
 - `strategy_versions`, `model_versions`, `training_runs`
 - `feature_snapshots`, `trade_candidates`, `model_predictions`
 - `backtest_runs`, `strategy_recommendations`
+- these tables now include schema-version and label-tracking fields for ML lineage.
+
+Destructive ML reset command (keeps ingestion tables):
+
+```bash
+cd backend
+python -m spx_backend.reset_ml_schema
+```
 
 ---
 
@@ -263,8 +283,10 @@ Recommended manual sequence for diagnostics:
 1) `POST /api/admin/run-quotes`
 2) `POST /api/admin/run-snapshot`
 3) `POST /api/admin/run-gex`
-4) `POST /api/admin/run-decision`
-5) `GET /api/admin/preflight`
+4) `POST /api/admin/run-feature-builder`
+5) `POST /api/admin/run-labeler`
+6) `POST /api/admin/run-decision`
+7) `GET /api/admin/preflight`
 
 If decisions are skipping:
 - Check `preflight.latest.snapshot_ts` freshness.
