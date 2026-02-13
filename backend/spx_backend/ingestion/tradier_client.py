@@ -25,7 +25,12 @@ class TradierClient:
     async def get_option_expirations(self, underlying: str) -> dict[str, Any]:
         url = f"{self.base_url}/markets/options/expirations"
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, params={"symbol": underlying}, headers=self._headers)
+            # includeAllRoots=true is required for SPX weeklies/daily expirations.
+            r = await client.get(
+                url,
+                params={"symbol": underlying, "includeAllRoots": "true", "strikes": "false"},
+                headers=self._headers,
+            )
             r.raise_for_status()
             return r.json()
 

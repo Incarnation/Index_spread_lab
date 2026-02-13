@@ -4,7 +4,7 @@ import bisect
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -12,6 +12,11 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.db import SessionLocal
+from spx_backend.dte import (
+    choose_expiration_for_trading_dte,
+    closest_expiration_for_trading_dte,
+    trading_dte_lookup,
+)
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.market_clock import MarketClockCache, is_rth
 
@@ -34,23 +39,6 @@ def _parse_expirations(resp: dict) -> list[date]:
             continue
     return sorted(out)
 
-
-def _choose_expiration_for_dte(expirations: list[date], target_dte: int, now_et: datetime, tolerance: int = 1) -> date | None:
-    """Pick an expiration within a DTE tolerance window."""
-    # DTE computed in calendar days (good enough for the MVP).
-    target_date = now_et.date() + timedelta(days=target_dte)
-    candidates = [e for e in expirations if abs((e - target_date).days) <= tolerance]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda e: abs((e - target_date).days))
-
-
-def _closest_expiration(expirations: list[date], target_dte: int, now_et: datetime) -> date | None:
-    """Pick the closest expiration to a target DTE."""
-    if not expirations:
-        return None
-    target_date = now_et.date() + timedelta(days=target_dte)
-    return min(expirations, key=lambda e: abs((e - target_date).days))
 
 def _parse_chain_options(chain: dict) -> list[dict]:
     """Normalize Tradier chain options payload to a list."""
@@ -150,6 +138,8 @@ class SnapshotJob:
 
         exp_resp = await self.tradier.get_option_expirations(underlying)
         expirations = _parse_expirations(exp_resp)
+        as_of = now_et.date()
+        exp_to_trading_dte = trading_dte_lookup(expirations, as_of)
 
         inserted: list[dict] = []
         chain_rows_inserted = 0
@@ -176,30 +166,25 @@ class SnapshotJob:
             if dte_mode == "range":
                 min_dte = min(settings.snapshot_dte_min_days, settings.snapshot_dte_max_days)
                 max_dte = max(settings.snapshot_dte_min_days, settings.snapshot_dte_max_days)
-                for exp in expirations:
-                    dte = (exp - now_et.date()).days
+                for exp, dte in exp_to_trading_dte.items():
                     if min_dte <= dte <= max_dte:
                         selected.append((dte, exp))
                 if not selected:
                     if settings.snapshot_range_fallback_enabled:
                         fallback_count = max(1, settings.snapshot_range_fallback_count)
                         center = (min_dte + max_dte) / 2.0
-                        future_exps = [exp for exp in expirations if (exp - now_et.date()).days >= 0]
-                        ranked = sorted(
-                            future_exps if future_exps else expirations,
-                            key=lambda exp: abs(((exp - now_et.date()).days) - center),
-                        )
-                        fallback_exps = ranked[:fallback_count]
-                        selected = [((exp - now_et.date()).days, exp) for exp in fallback_exps]
+                        ranked = sorted(exp_to_trading_dte.items(), key=lambda item: abs(item[1] - center))
+                        fallback_items = ranked[:fallback_count]
+                        selected = [(dte, exp) for exp, dte in fallback_items]
                         fallback_used = True
                         logger.warning(
-                            "snapshot_job: no expirations in dte range {}-{}; fallback enabled, selected {} closest expirations",
+                            "snapshot_job: no expirations in trading-dte range {}-{}; fallback enabled, selected {} closest expirations",
                             min_dte,
                             max_dte,
                             len(selected),
                         )
                     else:
-                        logger.warning("snapshot_job: no expirations in dte range {}-{}", min_dte, max_dte)
+                        logger.warning("snapshot_job: no expirations in trading-dte range {}-{}", min_dte, max_dte)
                         await session.commit()
                         return {
                             "skipped": True,
@@ -212,26 +197,26 @@ class SnapshotJob:
             else:
                 dte_targets = settings.dte_targets_list()
                 for target_dte in dte_targets:
-                    exp = _choose_expiration_for_dte(
+                    exp = choose_expiration_for_trading_dte(
                         expirations,
                         target_dte=target_dte,
-                        now_et=now_et,
+                        as_of=as_of,
                         tolerance=settings.snapshot_dte_tolerance_days,
                     )
                     if exp is None:
                         if force:
-                            exp = _closest_expiration(expirations, target_dte=target_dte, now_et=now_et)
+                            exp = closest_expiration_for_trading_dte(expirations, target_dte=target_dte, as_of=as_of)
                             if exp is None:
                                 logger.warning("snapshot_job: no expirations available to fallback")
                                 continue
                             logger.warning(
-                                "snapshot_job: no expiration within tolerance for target_dte={}; using closest exp={} (force mode)",
+                                "snapshot_job: no expiration within tolerance for trading target_dte={}; using closest exp={} (force mode)",
                                 target_dte,
                                 exp.isoformat(),
                             )
                         else:
                             logger.warning(
-                                "snapshot_job: no expiration found for target_dte={} ({} expirations)",
+                                "snapshot_job: no expiration found for trading target_dte={} ({} expirations)",
                                 target_dte,
                                 len(expirations),
                             )
@@ -239,7 +224,7 @@ class SnapshotJob:
                     if exp in seen_exp:
                         continue
                     seen_exp.add(exp)
-                    selected.append((target_dte, exp))
+                    selected.append((exp_to_trading_dte.get(exp, target_dte), exp))
 
             for target_dte, exp in selected:
 
@@ -340,6 +325,7 @@ class SnapshotJob:
                         "target_dte": target_dte,
                         "expiration": exp.isoformat(),
                         "actual_dte_days": (exp - now_et.date()).days,
+                        "actual_trading_dte": exp_to_trading_dte.get(exp),
                         "checksum": chk,
                         "fallback_used": fallback_used,
                     }

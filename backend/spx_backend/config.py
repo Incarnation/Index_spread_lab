@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     gex_spot_max_age_seconds: int = 600
     gex_contract_multiplier: int = 100
     gex_puts_negative: bool = True
-    gex_snapshot_batch_limit: int = 5
+    # Keep this >= number of expirations captured per snapshot cycle (e.g., 0-10 DTE => up to 11 snapshots).
+    gex_snapshot_batch_limit: int = 20
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
 

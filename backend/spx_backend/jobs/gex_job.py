@@ -27,7 +27,7 @@ class GexJob:
             rows = await session.execute(
                 text(
                     """
-                    SELECT cs.snapshot_id, cs.ts, cs.underlying
+                    SELECT cs.snapshot_id, cs.ts, cs.underlying, cs.target_dte
                     FROM chain_snapshots cs
                     LEFT JOIN gex_snapshots gs ON gs.snapshot_id = cs.snapshot_id
                     WHERE gs.snapshot_id IS NULL
@@ -43,7 +43,7 @@ class GexJob:
                 return {"skipped": True, "reason": "no_pending_snapshots"}
 
             computed = 0
-            for snapshot_id, ts, underlying in candidates:
+            for snapshot_id, ts, underlying, snapshot_target_dte in candidates:
                 spot = await self._get_spot_price(session, ts, underlying)
                 if spot is None:
                     logger.warning("gex_job: no spot price for snapshot_id={}", snapshot_id)
@@ -66,10 +66,13 @@ class GexJob:
 
                 # Filter by DTE window and select top-N strikes near spot.
                 filtered = []
+                resolved_snapshot_dte = int(snapshot_target_dte) if snapshot_target_dte is not None else None
                 for strike, right, oi, gamma, contract_size, expiration in opts:
                     if strike is None or expiration is None:
                         continue
-                    dte = (expiration - ts.date()).days
+                    dte = resolved_snapshot_dte
+                    if dte is None:
+                        dte = (expiration - ts.date()).days
                     if dte < 0 or dte > settings.gex_max_dte_days:
                         continue
                     filtered.append((strike, right, oi, gamma, contract_size, expiration, dte))
@@ -120,7 +123,10 @@ class GexJob:
                     # Aggregate by expiry+strike
                     if settings.gex_store_by_expiry and expiration is not None:
                         key = (expiration, strike)
-                        pe = per_expiry_strike.setdefault(key, {"gex_calls": 0.0, "gex_puts": 0.0, "oi": 0})
+                        pe = per_expiry_strike.setdefault(
+                            key,
+                            {"gex_calls": 0.0, "gex_puts": 0.0, "oi": 0, "dte_days": dte},
+                        )
                         if right == "P":
                             pe["gex_puts"] += gex_val
                         else:
@@ -183,7 +189,7 @@ class GexJob:
                 # Insert gex_by_expiry_strike
                 if settings.gex_store_by_expiry:
                     for (expiration, strike), data in per_expiry_strike.items():
-                        dte_days = (expiration - ts.date()).days if expiration else None
+                        dte_days = data.get("dte_days")
                         await session.execute(
                             text(
                                 """
@@ -193,7 +199,13 @@ class GexJob:
                                 VALUES (
                                   :snapshot_id, :expiration, :dte_days, :strike, :gex_net, :gex_calls, :gex_puts, :oi_total, :method
                                 )
-                                ON CONFLICT (snapshot_id, expiration, strike) DO NOTHING
+                                ON CONFLICT (snapshot_id, expiration, strike) DO UPDATE SET
+                                  dte_days = EXCLUDED.dte_days,
+                                  gex_net = EXCLUDED.gex_net,
+                                  gex_calls = EXCLUDED.gex_calls,
+                                  gex_puts = EXCLUDED.gex_puts,
+                                  oi_total = EXCLUDED.oi_total,
+                                  method = EXCLUDED.method
                                 """
                             ),
                             {

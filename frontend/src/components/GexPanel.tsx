@@ -35,7 +35,7 @@ export function GexPanel({
     () =>
       snapshots.map((snapshot) => ({
         value: String(snapshot.snapshot_id),
-        label: `#${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`,
+        label: `Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`,
       })),
     [snapshots],
   );
@@ -69,7 +69,7 @@ export function GexPanel({
         <Text fw={600}>Gamma exposure (GEX)</Text>
         <Group gap="sm">
           <Select
-            label="Snapshot"
+            label="Capture batch"
             data={snapshotOptions}
             value={selectedSnapshot ? String(selectedSnapshot.snapshot_id) : null}
             onChange={(value) => {
@@ -78,7 +78,7 @@ export function GexPanel({
               onSelectedSnapshotChange(snapshot);
             }}
             w={260}
-            placeholder="Select snapshot"
+            placeholder="Select capture batch"
           />
           <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
           {selectedDte === "custom" && (

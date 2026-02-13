@@ -155,12 +155,17 @@ class DecisionJob:
         tol = settings.decision_dte_tolerance_days
         min_dte = target_dte - tol
         max_dte = target_dte + tol
+        now_utc = now_et.astimezone(ZoneInfo("UTC"))
+        min_ts = now_utc - timedelta(minutes=settings.decision_snapshot_max_age_minutes)
+        freshness_sql = "" if force else "AND ts >= :min_ts"
         row = await session.execute(
             text(
-                """
+                f"""
                 SELECT snapshot_id, ts, expiration, target_dte
                 FROM chain_snapshots
                 WHERE underlying = :underlying
+                  AND ts <= :now_ts
+                  {freshness_sql}
                   AND target_dte BETWEEN :min_dte AND :max_dte
                 ORDER BY ABS(target_dte - :target_dte) ASC, ts DESC, snapshot_id DESC
                 LIMIT 1
@@ -171,6 +176,8 @@ class DecisionJob:
                 "min_dte": min_dte,
                 "max_dte": max_dte,
                 "target_dte": target_dte,
+                "now_ts": now_utc,
+                "min_ts": min_ts,
             },
         )
         result = row.fetchone()
@@ -179,10 +186,12 @@ class DecisionJob:
             # In sandbox/range-fallback mode we may not have near-term DTE snapshots.
             row = await session.execute(
                 text(
-                    """
+                    f"""
                     SELECT snapshot_id, ts, expiration, target_dte
                     FROM chain_snapshots
                     WHERE underlying = :underlying
+                      AND ts <= :now_ts
+                      {freshness_sql}
                     ORDER BY ABS(target_dte - :target_dte) ASC, ts DESC, snapshot_id DESC
                     LIMIT 1
                     """
@@ -190,6 +199,8 @@ class DecisionJob:
                 {
                     "underlying": settings.snapshot_underlying,
                     "target_dte": target_dte,
+                    "now_ts": now_utc,
+                    "min_ts": min_ts,
                 },
             )
             result = row.fetchone()
@@ -197,11 +208,6 @@ class DecisionJob:
         if not result:
             return None
         snapshot_id, ts, expiration, actual_dte = result
-        if not force:
-            age = (now_et.astimezone(ZoneInfo("UTC")) - ts).total_seconds() / 60.0
-            if age > settings.decision_snapshot_max_age_minutes:
-                logger.warning("decision_job: stale snapshot target_dte={} age_min={}", target_dte, round(age, 2))
-                return None
         if used_fallback:
             logger.warning(
                 "decision_job: no snapshot in tolerance for target_dte={}; using closest snapshot target_dte={}",

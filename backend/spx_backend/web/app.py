@@ -220,14 +220,25 @@ async def list_gex_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_
 
 @app.get("/api/gex/dtes")
 async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
-    """Return available DTEs for a GEX snapshot."""
+    """Return available DTEs for a GEX snapshot batch (same ts + underlying)."""
     r = await db.execute(
         text(
             """
-            SELECT DISTINCT dte_days
-            FROM gex_by_expiry_strike
-            WHERE snapshot_id = :snapshot_id AND dte_days IS NOT NULL
-            ORDER BY dte_days ASC
+            WITH anchor AS (
+              SELECT ts, underlying
+              FROM gex_snapshots
+              WHERE snapshot_id = :snapshot_id
+            ),
+            batch AS (
+              SELECT gs.snapshot_id
+              FROM gex_snapshots gs
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+            )
+            SELECT DISTINCT gbes.dte_days
+            FROM gex_by_expiry_strike gbes
+            JOIN batch b ON b.snapshot_id = gbes.snapshot_id
+            WHERE gbes.dte_days IS NOT NULL
+            ORDER BY gbes.dte_days ASC
             """
         ),
         {"snapshot_id": snapshot_id},
@@ -238,14 +249,24 @@ async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_sess
 
 @app.get("/api/gex/expirations")
 async def list_gex_expirations(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
-    """Return available expirations for a GEX snapshot."""
+    """Return available expirations for a GEX snapshot batch (same ts + underlying)."""
     r = await db.execute(
         text(
             """
-            SELECT DISTINCT expiration, dte_days
-            FROM gex_by_expiry_strike
-            WHERE snapshot_id = :snapshot_id
-            ORDER BY expiration ASC
+            WITH anchor AS (
+              SELECT ts, underlying
+              FROM gex_snapshots
+              WHERE snapshot_id = :snapshot_id
+            ),
+            batch AS (
+              SELECT gs.snapshot_id
+              FROM gex_snapshots gs
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+            )
+            SELECT DISTINCT gbes.expiration, gbes.dte_days
+            FROM gex_by_expiry_strike gbes
+            JOIN batch b ON b.snapshot_id = gbes.snapshot_id
+            ORDER BY gbes.expiration ASC
             """
         ),
         {"snapshot_id": snapshot_id},
@@ -270,7 +291,7 @@ async def get_gex_curve(
     expirations_csv: str | None = None,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return GEX curve by strike (optional DTE or custom expirations filter)."""
+    """Return GEX curve by strike for a snapshot batch (optional DTE/custom expirations)."""
     selected_expirations: list[date] = []
     if expirations_csv is not None:
         for part in expirations_csv.split(","):
@@ -287,15 +308,25 @@ async def get_gex_curve(
     if selected_expirations:
         stmt = text(
             """
-            SELECT strike,
-                   SUM(gex_net) AS gex_net,
-                   SUM(gex_calls) AS gex_calls,
-                   SUM(gex_puts) AS gex_puts
-            FROM gex_by_expiry_strike
-            WHERE snapshot_id = :snapshot_id
-              AND expiration IN :expirations
-            GROUP BY strike
-            ORDER BY strike ASC
+            WITH anchor AS (
+              SELECT ts, underlying
+              FROM gex_snapshots
+              WHERE snapshot_id = :snapshot_id
+            ),
+            batch AS (
+              SELECT gs.snapshot_id
+              FROM gex_snapshots gs
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+            )
+            SELECT gbes.strike,
+                   SUM(gbes.gex_net) AS gex_net,
+                   SUM(gbes.gex_calls) AS gex_calls,
+                   SUM(gbes.gex_puts) AS gex_puts
+            FROM gex_by_expiry_strike gbes
+            JOIN batch b ON b.snapshot_id = gbes.snapshot_id
+            WHERE gbes.expiration IN :expirations
+            GROUP BY gbes.strike
+            ORDER BY gbes.strike ASC
             """
         ).bindparams(bindparam("expirations", expanding=True))
         r = await db.execute(
@@ -303,6 +334,61 @@ async def get_gex_curve(
             {"snapshot_id": snapshot_id, "expirations": selected_expirations},
         )
     elif dte_days is None:
+        r = await db.execute(
+            text(
+                """
+                WITH anchor AS (
+                  SELECT ts, underlying
+                  FROM gex_snapshots
+                  WHERE snapshot_id = :snapshot_id
+                ),
+                batch AS (
+                  SELECT gs.snapshot_id
+                  FROM gex_snapshots gs
+                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+                )
+                SELECT gbes.strike,
+                       SUM(gbes.gex_net) AS gex_net,
+                       SUM(gbes.gex_calls) AS gex_calls,
+                       SUM(gbes.gex_puts) AS gex_puts
+                FROM gex_by_expiry_strike gbes
+                JOIN batch b ON b.snapshot_id = gbes.snapshot_id
+                GROUP BY gbes.strike
+                ORDER BY gbes.strike ASC
+                """
+            ),
+            {"snapshot_id": snapshot_id},
+        )
+    else:
+        r = await db.execute(
+            text(
+                """
+                WITH anchor AS (
+                  SELECT ts, underlying
+                  FROM gex_snapshots
+                  WHERE snapshot_id = :snapshot_id
+                ),
+                batch AS (
+                  SELECT gs.snapshot_id
+                  FROM gex_snapshots gs
+                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+                )
+                SELECT gbes.strike,
+                       SUM(gbes.gex_net) AS gex_net,
+                       SUM(gbes.gex_calls) AS gex_calls,
+                       SUM(gbes.gex_puts) AS gex_puts
+                FROM gex_by_expiry_strike gbes
+                JOIN batch b ON b.snapshot_id = gbes.snapshot_id
+                WHERE gbes.dte_days = :dte_days
+                GROUP BY gbes.strike
+                ORDER BY gbes.strike ASC
+                """
+            ),
+            {"snapshot_id": snapshot_id, "dte_days": dte_days},
+        )
+    rows = r.fetchall()
+    if (not rows) and (dte_days is None) and (not selected_expirations):
+        # Compatibility fallback for older data that only has gex_by_strike rows.
         r = await db.execute(
             text(
                 """
@@ -314,19 +400,7 @@ async def get_gex_curve(
             ),
             {"snapshot_id": snapshot_id},
         )
-    else:
-        r = await db.execute(
-            text(
-                """
-                SELECT strike, gex_net, gex_calls, gex_puts
-                FROM gex_by_expiry_strike
-                WHERE snapshot_id = :snapshot_id AND dte_days = :dte_days
-                ORDER BY strike ASC
-                """
-            ),
-            {"snapshot_id": snapshot_id, "dte_days": dte_days},
-        )
-    rows = r.fetchall()
+        rows = r.fetchall()
     return {
         "snapshot_id": snapshot_id,
         "dte_days": dte_days,
