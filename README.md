@@ -1,137 +1,162 @@
-## SPX Tools
+# SPX Tools
 
-A research + paper execution platform for **SPX index options** with a focus on **0–14 DTE credit spreads**.
+SPX Tools is a research and paper-execution platform for SPX index options with a practical focus on short-dated credit spread workflows.
 
-Current MVP capabilities:
-- **Backend**: FastAPI service that initializes Postgres, runs snapshot/quote/GEX jobs, and a rules‑based decision engine that writes `trade_decisions`.
-- **Frontend**: React (Vite) dashboard to run jobs, view snapshots, GEX charts, and trade decisions.
+The current stack is:
+- Backend: FastAPI + APScheduler + PostgreSQL
+- Frontend: React (Vite) + Mantine + Recharts
+- Data source: Tradier REST APIs (expirations, chain, quotes, market clock)
 
-Planned next steps (per `PROJECT_SPEC.md`):
-- Broker order placement + fills (paper sandbox).
-- Backtesting pipeline (Databento `OPRA.PILLAR` SPX, `CBBO-1m`) with live/backtest parity.
-- ML pipeline: feature snapshots, model versioning, and walk-forward evaluation.
+This repository is designed so live capture, analytics (GEX), and decision logs share one consistent schema that can later feed backtesting and ML.
 
 ---
 
-## Repo layout
+## Current Product Scope
+
+What is implemented now:
+- Scheduled option-chain snapshot capture.
+- Scheduled quote capture (SPX, VIX, VIX9D, SPY by default).
+- Scheduled GEX computation and persistence.
+- Rules-based decision engine that writes TRADE/SKIP decisions.
+- Admin APIs to manually trigger each pipeline stage.
+- React dashboard to inspect snapshots, GEX curves, and decisions.
+- Backend test suite for core business logic.
+
+What is not implemented yet:
+- Full broker order lifecycle in production usage (schema exists, execution flow is still intentionally limited).
+- Full historical backfill pipeline and walk-forward orchestration.
+- ML training/serving loop execution (schema scaffolding exists).
+
+---
+
+## How The System Works
+
+The pipeline runs in this order:
+
+1) Quote job
+- Pulls latest quotes for configured symbols (`QUOTE_SYMBOLS`).
+- Stores raw quote rows in `underlying_quotes`.
+- Updates `context_snapshots` (`spx_price`, `vix`, `term_structure`, etc).
+
+2) Snapshot job
+- Gets SPX expirations from Tradier (including all roots for weeklies/dailies).
+- Selects expirations by DTE policy (`range` or `targets`).
+- Pulls option chains and writes:
+  - `chain_snapshots` (raw payload + checksum)
+  - `option_chain_rows` (normalized per-option rows)
+
+3) GEX job
+- Reads option rows + latest eligible spot quote.
+- Computes gamma exposure aggregates.
+- Writes:
+  - `gex_snapshots`
+  - `gex_by_strike`
+  - `gex_by_expiry_strike`
+
+4) Decision job
+- At configured entry times, evaluates current snapshots.
+- Builds spread candidates and scores them.
+- Writes one decision record per run in `trade_decisions`:
+  - `TRADE` with chosen legs and params, or
+  - `SKIP` with reason.
+
+Important semantics:
+- DTE handling is trading-session based (weekends and market holidays are skipped).
+- GEX API data for UI is batch-scoped (same timestamp + underlying), not only one snapshot row.
+
+---
+
+## DTE Semantics (Critical)
+
+The project does not use raw calendar-day difference for target selection.
+It uses trading-session progression inferred from Tradier expiration sessions.
+
+Example from Thu 2026-02-12:
+- 0DTE -> 2026-02-12
+- 1DTE -> 2026-02-13
+- 2DTE -> 2026-02-17
+- 3DTE -> 2026-02-18
+
+Why 3DTE is 2026-02-18:
+- 2026-02-16 is a market holiday (Presidents' Day), so it is skipped as a trading session.
+
+---
+
+## Repository Layout
+
 - `backend/`
-  - `spx_backend/`: FastAPI app + scheduler + DB code
-  - `requirements.txt`: backend Python dependencies
+  - `spx_backend/config.py`: env-backed settings.
+  - `spx_backend/main.py`: app entrypoint (`PORT` aware for Railway).
+  - `spx_backend/web/app.py`: FastAPI routes + scheduler wiring.
+  - `spx_backend/jobs/`: snapshot, quote, gex, decision jobs.
+  - `spx_backend/dte.py`: trading-day DTE helper logic.
+  - `spx_backend/db_schema.sql`: schema bootstrap.
+  - `spx_backend/db_init.py`: idempotent schema initialization.
+  - `requirements.txt`: runtime dependencies.
+  - `requirements-dev.txt`: test dependencies.
+  - `tests/`: backend automated tests.
 - `frontend/`
-  - Vite + React dashboard
+  - `src/DashboardApp.tsx`: top-level container.
+  - `src/components/`: UI panels and widgets.
+  - `src/hooks/`: data and action hooks.
+  - `src/api.ts`: typed API client.
 
 ---
 
 ## Configuration
 
-Create a `.env` in the repo root (copy `.env.example`) and fill in:
-- **`DATABASE_URL`**: Postgres connection string for SQLAlchemy async
-  - format: `postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DBNAME`
-- **`TRADIER_BASE_URL`**: default `https://sandbox.tradier.com/v1` (paper)
-- **`TRADIER_ACCESS_TOKEN`**: your Tradier access token
-- **`TRADIER_ACCOUNT_ID`**: your paper account id (e.g. `VAxxxxxx`)
-- Optional:
-  - `SNAPSHOT_INTERVAL_MINUTES` (default 5)
-  - `SNAPSHOT_UNDERLYING` (default SPX)
-  - `SNAPSHOT_DTE_TARGETS` (default `3,5,7`)
-  - `SNAPSHOT_DTE_MODE` (default `range`, use `targets` for list mode)
-  - `SNAPSHOT_DTE_MIN_DAYS` (default `0`)
-  - `SNAPSHOT_DTE_MAX_DAYS` (default `10`)
-  - `SNAPSHOT_RANGE_FALLBACK_ENABLED` (default `false`)
-  - `SNAPSHOT_RANGE_FALLBACK_COUNT` (default `3`)
-  - `SNAPSHOT_DTE_TOLERANCE_DAYS` (default `1`)
-  - `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
-  - `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
-  - `QUOTE_INTERVAL_MINUTES` (default `5`)
-  - `DECISION_ENTRY_TIMES` (default `10:00,11:00,12:00`)
-  - `DECISION_DTE_TARGETS` (default `3,5,7`)
-  - `DECISION_DTE_TOLERANCE_DAYS` (default `1`)
-  - `DECISION_DELTA_TARGETS` (default `0.10,0.20`)
-  - `DECISION_SPREAD_SIDE` (default `put`)
-  - `DECISION_SPREAD_WIDTH_POINTS` (default `25`)
-  - `DECISION_CONTRACTS` (default `1`)
-  - `DECISION_SNAPSHOT_MAX_AGE_MINUTES` (default `15`)
-  - `DECISION_MAX_TRADES_PER_DAY` (default `1`)
-  - `DECISION_MAX_OPEN_TRADES` (default `1`)
-  - `DECISION_RULESET_VERSION` (default `rules_v1`)
-  - `DECISION_ALLOW_OUTSIDE_RTH` (default `false`)
-  - `GEX_ENABLED` (default `true`)
-  - `GEX_INTERVAL_MINUTES` (default `5`)
-  - `GEX_STORE_BY_EXPIRY` (default `true`)
-  - `GEX_SPOT_MAX_AGE_SECONDS` (default `600`)
-  - `GEX_CONTRACT_MULTIPLIER` (default `100`)
-  - `GEX_PUTS_NEGATIVE` (default `true`)
-  - `GEX_SNAPSHOT_BATCH_LIMIT` (default `5`)
-  - `GEX_STRIKE_LIMIT` (default `150`)
-  - `GEX_MAX_DTE_DAYS` (default `10`)
-  - `ALLOW_SNAPSHOT_OUTSIDE_RTH` (default `false`)
-  - `ALLOW_QUOTES_OUTSIDE_RTH` (default `false`)
-  - `MARKET_CLOCK_CACHE_SECONDS` (default `300`)
-  - `ADMIN_API_KEY` (optional admin auth)
-  - `CORS_ORIGINS` (default `http://localhost:5173`)
+Copy `.env.example` to `.env` and fill values.
+
+Required:
+- `DATABASE_URL` (`postgresql+asyncpg://...`)
+- `TRADIER_ACCESS_TOKEN`
+- `TRADIER_ACCOUNT_ID`
+
+Primary knobs:
+- Snapshot:
+  - `SNAPSHOT_DTE_MODE=range|targets`
+  - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
+  - `SNAPSHOT_STRIKES_EACH_SIDE`
+- Decision:
+  - `DECISION_ENTRY_TIMES`
+  - `DECISION_DTE_TARGETS`
+  - `DECISION_DTE_TOLERANCE_DAYS`
+  - `DECISION_DELTA_TARGETS`
+  - `DECISION_SPREAD_WIDTH_POINTS`
+  - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
+- GEX:
+  - `GEX_ENABLED=true`
+  - `GEX_MAX_DTE_DAYS`
+  - `GEX_STRIKE_LIMIT`
+  - `GEX_SNAPSHOT_BATCH_LIMIT` (recommended >= number of expirations captured per cycle; default `20`)
+- Ops:
+  - `ADMIN_API_KEY`
+  - `CORS_ORIGINS`
+  - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
+  - `ALLOW_QUOTES_OUTSIDE_RTH`
+
+Production recommendation:
+- Do not include quotes in Railway variable values (use raw values, e.g. `false`, not `"false"`).
 
 ---
 
-## Database setup
+## Local Development
 
-### Recommended: Railway Postgres (cloud)
-Use Railway Postgres for anything you want running 24/7 (snapshots, paper orders, dashboard history).
+### 1) Backend
 
-1) Create/add a Postgres service in Railway.
-2) Copy the Postgres connection string from Railway.
-3) Set `.env`:
-- If Railway gives you `postgresql://...`, convert it to:
-  - `postgresql+asyncpg://...`
-
-The backend auto-creates required tables on startup from:
-- `backend/spx_backend/db_schema.sql`
-
-### Alternative: local Postgres (development)
-If you prefer local DB for dev, you can run Postgres via Docker:
-
-```bash
-docker run --name spx-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=spx_tools -p 5432:5432 -d postgres:16
-```
-
-Then set:
-- `DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/spx_tools`
-
----
-
-## Running locally
-
-### Backend (FastAPI + scheduler)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r backend/requirements.txt
-
+python -m pip install -r backend/requirements.txt
 cd backend
 python -m spx_backend.main
 ```
 
-Backend endpoints:
-- `GET http://localhost:8000/health`
-- `GET http://localhost:8000/api/chain-snapshots?limit=50`
-- `GET http://localhost:8000/api/gex/snapshots?limit=50`
-- `GET http://localhost:8000/api/gex/curve?snapshot_id=...`
-- `GET http://localhost:8000/api/trade-decisions?limit=50`
-- `GET http://localhost:8000/api/admin/preflight`
-- `POST http://localhost:8000/api/admin/run-snapshot`
-- `POST http://localhost:8000/api/admin/run-quotes`
-- `POST http://localhost:8000/api/admin/run-gex`
-- `POST http://localhost:8000/api/admin/run-decision`
+Backend default URL:
+- `http://localhost:8000`
 
-Notes:
-- The scheduler runs four jobs:
-  - **Snapshot job**: stores option chain snapshots.
-  - **Quote job**: stores SPX/VIX/VIX9D/SPY quotes every `QUOTE_INTERVAL_MINUTES`.
-  - **GEX job**: computes gamma exposure aggregates.
-  - **Decision job**: writes `trade_decisions` at entry times (rules-only).
-- Market open/close checks use Tradier market clock with a short cache to reduce calls.
-- Market clock responses are stored in `market_clock_audit` for audit/debug.
+### 2) Frontend
 
-### Frontend (React)
 In a second terminal:
 
 ```bash
@@ -140,56 +165,137 @@ npm install
 npm run dev
 ```
 
-Open:
-- `http://localhost:5173/`
+Frontend default URL:
+- `http://localhost:5173`
 
-The Vite dev server proxies `/api/*` to the backend on `http://localhost:8000`.
+---
+
+## API Surface
+
+Public read endpoints:
+- `GET /health`
+- `GET /api/chain-snapshots`
+- `GET /api/gex/snapshots`
+- `GET /api/gex/dtes?snapshot_id=...`
+- `GET /api/gex/expirations?snapshot_id=...`
+- `GET /api/gex/curve?snapshot_id=...`
+- `GET /api/trade-decisions`
+
+Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
+- `POST /api/admin/run-snapshot`
+- `POST /api/admin/run-quotes`
+- `POST /api/admin/run-gex`
+- `POST /api/admin/run-decision`
+- `DELETE /api/admin/trade-decisions/{decision_id}`
+- `GET /api/admin/expirations?symbol=SPX`
+- `GET /api/admin/preflight`
+
+---
+
+## Database Model Overview
+
+Core ingestion:
+- `chain_snapshots`: one row per captured chain payload.
+- `option_chain_rows`: normalized options from each snapshot.
+- `underlying_quotes`: raw quote history.
+- `context_snapshots`: derived market context per timestamp.
+- `market_clock_audit`: Tradier clock states/errors.
+
+GEX:
+- `gex_snapshots`: summary values per snapshot.
+- `gex_by_strike`: strike curve per snapshot.
+- `gex_by_expiry_strike`: expiration-strike curve with DTE labels.
+
+Decisions/trading:
+- `trade_decisions`: TRADE/SKIP decisions and metadata.
+- `orders`, `fills`, `trades`, `trade_legs`: lifecycle schema scaffolding.
+
+ML/backtest scaffolding:
+- `strategy_versions`, `model_versions`, `training_runs`
+- `feature_snapshots`, `trade_candidates`, `model_predictions`
+- `backtest_runs`, `strategy_recommendations`
+
+---
+
+## Testing
+
+Backend tests:
+
+```bash
+cd backend
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Current test coverage includes:
+- Trading-day DTE mapping and expiration selection.
+- Decision candidate construction and snapshot freshness behavior.
+- GEX endpoint output modes (all / DTE / custom expirations).
+- Snapshot strike window helper.
+- Tradier expirations request parameter correctness.
 
 ---
 
 ## Deployment (Railway)
 
-### Backend
-This repo includes a `Dockerfile` that starts the backend. Typical Railway setup:
-- Create a service from this repo
-- Set environment variables (same as `.env`)
-- Ensure a Postgres plugin/service is attached and `DATABASE_URL` is set appropriately
+Backend service:
+- Uses root `Dockerfile`.
+- Reads `PORT` automatically.
+- Requires valid `DATABASE_URL` and Tradier credentials.
 
-Recommended env values before deploy:
-- `APP_ENV=production`
-- `ADMIN_API_KEY=<strong-random-key>`
-- `CORS_ORIGINS=https://<your-frontend-domain>`
-- `SNAPSHOT_RANGE_FALLBACK_ENABLED=false` (strict mode in production)
-- `TRADIER_BASE_URL`:
-  - paper/sandbox: `https://sandbox.tradier.com/v1`
-  - live: `https://api.tradier.com/v1`
+Checklist:
+1) Provision Railway Postgres.
+2) Set backend env vars from `.env.example`.
+3) Set `APP_ENV=production`.
+4) Set `ADMIN_API_KEY`.
+5) Set `CORS_ORIGINS` to your frontend domain.
+6) Keep secrets only in Railway variables.
 
-Notes:
-- The app now honors Railway `PORT` automatically.
-- Keep tokens/keys only in Railway Variables (not in repo files).
-
-### Frontend
-Two options:
-- **Separate service**: deploy `frontend/` as a static site (recommended when you want CDN/static hosting).
-- **Single service**: later we can configure the backend to serve the built React assets (good for “one container” simplicity).
-
-If frontend is deployed as a separate domain/service, set:
-- `VITE_API_BASE_URL=https://<your-backend-domain>`
-So frontend requests target backend APIs directly.
+Frontend service:
+- Deploy `frontend/` as static Vite app.
+- Set `VITE_API_BASE_URL=https://<backend-domain>`.
 
 ---
 
-## Troubleshooting
+## Ops Runbook
 
-### “No snapshots yet”
-- The scheduler skips outside RTH.
-- Also verify Tradier token/permissions and that the underlying symbol (`SPX`) is supported in your account.
+Recommended manual sequence for diagnostics:
+1) `POST /api/admin/run-quotes`
+2) `POST /api/admin/run-snapshot`
+3) `POST /api/admin/run-gex`
+4) `POST /api/admin/run-decision`
+5) `GET /api/admin/preflight`
 
-### Postgres schema errors on boot
-- The schema is executed statement-by-statement in `backend/spx_backend/db_init.py`.
-- If you manually created tables earlier, you may need one-time migrations (we’ll add Alembic once the schema stabilizes).
+If decisions are skipping:
+- Check `preflight.latest.snapshot_ts` freshness.
+- Check `DECISION_DTE_TARGETS` and tolerance.
+- Check `DECISION_SNAPSHOT_MAX_AGE_MINUTES`.
+- Inspect last `trade_decisions` reason.
 
-### Railway DB SSL issues
-If you see SSL errors connecting to Railway Postgres, paste the error message and we’ll add the correct asyncpg SSL settings.
+---
 
+## Common Troubleshooting
 
+No near-term expirations:
+- Verify `TRADIER_BASE_URL` and token.
+- Use `GET /api/admin/expirations?symbol=SPX`.
+
+GEX backlog:
+- Increase `GEX_SNAPSHOT_BATCH_LIMIT`.
+- Ensure quote job is running so spot is available.
+
+Only one date in custom DTE dropdown:
+- Ensure multiple expirations were captured in the same timestamp batch.
+- Verify `GET /api/gex/expirations?snapshot_id=...`.
+
+Unexpected DTE mapping:
+- Remember DTE is trading-session based, not calendar-day diff.
+
+---
+
+## Next Improvements
+
+- Add CI workflow (pytest on push/PR).
+- Expand integration tests with temp Postgres fixtures.
+- Add frontend test suite (Vitest + React Testing Library).
+- Add explicit decision skip reason taxonomy in API/UI.

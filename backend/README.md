@@ -1,186 +1,391 @@
-## SPX Tools Backend
+# SPX Tools Backend
 
-FastAPI backend for the SPX options platform. This service:
-- Initializes the Postgres schema on startup
-- Runs the Tradier snapshot scheduler (options chains)
-- Runs a separate quote-only scheduler (SPX/VIX/SPY/VIX9D)
-- Exposes APIs for snapshots and admin controls
+This backend is a FastAPI service that captures SPX options market data, computes GEX context, and produces rules-based trade decisions for paper workflow analysis.
 
----
-
-## How it works (high level)
-
-1) **Snapshot scheduler (options chains)**
-   - Every `SNAPSHOT_INTERVAL_MINUTES`, the job requests SPX option expirations,
-     selects expirations based on DTE mode (range or targets), and pulls option chains.
-   - Each response is stored as a row in `chain_snapshots` (raw JSON + checksum).
-
-2) **Quote worker (underlying/context)**
-   - Every `QUOTE_INTERVAL_MINUTES`, fetches quotes for `QUOTE_SYMBOLS`
-     (default: `SPX,VIX,VIX9D,SPY`).
-   - Quotes are stored in `underlying_quotes`.
-   - A `context_snapshots` row is updated with `spx_price`, `spy_price`, `vix`, `vix9d`,
-     and `term_structure`.
-
-3) **Holiday‑aware scheduling**
-   - Scheduler checks Tradier market clock and skips when the market is closed.
-   - Falls back to simple RTH logic if the market clock call fails.
-
-4) **Decision engine (rules‑based)**
-   - At `DECISION_ENTRY_TIMES`, evaluates the latest snapshots to decide TRADE/SKIP.
-   - Writes decisions into `trade_decisions` (no order placement yet).
+It is built for observability and reproducibility:
+- every chain snapshot is stored raw + normalized
+- market clock states are audited
+- decision runs are persisted (TRADE and SKIP) with reasons
+- preflight endpoint provides one-call pipeline health
 
 ---
 
-## Configuration (.env)
+## 1) Service Responsibilities
 
-Backend reads from `.env` in repo root (or `../.env` when running from `backend/`):
+The backend performs four continuous tasks:
+- Quote ingestion (`underlying_quotes`, `context_snapshots`)
+- Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
+- GEX computation (`gex_snapshots`, strike/expiry detail tables)
+- Decision generation (`trade_decisions`)
+
+And exposes APIs for:
+- dashboard data reads
+- admin run controls
+- quick health and diagnostics
+
+---
+
+## 2) Runtime Lifecycle
+
+Startup flow:
+1) Load settings from env (`spx_backend/config.py`).
+2) Initialize database schema from `spx_backend/db_schema.sql`.
+3) Build Tradier client + market clock cache.
+4) Start APScheduler jobs for quote/snapshot/gex/decision.
+5) Optionally run immediate first cycles to warm data.
+
+Shutdown flow:
+- Scheduler stops with FastAPI lifespan shutdown.
+
+Entrypoint:
+- `python -m spx_backend.main`
+- Honors Railway `PORT` automatically.
+
+---
+
+## 3) Core Modules
+
+- `spx_backend/web/app.py`
+  - FastAPI app, route handlers, scheduler wiring, auth guard.
+- `spx_backend/jobs/snapshot_job.py`
+  - Pulls expirations/chains, applies DTE policy, stores snapshots + rows.
+- `spx_backend/jobs/quote_job.py`
+  - Pulls quote symbols and updates context snapshot.
+- `spx_backend/jobs/gex_job.py`
+  - Computes GEX summary and curves.
+- `spx_backend/jobs/decision_job.py`
+  - Builds/scoring candidate spreads and writes TRADE/SKIP rows.
+- `spx_backend/market_clock.py`
+  - Tradier clock cache with DB audit rows and fallback behavior.
+- `spx_backend/dte.py`
+  - Trading-session DTE lookup and expiration chooser helpers.
+- `spx_backend/db_schema.sql`
+  - Complete schema bootstrap for ingestion, decision, ML scaffolding.
+
+---
+
+## 4) Data Flow In Detail
+
+### 4.1 Quote Job
+
+Input:
+- Tradier quotes for `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`).
+
+Output:
+- One row per symbol in `underlying_quotes`.
+- One upserted row in `context_snapshots` at current timestamp:
+  - `spx_price`, `spy_price`, `vix`, `vix9d`
+  - `term_structure = vix9d / vix` when available
+  - `notes_json` with source metadata
+
+RTH behavior:
+- If outside regular hours and `ALLOW_QUOTES_OUTSIDE_RTH=false`, job skips unless forced.
+- Market-open checks prefer cached Tradier clock; fallback to simple weekday/time logic.
+
+### 4.2 Snapshot Job
+
+Input:
+- Tradier expirations + option chain payloads.
+
+Selection:
+- DTE mode:
+  - `range`: capture expirations between min/max DTE.
+  - `targets`: capture nearest expirations for specific targets.
+- DTE semantics are trading-session based, not calendar difference.
+- Strikes are trimmed around spot (`SNAPSHOT_STRIKES_EACH_SIDE`).
+
+Output:
+- `chain_snapshots` raw payload with checksum.
+- `option_chain_rows` normalized rows (bid/ask/greeks/open interest/etc).
+
+Fallback mode:
+- Optional `SNAPSHOT_RANGE_FALLBACK_ENABLED=true` can capture nearest expirations if strict range has none (useful in sandbox; usually off in production).
+
+### 4.3 GEX Job
+
+Input:
+- Recent chain snapshots + option rows + recent spot quote.
+
+Formula (per option row):
+- `gex = sign * gamma * open_interest * contract_multiplier * spot^2`
+- sign is negative for puts when `GEX_PUTS_NEGATIVE=true`.
+
+Output tables:
+- `gex_snapshots`: aggregate totals and `zero_gamma_level`.
+- `gex_by_strike`: net/call/put GEX by strike.
+- `gex_by_expiry_strike`: same by expiration+strike with `dte_days`.
+
+Consistency behavior:
+- `gex_by_expiry_strike` upserts update values on conflict, so recalculations self-heal stale DTE labels.
+
+### 4.4 Decision Job
+
+Input:
+- Latest snapshots filtered by target DTE and freshness.
+- Latest context fields (VIX/GEX/zero-gamma when available).
+
+Core process:
+1) For each target DTE, choose freshest eligible snapshot.
+2) Build candidate vertical spread(s) using delta and configured width.
+3) Compute candidate credit and validate viability.
+4) Apply context score adjustments.
+5) Enforce guardrails (`DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`).
+6) Insert one `trade_decisions` row with final action.
+
+Why SKIP rows are stored:
+- They provide full auditability for why no trade occurred.
+- They are required to evaluate decision quality over time.
+
+---
+
+## 5) Trading-Day DTE Semantics
+
+The backend maps DTE using trading sessions from available expirations, not raw date subtraction.
+
+Implications:
+- Holidays/weekends do not count as trading days.
+- A calendar +3 day expiration can still be 2DTE or 3DTE depending on closures.
+- Snapshot selection and decision selection both use this logic.
+
+Helpers:
+- `trading_dte_lookup(...)`
+- `choose_expiration_for_trading_dte(...)`
+- `closest_expiration_for_trading_dte(...)`
+
+---
+
+## 6) API Reference
+
+### Public Endpoints
+
+- `GET /health`
+  - liveness probe
+- `GET /api/chain-snapshots?limit=...`
+  - recent chain snapshot metadata
+- `GET /api/trade-decisions?limit=...`
+  - recent decisions (TRADE/SKIP)
+- `GET /api/gex/snapshots?limit=...`
+  - recent GEX snapshot batches
+- `GET /api/gex/dtes?snapshot_id=...`
+  - available DTE options for selected GEX capture batch
+- `GET /api/gex/expirations?snapshot_id=...`
+  - available expiration dates for selected capture batch
+- `GET /api/gex/curve?snapshot_id=...&dte_days=...`
+- `GET /api/gex/curve?snapshot_id=...&expirations_csv=YYYY-MM-DD,YYYY-MM-DD`
+  - strike curve for all, one DTE, or custom expiration set
+
+Batch-scoped GEX note:
+- DTE/expiration/curve endpoints use all snapshots in the same capture batch (`same ts + underlying`), not only one row.
+
+### Admin Endpoints
+
+If `ADMIN_API_KEY` is set, include header:
+- `X-API-Key: <key>`
+
+Routes:
+- `POST /api/admin/run-snapshot`
+- `POST /api/admin/run-quotes`
+- `POST /api/admin/run-gex`
+- `POST /api/admin/run-decision`
+- `DELETE /api/admin/trade-decisions/{decision_id}`
+- `GET /api/admin/expirations?symbol=SPX`
+- `GET /api/admin/preflight`
+
+Preflight includes:
+- counts of key tables
+- latest timestamps for quote/snapshot/gex/decision/clock
+- latest detail object for snapshot/gex/decision
+- latest quote by symbol
+- warning tags (for missing data domains)
+
+---
+
+## 7) Configuration Reference
+
+Read from `.env` in repo root.
 
 Required:
-- `DATABASE_URL`  
-  Example: `postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DBNAME`
+- `DATABASE_URL` (`postgresql+asyncpg://...`)
 - `TRADIER_ACCESS_TOKEN`
 - `TRADIER_ACCOUNT_ID`
 
-Optional:
-- `TRADIER_BASE_URL` (default `https://sandbox.tradier.com/v1`)
-- `SNAPSHOT_INTERVAL_MINUTES` (default `5`)
-- `SNAPSHOT_UNDERLYING` (default `SPX`)
-- `SNAPSHOT_DTE_TARGETS` (default `3,5,7`)
-- `SNAPSHOT_DTE_MODE` (default `range`, use `targets` for list mode)
-- `SNAPSHOT_DTE_MIN_DAYS` (default `0`)
-- `SNAPSHOT_DTE_MAX_DAYS` (default `10`)
-- `SNAPSHOT_RANGE_FALLBACK_ENABLED` (default `false`)
-- `SNAPSHOT_RANGE_FALLBACK_COUNT` (default `3`)
-- `SNAPSHOT_DTE_TOLERANCE_DAYS` (default `1`)
-- `SNAPSHOT_STRIKES_EACH_SIDE` (default `100`)
-- `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`)
-- `QUOTE_INTERVAL_MINUTES` (default `5`)
-- `DECISION_ENTRY_TIMES` (default `10:00,11:00,12:00`)
-- `DECISION_DTE_TARGETS` (default `3,5,7`)
-- `DECISION_DTE_TOLERANCE_DAYS` (default `1`)
-- `DECISION_DELTA_TARGETS` (default `0.10,0.20`)
-- `DECISION_SPREAD_SIDE` (default `put`)
-- `DECISION_SPREAD_WIDTH_POINTS` (default `25`)
-- `DECISION_CONTRACTS` (default `1`)
-- `DECISION_SNAPSHOT_MAX_AGE_MINUTES` (default `15`)
-- `DECISION_MAX_TRADES_PER_DAY` (default `1`)
-- `DECISION_MAX_OPEN_TRADES` (default `1`)
-- `DECISION_RULESET_VERSION` (default `rules_v1`)
-- `DECISION_ALLOW_OUTSIDE_RTH` (default `false`)
-- `GEX_ENABLED` (default `true`)
-- `GEX_INTERVAL_MINUTES` (default `5`)
-- `GEX_STORE_BY_EXPIRY` (default `true`)
-- `GEX_SPOT_MAX_AGE_SECONDS` (default `600`)
-- `GEX_CONTRACT_MULTIPLIER` (default `100`)
-- `GEX_PUTS_NEGATIVE` (default `true`)
-- `GEX_SNAPSHOT_BATCH_LIMIT` (default `5`)
-- `GEX_STRIKE_LIMIT` (default `150`)
-- `GEX_MAX_DTE_DAYS` (default `10`)
-- `ALLOW_SNAPSHOT_OUTSIDE_RTH` (default `false`)
-- `ALLOW_QUOTES_OUTSIDE_RTH` (default `false`)
-- `MARKET_CLOCK_CACHE_SECONDS` (default `300`)
-- `ADMIN_API_KEY` (if set, admin endpoints require `X-API-Key`)
-- `CORS_ORIGINS` (default `http://localhost:5173`)
-- `TZ` (default `America/New_York`)
+High-impact settings:
+- Snapshot:
+  - `SNAPSHOT_INTERVAL_MINUTES`
+  - `SNAPSHOT_DTE_MODE`
+  - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
+  - `SNAPSHOT_DTE_TARGETS`, `SNAPSHOT_DTE_TOLERANCE_DAYS`
+  - `SNAPSHOT_STRIKES_EACH_SIDE`
+- Decision:
+  - `DECISION_ENTRY_TIMES`
+  - `DECISION_DTE_TARGETS`, `DECISION_DTE_TOLERANCE_DAYS`
+  - `DECISION_DELTA_TARGETS`
+  - `DECISION_SPREAD_SIDE`, `DECISION_SPREAD_WIDTH_POINTS`
+  - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
+  - `DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`
+- GEX:
+  - `GEX_ENABLED`, `GEX_INTERVAL_MINUTES`
+  - `GEX_SNAPSHOT_BATCH_LIMIT` (default `20`)
+  - `GEX_STRIKE_LIMIT` (default `150`)
+  - `GEX_MAX_DTE_DAYS` (default `10`)
+  - `GEX_SPOT_MAX_AGE_SECONDS`
+- Ops/Safety:
+  - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
+  - `ALLOW_QUOTES_OUTSIDE_RTH`
+  - `MARKET_CLOCK_CACHE_SECONDS`
+  - `ADMIN_API_KEY`
+  - `CORS_ORIGINS`
+  - `TZ`
 
 ---
 
-## Run locally
+## 8) Database Schema Guide
 
-From repo root:
+Schema file:
+- `spx_backend/db_schema.sql`
+
+Logical groups:
+
+Ingestion:
+- `option_instruments`
+- `chain_snapshots`
+- `option_chain_rows`
+- `underlying_quotes`
+- `context_snapshots`
+- `market_clock_audit`
+
+GEX analytics:
+- `gex_snapshots`
+- `gex_by_strike`
+- `gex_by_expiry_strike`
+
+Decision/trading:
+- `trade_decisions`
+- `orders`, `fills`
+- `trades`, `trade_legs`
+
+ML/backtest scaffolding:
+- `strategy_versions`
+- `model_versions`
+- `training_runs`
+- `feature_snapshots`
+- `trade_candidates`
+- `model_predictions`
+- `backtest_runs`
+- `strategy_recommendations`
+
+Initialization behavior:
+- schema is idempotent (`IF NOT EXISTS`)
+- executed statement-by-statement for asyncpg compatibility
+
+---
+
+## 9) Local Run Instructions
+
+From repository root:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r backend/requirements.txt
-
+python -m pip install -r backend/requirements.txt
 cd backend
 python -m spx_backend.main
 ```
 
-Backend endpoints:
-- `GET http://localhost:8000/health`
-- `GET http://localhost:8000/api/chain-snapshots?limit=50`
-
----
-
-## Trigger a snapshot manually (any time)
-
-If `ADMIN_API_KEY` is **not** set:
+Smoke test:
 
 ```bash
-curl -X POST http://localhost:8000/api/admin/run-snapshot
+curl http://localhost:8000/health
+curl http://localhost:8000/api/admin/preflight
 ```
 
-If `ADMIN_API_KEY` **is** set:
-
-```bash
-curl -X POST http://localhost:8000/api/admin/run-snapshot \
-  -H "X-API-Key: your_key_here"
-```
-
-## Trigger quotes manually (any time)
+Manual pipeline test:
 
 ```bash
 curl -X POST http://localhost:8000/api/admin/run-quotes
-```
-
-## Trigger GEX computation manually
-
-```bash
+curl -X POST http://localhost:8000/api/admin/run-snapshot
 curl -X POST http://localhost:8000/api/admin/run-gex
-```
-
-## Trigger decision engine manually
-
-```bash
 curl -X POST http://localhost:8000/api/admin/run-decision
+curl http://localhost:8000/api/admin/preflight
 ```
-
-To see which expirations Tradier is returning:
-
-```bash
-curl "http://localhost:8000/api/admin/expirations?symbol=SPX"
-```
-
-## Preflight health summary
-
-```bash
-curl "http://localhost:8000/api/admin/preflight"
-```
-
-Returns one-call pipeline health: counts and latest timestamps for quotes, snapshots, GEX, and decisions.
 
 ---
 
-## Railway deployment checklist
+## 10) Testing
 
-- Set `APP_ENV=production`
-- Set `ADMIN_API_KEY` to protect admin endpoints
-- Set `CORS_ORIGINS` to your deployed frontend URL
-- Choose `TRADIER_BASE_URL` intentionally:
-  - sandbox: `https://sandbox.tradier.com/v1`
-  - live: `https://api.tradier.com/v1`
-- Use strict range mode in production:
-  - `SNAPSHOT_RANGE_FALLBACK_ENABLED=false`
+Install test dependencies:
 
-The backend process reads Railway `PORT` automatically.
+```bash
+cd backend
+python -m pip install -r requirements-dev.txt
+```
+
+Run:
+
+```bash
+python -m pytest -q
+```
+
+Current coverage domains:
+- DTE helper behavior
+- Tradier expiration request params
+- Snapshot strike-selection helper
+- Decision candidate/scoring/freshness logic
+- GEX zero-gamma helper
+- GEX API output behavior (including custom expiration filter and fallback)
 
 ---
 
-## Database schema (MVP)
+## 11) Railway Deployment Notes
 
-Executed on startup from `spx_backend/db_schema.sql`.
+Required:
+- `APP_ENV=production`
+- valid `DATABASE_URL`
+- `ADMIN_API_KEY` enabled
+- `CORS_ORIGINS` includes deployed frontend
 
-Core tables:
-- `chain_snapshots`: raw Tradier chain payloads + checksum
-- `option_chain_rows`: per-option rows extracted from chain snapshots (incl. greeks + OI when available)
-- `underlying_quotes`: SPX/VIX/SPY quotes captured by quote worker
-- `context_snapshots`: context features (VIX, term structure, GEX placeholders)
-- `market_clock_audit`: cached market clock responses for holiday audit
-- `gex_snapshots` / `gex_by_strike` / `gex_by_expiry_strike`: GEX aggregates
-- `trade_decisions`: future decision events (TRADE / SKIP)
-- `orders` / `fills`: future paper broker order lifecycle
-- `trades` / `trade_legs`: normalized multi‑leg trade records (verticals/condors/butterflies)
+Tradier mode:
+- sandbox: `TRADIER_BASE_URL=https://sandbox.tradier.com/v1`
+- live: `TRADIER_BASE_URL=https://api.tradier.com/v1`
 
+Recommended production behavior:
+- `SNAPSHOT_RANGE_FALLBACK_ENABLED=false` (strict)
+- keep snapshot/quote outside-RTH flags disabled unless intentionally testing
+
+---
+
+## 12) Operational Debugging Queries
+
+Use API first:
+- `GET /api/admin/preflight` for fast status.
+
+Useful SQL checks:
+
+```sql
+-- latest snapshots
+SELECT snapshot_id, ts, target_dte, expiration
+FROM chain_snapshots
+ORDER BY ts DESC
+LIMIT 20;
+
+-- latest decisions
+SELECT decision_id, ts, decision, reason, target_dte, delta_target, score
+FROM trade_decisions
+ORDER BY ts DESC
+LIMIT 20;
+
+-- latest gex summary
+SELECT snapshot_id, ts, gex_net, zero_gamma_level
+FROM gex_snapshots
+ORDER BY ts DESC
+LIMIT 20;
+```
+
+---
+
+## 13) Known Limitations
+
+- Decision engine is rules-only today (no live ML inference).
+- Order placement/fill lifecycle tables exist but workflow remains staged.
+- Frontend test coverage has not yet been added.
+- Full backtest runner orchestration is still pending.
