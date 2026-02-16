@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import json
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from httpx import ASGITransport, AsyncClient
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from spx_backend.config import settings
@@ -177,23 +180,22 @@ class _DeterministicTradier:
         return {"options": {"option": options}}
 
 
-def _patch_job_session_locals(monkeypatch, session_factory) -> None:
-    """Patch job modules to use integration test DB session factory."""
-    monkeypatch.setattr(quote_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(snapshot_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(gex_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(decision_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(feature_builder_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(labeler_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(trainer_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(shadow_inference_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(promotion_gate_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(trade_pnl_module, "SessionLocal", session_factory)
+class _QuoteFetchFailsTradier(_DeterministicTradier):
+    """Tradier stub that raises quote-fetch errors."""
+
+    async def get_quotes(self, symbols: list[str] | str) -> dict:  # noqa: ARG002
+        raise RuntimeError("forced_quote_failure")
 
 
-@pytest.fixture
-async def workflow_client(integration_db_session, monkeypatch, admin_headers):  # noqa: ARG001
-    """Integration app/client with real jobs backed by deterministic Tradier + test DB."""
+class _NoExpirationsTradier(_DeterministicTradier):
+    """Tradier stub that returns an empty expiration list."""
+
+    async def get_option_expirations(self, symbol: str) -> dict:  # noqa: ARG002
+        return {"expirations": {"date": []}}
+
+
+def _configure_workflow_settings(monkeypatch) -> None:
+    """Pin workflow settings for deterministic integration behavior."""
     monkeypatch.setattr(settings, "quote_symbols", "SPX,SPY,VIX,VIX9D")
     monkeypatch.setattr(settings, "snapshot_dte_mode", "targets")
     monkeypatch.setattr(settings, "snapshot_dte_targets", "3")
@@ -210,6 +212,26 @@ async def workflow_client(integration_db_session, monkeypatch, admin_headers):  
     monkeypatch.setattr(settings, "trainer_test_days", 1)
     monkeypatch.setattr(settings, "shadow_inference_lookback_minutes", 10080)
 
+
+def _patch_job_session_locals(monkeypatch, session_factory) -> None:
+    """Patch job modules to use integration test DB session factory."""
+    monkeypatch.setattr(quote_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(snapshot_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(gex_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(decision_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(feature_builder_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(labeler_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(trainer_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(shadow_inference_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(promotion_gate_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(trade_pnl_module, "SessionLocal", session_factory)
+
+
+@asynccontextmanager
+async def _build_workflow_client(*, integration_db_session, monkeypatch, tradier):
+    """Build an integration app/client wired to test DB and provided Tradier stub."""
+    _configure_workflow_settings(monkeypatch)
+
     session_factory = async_sessionmaker(
         bind=integration_db_session.bind,
         autoflush=False,
@@ -218,7 +240,6 @@ async def workflow_client(integration_db_session, monkeypatch, admin_headers):  
     )
     _patch_job_session_locals(monkeypatch, session_factory)
 
-    tradier = _DeterministicTradier()
     app = FastAPI()
     app.include_router(public.router)
     app.include_router(admin.router)
@@ -243,6 +264,66 @@ async def workflow_client(integration_db_session, monkeypatch, admin_headers):  
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
+
+
+@pytest.fixture
+async def workflow_client(integration_db_session, monkeypatch, admin_headers):  # noqa: ARG001
+    """Integration app/client with real jobs backed by deterministic Tradier + test DB."""
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_DeterministicTradier(),
+    ) as client:
+        yield client
+
+
+async def _seed_completed_training_run(*, session, version: str, metrics: dict[str, Any]) -> tuple[int, int]:
+    """Seed one completed training run + model version for promotion gate tests."""
+    model_row = await session.execute(
+        text(
+            """
+            INSERT INTO model_versions (
+              model_name, version, algorithm, feature_spec_json,
+              data_snapshot_json, metrics_json, rollout_status, is_active, notes
+            )
+            VALUES (
+              :model_name, :version, 'bucket_empirical_v1', '{}'::jsonb,
+              '{}'::jsonb, '{}'::jsonb, 'shadow', false, 'seeded_for_gate_tests'
+            )
+            RETURNING model_version_id
+            """
+        ),
+        {
+            "model_name": settings.promotion_gate_model_name,
+            "version": version,
+        },
+    )
+    model_version_id = int(model_row.scalar_one())
+
+    now_utc = datetime.now(tz=ZoneInfo("UTC"))
+    run_row = await session.execute(
+        text(
+            """
+            INSERT INTO training_runs (
+              model_version_id, started_at, finished_at, status, config_json, metrics_json, notes
+            )
+            VALUES (
+              :model_version_id, :started_at, :finished_at, 'COMPLETED',
+              '{}'::jsonb, CAST(:metrics_json AS jsonb), 'seeded_completed'
+            )
+            RETURNING training_run_id
+            """
+        ),
+        {
+            "model_version_id": model_version_id,
+            "started_at": now_utc - timedelta(hours=1),
+            "finished_at": now_utc,
+            "metrics_json": json.dumps(metrics, default=str),
+        },
+    )
+    training_run_id = int(run_row.scalar_one())
+    await session.commit()
+    return training_run_id, model_version_id
 
 
 @pytest.mark.asyncio
@@ -333,3 +414,215 @@ async def test_db_backed_full_admin_workflow_pipeline(workflow_client, admin_hea
         "no_trades",
     }
     assert critical_warnings.isdisjoint(set(payload["warnings"]))
+
+
+@pytest.mark.asyncio
+async def test_db_backed_quote_fetch_failure_returns_skip(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Quote endpoint should return quote_fetch_failed when Tradier quotes call fails."""
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_QuoteFetchFailsTradier(),
+    ) as client:
+        run_quotes = await client.post("/api/admin/run-quotes", headers=admin_headers)
+
+    assert run_quotes.status_code == 200
+    payload = run_quotes.json()
+    assert payload["skipped"] is True
+    assert payload["reason"] == "quote_fetch_failed"
+    assert payload["quotes_inserted"] == 0
+
+    count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM underlying_quotes"))).scalar_one()
+    assert int(count) == 0
+
+
+@pytest.mark.asyncio
+async def test_db_backed_snapshot_no_expirations_returns_skip(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Snapshot endpoint should skip cleanly when no expirations are available."""
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_NoExpirationsTradier(),
+    ) as client:
+        run_snapshot = await client.post("/api/admin/run-snapshot", headers=admin_headers)
+
+    assert run_snapshot.status_code == 200
+    payload = run_snapshot.json()
+    assert payload["skipped"] is True
+    assert payload["reason"] == "no_expirations"
+    assert payload["chain_rows_inserted"] == 0
+    assert payload["inserted"] == []
+    assert payload["fallback_used"] is False
+
+    snapshots_count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM chain_snapshots"))).scalar_one()
+    rows_count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM option_chain_rows"))).scalar_one()
+    assert int(snapshots_count) == 0
+    assert int(rows_count) == 0
+
+
+@pytest.mark.asyncio
+async def test_db_backed_shadow_inference_no_model_returns_skip(
+    workflow_client,
+    integration_db_session,
+    admin_headers,
+) -> None:
+    """Shadow inference should skip with no_shadow_model in a fresh database."""
+    run_shadow = await workflow_client.post("/api/admin/run-shadow-inference", headers=admin_headers)
+    assert run_shadow.status_code == 200
+    payload = run_shadow.json()
+    assert payload["skipped"] is True
+    assert payload["reason"] == "no_shadow_model"
+
+    count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM model_predictions"))).scalar_one()
+    assert int(count) == 0
+
+
+@pytest.mark.asyncio
+async def test_db_backed_promotion_gate_fail_branch(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Promotion gate should stay in shadow when checks fail."""
+    fail_metrics = {
+        "resolved_test": 10,
+        "tp50_rate_test": 0.10,
+        "expectancy_test": -50.0,
+        "max_drawdown_test": 50000.0,
+        "tail_loss_proxy_test": -10000.0,
+        "avg_margin_usage_test": 10000.0,
+    }
+    training_run_id, model_version_id = await _seed_completed_training_run(
+        session=integration_db_session,
+        version="gate_fail_seed",
+        metrics=fail_metrics,
+    )
+
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_DeterministicTradier(),
+    ) as client:
+        run_gates = await client.post("/api/admin/run-promotion-gates", headers=admin_headers)
+
+    assert run_gates.status_code == 200
+    payload = run_gates.json()
+    assert payload["skipped"] is False
+    assert payload["passed"] is False
+    assert payload["rollout_status"] == "shadow"
+    assert payload["is_active"] is False
+    assert int(payload["training_run_id"]) == training_run_id
+    assert int(payload["model_version_id"]) == model_version_id
+
+    run_row = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT notes, metrics_json
+                FROM training_runs
+                WHERE training_run_id = :training_run_id
+                """
+            ),
+            {"training_run_id": training_run_id},
+        )
+    ).fetchone()
+    assert run_row is not None
+    assert run_row.notes == "gate_failed"
+    assert run_row.metrics_json["gate"]["passed"] is False
+
+    model_row = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT rollout_status, is_active, metrics_json
+                FROM model_versions
+                WHERE model_version_id = :model_version_id
+                """
+            ),
+            {"model_version_id": model_version_id},
+        )
+    ).fetchone()
+    assert model_row is not None
+    assert model_row.rollout_status == "shadow"
+    assert model_row.is_active is False
+    assert model_row.metrics_json["gate"]["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_db_backed_promotion_gate_pass_branch(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Promotion gate should advance to canary when checks pass."""
+    monkeypatch.setattr(settings, "promotion_gate_auto_activate", False)
+    pass_metrics = {
+        "resolved_test": 500,
+        "tp50_rate_test": 0.70,
+        "expectancy_test": 250.0,
+        "max_drawdown_test": 1000.0,
+        "tail_loss_proxy_test": 100.0,
+        "avg_margin_usage_test": 2000.0,
+    }
+    training_run_id, model_version_id = await _seed_completed_training_run(
+        session=integration_db_session,
+        version="gate_pass_seed",
+        metrics=pass_metrics,
+    )
+
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_DeterministicTradier(),
+    ) as client:
+        run_gates = await client.post("/api/admin/run-promotion-gates", headers=admin_headers)
+
+    assert run_gates.status_code == 200
+    payload = run_gates.json()
+    assert payload["skipped"] is False
+    assert payload["passed"] is True
+    assert payload["rollout_status"] == "canary"
+    assert payload["is_active"] is False
+    assert int(payload["training_run_id"]) == training_run_id
+    assert int(payload["model_version_id"]) == model_version_id
+
+    run_row = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT notes, metrics_json
+                FROM training_runs
+                WHERE training_run_id = :training_run_id
+                """
+            ),
+            {"training_run_id": training_run_id},
+        )
+    ).fetchone()
+    assert run_row is not None
+    assert run_row.notes == "gate_passed"
+    assert run_row.metrics_json["gate"]["passed"] is True
+
+    model_row = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT rollout_status, is_active, metrics_json
+                FROM model_versions
+                WHERE model_version_id = :model_version_id
+                """
+            ),
+            {"model_version_id": model_version_id},
+        )
+    ).fetchone()
+    assert model_row is not None
+    assert model_row.rollout_status == "canary"
+    assert model_row.is_active is False
+    assert model_row.metrics_json["gate"]["passed"] is True
