@@ -7,6 +7,7 @@ import {
   RunResultCard,
   TradeDecisionDetailsDrawer,
   TradeDecisionsPanel,
+  TradesLivePnlPanel,
 } from "./components";
 import { useAdminRuns, useDecisionDeletion, useGexData, useSnapshotsDecisions } from "./hooks";
 
@@ -25,7 +26,7 @@ export function DashboardApp() {
     setError(message);
   }, []);
 
-  const { items, decisions, loading, decisionsLoading, refresh } = useSnapshotsDecisions({
+  const { items, decisions, trades, loading, decisionsLoading, tradesLoading, refresh } = useSnapshotsDecisions({
     onError: handleError,
   });
 
@@ -49,9 +50,11 @@ export function DashboardApp() {
     runResult,
     runQuotesResult,
     runDecisionResult,
+    runTradePnlResult,
     runSnapshot,
     runQuotes,
     runDecision,
+    runTradePnl,
   } = useAdminRuns({
     onRefresh: refresh,
     onError: handleError,
@@ -107,6 +110,9 @@ export function DashboardApp() {
           onRunDecision={() => {
             void runDecision();
           }}
+          onRunTradePnl={() => {
+            void runTradePnl();
+          }}
         />
 
         {error && (
@@ -126,6 +132,7 @@ export function DashboardApp() {
         {runResult && <RunResultCard title="Snapshot run result" result={runResult} scrollHeight={220} />}
         {runQuotesResult && <RunResultCard title="Quote run result" result={runQuotesResult} />}
         {runDecisionResult && <RunResultCard title="Decision run result" result={runDecisionResult} />}
+        {runTradePnlResult && <RunResultCard title="Trade PnL run result" result={runTradePnlResult} />}
 
         <GexPanel
           snapshots={gexSnapshots}
@@ -154,6 +161,8 @@ export function DashboardApp() {
             void deleteDecision(decisionId);
           }}
         />
+
+        <TradesLivePnlPanel trades={trades} loading={tradesLoading} error={error} />
 
         <ChainSnapshotsPanel items={items} loading={loading} error={error} />
       </Container>

@@ -1,0 +1,29 @@
+-- Destructive reset of all application tables.
+-- Recreate by running init_db() after this script.
+
+DROP TABLE IF EXISTS trade_marks;
+DROP TABLE IF EXISTS trade_legs;
+DROP TABLE IF EXISTS fills;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS trades;
+DROP TABLE IF EXISTS trade_decisions;
+DROP TABLE IF EXISTS model_predictions;
+DROP TABLE IF EXISTS trade_candidates;
+DROP TABLE IF EXISTS feature_snapshots;
+DROP TABLE IF EXISTS strategy_recommendations;
+DROP TABLE IF EXISTS training_runs;
+DROP TABLE IF EXISTS backtest_runs;
+DROP TABLE IF EXISTS model_versions;
+DROP TABLE IF EXISTS strategy_versions;
+
+DROP TABLE IF EXISTS gex_by_expiry_strike;
+DROP TABLE IF EXISTS gex_by_strike;
+DROP TABLE IF EXISTS gex_snapshots;
+
+DROP TABLE IF EXISTS option_chain_rows;
+DROP TABLE IF EXISTS option_instruments;
+DROP TABLE IF EXISTS chain_snapshots;
+
+DROP TABLE IF EXISTS context_snapshots;
+DROP TABLE IF EXISTS underlying_quotes;
+DROP TABLE IF EXISTS market_clock_audit;

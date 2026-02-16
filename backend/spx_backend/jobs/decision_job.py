@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -124,7 +124,8 @@ class DecisionJob:
             candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
             chosen = candidates[0]
 
-            await self._insert_decision(
+            candidate_ref = await self._find_candidate_reference(session, now_et, chosen)
+            decision_id = await self._insert_decision(
                 session=session,
                 now_et=now_et,
                 entry_slot=entry_slot,
@@ -136,12 +137,28 @@ class DecisionJob:
                 score=chosen["score"],
                 chosen_legs_json=chosen["chosen_legs_json"],
                 strategy_params_json=chosen["strategy_params_json"],
+                candidate_id=candidate_ref.get("candidate_id"),
+                feature_snapshot_id=candidate_ref.get("feature_snapshot_id"),
                 decision_source="rules",
+            )
+            trade_id = await self._create_trade_from_decision(
+                session=session,
+                decision_id=decision_id,
+                now_et=now_et,
+                chosen=chosen,
+                candidate_ref=candidate_ref,
             )
             await session.commit()
 
         logger.info("decision_job: decision=TRADE target_dte={} delta_target={}", chosen["target_dte"], chosen["delta_target"])
-        return {"skipped": False, "decision": "TRADE", "now_et": now_et.isoformat(), "chosen": chosen}
+        return {
+            "skipped": False,
+            "decision": "TRADE",
+            "now_et": now_et.isoformat(),
+            "decision_id": decision_id,
+            "trade_id": trade_id,
+            "chosen": chosen,
+        }
 
     async def _get_latest_snapshot_for_dte(
         self,
@@ -359,22 +376,25 @@ class DecisionJob:
         score: float | None = None,
         chosen_legs_json: dict | None = None,
         strategy_params_json: dict | None = None,
+        candidate_id: int | None = None,
+        feature_snapshot_id: int | None = None,
         decision_source: str = "rules",
-    ) -> None:
+    ) -> int:
         """Persist a decision row to trade_decisions."""
-        await session.execute(
+        result = await session.execute(
             text(
                 """
                 INSERT INTO trade_decisions (
                   ts, target_dte, entry_slot, delta_target,
                   chosen_legs_json, strategy_params_json, ruleset_version,
-                  score, decision, reason, chain_snapshot_id, decision_source
+                  score, decision, reason, chain_snapshot_id, feature_snapshot_id, candidate_id, decision_source
                 )
                 VALUES (
                   :ts, :target_dte, :entry_slot, :delta_target,
                   CAST(:chosen_legs_json AS jsonb), CAST(:strategy_params_json AS jsonb), :ruleset_version,
-                  :score, :decision, :reason, :chain_snapshot_id, :decision_source
+                  :score, :decision, :reason, :chain_snapshot_id, :feature_snapshot_id, :candidate_id, :decision_source
                 )
+                RETURNING decision_id
                 """
             ),
             {
@@ -389,9 +409,179 @@ class DecisionJob:
                 "decision": decision,
                 "reason": reason,
                 "chain_snapshot_id": chain_snapshot_id,
+                "feature_snapshot_id": feature_snapshot_id,
+                "candidate_id": candidate_id,
                 "decision_source": decision_source,
             },
         )
+        return int(result.scalar_one())
+
+    async def _find_candidate_reference(self, session, now_et: datetime, chosen: dict) -> dict:
+        """Best-effort lookup to link trade_decision to trade_candidates rows."""
+        now_utc = now_et.astimezone(ZoneInfo("UTC"))
+        window_start = now_utc - timedelta(minutes=5)
+        window_end = now_utc + timedelta(minutes=5)
+        chosen_legs = chosen.get("chosen_legs_json") or {}
+        short_symbol = ((chosen_legs.get("short") or {}).get("symbol")) if isinstance(chosen_legs, dict) else None
+        long_symbol = ((chosen_legs.get("long") or {}).get("symbol")) if isinstance(chosen_legs, dict) else None
+        if not short_symbol or not long_symbol:
+            return {}
+        row = await session.execute(
+            text(
+                """
+                SELECT candidate_id, feature_snapshot_id
+                FROM trade_candidates
+                WHERE snapshot_id = :snapshot_id
+                  AND ts >= :window_start
+                  AND ts <= :window_end
+                  AND (candidate_json->'legs'->'short'->>'symbol') = :short_symbol
+                  AND (candidate_json->'legs'->'long'->>'symbol') = :long_symbol
+                ORDER BY ts DESC, candidate_id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "snapshot_id": chosen["snapshot_id"],
+                "window_start": window_start,
+                "window_end": window_end,
+                "short_symbol": short_symbol,
+                "long_symbol": long_symbol,
+            },
+        )
+        result = row.fetchone()
+        if not result:
+            return {}
+        return {"candidate_id": result.candidate_id, "feature_snapshot_id": result.feature_snapshot_id}
+
+    async def _create_trade_from_decision(
+        self,
+        *,
+        session,
+        decision_id: int,
+        now_et: datetime,
+        chosen: dict,
+        candidate_ref: dict,
+    ) -> int:
+        """Insert one OPEN trade and its legs from the chosen decision candidate."""
+        chosen_legs = chosen.get("chosen_legs_json") or {}
+        short_leg = chosen_legs.get("short") or {}
+        long_leg = chosen_legs.get("long") or {}
+
+        contracts = int(settings.decision_contracts or 1)
+        multiplier = int(settings.trade_pnl_contract_multiplier)
+        width_points = float(settings.decision_spread_width_points)
+        entry_credit = float(chosen.get("credit") or 0.0)
+        max_profit = max(entry_credit, 0.0) * contracts * multiplier
+        max_loss = max(width_points - entry_credit, 0.0) * contracts * multiplier
+        take_profit_target = max_profit * settings.trade_pnl_take_profit_pct
+        stop_loss_target = max_profit * settings.trade_pnl_stop_loss_pct
+
+        expiration_raw = chosen.get("expiration")
+        expiration: date | None = None
+        if isinstance(expiration_raw, date):
+            expiration = expiration_raw
+        elif isinstance(expiration_raw, str):
+            try:
+                expiration = date.fromisoformat(expiration_raw)
+            except ValueError:
+                expiration = None
+
+        option_right = "P" if settings.decision_spread_side.lower() == "put" else "C"
+        now_utc = now_et.astimezone(ZoneInfo("UTC"))
+        trade_insert = await session.execute(
+            text(
+                """
+                INSERT INTO trades (
+                  decision_id, candidate_id, feature_snapshot_id, entry_snapshot_id,
+                  trade_source, strategy_type, status, underlying, entry_time,
+                  target_dte, expiration, contracts, contract_multiplier, spread_width_points,
+                  entry_credit, max_profit, max_loss, take_profit_target, stop_loss_target,
+                  current_exit_cost, current_pnl, realized_pnl
+                )
+                VALUES (
+                  :decision_id, :candidate_id, :feature_snapshot_id, :entry_snapshot_id,
+                  :trade_source, :strategy_type, :status, :underlying, :entry_time,
+                  :target_dte, :expiration, :contracts, :contract_multiplier, :spread_width_points,
+                  :entry_credit, :max_profit, :max_loss, :take_profit_target, :stop_loss_target,
+                  :current_exit_cost, :current_pnl, :realized_pnl
+                )
+                RETURNING trade_id
+                """
+            ),
+            {
+                "decision_id": decision_id,
+                "candidate_id": candidate_ref.get("candidate_id"),
+                "feature_snapshot_id": candidate_ref.get("feature_snapshot_id"),
+                "entry_snapshot_id": chosen.get("snapshot_id"),
+                "trade_source": "paper",
+                "strategy_type": f"credit_vertical_{settings.decision_spread_side.lower()}",
+                "status": "OPEN",
+                "underlying": settings.snapshot_underlying,
+                "entry_time": now_utc,
+                "target_dte": chosen.get("target_dte"),
+                "expiration": expiration,
+                "contracts": contracts,
+                "contract_multiplier": multiplier,
+                "spread_width_points": width_points,
+                "entry_credit": entry_credit,
+                "max_profit": max_profit,
+                "max_loss": max_loss,
+                "take_profit_target": take_profit_target,
+                "stop_loss_target": stop_loss_target,
+                "current_exit_cost": None,
+                "current_pnl": 0.0,
+                "realized_pnl": None,
+            },
+        )
+        trade_id = int(trade_insert.scalar_one())
+
+        await session.execute(
+            text(
+                """
+                INSERT INTO trade_legs (
+                  trade_id, leg_index, option_symbol, side, qty, entry_price, strike, expiration, option_right
+                )
+                VALUES (
+                  :trade_id, :leg_index, :option_symbol, :side, :qty, :entry_price, :strike, :expiration, :option_right
+                )
+                """
+            ),
+            {
+                "trade_id": trade_id,
+                "leg_index": 1,
+                "option_symbol": short_leg.get("symbol"),
+                "side": "STO",
+                "qty": contracts,
+                "entry_price": short_leg.get("mid"),
+                "strike": short_leg.get("strike"),
+                "expiration": expiration,
+                "option_right": option_right,
+            },
+        )
+        await session.execute(
+            text(
+                """
+                INSERT INTO trade_legs (
+                  trade_id, leg_index, option_symbol, side, qty, entry_price, strike, expiration, option_right
+                )
+                VALUES (
+                  :trade_id, :leg_index, :option_symbol, :side, :qty, :entry_price, :strike, :expiration, :option_right
+                )
+                """
+            ),
+            {
+                "trade_id": trade_id,
+                "leg_index": 2,
+                "option_symbol": long_leg.get("symbol"),
+                "side": "BTO",
+                "qty": contracts,
+                "entry_price": long_leg.get("mid"),
+                "strike": long_leg.get("strike"),
+                "expiration": expiration,
+                "option_right": option_right,
+            },
+        )
+        return trade_id
 
     async def _max_open_trades(self, session) -> int:
         """Count OPEN trades to enforce risk limits."""

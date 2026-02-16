@@ -2,6 +2,7 @@
 -- This keeps ingestion/market-data tables intact (snapshots, option rows, quotes, GEX, context).
 
 DROP TABLE IF EXISTS trade_legs;
+DROP TABLE IF EXISTS trade_marks;
 DROP TABLE IF EXISTS fills;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS trades;

@@ -134,6 +134,14 @@ Primary knobs:
   - `LABELER_BATCH_LIMIT`
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
+- Live trade PnL:
+  - `TRADE_PNL_ENABLED`
+  - `TRADE_PNL_INTERVAL_MINUTES`
+  - `TRADE_PNL_ALLOW_OUTSIDE_RTH`
+  - `TRADE_PNL_MARK_MAX_AGE_MINUTES`
+  - `TRADE_PNL_TAKE_PROFIT_PCT`
+  - `TRADE_PNL_STOP_LOSS_PCT`
+  - `TRADE_PNL_CONTRACT_MULTIPLIER`
 - GEX:
   - `GEX_ENABLED=true`
   - `GEX_MAX_DTE_DAYS`
@@ -198,6 +206,7 @@ Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
 - `POST /api/admin/run-decision`
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
+- `POST /api/admin/run-trade-pnl`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -233,6 +242,13 @@ Destructive ML reset command (keeps ingestion tables):
 ```bash
 cd backend
 python -m spx_backend.reset_ml_schema
+```
+
+Destructive full reset command (drops all app tables):
+
+```bash
+cd backend
+python -m spx_backend.reset_all_schema
 ```
 
 ---
@@ -286,7 +302,8 @@ Recommended manual sequence for diagnostics:
 4) `POST /api/admin/run-feature-builder`
 5) `POST /api/admin/run-labeler`
 6) `POST /api/admin/run-decision`
-7) `GET /api/admin/preflight`
+7) `POST /api/admin/run-trade-pnl`
+8) `GET /api/admin/preflight`
 
 If decisions are skipping:
 - Check `preflight.latest.snapshot_ts` freshness.

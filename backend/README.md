@@ -12,13 +12,14 @@ It is built for observability and reproducibility:
 
 ## 1) Service Responsibilities
 
-The backend performs six continuous tasks:
+The backend performs seven continuous tasks:
 - Quote ingestion (`underlying_quotes`, `context_snapshots`)
 - Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
 - GEX computation (`gex_snapshots`, strike/expiry detail tables)
 - Decision generation (`trade_decisions`)
 - Feature generation (`feature_snapshots`, `trade_candidates`)
 - Label resolution (`trade_candidates.label_*`, `realized_pnl`)
+- Live trade mark-to-market (`trades`, `trade_legs`, `trade_marks`)
 
 And exposes APIs for:
 - dashboard data reads
@@ -33,7 +34,7 @@ Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/db_schema.sql`.
 3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/snapshot/gex/decision/feature-builder/labeler.
+4) Start APScheduler jobs for quote/snapshot/gex/decision/feature-builder/labeler/trade-pnl.
 5) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
@@ -158,6 +159,17 @@ Output:
 - Status updates in `label_status`.
 - Scalar outcomes in `realized_pnl` and `hit_tp50_before_sl_or_expiry`.
 
+### 4.7 Trade PnL Job
+
+Input:
+- Open rows in `trades` and `trade_legs`.
+- Latest chain marks for both legs from `option_chain_rows`.
+
+Output:
+- Rolling mark-to-market updates in `trades.current_pnl` every interval.
+- Mark history in `trade_marks`.
+- Auto-close updates (`status`, `exit_time`, `realized_pnl`, `exit_reason`) when TP/SL/expiry rules are met.
+
 ---
 
 ## 5) Trading-Day DTE Semantics
@@ -211,6 +223,7 @@ Routes:
 - `POST /api/admin/run-decision`
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
+- `POST /api/admin/run-trade-pnl`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -261,6 +274,14 @@ High-impact settings:
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
   - `LABEL_CONTRACT_MULTIPLIER`
+- Trade PnL:
+  - `TRADE_PNL_ENABLED`
+  - `TRADE_PNL_INTERVAL_MINUTES`
+  - `TRADE_PNL_ALLOW_OUTSIDE_RTH`
+  - `TRADE_PNL_MARK_MAX_AGE_MINUTES`
+  - `TRADE_PNL_TAKE_PROFIT_PCT`
+  - `TRADE_PNL_STOP_LOSS_PCT`
+  - `TRADE_PNL_CONTRACT_MULTIPLIER`
 - GEX:
   - `GEX_ENABLED`, `GEX_INTERVAL_MINUTES`
   - `GEX_SNAPSHOT_BATCH_LIMIT` (default `20`)
@@ -322,6 +343,11 @@ Destructive ML reset:
 - CLI: `python -m spx_backend.reset_ml_schema`
 - This drops and recreates ML/decision/trade tables only (market-data ingestion tables are preserved).
 
+Destructive full reset:
+- reset SQL: `spx_backend/db_reset_all_tables.sql`
+- CLI: `python -m spx_backend.reset_all_schema`
+- This drops and recreates all app tables, including market-data ingestion history.
+
 ---
 
 ## 9) Local Run Instructions
@@ -343,6 +369,13 @@ cd backend
 python -m spx_backend.reset_ml_schema
 ```
 
+Reset all schema (destructive; drops all app tables):
+
+```bash
+cd backend
+python -m spx_backend.reset_all_schema
+```
+
 Smoke test:
 
 ```bash
@@ -359,6 +392,7 @@ curl -X POST http://localhost:8000/api/admin/run-gex
 curl -X POST http://localhost:8000/api/admin/run-feature-builder
 curl -X POST http://localhost:8000/api/admin/run-labeler
 curl -X POST http://localhost:8000/api/admin/run-decision
+curl -X POST http://localhost:8000/api/admin/run-trade-pnl
 curl http://localhost:8000/api/admin/preflight
 ```
 

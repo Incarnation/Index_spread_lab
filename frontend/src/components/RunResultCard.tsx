@@ -1,7 +1,7 @@
 import { Badge, Card, Code, Group, ScrollArea, Text } from "@mantine/core";
-import type { RunDecisionResult, RunQuotesResult, RunSnapshotResult } from "../api";
+import type { RunDecisionResult, RunQuotesResult, RunSnapshotResult, RunTradePnlResult } from "../api";
 
-type ResultPayload = RunSnapshotResult | RunQuotesResult | RunDecisionResult;
+type ResultPayload = RunSnapshotResult | RunQuotesResult | RunDecisionResult | RunTradePnlResult;
 
 type RunResultCardProps = {
   title: string;

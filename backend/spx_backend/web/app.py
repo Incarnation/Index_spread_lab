@@ -19,6 +19,7 @@ from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
+from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
 from spx_backend.market_clock import MarketClockCache
 
 
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
     decision_job = DecisionJob(clock_cache=clock_cache)
     feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
     labeler_job = LabelerJob()
+    trade_pnl_job = TradePnlJob(clock_cache=clock_cache)
 
     scheduler.add_job(
         snapshot_job.run_once,
@@ -88,6 +90,14 @@ async def lifespan(app: FastAPI):
             id="labeler_job",
             replace_existing=True,
         )
+    if settings.trade_pnl_enabled:
+        scheduler.add_job(
+            trade_pnl_job.run_once,
+            "interval",
+            minutes=settings.trade_pnl_interval_minutes,
+            id="trade_pnl_job",
+            replace_existing=True,
+        )
     scheduler.start()
 
     app.state.scheduler = scheduler
@@ -99,6 +109,7 @@ async def lifespan(app: FastAPI):
     app.state.decision_job = decision_job
     app.state.feature_builder_job = feature_builder_job
     app.state.labeler_job = labeler_job
+    app.state.trade_pnl_job = trade_pnl_job
 
     # Run once immediately on boot (useful for confirming wiring).
     try:
@@ -200,6 +211,114 @@ async def list_trade_decisions(limit: int = 50, db: AsyncSession = Depends(get_d
                 "ruleset_version": row.ruleset_version,
                 "chosen_legs_json": row.chosen_legs_json,
                 "strategy_params_json": row.strategy_params_json,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/trades")
+async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return recent trades with live PnL fields and leg metadata."""
+    limit = max(1, min(limit, 500))
+    normalized_status = status.strip().upper() if status is not None else None
+    if normalized_status not in {None, "OPEN", "CLOSED", "ROLLED"}:
+        raise HTTPException(status_code=400, detail="invalid_status")
+
+    r = await db.execute(
+        text(
+            """
+            SELECT
+              t.trade_id,
+              t.decision_id,
+              t.candidate_id,
+              t.feature_snapshot_id,
+              t.status,
+              t.trade_source,
+              t.strategy_type,
+              t.underlying,
+              t.entry_time,
+              t.exit_time,
+              t.last_mark_ts,
+              t.target_dte,
+              t.expiration,
+              t.contracts,
+              t.contract_multiplier,
+              t.spread_width_points,
+              t.entry_credit,
+              t.current_exit_cost,
+              t.current_pnl,
+              t.realized_pnl,
+              t.max_profit,
+              t.max_loss,
+              t.take_profit_target,
+              t.stop_loss_target,
+              t.exit_reason,
+              (
+                SELECT COUNT(*)
+                FROM trade_marks tm
+                WHERE tm.trade_id = t.trade_id
+              ) AS mark_count,
+              COALESCE(
+                (
+                  SELECT jsonb_agg(
+                    jsonb_build_object(
+                      'leg_index', tl.leg_index,
+                      'option_symbol', tl.option_symbol,
+                      'side', tl.side,
+                      'qty', tl.qty,
+                      'entry_price', tl.entry_price,
+                      'exit_price', tl.exit_price,
+                      'strike', tl.strike,
+                      'expiration', tl.expiration,
+                      'option_right', tl.option_right
+                    )
+                    ORDER BY tl.leg_index ASC
+                  )
+                  FROM trade_legs tl
+                  WHERE tl.trade_id = t.trade_id
+                ),
+                '[]'::jsonb
+              ) AS legs_json
+            FROM trades t
+            WHERE (:status IS NULL OR t.status = :status)
+            ORDER BY t.entry_time DESC, t.trade_id DESC
+            LIMIT :limit
+            """
+        ),
+        {"status": normalized_status, "limit": limit},
+    )
+    rows = r.fetchall()
+    return {
+        "items": [
+            {
+                "trade_id": row.trade_id,
+                "decision_id": row.decision_id,
+                "candidate_id": row.candidate_id,
+                "feature_snapshot_id": row.feature_snapshot_id,
+                "status": row.status,
+                "trade_source": row.trade_source,
+                "strategy_type": row.strategy_type,
+                "underlying": row.underlying,
+                "entry_time": row.entry_time.isoformat(),
+                "exit_time": (row.exit_time.isoformat() if row.exit_time is not None else None),
+                "last_mark_ts": (row.last_mark_ts.isoformat() if row.last_mark_ts is not None else None),
+                "target_dte": row.target_dte,
+                "expiration": (str(row.expiration) if row.expiration is not None else None),
+                "contracts": row.contracts,
+                "contract_multiplier": row.contract_multiplier,
+                "spread_width_points": row.spread_width_points,
+                "entry_credit": row.entry_credit,
+                "current_exit_cost": row.current_exit_cost,
+                "current_pnl": row.current_pnl,
+                "realized_pnl": row.realized_pnl,
+                "max_profit": row.max_profit,
+                "max_loss": row.max_loss,
+                "take_profit_target": row.take_profit_target,
+                "stop_loss_target": row.stop_loss_target,
+                "exit_reason": row.exit_reason,
+                "mark_count": int(row.mark_count or 0),
+                "legs": list(row.legs_json or []),
             }
             for row in rows
         ]
@@ -497,6 +616,14 @@ async def admin_run_labeler(request: Request, _: None = Depends(_require_admin))
     return result
 
 
+@app.post("/api/admin/run-trade-pnl")
+async def admin_run_trade_pnl(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force trade mark-to-market run immediately."""
+    job: TradePnlJob = getattr(request.app.state, "trade_pnl_job", build_trade_pnl_job())
+    result = await job.run_once(force=True)
+    return result
+
+
 @app.delete("/api/admin/trade-decisions/{decision_id}")
 async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
     """Delete one trade decision row by ID."""
@@ -545,12 +672,17 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
               (SELECT COUNT(*) FROM feature_snapshots) AS feature_snapshots_count,
               (SELECT COUNT(*) FROM trade_candidates) AS trade_candidates_count,
               (SELECT COUNT(*) FROM trade_candidates WHERE label_status = 'resolved') AS labeled_candidates_count,
+              (SELECT COUNT(*) FROM trades) AS trades_count,
+              (SELECT COUNT(*) FROM trades WHERE status = 'OPEN') AS open_trades_count,
+              (SELECT COUNT(*) FROM trades WHERE status = 'CLOSED') AS closed_trades_count,
               (SELECT MAX(ts) FROM underlying_quotes) AS latest_quote_ts,
               (SELECT MAX(ts) FROM chain_snapshots) AS latest_snapshot_ts,
               (SELECT MAX(ts) FROM gex_snapshots) AS latest_gex_ts,
               (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
               (SELECT MAX(ts) FROM feature_snapshots) AS latest_feature_ts,
               (SELECT MAX(ts) FROM trade_candidates) AS latest_candidate_ts,
+              (SELECT MAX(last_mark_ts) FROM trades) AS latest_trade_mark_ts,
+              (SELECT MAX(entry_time) FROM trades) AS latest_trade_entry_ts,
               (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
             """
         )
@@ -617,6 +749,9 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "feature_snapshots": int(summary.feature_snapshots_count or 0),
         "trade_candidates": int(summary.trade_candidates_count or 0),
         "labeled_candidates": int(summary.labeled_candidates_count or 0),
+        "trades": int(summary.trades_count or 0),
+        "open_trades": int(summary.open_trades_count or 0),
+        "closed_trades": int(summary.closed_trades_count or 0),
     }
     latest = {
         "quote_ts": _iso(summary.latest_quote_ts),
@@ -625,6 +760,8 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "decision_ts": _iso(summary.latest_decision_ts),
         "feature_ts": _iso(summary.latest_feature_ts),
         "candidate_ts": _iso(summary.latest_candidate_ts),
+        "trade_mark_ts": _iso(summary.latest_trade_mark_ts),
+        "trade_entry_ts": _iso(summary.latest_trade_entry_ts),
         "market_clock_ts": _iso(summary.latest_market_clock_ts),
     }
 
@@ -639,6 +776,8 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         warnings.append("no_feature_snapshots")
     if counts["trade_candidates"] == 0:
         warnings.append("no_trade_candidates")
+    if counts["trades"] == 0:
+        warnings.append("no_trades")
 
     return {
         "now_utc": f"{datetime.utcnow().isoformat()}Z",

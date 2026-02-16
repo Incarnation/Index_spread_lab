@@ -74,6 +74,24 @@ export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult
   return (await r.json()) as RunDecisionResult;
 }
 
+export type RunTradePnlResult = {
+  skipped: boolean;
+  reason?: string | null;
+  now_et: string;
+  updated?: number;
+  closed?: number;
+  marks_written?: number;
+};
+
+export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-trade-pnl`), {
+    method: "POST",
+    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as RunTradePnlResult;
+}
+
 export type GexSnapshot = {
   snapshot_id: number;
   ts: string;
@@ -150,6 +168,57 @@ export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> 
   const r = await fetch(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: TradeDecision[] };
+  return data.items;
+}
+
+export type TradeLeg = {
+  leg_index: number;
+  option_symbol: string;
+  side: string;
+  qty: number;
+  entry_price: number | null;
+  exit_price: number | null;
+  strike: number | null;
+  expiration: string | null;
+  option_right: string | null;
+};
+
+export type TradeRow = {
+  trade_id: number;
+  decision_id: number | null;
+  candidate_id: number | null;
+  feature_snapshot_id: number | null;
+  status: string;
+  trade_source: string;
+  strategy_type: string;
+  underlying: string;
+  entry_time: string;
+  exit_time: string | null;
+  last_mark_ts: string | null;
+  target_dte: number | null;
+  expiration: string | null;
+  contracts: number;
+  contract_multiplier: number;
+  spread_width_points: number | null;
+  entry_credit: number | null;
+  current_exit_cost: number | null;
+  current_pnl: number | null;
+  realized_pnl: number | null;
+  max_profit: number | null;
+  max_loss: number | null;
+  take_profit_target: number | null;
+  stop_loss_target: number | null;
+  exit_reason: string | null;
+  mark_count: number;
+  legs: TradeLeg[];
+};
+
+export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROLLED"): Promise<TradeRow[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (status) params.set("status", status);
+  const r = await fetch(apiUrl(`/api/trades?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = (await r.json()) as { items: TradeRow[] };
   return data.items;
 }
 

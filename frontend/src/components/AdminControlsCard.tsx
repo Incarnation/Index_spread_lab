@@ -8,6 +8,7 @@ type AdminControlsCardProps = {
   onRunSnapshot: () => void;
   onRunQuotes: () => void;
   onRunDecision: () => void;
+  onRunTradePnl: () => void;
 };
 
 export function AdminControlsCard({
@@ -17,6 +18,7 @@ export function AdminControlsCard({
   onRunSnapshot,
   onRunQuotes,
   onRunDecision,
+  onRunTradePnl,
 }: AdminControlsCardProps) {
   return (
     <Card withBorder radius="md" mt="lg" p="md">
@@ -31,6 +33,9 @@ export function AdminControlsCard({
           </Button>
           <Button onClick={onRunDecision} variant="outline">
             Run decision now
+          </Button>
+          <Button onClick={onRunTradePnl} variant="outline">
+            Run trade PnL now
           </Button>
         </Group>
         <TextInput

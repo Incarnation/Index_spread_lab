@@ -4,3 +4,4 @@ export { GexPanel } from "./GexPanel";
 export { RunResultCard } from "./RunResultCard";
 export { TradeDecisionDetailsDrawer } from "./TradeDecisionDetailsDrawer";
 export { TradeDecisionsPanel } from "./TradeDecisionsPanel";
+export { TradesLivePnlPanel } from "./TradesLivePnlPanel";

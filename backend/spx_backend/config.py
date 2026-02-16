@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     label_schema_version: str = "label_v1"
     label_contract_multiplier: int = 100
 
+    # Live trade PnL mark-to-market job
+    trade_pnl_enabled: bool = True
+    trade_pnl_interval_minutes: int = 5
+    trade_pnl_allow_outside_rth: bool = False
+    trade_pnl_mark_max_age_minutes: int = 30
+    trade_pnl_take_profit_pct: float = 0.50
+    trade_pnl_stop_loss_pct: float = 1.00
+    trade_pnl_contract_multiplier: int = 100
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls

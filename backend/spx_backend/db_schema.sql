@@ -388,6 +388,10 @@ CREATE INDEX IF NOT EXISTS idx_fills_order_ts ON fills (order_id, ts);
 CREATE TABLE IF NOT EXISTS trades (
   trade_id BIGSERIAL PRIMARY KEY,
   decision_id BIGINT NULL REFERENCES trade_decisions(decision_id),
+  candidate_id BIGINT NULL REFERENCES trade_candidates(candidate_id),
+  feature_snapshot_id BIGINT NULL REFERENCES feature_snapshots(feature_snapshot_id),
+  entry_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id),
+  last_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id),
   backtest_run_id BIGINT NULL REFERENCES backtest_runs(run_id),
   trade_source TEXT NOT NULL DEFAULT 'live', -- live/paper/backtest
   strategy_version_id BIGINT NULL REFERENCES strategy_versions(strategy_version_id),
@@ -397,16 +401,27 @@ CREATE TABLE IF NOT EXISTS trades (
   underlying TEXT NOT NULL,
   entry_time TIMESTAMPTZ NOT NULL,
   exit_time TIMESTAMPTZ NULL,
+  last_mark_ts TIMESTAMPTZ NULL,
   target_dte INTEGER NULL,
+  expiration DATE NULL,
+  contracts INTEGER NOT NULL DEFAULT 1,
+  contract_multiplier INTEGER NOT NULL DEFAULT 100,
+  spread_width_points DOUBLE PRECISION NULL,
   entry_credit DOUBLE PRECISION NULL,
   max_profit DOUBLE PRECISION NULL,
+  max_loss DOUBLE PRECISION NULL,
+  take_profit_target DOUBLE PRECISION NULL,
+  stop_loss_target DOUBLE PRECISION NULL,
+  current_exit_cost DOUBLE PRECISION NULL,
   current_pnl DOUBLE PRECISION NULL,
+  realized_pnl DOUBLE PRECISION NULL,
   exit_reason TEXT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades (entry_time DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_backtest_run ON trades (backtest_run_id, entry_time DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_entry ON trades (strategy_version_id, entry_time DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_status_entry ON trades (status, entry_time DESC);
 
 CREATE TABLE IF NOT EXISTS trade_legs (
   trade_id BIGINT NOT NULL REFERENCES trades(trade_id),
@@ -421,4 +436,21 @@ CREATE TABLE IF NOT EXISTS trade_legs (
   option_right TEXT NULL,
   PRIMARY KEY (trade_id, leg_index)
 );
+
+CREATE TABLE IF NOT EXISTS trade_marks (
+  mark_id BIGSERIAL PRIMARY KEY,
+  trade_id BIGINT NOT NULL REFERENCES trades(trade_id) ON DELETE CASCADE,
+  snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE SET NULL,
+  ts TIMESTAMPTZ NOT NULL,
+  short_mid DOUBLE PRECISION NULL,
+  long_mid DOUBLE PRECISION NULL,
+  exit_cost DOUBLE PRECISION NULL,
+  pnl DOUBLE PRECISION NULL,
+  status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN/CLOSED
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (trade_id, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_marks_trade_ts ON trade_marks (trade_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_marks_ts ON trade_marks (ts DESC);
 

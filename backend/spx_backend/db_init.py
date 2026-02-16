@@ -27,3 +27,10 @@ async def reset_ml_tables() -> None:
     await _execute_sql_file(reset_path)
     await init_db()
 
+
+async def reset_all_tables() -> None:
+    """Drop and recreate all application tables."""
+    reset_path = Path(__file__).with_name("db_reset_all_tables.sql")
+    await _execute_sql_file(reset_path)
+    await init_db()
+
