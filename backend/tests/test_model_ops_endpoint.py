@@ -9,19 +9,27 @@ from spx_backend.web.app import get_model_ops
 
 
 class _FakeExecResult:
+    """Minimal async execute result wrapper for endpoint unit tests."""
+
     def __init__(self, rows):
+        """Store one batch of rows returned by a fake DB call."""
         self._rows = rows
 
     def fetchone(self):
+        """Return first row to mimic SQLAlchemy result behavior."""
         return self._rows[0] if self._rows else None
 
 
 class _FakeSession:
+    """Small fake async DB session that records SQL and params."""
+
     def __init__(self, row_batches):
+        """Preload result batches consumed by successive execute() calls."""
         self._row_batches = list(row_batches)
         self.calls: list[tuple[str, dict]] = []
 
     async def execute(self, stmt, params=None):
+        """Capture SQL text and return the next prepared result batch."""
         self.calls.append((str(stmt), params or {}))
         rows = self._row_batches.pop(0) if self._row_batches else []
         return _FakeExecResult(rows)
@@ -29,6 +37,7 @@ class _FakeSession:
 
 @pytest.mark.asyncio
 async def test_get_model_ops_shapes_response() -> None:
+    """Verify /api/model-ops response structure and model-ops payload mapping."""
     session = _FakeSession(
         row_batches=[
             [
@@ -97,10 +106,14 @@ async def test_get_model_ops_shapes_response() -> None:
     assert result["active_model_version"]["is_active"] is True
     assert result["warnings"] == []
     assert len(session.calls) == 4
+    # Regression guard: fully qualify created_at to avoid Postgres ambiguity in joined subquery.
+    assert "MAX(mp.created_at)" in session.calls[0][0]
+    assert "MAX(created_at)" not in session.calls[0][0]
 
 
 @pytest.mark.asyncio
 async def test_get_model_ops_returns_warnings_when_no_data() -> None:
+    """Ensure warnings are emitted when model-ops tables are empty."""
     session = _FakeSession(
         row_batches=[
             [

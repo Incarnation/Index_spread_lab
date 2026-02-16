@@ -407,7 +407,7 @@ async def get_model_ops(model_name: str | None = None, db: AsyncSession = Depend
                   (SELECT COUNT(*) FROM model_predictions mp
                     JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
                     WHERE mv.model_name = :model_name AND mp.created_at >= :since_24h) AS model_predictions_24h_count,
-                  (SELECT MAX(created_at) FROM model_predictions mp
+                  (SELECT MAX(mp.created_at) FROM model_predictions mp
                     JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
                     WHERE mv.model_name = :model_name) AS latest_prediction_ts
                 """
