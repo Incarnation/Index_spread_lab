@@ -89,6 +89,7 @@ class FeatureBuilderJob:
         options: list[dict],
         spot: float | None,
         context: dict | None,
+        spread_side: str,
     ) -> dict:
         """Build compact, reproducible market-state feature payload."""
         spreads = [float(o["ask"]) - float(o["bid"]) for o in options]
@@ -134,7 +135,8 @@ class FeatureBuilderJob:
                 "context_age_sec": context_age_sec,
             },
             "decision_config": {
-                "spread_side": settings.decision_spread_side.lower(),
+                "spread_side": spread_side.lower(),
+                "spread_sides_enabled": settings.decision_spread_sides_list(),
                 "width_points": settings.decision_spread_width_points,
                 "contracts": settings.decision_contracts,
                 "delta_targets": settings.decision_delta_targets_list(),
@@ -146,6 +148,9 @@ class FeatureBuilderJob:
         chosen = candidate["chosen_legs_json"]
         short_leg = chosen.get("short") or {}
         long_leg = chosen.get("long") or {}
+        spread_side = str(chosen.get("spread_side") or settings.decision_spread_side).lower()
+        width_points = float(chosen.get("width_points") or settings.decision_spread_width_points)
+        contracts = int(short_leg.get("qty") or settings.decision_contracts)
         return {
             "schema_version": settings.candidate_schema_version,
             "underlying": settings.snapshot_underlying,
@@ -153,9 +158,9 @@ class FeatureBuilderJob:
             "expiration": str(candidate["expiration"]),
             "target_dte": candidate["target_dte"],
             "delta_target": candidate["delta_target"],
-            "spread_side": settings.decision_spread_side.lower(),
-            "width_points": settings.decision_spread_width_points,
-            "contracts": settings.decision_contracts,
+            "spread_side": spread_side,
+            "width_points": width_points,
+            "contracts": contracts,
             "entry_credit": candidate["credit"],
             "score": candidate["score"],
             "delta_diff": candidate["delta_diff"],
@@ -184,8 +189,11 @@ class FeatureBuilderJob:
 
         target_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
+        spread_sides = settings.decision_spread_sides_list()
         if not target_dtes or not delta_targets:
             return {"skipped": True, "reason": "missing_targets", "now_et": now_et.isoformat()}
+        if not spread_sides:
+            return {"skipped": True, "reason": "missing_spread_sides", "now_et": now_et.isoformat()}
 
         helper = DecisionJob(clock_cache=self.clock_cache)
         features_inserted = 0
@@ -197,138 +205,142 @@ class FeatureBuilderJob:
             context = await helper._get_latest_context(session, now_et)
             context_ts = _iso_to_dt(context.get("ts")) if context else None
 
-            for target_dte in target_dtes:
-                snapshot = await helper._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
-                if snapshot is None:
-                    continue
-                options = await helper._get_option_rows(session, snapshot["snapshot_id"])
-                if not options:
-                    continue
+            for spread_side in spread_sides:
+                for target_dte in target_dtes:
+                    snapshot = await helper._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    if snapshot is None:
+                        continue
+                    options = await helper._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
+                    if not options:
+                        continue
 
-                feature_payload = self._build_feature_payload(
-                    now_et=now_et,
-                    snapshot=snapshot,
-                    options=options,
-                    spot=spot,
-                    context=context,
-                )
-                feature_hash = stable_json_hash(feature_payload)
-                feature_insert = await session.execute(
-                    text(
-                        """
-                        INSERT INTO feature_snapshots (
-                          ts, snapshot_id, context_ts, underlying, target_dte, entry_slot,
-                          strategy_version_id, data_source, feature_schema_version, feature_hash,
-                          source_job, source_run_id, features_json, label_status, label_horizon
-                        )
-                        VALUES (
-                          :ts, :snapshot_id, :context_ts, :underlying, :target_dte, :entry_slot,
-                          :strategy_version_id, :data_source, :feature_schema_version, :feature_hash,
-                          :source_job, :source_run_id, CAST(:features_json AS jsonb), :label_status, :label_horizon
-                        )
-                        RETURNING feature_snapshot_id
-                        """
-                    ),
-                    {
-                        "ts": now_et.astimezone(ZoneInfo("UTC")),
-                        "snapshot_id": snapshot["snapshot_id"],
-                        "context_ts": context_ts,
-                        "underlying": settings.snapshot_underlying,
-                        "target_dte": snapshot["target_dte"],
-                        "entry_slot": entry_slot,
-                        "strategy_version_id": None,
-                        "data_source": "live",
-                        "feature_schema_version": settings.feature_schema_version,
-                        "feature_hash": feature_hash,
-                        "source_job": "feature_builder_job",
-                        "source_run_id": None,
-                        "features_json": _to_json(feature_payload),
-                        "label_status": "pending",
-                        "label_horizon": "to_expiration",
-                    },
-                )
-                feature_snapshot_id = feature_insert.scalar_one()
-                features_inserted += 1
-
-                candidates: list[dict] = []
-                for delta_target in delta_targets:
-                    candidate = helper._build_candidate(
+                    feature_payload = self._build_feature_payload(
+                        now_et=now_et,
+                        snapshot=snapshot,
                         options=options,
-                        target_dte=snapshot["target_dte"],
-                        delta_target=delta_target,
-                        spread_side=settings.decision_spread_side,
-                        width_points=settings.decision_spread_width_points,
-                        snapshot_id=snapshot["snapshot_id"],
-                        expiration=snapshot["expiration"],
                         spot=spot,
                         context=context,
+                        spread_side=spread_side,
                     )
-                    if candidate:
-                        candidates.append(candidate)
-
-                # Ranking is persisted to support model-vs-rules comparison later.
-                candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
-                for rank, candidate in enumerate(candidates, start=1):
-                    candidate_json = self._build_candidate_json(candidate)
-                    candidate_hash = build_candidate_hash(candidate_json)
-                    entry_credit = float(candidate["credit"])
-                    width_points = float(settings.decision_spread_width_points)
-                    max_loss = max(width_points - entry_credit, 0.0)
-                    credit_to_width = (entry_credit / width_points) if width_points > 0 else None
-                    constraints_json = {
-                        "credit_positive": entry_credit > 0,
-                        "width_points": width_points,
-                        "delta_target": candidate["delta_target"],
-                    }
-
-                    insert_candidate = await session.execute(
+                    feature_hash = stable_json_hash(feature_payload)
+                    feature_insert = await session.execute(
                         text(
                             """
-                            INSERT INTO trade_candidates (
-                              ts, feature_snapshot_id, snapshot_id, strategy_version_id,
-                              candidate_hash, candidate_schema_version, candidate_rank,
-                              entry_credit, max_loss, credit_to_width, candidate_json, constraints_json,
-                              label_status, label_horizon
+                            INSERT INTO feature_snapshots (
+                              ts, snapshot_id, context_ts, underlying, target_dte, entry_slot,
+                              strategy_version_id, data_source, feature_schema_version, feature_hash,
+                              source_job, source_run_id, features_json, label_status, label_horizon
                             )
                             VALUES (
-                              :ts, :feature_snapshot_id, :snapshot_id, :strategy_version_id,
-                              :candidate_hash, :candidate_schema_version, :candidate_rank,
-                              :entry_credit, :max_loss, :credit_to_width, CAST(:candidate_json AS jsonb), CAST(:constraints_json AS jsonb),
-                              :label_status, :label_horizon
+                              :ts, :snapshot_id, :context_ts, :underlying, :target_dte, :entry_slot,
+                              :strategy_version_id, :data_source, :feature_schema_version, :feature_hash,
+                              :source_job, :source_run_id, CAST(:features_json AS jsonb), :label_status, :label_horizon
                             )
-                            ON CONFLICT (feature_snapshot_id, candidate_hash) DO NOTHING
-                            RETURNING candidate_id
+                            RETURNING feature_snapshot_id
                             """
                         ),
                         {
                             "ts": now_et.astimezone(ZoneInfo("UTC")),
-                            "feature_snapshot_id": feature_snapshot_id,
-                            "snapshot_id": candidate["snapshot_id"],
+                            "snapshot_id": snapshot["snapshot_id"],
+                            "context_ts": context_ts,
+                            "underlying": settings.snapshot_underlying,
+                            "target_dte": snapshot["target_dte"],
+                            "entry_slot": entry_slot,
                             "strategy_version_id": None,
-                            "candidate_hash": candidate_hash,
-                            "candidate_schema_version": settings.candidate_schema_version,
-                            "candidate_rank": rank,
-                            "entry_credit": entry_credit,
-                            "max_loss": max_loss,
-                            "credit_to_width": credit_to_width,
-                            "candidate_json": _to_json(candidate_json),
-                            "constraints_json": _to_json(constraints_json),
+                            "data_source": "live",
+                            "feature_schema_version": settings.feature_schema_version,
+                            "feature_hash": feature_hash,
+                            "source_job": "feature_builder_job",
+                            "source_run_id": None,
+                            "features_json": _to_json(feature_payload),
                             "label_status": "pending",
                             "label_horizon": "to_expiration",
                         },
                     )
-                    candidate_id = insert_candidate.scalar_one_or_none()
-                    if candidate_id is not None:
-                        candidates_inserted += 1
+                    feature_snapshot_id = feature_insert.scalar_one()
+                    features_inserted += 1
 
-                built.append(
-                    {
-                        "target_dte": snapshot["target_dte"],
-                        "snapshot_id": snapshot["snapshot_id"],
-                        "feature_snapshot_id": feature_snapshot_id,
-                        "candidate_count": len(candidates),
-                    }
-                )
+                    candidates: list[dict] = []
+                    for delta_target in delta_targets:
+                        candidate = helper._build_candidate(
+                            options=options,
+                            target_dte=snapshot["target_dte"],
+                            delta_target=delta_target,
+                            spread_side=spread_side,
+                            width_points=settings.decision_spread_width_points,
+                            snapshot_id=snapshot["snapshot_id"],
+                            expiration=snapshot["expiration"],
+                            spot=spot,
+                            context=context,
+                        )
+                        if candidate:
+                            candidates.append(candidate)
+
+                    # Ranking is persisted to support model-vs-rules comparison later.
+                    candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
+                    for rank, candidate in enumerate(candidates, start=1):
+                        candidate_json = self._build_candidate_json(candidate)
+                        candidate_hash = build_candidate_hash(candidate_json)
+                        entry_credit = float(candidate["credit"])
+                        width_points = float(candidate_json["width_points"])
+                        max_loss = max(width_points - entry_credit, 0.0)
+                        credit_to_width = (entry_credit / width_points) if width_points > 0 else None
+                        constraints_json = {
+                            "credit_positive": entry_credit > 0,
+                            "width_points": width_points,
+                            "delta_target": candidate["delta_target"],
+                            "spread_side": spread_side,
+                        }
+
+                        insert_candidate = await session.execute(
+                            text(
+                                """
+                                INSERT INTO trade_candidates (
+                                  ts, feature_snapshot_id, snapshot_id, strategy_version_id,
+                                  candidate_hash, candidate_schema_version, candidate_rank,
+                                  entry_credit, max_loss, credit_to_width, candidate_json, constraints_json,
+                                  label_status, label_horizon
+                                )
+                                VALUES (
+                                  :ts, :feature_snapshot_id, :snapshot_id, :strategy_version_id,
+                                  :candidate_hash, :candidate_schema_version, :candidate_rank,
+                                  :entry_credit, :max_loss, :credit_to_width, CAST(:candidate_json AS jsonb), CAST(:constraints_json AS jsonb),
+                                  :label_status, :label_horizon
+                                )
+                                ON CONFLICT (feature_snapshot_id, candidate_hash) DO NOTHING
+                                RETURNING candidate_id
+                                """
+                            ),
+                            {
+                                "ts": now_et.astimezone(ZoneInfo("UTC")),
+                                "feature_snapshot_id": feature_snapshot_id,
+                                "snapshot_id": candidate["snapshot_id"],
+                                "strategy_version_id": None,
+                                "candidate_hash": candidate_hash,
+                                "candidate_schema_version": settings.candidate_schema_version,
+                                "candidate_rank": rank,
+                                "entry_credit": entry_credit,
+                                "max_loss": max_loss,
+                                "credit_to_width": credit_to_width,
+                                "candidate_json": _to_json(candidate_json),
+                                "constraints_json": _to_json(constraints_json),
+                                "label_status": "pending",
+                                "label_horizon": "to_expiration",
+                            },
+                        )
+                        candidate_id = insert_candidate.scalar_one_or_none()
+                        if candidate_id is not None:
+                            candidates_inserted += 1
+
+                    built.append(
+                        {
+                            "spread_side": spread_side,
+                            "target_dte": snapshot["target_dte"],
+                            "snapshot_id": snapshot["snapshot_id"],
+                            "feature_snapshot_id": feature_snapshot_id,
+                            "candidate_count": len(candidates),
+                        }
+                    )
 
             await session.commit()
 

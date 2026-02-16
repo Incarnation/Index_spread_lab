@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -135,3 +136,39 @@ async def test_snapshot_selection_force_mode_disables_freshness_filter(monkeypat
     assert "ts <= :now_ts" in sql
     assert "ts >= :min_ts" not in sql
     assert "now_ts" in params
+
+
+def test_decision_spread_sides_list_parses_csv_and_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "decision_spread_side", "put")
+    monkeypatch.setattr(settings, "decision_spread_sides", "put, call, invalid, put")
+    assert settings.decision_spread_sides_list() == ["put", "call"]
+
+    monkeypatch.setattr(settings, "decision_spread_sides", "")
+    monkeypatch.setattr(settings, "decision_spread_side", "call")
+    assert settings.decision_spread_sides_list() == ["call"]
+
+
+def test_decision_dte_targets_list_parses_zero_and_ten(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "decision_dte_targets", "0,3,5,7,10")
+    assert settings.decision_dte_targets_list() == [0, 3, 5, 7, 10]
+
+
+@pytest.mark.asyncio
+async def test_side_limit_helpers_use_strategy_type_pattern(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_default_decision_settings(monkeypatch)
+    job = DecisionJob()
+    session = _FakeSession(rows=[SimpleNamespace(cnt=2), SimpleNamespace(cnt=3)])
+    now_et = datetime(2026, 2, 12, 12, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    open_count = await job._max_open_trades_by_side(session, "call")
+    daily_count = await job._trades_today_by_side(session, now_et, "put")
+
+    assert open_count == 2
+    assert daily_count == 3
+
+    first_sql, first_params = session.calls[0]
+    second_sql, second_params = session.calls[1]
+    assert "strategy_type LIKE :strategy_type_pattern" in first_sql
+    assert first_params["strategy_type_pattern"] == "%_call"
+    assert "strategy_type LIKE :strategy_type_pattern" in second_sql
+    assert second_params["strategy_type_pattern"] == "%_put"

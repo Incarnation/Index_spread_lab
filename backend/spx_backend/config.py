@@ -41,15 +41,18 @@ class Settings(BaseSettings):
     gex_max_dte_days: int = 10
 
     decision_entry_times: str = "10:00,11:00,12:00"
-    decision_dte_targets: str = "3,5,7"
+    decision_dte_targets: str = "0,3,5,7,10"
     decision_dte_tolerance_days: int = 1
     decision_delta_targets: str = "0.10,0.20"
     decision_spread_side: str = "put"
+    decision_spread_sides: str = ""
     decision_spread_width_points: float = 25.0
     decision_contracts: int = 1
     decision_snapshot_max_age_minutes: int = 15
-    decision_max_trades_per_day: int = 1
-    decision_max_open_trades: int = 1
+    decision_max_trades_per_day: int = 20
+    decision_max_open_trades: int = 15
+    decision_max_trades_per_side_per_day: int = 0
+    decision_max_open_trades_per_side: int = 0
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
 
@@ -118,6 +121,19 @@ class Settings(BaseSettings):
     def decision_delta_targets_list(self) -> list[float]:
         parts = [p.strip() for p in self.decision_delta_targets.split(",") if p.strip()]
         return [float(p) for p in parts]
+
+    def decision_spread_sides_list(self) -> list[str]:
+        """Parse allowed spread sides with fallback to single-side config."""
+        raw = self.decision_spread_sides.strip()
+        source = raw if raw else self.decision_spread_side
+        out: list[str] = []
+        for part in source.split(","):
+            side = part.strip().lower()
+            if side not in {"put", "call"}:
+                continue
+            if side not in out:
+                out.append(side)
+        return out
 
 
 settings = Settings()

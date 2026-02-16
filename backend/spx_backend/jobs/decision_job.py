@@ -51,8 +51,11 @@ class DecisionJob:
 
         decision_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
+        spread_sides = settings.decision_spread_sides_list()
         if not decision_dtes or not delta_targets:
             return {"skipped": True, "reason": "missing_targets", "now_et": now_et.isoformat()}
+        if not spread_sides:
+            return {"skipped": True, "reason": "missing_spread_sides", "now_et": now_et.isoformat()}
 
         async with SessionLocal() as session:
             if await self._max_open_trades(session) >= settings.decision_max_open_trades:
@@ -81,31 +84,64 @@ class DecisionJob:
                 await session.commit()
                 return {"skipped": True, "reason": "max_trades_per_day", "now_et": now_et.isoformat()}
 
+            side_limits: dict[str, str] = {}
+            eligible_spread_sides: list[str] = []
+            for spread_side in spread_sides:
+                if settings.decision_max_open_trades_per_side > 0:
+                    open_for_side = await self._max_open_trades_by_side(session, spread_side)
+                    if open_for_side >= settings.decision_max_open_trades_per_side:
+                        side_limits[spread_side] = "max_open_trades_per_side"
+                        continue
+                if settings.decision_max_trades_per_side_per_day > 0:
+                    trades_for_side = await self._trades_today_by_side(session, now_et, spread_side)
+                    if trades_for_side >= settings.decision_max_trades_per_side_per_day:
+                        side_limits[spread_side] = "max_trades_per_side_per_day"
+                        continue
+                eligible_spread_sides.append(spread_side)
+
+            if not eligible_spread_sides:
+                await self._insert_decision(
+                    session=session,
+                    now_et=now_et,
+                    entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP",
+                    reason="side_limits_reached",
+                    strategy_params_json={
+                        "requested_spread_sides": spread_sides,
+                        "side_limits": side_limits,
+                    },
+                )
+                await session.commit()
+                return {"skipped": True, "reason": "side_limits_reached", "now_et": now_et.isoformat()}
+
             spot = await self._get_spot_price(session, now_et, settings.snapshot_underlying)
             context = await self._get_latest_context(session, now_et)
 
             candidates: list[dict] = []
-            for target_dte in decision_dtes:
-                snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
-                if snapshot is None:
-                    continue
-                options = await self._get_option_rows(session, snapshot["snapshot_id"])
-                if not options:
-                    continue
-                for delta_target in delta_targets:
-                    candidate = self._build_candidate(
-                        options=options,
-                        target_dte=snapshot["target_dte"],
-                        delta_target=delta_target,
-                        spread_side=settings.decision_spread_side,
-                        width_points=settings.decision_spread_width_points,
-                        snapshot_id=snapshot["snapshot_id"],
-                        expiration=snapshot["expiration"],
-                        spot=spot,
-                        context=context,
-                    )
-                    if candidate:
-                        candidates.append(candidate)
+            for spread_side in eligible_spread_sides:
+                for target_dte in decision_dtes:
+                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    if snapshot is None:
+                        continue
+                    options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
+                    if not options:
+                        continue
+                    for delta_target in delta_targets:
+                        candidate = self._build_candidate(
+                            options=options,
+                            target_dte=snapshot["target_dte"],
+                            delta_target=delta_target,
+                            spread_side=spread_side,
+                            width_points=settings.decision_spread_width_points,
+                            snapshot_id=snapshot["snapshot_id"],
+                            expiration=snapshot["expiration"],
+                            spot=spot,
+                            context=context,
+                        )
+                        if candidate:
+                            candidates.append(candidate)
 
             if not candidates:
                 await self._insert_decision(
@@ -116,6 +152,10 @@ class DecisionJob:
                     delta_target=delta_targets[0],
                     decision="SKIP",
                     reason="no_candidates",
+                    strategy_params_json={
+                        "spread_sides_considered": eligible_spread_sides,
+                        "side_limits": side_limits,
+                    },
                 )
                 await session.commit()
                 return {"skipped": True, "reason": "no_candidates", "now_et": now_et.isoformat()}
@@ -233,9 +273,12 @@ class DecisionJob:
             )
         return {"snapshot_id": snapshot_id, "ts": ts, "expiration": expiration, "target_dte": actual_dte}
 
-    async def _get_option_rows(self, session, snapshot_id: int) -> list[dict]:
+    async def _get_option_rows(self, session, snapshot_id: int, *, spread_side: str) -> list[dict]:
         """Load and sanitize option rows for a given snapshot."""
-        right = "P" if settings.decision_spread_side.lower() == "put" else "C"
+        side = spread_side.lower().strip()
+        if side not in {"put", "call"}:
+            return []
+        right = "P" if side == "put" else "C"
         rows = await session.execute(
             text(
                 """
@@ -466,10 +509,13 @@ class DecisionJob:
         chosen_legs = chosen.get("chosen_legs_json") or {}
         short_leg = chosen_legs.get("short") or {}
         long_leg = chosen_legs.get("long") or {}
+        spread_side = str(chosen_legs.get("spread_side") or settings.decision_spread_side).lower()
+        if spread_side not in {"put", "call"}:
+            spread_side = settings.decision_spread_side.lower()
 
         contracts = int(settings.decision_contracts or 1)
         multiplier = int(settings.trade_pnl_contract_multiplier)
-        width_points = float(settings.decision_spread_width_points)
+        width_points = float(chosen_legs.get("width_points") or settings.decision_spread_width_points)
         entry_credit = float(chosen.get("credit") or 0.0)
         max_profit = max(entry_credit, 0.0) * contracts * multiplier
         max_loss = max(width_points - entry_credit, 0.0) * contracts * multiplier
@@ -486,7 +532,7 @@ class DecisionJob:
             except ValueError:
                 expiration = None
 
-        option_right = "P" if settings.decision_spread_side.lower() == "put" else "C"
+        option_right = "P" if spread_side == "put" else "C"
         now_utc = now_et.astimezone(ZoneInfo("UTC"))
         trade_insert = await session.execute(
             text(
@@ -514,7 +560,7 @@ class DecisionJob:
                 "feature_snapshot_id": candidate_ref.get("feature_snapshot_id"),
                 "entry_snapshot_id": chosen.get("snapshot_id"),
                 "trade_source": "paper",
-                "strategy_type": f"credit_vertical_{settings.decision_spread_side.lower()}",
+                "strategy_type": f"credit_vertical_{spread_side}",
                 "status": "OPEN",
                 "underlying": settings.snapshot_underlying,
                 "entry_time": now_utc,
@@ -597,6 +643,25 @@ class DecisionJob:
         result = row.fetchone()
         return int(result.cnt if result else 0)
 
+    async def _max_open_trades_by_side(self, session, spread_side: str) -> int:
+        """Count OPEN trades for one spread side (put/call)."""
+        side = spread_side.lower().strip()
+        if side not in {"put", "call"}:
+            return 0
+        row = await session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM trades
+                WHERE status = 'OPEN'
+                  AND strategy_type LIKE :strategy_type_pattern
+                """
+            ),
+            {"strategy_type_pattern": f"%_{side}"},
+        )
+        result = row.fetchone()
+        return int(result.cnt if result else 0)
+
     async def _trades_today(self, session, now_et: datetime) -> int:
         """Count TRADE decisions for the current day."""
         day_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -614,6 +679,32 @@ class DecisionJob:
             {
                 "start_ts": day_start.astimezone(ZoneInfo("UTC")),
                 "end_ts": next_day.astimezone(ZoneInfo("UTC")),
+            },
+        )
+        result = row.fetchone()
+        return int(result.cnt if result else 0)
+
+    async def _trades_today_by_side(self, session, now_et: datetime, spread_side: str) -> int:
+        """Count trades entered today for one spread side (put/call)."""
+        side = spread_side.lower().strip()
+        if side not in {"put", "call"}:
+            return 0
+        day_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day = day_start + timedelta(days=1)
+        row = await session.execute(
+            text(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM trades
+                WHERE entry_time >= :start_ts
+                  AND entry_time < :end_ts
+                  AND strategy_type LIKE :strategy_type_pattern
+                """
+            ),
+            {
+                "start_ts": day_start.astimezone(ZoneInfo("UTC")),
+                "end_ts": next_day.astimezone(ZoneInfo("UTC")),
+                "strategy_type_pattern": f"%_{side}",
             },
         )
         result = row.fetchone()
