@@ -417,6 +417,7 @@ async def test_db_backed_full_admin_workflow_pipeline(workflow_client, admin_hea
 
 
 @pytest.mark.asyncio
+@pytest.mark.regression
 async def test_db_backed_quote_fetch_failure_returns_skip(
     integration_db_session,
     monkeypatch,
@@ -441,6 +442,7 @@ async def test_db_backed_quote_fetch_failure_returns_skip(
 
 
 @pytest.mark.asyncio
+@pytest.mark.regression
 async def test_db_backed_snapshot_no_expirations_returns_skip(
     integration_db_session,
     monkeypatch,
@@ -469,6 +471,7 @@ async def test_db_backed_snapshot_no_expirations_returns_skip(
 
 
 @pytest.mark.asyncio
+@pytest.mark.regression
 async def test_db_backed_shadow_inference_no_model_returns_skip(
     workflow_client,
     integration_db_session,
@@ -486,6 +489,7 @@ async def test_db_backed_shadow_inference_no_model_returns_skip(
 
 
 @pytest.mark.asyncio
+@pytest.mark.regression
 async def test_db_backed_promotion_gate_fail_branch(
     integration_db_session,
     monkeypatch,
@@ -557,6 +561,7 @@ async def test_db_backed_promotion_gate_fail_branch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.regression
 async def test_db_backed_promotion_gate_pass_branch(
     integration_db_session,
     monkeypatch,

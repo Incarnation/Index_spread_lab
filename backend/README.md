@@ -495,6 +495,8 @@ make test-e2e-up
 make test-e2e-mocked
 make test-e2e-db
 make test-e2e
+make test-e2e-regression
+make test-predeploy
 make test-e2e-down
 ```
 
@@ -502,11 +504,13 @@ If your default `python` is not your backend runtime, override interpreter:
 
 ```bash
 make PYTHON_BIN=python3.11 test-e2e
+make PYTHON_BIN=python3.11 test-predeploy
 ```
 
 Safety guard behavior:
 - Integration tests skip entirely when `DATABASE_URL_TEST` is unset.
 - Integration tests fail fast if `DATABASE_URL_TEST` host is not `localhost`/`127.0.0.1` or DB name does not include `test`.
+- `make test-e2e-regression` runs only failure/edge regression checks (`-m "integration and regression"`).
 
 Current coverage domains:
 - DTE helper behavior
@@ -517,6 +521,7 @@ Current coverage domains:
 - GEX API output behavior (including custom expiration filter and fallback)
 - HTTP-level mocked E2E router workflows
 - DB-backed integration smoke tests (`-m integration`)
+- DB-backed regression failure pack (quote fetch fail, no expirations, no shadow model, promotion gate fail/pass)
 
 ---
 
@@ -569,7 +574,7 @@ LIMIT 20;
 
 ## 13) Known Limitations
 
-- Decision engine is rules-only today (no live ML inference).
+- Hybrid decision path is implemented, but defaults to rules-first with model ranking gated by config/promotions.
 - Order placement/fill lifecycle tables exist but workflow remains staged.
 - Frontend test coverage has not yet been added.
 - Full backtest runner orchestration is still pending.

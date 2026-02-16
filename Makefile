@@ -1,4 +1,4 @@
-.PHONY: test-e2e-mocked test-e2e-db test-e2e test-e2e-up test-e2e-down
+.PHONY: test-e2e-mocked test-e2e-db test-e2e test-e2e-up test-e2e-down test-e2e-regression test-predeploy
 
 DATABASE_URL_TEST ?= postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test
 PYTHON_BIN ?= python3.11
@@ -16,3 +16,16 @@ test-e2e-db:
 	cd backend && DATABASE_URL_TEST="$(DATABASE_URL_TEST)" $(PYTHON_BIN) -m pytest -q -m integration
 
 test-e2e: test-e2e-up test-e2e-mocked test-e2e-db
+
+test-e2e-regression:
+	@set -e; \
+	trap '$(MAKE) -C "$(CURDIR)" test-e2e-down' EXIT; \
+	$(MAKE) test-e2e-up; \
+	(cd backend && DATABASE_URL_TEST="$(DATABASE_URL_TEST)" $(PYTHON_BIN) -m pytest -q -m "integration and regression")
+
+test-predeploy:
+	@set -e; \
+	trap '$(MAKE) -C "$(CURDIR)" test-e2e-down' EXIT; \
+	$(MAKE) test-e2e-up; \
+	(cd backend && $(PYTHON_BIN) -m pytest -q -m "not integration"); \
+	(cd backend && DATABASE_URL_TEST="$(DATABASE_URL_TEST)" $(PYTHON_BIN) -m pytest -q -m integration)

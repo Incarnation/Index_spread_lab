@@ -300,6 +300,8 @@ make test-e2e-up
 make test-e2e-mocked
 make test-e2e-db
 make test-e2e
+make test-e2e-regression
+make test-predeploy
 make test-e2e-down
 ```
 
@@ -307,11 +309,13 @@ If needed, specify interpreter explicitly:
 
 ```bash
 make PYTHON_BIN=python3.11 test-e2e
+make PYTHON_BIN=python3.11 test-predeploy
 ```
 
 Safety behavior:
 - integration tests skip if `DATABASE_URL_TEST` is not set
 - they fail fast if DB host is not local or DB name does not include `test`
+- `make test-e2e-regression` runs only targeted failure/edge-path checks (`-m "integration and regression"`)
 
 Current test coverage includes:
 - Trading-day DTE mapping and expiration selection.
@@ -321,6 +325,7 @@ Current test coverage includes:
 - Tradier expirations request parameter correctness.
 - HTTP-level mocked E2E API workflows.
 - DB-backed integration smoke tests behind `-m integration`.
+- DB-backed regression failure-pack (quote fetch fail, no-expiration snapshot, no-shadow-model, promotion gate fail/pass branches).
 
 ---
 
@@ -338,6 +343,7 @@ Checklist:
 4) Set `ADMIN_API_KEY`.
 5) Set `CORS_ORIGINS` to your frontend domain.
 6) Keep secrets only in Railway variables.
+7) Run `make test-predeploy` before shipping changes.
 
 Frontend service:
 - Deploy `frontend/` as static Vite app.
@@ -386,7 +392,7 @@ Unexpected DTE mapping:
 
 ## Next Improvements
 
-- Add CI workflow (pytest on push/PR).
+- CI now runs the backend predeploy gate (`make test-predeploy`) on push/PR; next step is splitting into faster parallel jobs.
 - Expand integration tests with temp Postgres fixtures.
 - Add frontend test suite (Vitest + React Testing Library).
 - Add explicit decision skip reason taxonomy in API/UI.
