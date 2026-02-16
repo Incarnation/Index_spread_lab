@@ -65,6 +65,38 @@ def _iso_to_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _to_float(value: object) -> float | None:
+    """Convert an arbitrary object to float when possible."""
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def classify_vix_regime(vix: float | None) -> str:
+    """Classify VIX level into low/normal/high regimes for model features."""
+    if vix is None:
+        return "unknown"
+    if vix < 15.0:
+        return "low"
+    if vix <= 25.0:
+        return "normal"
+    return "high"
+
+
+def classify_term_structure_regime(term_structure: float | None) -> str:
+    """Classify VIX term-structure into contango/flat/backwardation regimes."""
+    if term_structure is None:
+        return "unknown"
+    if term_structure < 0.95:
+        return "contango"
+    if term_structure <= 1.05:
+        return "flat"
+    return "backwardation"
+
+
 @dataclass(frozen=True)
 class FeatureBuilderJob:
     """Generate feature snapshots and trade candidates at decision times."""
@@ -103,6 +135,9 @@ class FeatureBuilderJob:
 
         snapshot_age_sec = (now_utc - snapshot_ts).total_seconds() if snapshot_ts else None
         context_age_sec = (now_utc - context_ts).total_seconds() if context_ts else None
+        vix = _to_float(None if context is None else context.get("vix"))
+        vix9d = _to_float(None if context is None else context.get("vix9d"))
+        term_structure = _to_float(None if context is None else context.get("term_structure"))
 
         return {
             "schema_version": settings.feature_schema_version,
@@ -114,9 +149,11 @@ class FeatureBuilderJob:
             "expiration": str(snapshot["expiration"]),
             "spot": {"spx_last": spot},
             "vol_context": {
-                "vix": None if context is None else context.get("vix"),
-                "vix9d": None if context is None else context.get("vix9d"),
-                "term_structure": None if context is None else context.get("term_structure"),
+                "vix": vix,
+                "vix9d": vix9d,
+                "term_structure": term_structure,
+                "vix_regime": classify_vix_regime(vix),
+                "term_structure_regime": classify_term_structure_regime(term_structure),
             },
             "gex_context": {
                 "gex_net": None if context is None else context.get("gex_net"),
@@ -148,6 +185,9 @@ class FeatureBuilderJob:
         chosen = candidate["chosen_legs_json"]
         short_leg = chosen.get("short") or {}
         long_leg = chosen.get("long") or {}
+        context = chosen.get("context") if isinstance(chosen.get("context"), dict) else {}
+        vix = _to_float(context.get("vix")) if isinstance(context, dict) else None
+        term_structure = _to_float(context.get("term_structure")) if isinstance(context, dict) else None
         spread_side = str(chosen.get("spread_side") or settings.decision_spread_side).lower()
         width_points = float(chosen.get("width_points") or settings.decision_spread_width_points)
         contracts = int(short_leg.get("qty") or settings.decision_contracts)
@@ -165,8 +205,10 @@ class FeatureBuilderJob:
             "score": candidate["score"],
             "delta_diff": candidate["delta_diff"],
             "context_score": candidate.get("context_score"),
+            "vix_regime": classify_vix_regime(vix),
+            "term_structure_regime": classify_term_structure_regime(term_structure),
             "legs": {"short": short_leg, "long": long_leg},
-            "context": chosen.get("context"),
+            "context": context,
             "context_flags": chosen.get("context_flags"),
         }
 

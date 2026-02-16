@@ -44,6 +44,8 @@ The pipeline runs in this order:
 - Pulls option chains and writes:
   - `chain_snapshots` (raw payload + checksum)
   - `option_chain_rows` (normalized per-option rows)
+- Optional VIX snapshot stream can run in parallel and writes the same tables with `underlying='VIX'` for model fitting features.
+- Decision/trade execution remains SPX-only.
 
 3) GEX job
 - Reads option rows + latest eligible spot quote.
@@ -119,6 +121,13 @@ Primary knobs:
   - `SNAPSHOT_DTE_MODE=range|targets`
   - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
   - `SNAPSHOT_STRIKES_EACH_SIDE`
+  - `VIX_SNAPSHOT_ENABLED=true|false`
+  - `VIX_SNAPSHOT_INTERVAL_MINUTES`
+  - `VIX_SNAPSHOT_DTE_MODE=range|targets`
+  - `VIX_SNAPSHOT_DTE_MIN_DAYS`, `VIX_SNAPSHOT_DTE_MAX_DAYS`
+  - `VIX_SNAPSHOT_DTE_TARGETS`
+  - `VIX_SNAPSHOT_STRIKES_EACH_SIDE`
+  - `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH`
 - Decision:
   - `DECISION_ENTRY_TIMES`
   - `DECISION_DTE_TARGETS`
@@ -157,6 +166,7 @@ Primary knobs:
 
 Production recommendation:
 - Do not include quotes in Railway variable values (use raw values, e.g. `false`, not `"false"`).
+- If enabling VIX snapshots, keep `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` by default; use VIX chains for model features/training context, not direct execution signals.
 
 ---
 

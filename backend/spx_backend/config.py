@@ -26,7 +26,19 @@ class Settings(BaseSettings):
     snapshot_range_fallback_enabled: bool = False
     snapshot_range_fallback_count: int = 3
     snapshot_dte_tolerance_days: int = 1
-    snapshot_strikes_each_side: int = 100
+    snapshot_strikes_each_side: int = 75
+    vix_snapshot_enabled: bool = False
+    vix_snapshot_interval_minutes: int = 5
+    vix_snapshot_underlying: str = "VIX"
+    vix_snapshot_dte_targets: str = "14,21,28"
+    vix_snapshot_dte_mode: str = "range"  # "range" or "targets"
+    vix_snapshot_dte_min_days: int = 7
+    vix_snapshot_dte_max_days: int = 45
+    vix_snapshot_range_fallback_enabled: bool = False
+    vix_snapshot_range_fallback_count: int = 3
+    vix_snapshot_dte_tolerance_days: int = 2
+    vix_snapshot_strikes_each_side: int = 50
+    vix_allow_snapshot_outside_rth: bool = False
     quote_symbols: str = "SPX,VIX,VIX9D,SPY"
     quote_interval_minutes: int = 5
     gex_enabled: bool = True
@@ -132,10 +144,26 @@ class Settings(BaseSettings):
     admin_api_key: str | None = None
     market_clock_cache_seconds: int = 300
 
+    def _parse_int_csv(self, value: str) -> list[int]:
+        """Parse comma-separated integer values, ignoring malformed items."""
+        out: list[int] = []
+        for part in value.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                out.append(int(token))
+            except ValueError:
+                continue
+        return out
+
     def dte_targets_list(self) -> list[int]:
         """Parse snapshot DTE targets from comma-separated env configuration."""
-        parts = [p.strip() for p in self.snapshot_dte_targets.split(",") if p.strip()]
-        return [int(p) for p in parts]
+        return self._parse_int_csv(self.snapshot_dte_targets)
+
+    def vix_snapshot_dte_targets_list(self) -> list[int]:
+        """Parse VIX snapshot DTE targets from comma-separated env configuration."""
+        return self._parse_int_csv(self.vix_snapshot_dte_targets)
 
     def quote_symbols_list(self) -> list[str]:
         """Parse quote symbol list from comma-separated env configuration."""

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_ts ON chain_snapshots (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_exp ON chain_snapshots (expiration, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_chain_snapshots_underlying_ts ON chain_snapshots (underlying, ts DESC);
 
 CREATE TABLE IF NOT EXISTS option_chain_rows (
   snapshot_id BIGINT NOT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -52,6 +53,10 @@ CREATE TABLE IF NOT EXISTS option_chain_rows (
 
 CREATE INDEX IF NOT EXISTS idx_option_chain_rows_exp_strike ON option_chain_rows (expiration, strike, option_right);
 CREATE INDEX IF NOT EXISTS idx_option_chain_rows_symbol ON option_chain_rows (option_symbol);
+CREATE INDEX IF NOT EXISTS idx_option_chain_rows_underlying_exp_strike
+  ON option_chain_rows (underlying, expiration, strike, option_right);
+CREATE INDEX IF NOT EXISTS idx_option_chain_rows_underlying_snapshot
+  ON option_chain_rows (underlying, snapshot_id);
 
 CREATE TABLE IF NOT EXISTS gex_snapshots (
   snapshot_id BIGINT PRIMARY KEY REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -240,6 +245,7 @@ CREATE INDEX IF NOT EXISTS idx_feature_snapshots_snapshot ON feature_snapshots (
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_strategy_ts ON feature_snapshots (strategy_version_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_label_status ON feature_snapshots (label_status, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_feature_hash ON feature_snapshots (feature_hash);
+CREATE INDEX IF NOT EXISTS idx_feature_snapshots_underlying_ts ON feature_snapshots (underlying, ts DESC);
 
 CREATE TABLE IF NOT EXISTS trade_candidates (
   candidate_id BIGSERIAL PRIMARY KEY,

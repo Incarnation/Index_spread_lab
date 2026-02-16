@@ -268,7 +268,7 @@ For each configured `target_dte`:
 
 ### Strike filtering (storage optimization)
 To reduce storage, the job can filter `option_chain_rows` to strikes near spot:
-- Keep `SNAPSHOT_STRIKES_EACH_SIDE` below and above spot (e.g., 100/100)
+- Keep `SNAPSHOT_STRIKES_EACH_SIDE` below and above spot (e.g., 75/75)
 - Raw `chain_snapshots` are still stored for reproducibility
 
 #### Force-mode fallback (for testing)

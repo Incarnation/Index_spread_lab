@@ -37,6 +37,28 @@ def _bucket(value: float | None, *, step: float) -> float | None:
     return round(bucketed, 6)
 
 
+def _classify_vix_regime(vix: float | None) -> str:
+    """Classify VIX level into low/normal/high regimes."""
+    if vix is None:
+        return "unknown"
+    if vix < 15.0:
+        return "low"
+    if vix <= 25.0:
+        return "normal"
+    return "high"
+
+
+def _classify_term_structure_regime(term_structure: float | None) -> str:
+    """Classify VIX9D/VIX ratio into contango/flat/backwardation regimes."""
+    if term_structure is None:
+        return "unknown"
+    if term_structure < 0.95:
+        return "contango"
+    if term_structure <= 1.05:
+        return "flat"
+    return "backwardation"
+
+
 def compute_max_drawdown(pnls: list[float]) -> float:
     """Compute max drawdown from a sequence of incremental PnLs."""
     equity = 0.0
@@ -134,6 +156,24 @@ def extract_candidate_features(
         context_regime = "headwind"
     else:
         context_regime = "neutral"
+    context_payload = candidate_json.get("context")
+    context = context_payload if isinstance(context_payload, dict) else {}
+    vix = _as_float(candidate_json.get("vix"))
+    if vix is None:
+        vix = _as_float(context.get("vix")) if isinstance(context, dict) else None
+    term_structure = _as_float(candidate_json.get("term_structure"))
+    if term_structure is None:
+        term_structure = _as_float(context.get("term_structure")) if isinstance(context, dict) else None
+    raw_vix_regime = candidate_json.get("vix_regime")
+    if isinstance(raw_vix_regime, str) and raw_vix_regime.strip():
+        vix_regime = raw_vix_regime.strip().lower()
+    else:
+        vix_regime = _classify_vix_regime(vix)
+    raw_term_regime = candidate_json.get("term_structure_regime")
+    if isinstance(raw_term_regime, str) and raw_term_regime.strip():
+        term_structure_regime = raw_term_regime.strip().lower()
+    else:
+        term_structure_regime = _classify_term_structure_regime(term_structure)
 
     contracts = _as_int(candidate_json.get("contracts")) or 1
     margin_usage = compute_margin_usage_dollars(
@@ -150,6 +190,8 @@ def extract_candidate_features(
         "delta_target": delta_target,
         "credit_to_width": credit_to_width,
         "context_regime": context_regime,
+        "vix_regime": vix_regime,
+        "term_structure_regime": term_structure_regime,
         "contracts": contracts,
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,
@@ -166,6 +208,8 @@ def build_bucket_key(features: dict[str, Any]) -> str:
             str(features.get("delta_bucket") if features.get("delta_bucket") is not None else "na"),
             str(features.get("credit_bucket") if features.get("credit_bucket") is not None else "na"),
             str(features.get("context_regime") or "neutral"),
+            str(features.get("vix_regime") or "unknown"),
+            str(features.get("term_structure_regime") or "unknown"),
         ]
     )
 

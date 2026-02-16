@@ -3,7 +3,7 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -111,10 +111,63 @@ def _select_strikes_near_spot(options: list[dict], spot: float, each_side: int) 
 
 
 @dataclass(frozen=True)
+class SnapshotJobConfig:
+    """Configuration values for one snapshot ingestion stream."""
+
+    job_name: str
+    underlying: str
+    dte_mode: str
+    dte_targets: list[int]
+    dte_min_days: int
+    dte_max_days: int
+    range_fallback_enabled: bool
+    range_fallback_count: int
+    dte_tolerance_days: int
+    strikes_each_side: int
+    allow_outside_rth: bool
+
+
+def _default_snapshot_job_config() -> SnapshotJobConfig:
+    """Build the default SPX snapshot configuration from global settings."""
+    return SnapshotJobConfig(
+        job_name="snapshot_job",
+        underlying=settings.snapshot_underlying,
+        dte_mode=settings.snapshot_dte_mode,
+        dte_targets=settings.dte_targets_list(),
+        dte_min_days=settings.snapshot_dte_min_days,
+        dte_max_days=settings.snapshot_dte_max_days,
+        range_fallback_enabled=settings.snapshot_range_fallback_enabled,
+        range_fallback_count=settings.snapshot_range_fallback_count,
+        dte_tolerance_days=settings.snapshot_dte_tolerance_days,
+        strikes_each_side=settings.snapshot_strikes_each_side,
+        allow_outside_rth=settings.allow_snapshot_outside_rth,
+    )
+
+
+def _default_vix_snapshot_job_config() -> SnapshotJobConfig:
+    """Build the default VIX snapshot configuration from global settings."""
+    return SnapshotJobConfig(
+        job_name="snapshot_job_vix",
+        underlying=settings.vix_snapshot_underlying,
+        dte_mode=settings.vix_snapshot_dte_mode,
+        dte_targets=settings.vix_snapshot_dte_targets_list(),
+        dte_min_days=settings.vix_snapshot_dte_min_days,
+        dte_max_days=settings.vix_snapshot_dte_max_days,
+        range_fallback_enabled=settings.vix_snapshot_range_fallback_enabled,
+        range_fallback_count=settings.vix_snapshot_range_fallback_count,
+        dte_tolerance_days=settings.vix_snapshot_dte_tolerance_days,
+        strikes_each_side=settings.vix_snapshot_strikes_each_side,
+        allow_outside_rth=settings.vix_allow_snapshot_outside_rth,
+    )
+
+
+@dataclass(frozen=True)
 class SnapshotJob:
     """Periodic Tradier chain snapshot job."""
+
     tradier: TradierClient
     clock_cache: MarketClockCache | None = None
+    config: SnapshotJobConfig = field(default_factory=_default_snapshot_job_config)
 
     async def _market_open(self, now_et: datetime) -> bool:
         """Check if market is open using cache or RTH fallback."""
@@ -126,15 +179,15 @@ class SnapshotJob:
         """Run one snapshot cycle and store chains."""
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
-        logger.info("snapshot_job: start force={} now_et={}", force, now_et.isoformat())
+        logger.info("{}: start force={} now_et={}", self.config.job_name, force, now_et.isoformat())
 
-        if (not force) and (not settings.allow_snapshot_outside_rth):
+        if (not force) and (not self.config.allow_outside_rth):
             if not await self._market_open(now_et):
-                logger.info("snapshot_job: market closed; skipping (now_et={})", now_et.isoformat())
+                logger.info("{}: market closed; skipping (now_et={})", self.config.job_name, now_et.isoformat())
                 return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat(), "inserted": []}
 
-        underlying = settings.snapshot_underlying
-        dte_mode = settings.snapshot_dte_mode.strip().lower()
+        underlying = self.config.underlying
+        dte_mode = self.config.dte_mode.strip().lower()
 
         exp_resp = await self.tradier.get_option_expirations(underlying)
         expirations = _parse_expirations(exp_resp)
@@ -145,7 +198,7 @@ class SnapshotJob:
         chain_rows_inserted = 0
         async with SessionLocal() as session:
             if not expirations:
-                logger.warning("snapshot_job: no expirations returned for {}", underlying)
+                logger.warning("{}: no expirations returned for {}", self.config.job_name, underlying)
                 await session.commit()
                 return {
                     "skipped": True,
@@ -158,33 +211,34 @@ class SnapshotJob:
 
             spot = await self._get_spot_price(session, now_et, underlying)
             if spot is None:
-                logger.warning("snapshot_job: no spot price for {}; storing full chains", underlying)
+                logger.warning("{}: no spot price for {}; storing full chains", self.config.job_name, underlying)
 
             selected: list[tuple[int, date]] = []
             fallback_used = False
             seen_exp: set[date] = set()
             if dte_mode == "range":
-                min_dte = min(settings.snapshot_dte_min_days, settings.snapshot_dte_max_days)
-                max_dte = max(settings.snapshot_dte_min_days, settings.snapshot_dte_max_days)
+                min_dte = min(self.config.dte_min_days, self.config.dte_max_days)
+                max_dte = max(self.config.dte_min_days, self.config.dte_max_days)
                 for exp, dte in exp_to_trading_dte.items():
                     if min_dte <= dte <= max_dte:
                         selected.append((dte, exp))
                 if not selected:
-                    if settings.snapshot_range_fallback_enabled:
-                        fallback_count = max(1, settings.snapshot_range_fallback_count)
+                    if self.config.range_fallback_enabled:
+                        fallback_count = max(1, self.config.range_fallback_count)
                         center = (min_dte + max_dte) / 2.0
                         ranked = sorted(exp_to_trading_dte.items(), key=lambda item: abs(item[1] - center))
                         fallback_items = ranked[:fallback_count]
                         selected = [(dte, exp) for exp, dte in fallback_items]
                         fallback_used = True
                         logger.warning(
-                            "snapshot_job: no expirations in trading-dte range {}-{}; fallback enabled, selected {} closest expirations",
+                            "{}: no expirations in trading-dte range {}-{}; fallback enabled, selected {} closest expirations",
+                            self.config.job_name,
                             min_dte,
                             max_dte,
                             len(selected),
                         )
                     else:
-                        logger.warning("snapshot_job: no expirations in trading-dte range {}-{}", min_dte, max_dte)
+                        logger.warning("{}: no expirations in trading-dte range {}-{}", self.config.job_name, min_dte, max_dte)
                         await session.commit()
                         return {
                             "skipped": True,
@@ -195,28 +249,30 @@ class SnapshotJob:
                             "fallback_used": False,
                         }
             else:
-                dte_targets = settings.dte_targets_list()
+                dte_targets = self.config.dte_targets
                 for target_dte in dte_targets:
                     exp = choose_expiration_for_trading_dte(
                         expirations,
                         target_dte=target_dte,
                         as_of=as_of,
-                        tolerance=settings.snapshot_dte_tolerance_days,
+                        tolerance=self.config.dte_tolerance_days,
                     )
                     if exp is None:
                         if force:
                             exp = closest_expiration_for_trading_dte(expirations, target_dte=target_dte, as_of=as_of)
                             if exp is None:
-                                logger.warning("snapshot_job: no expirations available to fallback")
+                                logger.warning("{}: no expirations available to fallback", self.config.job_name)
                                 continue
                             logger.warning(
-                                "snapshot_job: no expiration within tolerance for trading target_dte={}; using closest exp={} (force mode)",
+                                "{}: no expiration within tolerance for trading target_dte={}; using closest exp={} (force mode)",
+                                self.config.job_name,
                                 target_dte,
                                 exp.isoformat(),
                             )
                         else:
                             logger.warning(
-                                "snapshot_job: no expiration found for trading target_dte={} ({} expirations)",
+                                "{}: no expiration found for trading target_dte={} ({} expirations)",
+                                self.config.job_name,
                                 target_dte,
                                 len(expirations),
                             )
@@ -253,15 +309,16 @@ class SnapshotJob:
                 # Extract per-option rows with open_interest + greeks if present.
                 options = _parse_chain_options(chain)
                 selected_strikes: set[float] | None = None
-                if spot is not None and settings.snapshot_strikes_each_side > 0:
+                if spot is not None and self.config.strikes_each_side > 0:
                     selected_strikes = _select_strikes_near_spot(
                         options,
                         float(spot),
-                        settings.snapshot_strikes_each_side,
+                        self.config.strikes_each_side,
                     )
                     if selected_strikes:
                         logger.info(
-                            "snapshot_job: filtering to {} strikes around spot={} (exp={})",
+                            "{}: filtering to {} strikes around spot={} (exp={})",
+                            self.config.job_name,
                             len(selected_strikes),
                             spot,
                             exp.isoformat(),
@@ -297,7 +354,7 @@ class SnapshotJob:
                         {
                             "snapshot_id": snapshot_id,
                             "option_symbol": symbol,
-                            "underlying": opt.get("underlying") or underlying,
+                            "underlying": underlying,
                             "expiration": (_to_date(opt.get("expiration_date")) or exp),
                             "strike": strike_val,
                             "option_right": _normalize_option_right(opt),
@@ -332,7 +389,7 @@ class SnapshotJob:
                 )
 
             await session.commit()
-        logger.info("snapshot_job: inserted_chains={} chain_rows={}", len(inserted), chain_rows_inserted)
+        logger.info("{}: inserted_chains={} chain_rows={}", self.config.job_name, len(inserted), chain_rows_inserted)
         return {
             "skipped": False,
             "reason": None,
@@ -365,8 +422,19 @@ class SnapshotJob:
         return float(last)
 
 
-def build_snapshot_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> SnapshotJob:
-    """Factory helper for SnapshotJob."""
+def build_snapshot_job(
+    clock_cache: MarketClockCache | None = None,
+    tradier: TradierClient | None = None,
+    config: SnapshotJobConfig | None = None,
+) -> SnapshotJob:
+    """Factory helper for SPX snapshot ingestion job."""
     client = tradier or get_tradier_client()
-    return SnapshotJob(tradier=client, clock_cache=clock_cache)
+    snapshot_config = config or _default_snapshot_job_config()
+    return SnapshotJob(tradier=client, clock_cache=clock_cache, config=snapshot_config)
+
+
+def build_vix_snapshot_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> SnapshotJob:
+    """Factory helper for VIX snapshot ingestion job."""
+    client = tradier or get_tradier_client()
+    return SnapshotJob(tradier=client, clock_cache=clock_cache, config=_default_vix_snapshot_job_config())
 

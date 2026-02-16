@@ -15,7 +15,7 @@ from spx_backend.jobs.labeler_job import LabelerJob
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
-from spx_backend.jobs.snapshot_job import SnapshotJob
+from spx_backend.jobs.snapshot_job import build_snapshot_job, build_vix_snapshot_job
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
@@ -42,7 +42,8 @@ async def lifespan(app: FastAPI):
     tradier = get_tradier_client()
     clock_cache = MarketClockCache(tradier=tradier, ttl_seconds=settings.market_clock_cache_seconds)
 
-    snapshot_job = SnapshotJob(tradier=tradier, clock_cache=clock_cache)
+    snapshot_job = build_snapshot_job(tradier=tradier, clock_cache=clock_cache)
+    vix_snapshot_job = build_vix_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.vix_snapshot_enabled else None
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob()
     decision_job = DecisionJob(clock_cache=clock_cache)
@@ -60,6 +61,14 @@ async def lifespan(app: FastAPI):
         id="snapshot_job",
         replace_existing=True,
     )
+    if vix_snapshot_job is not None:
+        scheduler.add_job(
+            vix_snapshot_job.run_once,
+            "interval",
+            minutes=settings.vix_snapshot_interval_minutes,
+            id="snapshot_job_vix",
+            replace_existing=True,
+        )
     scheduler.add_job(
         quote_job.run_once,
         "interval",
@@ -140,6 +149,7 @@ async def lifespan(app: FastAPI):
     app.state.tradier = tradier
     app.state.clock_cache = clock_cache
     app.state.snapshot_job = snapshot_job
+    app.state.vix_snapshot_job = vix_snapshot_job
     app.state.quote_job = quote_job
     app.state.gex_job = gex_job
     app.state.decision_job = decision_job
@@ -154,6 +164,8 @@ async def lifespan(app: FastAPI):
     try:
         await quote_job.run_once()
         await snapshot_job.run_once()
+        if vix_snapshot_job is not None:
+            await vix_snapshot_job.run_once()
         await gex_job.run_once()
     except Exception:
         # Don't crash the web app if the first snapshot fails.

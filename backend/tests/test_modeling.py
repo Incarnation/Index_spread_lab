@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from spx_backend.jobs.modeling import (
+    build_bucket_key,
     extract_candidate_features,
     predict_with_bucket_model,
     summarize_strategy_quality,
@@ -78,6 +79,7 @@ def test_extract_candidate_features_and_quality_summary() -> None:
             "width_points": 10.0,
             "contracts": 1,
             "context_flags": ["gex_support"],
+            "context": {"vix": 30.0, "term_structure": 1.12},
         },
         max_loss_points=8.5,
         contract_multiplier=100,
@@ -86,7 +88,10 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert features["target_dte"] == 5
     assert features["credit_to_width"] == 0.15
     assert features["context_regime"] == "support"
+    assert features["vix_regime"] == "high"
+    assert features["term_structure_regime"] == "backwardation"
     assert features["margin_usage"] == 850.0
+    assert build_bucket_key(features).endswith("support|high|backwardation")
 
     summary = summarize_strategy_quality(
         realized_pnls=[40.0, -20.0, 25.0, -10.0],

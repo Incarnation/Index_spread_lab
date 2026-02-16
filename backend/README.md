@@ -34,7 +34,7 @@ Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
 3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/snapshot/gex/decision/feature-builder/labeler/trade-pnl.
+4) Start APScheduler jobs for quote/SPX snapshot/(optional) VIX snapshot/gex/decision/feature-builder/labeler/trade-pnl.
 5) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
@@ -110,6 +110,11 @@ Selection:
 Output:
 - `chain_snapshots` raw payload with checksum.
 - `option_chain_rows` normalized rows (bid/ask/greeks/open interest/etc).
+
+Dual-stream behavior:
+- SPX snapshot stream remains the trading/decision source.
+- Optional VIX snapshot stream writes the same tables with `underlying='VIX'` for model features/training context.
+- Decision execution continues to use SPX snapshots only.
 
 Fallback mode:
 - Optional `SNAPSHOT_RANGE_FALLBACK_ENABLED=true` can capture nearest expirations if strict range has none (useful in sandbox; usually off in production).
@@ -259,10 +264,21 @@ Required:
 High-impact settings:
 - Snapshot:
   - `SNAPSHOT_INTERVAL_MINUTES`
+  - `SNAPSHOT_UNDERLYING`
   - `SNAPSHOT_DTE_MODE`
   - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
   - `SNAPSHOT_DTE_TARGETS`, `SNAPSHOT_DTE_TOLERANCE_DAYS`
   - `SNAPSHOT_STRIKES_EACH_SIDE`
+  - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
+  - Optional VIX snapshot stream:
+    - `VIX_SNAPSHOT_ENABLED`
+    - `VIX_SNAPSHOT_INTERVAL_MINUTES`
+    - `VIX_SNAPSHOT_UNDERLYING` (default `VIX`)
+    - `VIX_SNAPSHOT_DTE_MODE`
+    - `VIX_SNAPSHOT_DTE_MIN_DAYS`, `VIX_SNAPSHOT_DTE_MAX_DAYS`
+    - `VIX_SNAPSHOT_DTE_TARGETS`, `VIX_SNAPSHOT_DTE_TOLERANCE_DAYS`
+    - `VIX_SNAPSHOT_STRIKES_EACH_SIDE`
+    - `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH`
 - Decision:
   - `DECISION_ENTRY_TIMES`
   - `DECISION_DTE_TARGETS`, `DECISION_DTE_TOLERANCE_DAYS`
@@ -299,12 +315,20 @@ High-impact settings:
   - `GEX_MAX_DTE_DAYS` (default `10`)
   - `GEX_SPOT_MAX_AGE_SECONDS`
 - Ops/Safety:
-  - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
   - `ALLOW_QUOTES_OUTSIDE_RTH`
   - `MARKET_CLOCK_CACHE_SECONDS`
   - `ADMIN_API_KEY`
   - `CORS_ORIGINS`
   - `TZ`
+
+Recommended VIX model-fitting profile:
+- `VIX_SNAPSHOT_ENABLED=true`
+- `VIX_SNAPSHOT_INTERVAL_MINUTES=5`
+- `VIX_SNAPSHOT_DTE_MODE=range`
+- `VIX_SNAPSHOT_DTE_MIN_DAYS=7`
+- `VIX_SNAPSHOT_DTE_MAX_DAYS=45`
+- `VIX_SNAPSHOT_STRIKES_EACH_SIDE=50`
+- Keep `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` unless running controlled backfill/sandbox cycles.
 
 ---
 
