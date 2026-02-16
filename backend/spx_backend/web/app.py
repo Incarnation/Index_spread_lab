@@ -15,7 +15,7 @@ from spx_backend.jobs.labeler_job import LabelerJob
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
-from spx_backend.jobs.snapshot_job import build_snapshot_job, build_vix_snapshot_job
+from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job, build_vix_snapshot_job
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
     clock_cache = MarketClockCache(tradier=tradier, ttl_seconds=settings.market_clock_cache_seconds)
 
     snapshot_job = build_snapshot_job(tradier=tradier, clock_cache=clock_cache)
+    spy_snapshot_job = build_spy_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.spy_snapshot_enabled else None
     vix_snapshot_job = build_vix_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.vix_snapshot_enabled else None
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob()
@@ -67,6 +68,14 @@ async def lifespan(app: FastAPI):
             "interval",
             minutes=settings.vix_snapshot_interval_minutes,
             id="snapshot_job_vix",
+            replace_existing=True,
+        )
+    if spy_snapshot_job is not None:
+        scheduler.add_job(
+            spy_snapshot_job.run_once,
+            "interval",
+            minutes=settings.spy_snapshot_interval_minutes,
+            id="snapshot_job_spy",
             replace_existing=True,
         )
     scheduler.add_job(
@@ -149,6 +158,7 @@ async def lifespan(app: FastAPI):
     app.state.tradier = tradier
     app.state.clock_cache = clock_cache
     app.state.snapshot_job = snapshot_job
+    app.state.spy_snapshot_job = spy_snapshot_job
     app.state.vix_snapshot_job = vix_snapshot_job
     app.state.quote_job = quote_job
     app.state.gex_job = gex_job
@@ -164,6 +174,8 @@ async def lifespan(app: FastAPI):
     try:
         await quote_job.run_once()
         await snapshot_job.run_once()
+        if spy_snapshot_job is not None:
+            await spy_snapshot_job.run_once()
         if vix_snapshot_job is not None:
             await vix_snapshot_job.run_once()
         await gex_job.run_once()

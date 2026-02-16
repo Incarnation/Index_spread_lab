@@ -79,7 +79,7 @@ def test_extract_candidate_features_and_quality_summary() -> None:
             "width_points": 10.0,
             "contracts": 1,
             "context_flags": ["gex_support"],
-            "context": {"vix": 30.0, "term_structure": 1.12},
+            "context": {"vix": 30.0, "term_structure": 1.12, "spy_price": 620.0, "spx_price": 6200.0},
         },
         max_loss_points=8.5,
         contract_multiplier=100,
@@ -90,8 +90,9 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert features["context_regime"] == "support"
     assert features["vix_regime"] == "high"
     assert features["term_structure_regime"] == "backwardation"
+    assert features["spy_spx_ratio_regime"] == "parity"
     assert features["margin_usage"] == 850.0
-    assert build_bucket_key(features).endswith("support|high|backwardation")
+    assert build_bucket_key(features).endswith("support|high|backwardation|parity")
 
     summary = summarize_strategy_quality(
         realized_pnls=[40.0, -20.0, 25.0, -10.0],

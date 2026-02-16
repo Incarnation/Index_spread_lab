@@ -59,6 +59,17 @@ def _classify_term_structure_regime(term_structure: float | None) -> str:
     return "backwardation"
 
 
+def _classify_spy_spx_ratio_regime(spy_spx_ratio: float | None) -> str:
+    """Classify SPY/SPX ratio into discount/parity/premium regimes."""
+    if spy_spx_ratio is None:
+        return "unknown"
+    if spy_spx_ratio < 0.099:
+        return "discount"
+    if spy_spx_ratio <= 0.101:
+        return "parity"
+    return "premium"
+
+
 def compute_max_drawdown(pnls: list[float]) -> float:
     """Compute max drawdown from a sequence of incremental PnLs."""
     equity = 0.0
@@ -164,6 +175,16 @@ def extract_candidate_features(
     term_structure = _as_float(candidate_json.get("term_structure"))
     if term_structure is None:
         term_structure = _as_float(context.get("term_structure")) if isinstance(context, dict) else None
+    spy_spx_ratio = _as_float(candidate_json.get("spy_spx_ratio"))
+    if spy_spx_ratio is None:
+        spy_price = _as_float(candidate_json.get("spy_price"))
+        if spy_price is None:
+            spy_price = _as_float(context.get("spy_price")) if isinstance(context, dict) else None
+        spx_price = _as_float(candidate_json.get("spx_price"))
+        if spx_price is None:
+            spx_price = _as_float(context.get("spx_price")) if isinstance(context, dict) else None
+        if spy_price is not None and spx_price is not None and spx_price > 0:
+            spy_spx_ratio = spy_price / spx_price
     raw_vix_regime = candidate_json.get("vix_regime")
     if isinstance(raw_vix_regime, str) and raw_vix_regime.strip():
         vix_regime = raw_vix_regime.strip().lower()
@@ -174,6 +195,11 @@ def extract_candidate_features(
         term_structure_regime = raw_term_regime.strip().lower()
     else:
         term_structure_regime = _classify_term_structure_regime(term_structure)
+    raw_spy_ratio_regime = candidate_json.get("spy_spx_ratio_regime")
+    if isinstance(raw_spy_ratio_regime, str) and raw_spy_ratio_regime.strip():
+        spy_spx_ratio_regime = raw_spy_ratio_regime.strip().lower()
+    else:
+        spy_spx_ratio_regime = _classify_spy_spx_ratio_regime(spy_spx_ratio)
 
     contracts = _as_int(candidate_json.get("contracts")) or 1
     margin_usage = compute_margin_usage_dollars(
@@ -192,6 +218,7 @@ def extract_candidate_features(
         "context_regime": context_regime,
         "vix_regime": vix_regime,
         "term_structure_regime": term_structure_regime,
+        "spy_spx_ratio_regime": spy_spx_ratio_regime,
         "contracts": contracts,
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,
@@ -210,6 +237,7 @@ def build_bucket_key(features: dict[str, Any]) -> str:
             str(features.get("context_regime") or "neutral"),
             str(features.get("vix_regime") or "unknown"),
             str(features.get("term_structure_regime") or "unknown"),
+            str(features.get("spy_spx_ratio_regime") or "unknown"),
         ]
     )
 

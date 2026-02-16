@@ -44,6 +44,7 @@ The pipeline runs in this order:
 - Pulls option chains and writes:
   - `chain_snapshots` (raw payload + checksum)
   - `option_chain_rows` (normalized per-option rows)
+- Dedicated SPY snapshot stream (enabled by default) runs in parallel and stores `underlying='SPY'` rows for future SPY model fitting.
 - Optional VIX snapshot stream can run in parallel and writes the same tables with `underlying='VIX'` for model fitting features.
 - Decision/trade execution remains SPX-only.
 
@@ -121,6 +122,13 @@ Primary knobs:
   - `SNAPSHOT_DTE_MODE=range|targets`
   - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
   - `SNAPSHOT_STRIKES_EACH_SIDE`
+  - `SPY_SNAPSHOT_ENABLED=true|false`
+  - `SPY_SNAPSHOT_INTERVAL_MINUTES`
+  - `SPY_SNAPSHOT_DTE_MODE=range|targets`
+  - `SPY_SNAPSHOT_DTE_MIN_DAYS`, `SPY_SNAPSHOT_DTE_MAX_DAYS`
+  - `SPY_SNAPSHOT_DTE_TARGETS`
+  - `SPY_SNAPSHOT_STRIKES_EACH_SIDE`
+  - `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH`
   - `VIX_SNAPSHOT_ENABLED=true|false`
   - `VIX_SNAPSHOT_INTERVAL_MINUTES`
   - `VIX_SNAPSHOT_DTE_MODE=range|targets`
@@ -166,6 +174,7 @@ Primary knobs:
 
 Production recommendation:
 - Do not include quotes in Railway variable values (use raw values, e.g. `false`, not `"false"`).
+- Keep `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` for production scheduling.
 - If enabling VIX snapshots, keep `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` by default; use VIX chains for model features/training context, not direct execution signals.
 
 ---
@@ -275,12 +284,43 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+DB-backed integration tests (separate local test DB):
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test"
+cd backend
+python -m pytest -q -m integration
+```
+
+Convenience Make targets (from repo root):
+
+```bash
+make test-e2e-up
+make test-e2e-mocked
+make test-e2e-db
+make test-e2e
+make test-e2e-down
+```
+
+If needed, specify interpreter explicitly:
+
+```bash
+make PYTHON_BIN=python3.11 test-e2e
+```
+
+Safety behavior:
+- integration tests skip if `DATABASE_URL_TEST` is not set
+- they fail fast if DB host is not local or DB name does not include `test`
+
 Current test coverage includes:
 - Trading-day DTE mapping and expiration selection.
 - Decision candidate construction and snapshot freshness behavior.
 - GEX endpoint output modes (all / DTE / custom expirations).
 - Snapshot strike window helper.
 - Tradier expirations request parameter correctness.
+- HTTP-level mocked E2E API workflows.
+- DB-backed integration smoke tests behind `-m integration`.
 
 ---
 

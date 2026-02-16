@@ -97,6 +97,17 @@ def classify_term_structure_regime(term_structure: float | None) -> str:
     return "backwardation"
 
 
+def classify_spy_spx_ratio_regime(spy_spx_ratio: float | None) -> str:
+    """Classify SPY/SPX ratio into discount/parity/premium regimes."""
+    if spy_spx_ratio is None:
+        return "unknown"
+    if spy_spx_ratio < 0.099:
+        return "discount"
+    if spy_spx_ratio <= 0.101:
+        return "parity"
+    return "premium"
+
+
 @dataclass(frozen=True)
 class FeatureBuilderJob:
     """Generate feature snapshots and trade candidates at decision times."""
@@ -138,6 +149,11 @@ class FeatureBuilderJob:
         vix = _to_float(None if context is None else context.get("vix"))
         vix9d = _to_float(None if context is None else context.get("vix9d"))
         term_structure = _to_float(None if context is None else context.get("term_structure"))
+        spy_price = _to_float(None if context is None else context.get("spy_price"))
+        spx_price = _to_float(None if context is None else context.get("spx_price"))
+        if spx_price is None:
+            spx_price = _to_float(spot)
+        spy_spx_ratio = (spy_price / spx_price) if spy_price is not None and spx_price is not None and spx_price > 0 else None
 
         return {
             "schema_version": settings.feature_schema_version,
@@ -149,6 +165,10 @@ class FeatureBuilderJob:
             "expiration": str(snapshot["expiration"]),
             "spot": {"spx_last": spot},
             "vol_context": {
+                "spx_price": spx_price,
+                "spy_price": spy_price,
+                "spy_spx_ratio": spy_spx_ratio,
+                "spy_spx_ratio_regime": classify_spy_spx_ratio_regime(spy_spx_ratio),
                 "vix": vix,
                 "vix9d": vix9d,
                 "term_structure": term_structure,
@@ -188,6 +208,11 @@ class FeatureBuilderJob:
         context = chosen.get("context") if isinstance(chosen.get("context"), dict) else {}
         vix = _to_float(context.get("vix")) if isinstance(context, dict) else None
         term_structure = _to_float(context.get("term_structure")) if isinstance(context, dict) else None
+        spy_price = _to_float(context.get("spy_price")) if isinstance(context, dict) else None
+        spx_price = _to_float(context.get("spx_price")) if isinstance(context, dict) else None
+        if spx_price is None:
+            spx_price = _to_float(chosen.get("spot"))
+        spy_spx_ratio = (spy_price / spx_price) if spy_price is not None and spx_price is not None and spx_price > 0 else None
         spread_side = str(chosen.get("spread_side") or settings.decision_spread_side).lower()
         width_points = float(chosen.get("width_points") or settings.decision_spread_width_points)
         contracts = int(short_leg.get("qty") or settings.decision_contracts)
@@ -205,6 +230,10 @@ class FeatureBuilderJob:
             "score": candidate["score"],
             "delta_diff": candidate["delta_diff"],
             "context_score": candidate.get("context_score"),
+            "spy_price": spy_price,
+            "spx_price": spx_price,
+            "spy_spx_ratio": spy_spx_ratio,
+            "spy_spx_ratio_regime": classify_spy_spx_ratio_regime(spy_spx_ratio),
             "vix_regime": classify_vix_regime(vix),
             "term_structure_regime": classify_term_structure_regime(term_structure),
             "legs": {"short": short_leg, "long": long_leg},

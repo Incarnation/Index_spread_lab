@@ -34,7 +34,7 @@ Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
 3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/SPX snapshot/(optional) VIX snapshot/gex/decision/feature-builder/labeler/trade-pnl.
+4) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/decision/feature-builder/labeler/trade-pnl.
 5) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
@@ -113,6 +113,7 @@ Output:
 
 Dual-stream behavior:
 - SPX snapshot stream remains the trading/decision source.
+- SPY snapshot stream (enabled by default) writes the same tables with `underlying='SPY'` for future SPY model fitting.
 - Optional VIX snapshot stream writes the same tables with `underlying='VIX'` for model features/training context.
 - Decision execution continues to use SPX snapshots only.
 
@@ -270,6 +271,15 @@ High-impact settings:
   - `SNAPSHOT_DTE_TARGETS`, `SNAPSHOT_DTE_TOLERANCE_DAYS`
   - `SNAPSHOT_STRIKES_EACH_SIDE`
   - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
+  - Optional SPY snapshot stream (enabled by default):
+    - `SPY_SNAPSHOT_ENABLED`
+    - `SPY_SNAPSHOT_INTERVAL_MINUTES`
+    - `SPY_SNAPSHOT_UNDERLYING` (default `SPY`)
+    - `SPY_SNAPSHOT_DTE_MODE`
+    - `SPY_SNAPSHOT_DTE_MIN_DAYS`, `SPY_SNAPSHOT_DTE_MAX_DAYS`
+    - `SPY_SNAPSHOT_DTE_TARGETS`, `SPY_SNAPSHOT_DTE_TOLERANCE_DAYS`
+    - `SPY_SNAPSHOT_STRIKES_EACH_SIDE`
+    - `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH`
   - Optional VIX snapshot stream:
     - `VIX_SNAPSHOT_ENABLED`
     - `VIX_SNAPSHOT_INTERVAL_MINUTES`
@@ -320,6 +330,15 @@ High-impact settings:
   - `ADMIN_API_KEY`
   - `CORS_ORIGINS`
   - `TZ`
+
+Recommended SPY model-fitting profile:
+- `SPY_SNAPSHOT_ENABLED=true`
+- `SPY_SNAPSHOT_INTERVAL_MINUTES=5`
+- `SPY_SNAPSHOT_DTE_MODE=range`
+- `SPY_SNAPSHOT_DTE_MIN_DAYS=0`
+- `SPY_SNAPSHOT_DTE_MAX_DAYS=10`
+- `SPY_SNAPSHOT_STRIKES_EACH_SIDE=75`
+- Keep `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` in production.
 
 Recommended VIX model-fitting profile:
 - `VIX_SNAPSHOT_ENABLED=true`
@@ -447,6 +466,48 @@ Run:
 python -m pytest -q
 ```
 
+DB-backed integration tests (safe mode):
+
+1) Start dedicated local Postgres test DB:
+
+```bash
+cd ..
+docker compose -f docker-compose.test.yml up -d
+```
+
+2) Set `DATABASE_URL_TEST` (example in `backend/.env.test.example`):
+
+```bash
+export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test"
+```
+
+3) Run only integration tests:
+
+```bash
+cd backend
+python -m pytest -q -m integration
+```
+
+Convenience Make targets (run from repo root):
+
+```bash
+make test-e2e-up
+make test-e2e-mocked
+make test-e2e-db
+make test-e2e
+make test-e2e-down
+```
+
+If your default `python` is not your backend runtime, override interpreter:
+
+```bash
+make PYTHON_BIN=python3.11 test-e2e
+```
+
+Safety guard behavior:
+- Integration tests skip entirely when `DATABASE_URL_TEST` is unset.
+- Integration tests fail fast if `DATABASE_URL_TEST` host is not `localhost`/`127.0.0.1` or DB name does not include `test`.
+
 Current coverage domains:
 - DTE helper behavior
 - Tradier expiration request params
@@ -454,6 +515,8 @@ Current coverage domains:
 - Decision candidate/scoring/freshness logic
 - GEX zero-gamma helper
 - GEX API output behavior (including custom expiration filter and fallback)
+- HTTP-level mocked E2E router workflows
+- DB-backed integration smoke tests (`-m integration`)
 
 ---
 

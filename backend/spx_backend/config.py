@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     snapshot_range_fallback_count: int = 3
     snapshot_dte_tolerance_days: int = 1
     snapshot_strikes_each_side: int = 75
+    spy_snapshot_enabled: bool = True
+    spy_snapshot_interval_minutes: int = 5
+    spy_snapshot_underlying: str = "SPY"
+    spy_snapshot_dte_targets: str = "3,5,7"
+    spy_snapshot_dte_mode: str = "range"  # "range" or "targets"
+    spy_snapshot_dte_min_days: int = 0
+    spy_snapshot_dte_max_days: int = 10
+    spy_snapshot_range_fallback_enabled: bool = False
+    spy_snapshot_range_fallback_count: int = 3
+    spy_snapshot_dte_tolerance_days: int = 1
+    spy_snapshot_strikes_each_side: int = 75
+    spy_allow_snapshot_outside_rth: bool = False
     vix_snapshot_enabled: bool = False
     vix_snapshot_interval_minutes: int = 5
     vix_snapshot_underlying: str = "VIX"
@@ -164,6 +176,10 @@ class Settings(BaseSettings):
     def vix_snapshot_dte_targets_list(self) -> list[int]:
         """Parse VIX snapshot DTE targets from comma-separated env configuration."""
         return self._parse_int_csv(self.vix_snapshot_dte_targets)
+
+    def spy_snapshot_dte_targets_list(self) -> list[int]:
+        """Parse SPY snapshot DTE targets from comma-separated env configuration."""
+        return self._parse_int_csv(self.spy_snapshot_dte_targets)
 
     def quote_symbols_list(self) -> list[str]:
         """Parse quote symbol list from comma-separated env configuration."""

@@ -116,8 +116,20 @@ class _FakeTradier:
         }
 
 
+@pytest.mark.parametrize(
+    ("underlying", "job_name", "targets"),
+    [
+        ("VIX", "snapshot_job_vix_test", [14, 21]),
+        ("SPY", "snapshot_job_spy_test", [3, 5]),
+    ],
+)
 @pytest.mark.asyncio
-async def test_snapshot_job_uses_configured_underlying_for_chain_and_rows(monkeypatch) -> None:
+async def test_snapshot_job_uses_configured_underlying_for_chain_and_rows(
+    monkeypatch,
+    underlying: str,
+    job_name: str,
+    targets: list[int],
+) -> None:
     """Ensure per-job underlying config is persisted on snapshot + option rows."""
     capture_session = _CaptureSession()
     monkeypatch.setattr(snapshot_module, "SessionLocal", _SessionFactory(capture_session))
@@ -125,10 +137,10 @@ async def test_snapshot_job_uses_configured_underlying_for_chain_and_rows(monkey
     job = SnapshotJob(
         tradier=_FakeTradier(),
         config=SnapshotJobConfig(
-            job_name="snapshot_job_vix_test",
-            underlying="VIX",
+            job_name=job_name,
+            underlying=underlying,
             dte_mode="range",
-            dte_targets=[14, 21],
+            dte_targets=targets,
             dte_min_days=0,
             dte_max_days=365,
             range_fallback_enabled=False,
@@ -142,5 +154,5 @@ async def test_snapshot_job_uses_configured_underlying_for_chain_and_rows(monkey
     result = await job.run_once(force=True)
 
     assert result["skipped"] is False
-    assert capture_session.chain_insert_params[0]["underlying"] == "VIX"
-    assert capture_session.option_insert_params[0]["underlying"] == "VIX"
+    assert capture_session.chain_insert_params[0]["underlying"] == underlying
+    assert capture_session.option_insert_params[0]["underlying"] == underlying
