@@ -33,6 +33,7 @@ def test_evaluate_candidate_outcome_hits_take_profit_first() -> None:
     )
     assert result is not None
     assert result["hit_tp50_before_sl_or_expiry"] is True
+    assert result["hit_tp100_at_expiry"] is False
     assert result["exit_reason"] == "TAKE_PROFIT_50"
 
 
@@ -62,6 +63,7 @@ def test_evaluate_candidate_outcome_resolves_on_last_mark_when_no_tp() -> None:
     )
     assert result is not None
     assert result["hit_tp50_before_sl_or_expiry"] is False
+    assert result["hit_tp100_at_expiry"] is False
     assert result["exit_reason"] == "EXPIRY_OR_LAST_MARK"
     assert result["realized_pnl"] < 50.0
 
@@ -75,3 +77,36 @@ def test_evaluate_candidate_outcome_none_for_empty_marks() -> None:
         contract_multiplier=100,
     )
     assert result is None
+
+
+def test_evaluate_candidate_outcome_tracks_tp100_at_expiry_even_if_tp50_hit_early() -> None:
+    marks = [
+        LabelMark(
+            ts=datetime(2026, 2, 13, 15, 0, tzinfo=ZoneInfo("UTC")),
+            short_bid=0.35,
+            short_ask=0.45,
+            long_bid=0.00,
+            long_ask=0.05,
+        ),
+        LabelMark(
+            ts=datetime(2026, 2, 13, 15, 5, tzinfo=ZoneInfo("UTC")),
+            short_bid=0.00,
+            short_ask=0.00,
+            long_bid=0.00,
+            long_ask=0.00,
+        ),
+    ]
+    # entry_credit = 1.00 -> TP50 threshold = 50, TP100-at-expiry threshold = 100
+    result = evaluate_candidate_outcome(
+        entry_credit=1.0,
+        marks=marks,
+        contracts=1,
+        take_profit_pct=0.50,
+        contract_multiplier=100,
+    )
+    assert result is not None
+    assert result["hit_tp50_before_sl_or_expiry"] is True
+    assert result["hit_tp100_at_expiry"] is True
+    # Realized outcome remains TP50-first for live policy.
+    assert result["exit_reason"] == "TAKE_PROFIT_50"
+    assert result["realized_pnl"] < result["expiry_pnl"]

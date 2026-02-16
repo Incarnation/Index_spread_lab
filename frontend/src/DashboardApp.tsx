@@ -4,6 +4,7 @@ import {
   AdminControlsCard,
   ChainSnapshotsPanel,
   GexPanel,
+  LabelMetricsPanel,
   RunResultCard,
   TradeDecisionDetailsDrawer,
   TradeDecisionsPanel,
@@ -26,9 +27,17 @@ export function DashboardApp() {
     setError(message);
   }, []);
 
-  const { items, decisions, trades, loading, decisionsLoading, tradesLoading, refresh } = useSnapshotsDecisions({
-    onError: handleError,
-  });
+  const {
+    items,
+    decisions,
+    trades,
+    labelMetrics,
+    loading,
+    decisionsLoading,
+    tradesLoading,
+    labelMetricsLoading,
+    refresh,
+  } = useSnapshotsDecisions({ onError: handleError });
 
   const {
     gexSnapshots,
@@ -161,6 +170,8 @@ export function DashboardApp() {
             void deleteDecision(decisionId);
           }}
         />
+
+        <LabelMetricsPanel metrics={labelMetrics} loading={labelMetricsLoading} error={error} />
 
         <TradesLivePnlPanel trades={trades} loading={tradesLoading} error={error} />
 

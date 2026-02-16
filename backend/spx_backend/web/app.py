@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -328,6 +329,95 @@ async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSess
             }
             for row in rows
         ]
+    }
+
+
+@app.get("/api/label-metrics")
+async def get_label_metrics(lookback_days: int = 90, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return TP50/TP100 label metrics overall and by spread side."""
+    if lookback_days <= 0 or lookback_days > 3650:
+        raise HTTPException(status_code=400, detail="invalid_lookback_days")
+
+    window_start = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=lookback_days)
+
+    summary_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  COUNT(*)::bigint AS resolved_count,
+                  SUM(CASE WHEN COALESCE(hit_tp50_before_sl_or_expiry, false) THEN 1 ELSE 0 END)::bigint AS tp50_count,
+                  SUM(CASE WHEN COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) THEN 1 ELSE 0 END)::bigint AS tp100_count,
+                  AVG(realized_pnl) AS avg_realized_pnl
+                FROM trade_candidates
+                WHERE label_status = 'resolved'
+                  AND ts >= :window_start
+                """
+            ),
+            {"window_start": window_start},
+        )
+    ).fetchone()
+
+    side_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  COALESCE(candidate_json->>'spread_side', 'unknown') AS spread_side,
+                  COUNT(*)::bigint AS resolved_count,
+                  SUM(CASE WHEN COALESCE(hit_tp50_before_sl_or_expiry, false) THEN 1 ELSE 0 END)::bigint AS tp50_count,
+                  SUM(CASE WHEN COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) THEN 1 ELSE 0 END)::bigint AS tp100_count,
+                  AVG(realized_pnl) AS avg_realized_pnl
+                FROM trade_candidates
+                WHERE label_status = 'resolved'
+                  AND ts >= :window_start
+                GROUP BY spread_side
+                ORDER BY spread_side ASC
+                """
+            ),
+            {"window_start": window_start},
+        )
+    ).fetchall()
+
+    def _rate(numerator: int, denominator: int) -> float | None:
+        if denominator <= 0:
+            return None
+        return numerator / denominator
+
+    total_resolved = int(summary_row.resolved_count or 0) if summary_row is not None else 0
+    total_tp50 = int(summary_row.tp50_count or 0) if summary_row is not None else 0
+    total_tp100 = int(summary_row.tp100_count or 0) if summary_row is not None else 0
+    total_avg_pnl = float(summary_row.avg_realized_pnl) if (summary_row is not None and summary_row.avg_realized_pnl is not None) else None
+
+    by_side = []
+    for row in side_rows:
+        resolved_count = int(row.resolved_count or 0)
+        tp50_count = int(row.tp50_count or 0)
+        tp100_count = int(row.tp100_count or 0)
+        by_side.append(
+            {
+                "spread_side": row.spread_side,
+                "resolved": resolved_count,
+                "tp50": tp50_count,
+                "tp100_at_expiry": tp100_count,
+                "tp50_rate": _rate(tp50_count, resolved_count),
+                "tp100_at_expiry_rate": _rate(tp100_count, resolved_count),
+                "avg_realized_pnl": (float(row.avg_realized_pnl) if row.avg_realized_pnl is not None else None),
+            }
+        )
+
+    return {
+        "lookback_days": lookback_days,
+        "window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
+        "summary": {
+            "resolved": total_resolved,
+            "tp50": total_tp50,
+            "tp100_at_expiry": total_tp100,
+            "tp50_rate": _rate(total_tp50, total_resolved),
+            "tp100_at_expiry_rate": _rate(total_tp100, total_resolved),
+            "avg_realized_pnl": total_avg_pnl,
+        },
+        "by_side": by_side,
     }
 
 

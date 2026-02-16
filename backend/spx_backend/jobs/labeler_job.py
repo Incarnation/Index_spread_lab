@@ -45,11 +45,15 @@ def evaluate_candidate_outcome(
     take_profit_pct: float,
     contract_multiplier: int,
 ) -> dict | None:
-    """Evaluate TP50-first outcome and realized PnL from a forward mark series."""
+    """Evaluate TP50 live outcome while also tracking TP100 at expiry mark."""
     if not marks:
         return None
 
     tp_threshold = max(entry_credit, 0.0) * contract_multiplier * max(contracts, 1) * max(take_profit_pct, 0.0)
+    tp100_threshold = max(entry_credit, 0.0) * contract_multiplier * max(contracts, 1)
+    first_tp50_ts: datetime | None = None
+    first_tp50_pnl: float | None = None
+    first_tp50_exit_cost: float | None = None
     last_pnl: float | None = None
     last_exit_cost: float | None = None
     last_ts: datetime | None = None
@@ -65,24 +69,40 @@ def evaluate_candidate_outcome(
         last_exit_cost = exit_cost
         last_ts = mark.ts
 
-        if pnl >= tp_threshold:
-            return {
-                "resolved": True,
-                "hit_tp50_before_sl_or_expiry": True,
-                "realized_pnl": pnl,
-                "exit_cost": exit_cost,
-                "exit_reason": "TAKE_PROFIT_50",
-                "resolved_ts": mark.ts,
-            }
+        # Capture first TP50 hit for live-style realized outcome.
+        if first_tp50_ts is None and pnl >= tp_threshold:
+            first_tp50_ts = mark.ts
+            first_tp50_pnl = pnl
+            first_tp50_exit_cost = exit_cost
 
     if last_ts is None:
         return None
 
+    hit_tp100_at_expiry = bool(last_pnl is not None and last_pnl >= tp100_threshold)
+
+    if first_tp50_ts is not None:
+        return {
+            "resolved": True,
+            "hit_tp50_before_sl_or_expiry": True,
+            "hit_tp100_at_expiry": hit_tp100_at_expiry,
+            "realized_pnl": first_tp50_pnl,
+            "exit_cost": first_tp50_exit_cost,
+            "expiry_pnl": last_pnl,
+            "expiry_exit_cost": last_exit_cost,
+            "expiry_ts": last_ts,
+            "exit_reason": "TAKE_PROFIT_50",
+            "resolved_ts": first_tp50_ts,
+        }
+
     return {
         "resolved": True,
         "hit_tp50_before_sl_or_expiry": False,
+        "hit_tp100_at_expiry": hit_tp100_at_expiry,
         "realized_pnl": last_pnl,
         "exit_cost": last_exit_cost,
+        "expiry_pnl": last_pnl,
+        "expiry_exit_cost": last_exit_cost,
+        "expiry_ts": last_ts,
         "exit_reason": "EXPIRY_OR_LAST_MARK",
         "resolved_ts": last_ts,
     }
@@ -91,6 +111,24 @@ def evaluate_candidate_outcome(
 @dataclass(frozen=True)
 class LabelerJob:
     """Resolve pending candidate outcomes into label columns/json."""
+
+    async def _has_hit_tp100_column(self, *, session) -> bool:
+        """Check if optional trade_candidates.hit_tp100_at_expiry column exists."""
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'trade_candidates'
+                      AND column_name = 'hit_tp100_at_expiry'
+                    LIMIT 1
+                    """
+                )
+            )
+        ).fetchone()
+        return row is not None
 
     async def _load_forward_marks(
         self,
@@ -184,6 +222,7 @@ class LabelerJob:
         skipped_fresh = 0
 
         async with SessionLocal() as session:
+            has_hit_tp100_column = await self._has_hit_tp100_column(session=session)
             pending_rows = await session.execute(
                 text(
                     """
@@ -285,10 +324,18 @@ class LabelerJob:
                     "exit_cost": result["exit_cost"],
                     "realized_pnl": result["realized_pnl"],
                     "hit_tp50_before_sl_or_expiry": result["hit_tp50_before_sl_or_expiry"],
+                    "hit_tp100_at_expiry": result["hit_tp100_at_expiry"],
+                    "expiry_pnl": result.get("expiry_pnl"),
+                    "expiry_exit_cost": result.get("expiry_exit_cost"),
+                    "expiry_ts_utc": (
+                        result["expiry_ts"].isoformat()
+                        if isinstance(result.get("expiry_ts"), datetime)
+                        else None
+                    ),
                 }
                 await session.execute(
                     text(
-                        """
+                        f"""
                         UPDATE trade_candidates
                         SET label_json = CAST(:label_json AS jsonb),
                             label_schema_version = :label_schema_version,
@@ -296,19 +343,33 @@ class LabelerJob:
                             label_horizon = 'to_expiration',
                             resolved_at = :resolved_at,
                             realized_pnl = :realized_pnl,
-                            hit_tp50_before_sl_or_expiry = :hit_tp50_before_sl_or_expiry,
+                            hit_tp50_before_sl_or_expiry = :hit_tp50_before_sl_or_expiry
+                            {", hit_tp100_at_expiry = :hit_tp100_at_expiry" if has_hit_tp100_column else ""}
+                            ,
                             label_error = NULL
                         WHERE candidate_id = :candidate_id
                         """
                     ),
-                    {
-                        "candidate_id": candidate_id,
-                        "label_json": _to_json(label_json),
-                        "label_schema_version": settings.label_schema_version,
-                        "resolved_at": result["resolved_ts"],
-                        "realized_pnl": result["realized_pnl"],
-                        "hit_tp50_before_sl_or_expiry": result["hit_tp50_before_sl_or_expiry"],
-                    },
+                    (
+                        {
+                            "candidate_id": candidate_id,
+                            "label_json": _to_json(label_json),
+                            "label_schema_version": settings.label_schema_version,
+                            "resolved_at": result["resolved_ts"],
+                            "realized_pnl": result["realized_pnl"],
+                            "hit_tp50_before_sl_or_expiry": result["hit_tp50_before_sl_or_expiry"],
+                            "hit_tp100_at_expiry": result["hit_tp100_at_expiry"],
+                        }
+                        if has_hit_tp100_column
+                        else {
+                            "candidate_id": candidate_id,
+                            "label_json": _to_json(label_json),
+                            "label_schema_version": settings.label_schema_version,
+                            "resolved_at": result["resolved_ts"],
+                            "realized_pnl": result["realized_pnl"],
+                            "hit_tp50_before_sl_or_expiry": result["hit_tp50_before_sl_or_expiry"],
+                        }
+                    ),
                 )
                 resolved_count += 1
 

@@ -222,6 +222,38 @@ export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROL
   return data.items;
 }
 
+export type LabelMetricsSummary = {
+  resolved: number;
+  tp50: number;
+  tp100_at_expiry: number;
+  tp50_rate: number | null;
+  tp100_at_expiry_rate: number | null;
+  avg_realized_pnl: number | null;
+};
+
+export type LabelMetricsBySide = {
+  spread_side: string;
+  resolved: number;
+  tp50: number;
+  tp100_at_expiry: number;
+  tp50_rate: number | null;
+  tp100_at_expiry_rate: number | null;
+  avg_realized_pnl: number | null;
+};
+
+export type LabelMetricsResponse = {
+  lookback_days: number;
+  window_start_utc: string;
+  summary: LabelMetricsSummary;
+  by_side: LabelMetricsBySide[];
+};
+
+export async function fetchLabelMetrics(lookbackDays = 90): Promise<LabelMetricsResponse> {
+  const r = await fetch(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as LabelMetricsResponse;
+}
+
 export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
   const r = await fetch(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
     method: "DELETE",
