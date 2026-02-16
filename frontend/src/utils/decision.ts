@@ -10,6 +10,12 @@ export type DecisionSummary = {
   vix?: number;
 };
 
+/**
+ * Parse the decision JSON payload into table-friendly numeric fields.
+ *
+ * Returns null when payload is absent or malformed so callers can render
+ * placeholder values safely without throwing.
+ */
 export function getDecisionSummary(row: TradeDecision): DecisionSummary | null {
   const data = parseJsonRecord(row.chosen_legs_json as Record<string, unknown> | string | null);
   if (!data) return null;

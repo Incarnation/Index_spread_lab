@@ -12,6 +12,12 @@ type TradeDecisionsPanelProps = {
   onDeleteDecision: (decisionId: number) => void;
 };
 
+/**
+ * Render latest decision-engine outputs and row-level actions.
+ *
+ * Operators can inspect selected legs/context, open the detail drawer,
+ * and delete individual decision records from this table.
+ */
 export function TradeDecisionsPanel({
   decisions,
   loading,

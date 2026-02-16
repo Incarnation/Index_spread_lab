@@ -4,6 +4,7 @@ from spx_backend.backtest.engine import BacktestConfig, BacktestEngine
 
 
 def main() -> None:
+    """Run a local backtest and print a compact console summary."""
     # Update these paths to match your local Databento Parquet downloads.
     # Optional CSV examples live under `spx_backend/backtest/data/samples/`.
     cfg = BacktestConfig(

@@ -13,8 +13,11 @@ from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
+from spx_backend.jobs.promotion_gate_job import PromotionGateJob, build_promotion_gate_job
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
+from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob, build_shadow_inference_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
+from spx_backend.jobs.trainer_job import TrainerJob, build_trainer_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
 
 router = APIRouter()
@@ -85,6 +88,30 @@ async def admin_run_trade_pnl(request: Request, _: None = Depends(_require_admin
     return result
 
 
+@router.post("/api/admin/run-trainer")
+async def admin_run_trainer(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force weekly trainer run immediately."""
+    job: TrainerJob = getattr(request.app.state, "trainer_job", build_trainer_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-shadow-inference")
+async def admin_run_shadow_inference(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force shadow inference run immediately."""
+    job: ShadowInferenceJob = getattr(request.app.state, "shadow_inference_job", build_shadow_inference_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-promotion-gates")
+async def admin_run_promotion_gates(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force promotion gate evaluation immediately."""
+    job: PromotionGateJob = getattr(request.app.state, "promotion_gate_job", build_promotion_gate_job())
+    result = await job.run_once(force=True)
+    return result
+
+
 @router.delete("/api/admin/trade-decisions/{decision_id}")
 async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
     """Delete one trade decision row by ID."""
@@ -119,6 +146,7 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
     """Return one-call pipeline health summary."""
 
     def _iso(ts) -> str | None:
+        """Convert nullable timestamps into ISO strings for preflight payloads."""
         return ts.isoformat() if ts is not None else None
 
     r = await db.execute(
@@ -133,6 +161,9 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
               (SELECT COUNT(*) FROM feature_snapshots) AS feature_snapshots_count,
               (SELECT COUNT(*) FROM trade_candidates) AS trade_candidates_count,
               (SELECT COUNT(*) FROM trade_candidates WHERE label_status = 'resolved') AS labeled_candidates_count,
+              (SELECT COUNT(*) FROM model_versions) AS model_versions_count,
+              (SELECT COUNT(*) FROM training_runs) AS training_runs_count,
+              (SELECT COUNT(*) FROM model_predictions) AS model_predictions_count,
               (SELECT COUNT(*) FROM trades) AS trades_count,
               (SELECT COUNT(*) FROM trades WHERE status = 'OPEN') AS open_trades_count,
               (SELECT COUNT(*) FROM trades WHERE status = 'CLOSED') AS closed_trades_count,
@@ -142,6 +173,9 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
               (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
               (SELECT MAX(ts) FROM feature_snapshots) AS latest_feature_ts,
               (SELECT MAX(ts) FROM trade_candidates) AS latest_candidate_ts,
+              (SELECT MAX(created_at) FROM model_versions) AS latest_model_version_ts,
+              (SELECT MAX(finished_at) FROM training_runs) AS latest_training_run_ts,
+              (SELECT MAX(created_at) FROM model_predictions) AS latest_prediction_ts,
               (SELECT MAX(last_mark_ts) FROM trades) AS latest_trade_mark_ts,
               (SELECT MAX(entry_time) FROM trades) AS latest_trade_entry_ts,
               (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
@@ -210,6 +244,9 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "feature_snapshots": int(summary.feature_snapshots_count or 0),
         "trade_candidates": int(summary.trade_candidates_count or 0),
         "labeled_candidates": int(summary.labeled_candidates_count or 0),
+        "model_versions": int(summary.model_versions_count or 0),
+        "training_runs": int(summary.training_runs_count or 0),
+        "model_predictions": int(summary.model_predictions_count or 0),
         "trades": int(summary.trades_count or 0),
         "open_trades": int(summary.open_trades_count or 0),
         "closed_trades": int(summary.closed_trades_count or 0),
@@ -221,6 +258,9 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "decision_ts": _iso(summary.latest_decision_ts),
         "feature_ts": _iso(summary.latest_feature_ts),
         "candidate_ts": _iso(summary.latest_candidate_ts),
+        "model_version_ts": _iso(summary.latest_model_version_ts),
+        "training_run_ts": _iso(summary.latest_training_run_ts),
+        "prediction_ts": _iso(summary.latest_prediction_ts),
         "trade_mark_ts": _iso(summary.latest_trade_mark_ts),
         "trade_entry_ts": _iso(summary.latest_trade_entry_ts),
         "market_clock_ts": _iso(summary.latest_market_clock_ts),
@@ -237,6 +277,12 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         warnings.append("no_feature_snapshots")
     if counts["trade_candidates"] == 0:
         warnings.append("no_trade_candidates")
+    if counts["model_versions"] == 0:
+        warnings.append("no_model_versions")
+    if counts["training_runs"] == 0:
+        warnings.append("no_training_runs")
+    if counts["model_predictions"] == 0:
+        warnings.append("no_model_predictions")
     if counts["trades"] == 0:
         warnings.append("no_trades")
 

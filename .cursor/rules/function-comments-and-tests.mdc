@@ -1,0 +1,20 @@
+---
+description: Require detailed function comments and tests for new changes
+alwaysApply: true
+---
+
+# Function Comments and Tests
+
+- Add a clear, detailed docstring/comment for every function you create or edit.
+- For backend Python:
+  - Add a function docstring describing inputs, behavior, and return value.
+  - Add inline comments ahead of non-obvious logic blocks (ranking, filtering, joins, gates).
+- For frontend TypeScript/React:
+  - Add JSDoc-style comments for exported functions/components/hooks.
+  - Add short comments for important formatting or state-management helpers.
+- Keep comments accurate and maintain them when code behavior changes.
+- Every new feature/fix must include automated tests:
+  - Add or update backend tests for new endpoints/jobs/logic.
+  - Run the full backend test suite before finishing.
+  - Run frontend build/typecheck when frontend code changes.
+

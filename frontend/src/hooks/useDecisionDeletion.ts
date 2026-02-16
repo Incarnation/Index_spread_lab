@@ -16,6 +16,12 @@ type UseDecisionDeletionResult = {
   deleteDecision: (decisionId: number) => Promise<void>;
 };
 
+/**
+ * Handle deletion of persisted trade-decision rows and related UI feedback.
+ *
+ * The hook owns confirmation flow, optimistic drawer cleanup, success toast
+ * text, and refresh/error callbacks after API completion.
+ */
 export function useDecisionDeletion({
   adminKey,
   activeDrawerDecisionId,
@@ -27,6 +33,9 @@ export function useDecisionDeletion({
   const [deletingDecisionId, setDeletingDecisionId] = React.useState<number | null>(null);
   const [successMessage, setSuccessMessage] = React.useState<string | null>(null);
 
+  /**
+   * Delete a decision after confirmation and refresh table state.
+   */
   const deleteDecision = React.useCallback(
     async (decisionId: number) => {
       const ok = window.confirm(`Delete trade decision #${decisionId}?`);

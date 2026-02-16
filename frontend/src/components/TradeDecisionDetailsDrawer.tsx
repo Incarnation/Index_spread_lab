@@ -8,6 +8,12 @@ type TradeDecisionDetailsDrawerProps = {
   decision: TradeDecision | null;
 };
 
+/**
+ * Show full JSON payloads for one decision in a side drawer.
+ *
+ * This view exposes complete chosen-leg and strategy-parameter records for
+ * troubleshooting or auditing decisions beyond the compact table columns.
+ */
 export function TradeDecisionDetailsDrawer({ opened, onClose, decision }: TradeDecisionDetailsDrawerProps) {
   const payload = decision ? parseJsonRecord(decision.chosen_legs_json as Record<string, unknown> | string | null) : null;
   const strategyParams = decision ? parseJsonRecord(decision.strategy_params_json as Record<string, unknown> | string | null) : null;

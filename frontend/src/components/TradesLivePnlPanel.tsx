@@ -8,18 +8,21 @@ type TradesLivePnlPanelProps = {
   error: string | null;
 };
 
+/** Format PnL values as signed USD text with graceful null handling. */
 function formatMoney(value: number | null): string {
   if (typeof value !== "number" || Number.isNaN(value)) return "—";
   const sign = value > 0 ? "+" : "";
   return `${sign}$${value.toFixed(2)}`;
 }
 
+/** Build a compact human-readable label for one trade leg. */
 function legLabel(leg: TradeLeg): string {
   const strike = typeof leg.strike === "number" ? leg.strike.toFixed(0) : "—";
   const right = leg.option_right ?? "";
   return `${leg.side} ${strike}${right} x${leg.qty}`;
 }
 
+/** Map numeric PnL to semantic text color used in the table. */
 function pnlColor(value: number | null): string | undefined {
   if (typeof value !== "number" || Number.isNaN(value)) return undefined;
   if (value > 0) return "green";
@@ -27,6 +30,12 @@ function pnlColor(value: number | null): string | undefined {
   return "dimmed";
 }
 
+/**
+ * Render live and realized PnL state for each recorded trade.
+ *
+ * This panel is the operational view for open/closed positions, last marks,
+ * TP/SL targets, and current profit state per trade.
+ */
 export function TradesLivePnlPanel({ trades, loading, error }: TradesLivePnlPanelProps) {
   const openCount = trades.filter((t) => t.status === "OPEN").length;
   const closedCount = trades.filter((t) => t.status === "CLOSED").length;

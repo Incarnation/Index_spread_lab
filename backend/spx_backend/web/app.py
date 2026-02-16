@@ -12,14 +12,19 @@ from spx_backend.jobs.decision_job import DecisionJob
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob
+from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
+from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
 from spx_backend.jobs.snapshot_job import SnapshotJob
+from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
 from spx_backend.web.routers import admin, public
 from spx_backend.web.routers.public import (
     get_gex_curve,
     get_label_metrics,
+    get_model_ops,
+    get_strategy_metrics,
     list_gex_dtes,
     list_gex_expirations,
     list_trades,
@@ -44,6 +49,9 @@ async def lifespan(app: FastAPI):
     feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
     labeler_job = LabelerJob()
     trade_pnl_job = TradePnlJob(clock_cache=clock_cache)
+    trainer_job = TrainerJob()
+    shadow_inference_job = ShadowInferenceJob()
+    promotion_gate_job = PromotionGateJob()
 
     scheduler.add_job(
         snapshot_job.run_once,
@@ -100,6 +108,32 @@ async def lifespan(app: FastAPI):
             id="trade_pnl_job",
             replace_existing=True,
         )
+    if settings.trainer_enabled:
+        scheduler.add_job(
+            trainer_job.run_once,
+            "cron",
+            day_of_week=settings.trainer_weekday,
+            hour=settings.trainer_hour,
+            minute=settings.trainer_minute,
+            id="trainer_job",
+            replace_existing=True,
+        )
+    if settings.shadow_inference_enabled:
+        scheduler.add_job(
+            shadow_inference_job.run_once,
+            "interval",
+            minutes=settings.shadow_inference_interval_minutes,
+            id="shadow_inference_job",
+            replace_existing=True,
+        )
+    if settings.promotion_gate_enabled:
+        scheduler.add_job(
+            promotion_gate_job.run_once,
+            "interval",
+            minutes=settings.promotion_gate_interval_minutes,
+            id="promotion_gate_job",
+            replace_existing=True,
+        )
     scheduler.start()
 
     app.state.scheduler = scheduler
@@ -112,6 +146,9 @@ async def lifespan(app: FastAPI):
     app.state.feature_builder_job = feature_builder_job
     app.state.labeler_job = labeler_job
     app.state.trade_pnl_job = trade_pnl_job
+    app.state.trainer_job = trainer_job
+    app.state.shadow_inference_job = shadow_inference_job
+    app.state.promotion_gate_job = promotion_gate_job
 
     # Run once immediately on boot (useful for confirming wiring).
     try:
@@ -150,6 +187,8 @@ __all__ = [
     # Re-exported endpoint symbols for tests/backward compatibility.
     "list_trades",
     "get_label_metrics",
+    "get_model_ops",
+    "get_strategy_metrics",
     "list_gex_dtes",
     "list_gex_expirations",
     "get_gex_curve",

@@ -8,6 +8,12 @@ type ChainSnapshotsPanelProps = {
   error: string | null;
 };
 
+/**
+ * Show recently captured option-chain snapshot batches.
+ *
+ * This gives quick visibility into data freshness, target DTE coverage,
+ * and checksum identifiers used for audit/debug workflows.
+ */
 export function ChainSnapshotsPanel({ items, loading, error }: ChainSnapshotsPanelProps) {
   return (
     <Card withBorder radius="md" mt="lg" p="md">

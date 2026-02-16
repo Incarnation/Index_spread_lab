@@ -49,10 +49,12 @@ type HeatmapRow = {
   byStrike: Map<number, number>;
 };
 
+/** Coerce nullable numeric fields from API rows into chart-safe numbers. */
 function toNumeric(value: number | null): number {
   return typeof value === "number" ? value : 0;
 }
 
+/** Find the closest plotted strike to a target level (spot or zero-gamma). */
 function findNearestStrike(target: number | null | undefined, strikes: number[]): number | null {
   if (typeof target !== "number" || strikes.length === 0) return null;
   let nearest = strikes[0];
@@ -68,6 +70,7 @@ function findNearestStrike(target: number | null | undefined, strikes: number[])
   return nearest;
 }
 
+/** Compact large GEX values for axis ticks and tooltips. */
 function formatCompactNumber(value: number): string {
   const absolute = Math.abs(value);
   if (absolute >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
@@ -76,6 +79,7 @@ function formatCompactNumber(value: number): string {
   return value.toFixed(0);
 }
 
+/** Convert heatmap magnitude/sign into a red-gray-green color scale. */
 function heatmapColor(value: number | undefined, maxAbs: number): string {
   if (typeof value !== "number") return "#f1f3f5";
   if (maxAbs <= 0) return "#dee2e6";
@@ -85,6 +89,11 @@ function heatmapColor(value: number | undefined, maxAbs: number): string {
   return `rgba(224, 49, 49, ${alpha})`;
 }
 
+/**
+ * Render GEX analytics with two chart modes:
+ * - composed chart for stacked calls/puts + net line
+ * - strike/expiration heatmap for cross-expiry structure
+ */
 export function GexPanel({
   snapshots,
   selectedSnapshot,
@@ -184,6 +193,10 @@ export function GexPanel({
     return Math.ceil(heatmapStrikes.length / 12);
   }, [heatmapStrikes.length]);
 
+  /**
+   * Load per-expiration curves for heatmap mode and normalize them into a
+   * shared strike grid so each expiration row can be rendered consistently.
+   */
   React.useEffect(() => {
     if (chartView !== "heatmap") return;
     if (selectedSnapshotId == null || needsCustomSelections || heatmapExpirations.length === 0) {

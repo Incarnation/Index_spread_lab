@@ -9,6 +9,11 @@ type RunResultCardProps = {
   scrollHeight?: number;
 };
 
+/**
+ * Display raw admin-run payloads with a compact status badge.
+ *
+ * This keeps manual run diagnostics visible without leaving the dashboard.
+ */
 export function RunResultCard({ title, result, scrollHeight }: RunResultCardProps) {
   const body = <Code block>{JSON.stringify(result, null, 2)}</Code>;
 

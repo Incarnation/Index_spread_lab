@@ -29,6 +29,12 @@ type UseAdminRunsResult = {
   runTradePnl: () => Promise<void>;
 };
 
+/**
+ * Manage admin-triggered job actions and their result payloads.
+ *
+ * The hook keeps endpoint responses separate per action so the dashboard can
+ * show the most recent run output for snapshot/quotes/decision/trade-pnl jobs.
+ */
 export function useAdminRuns({ onRefresh, onError, onClearError }: UseAdminRunsArgs): UseAdminRunsResult {
   const [adminKey, setAdminKey] = React.useState<string>("");
   const [runResult, setRunResult] = React.useState<RunSnapshotResult | null>(null);
@@ -36,6 +42,9 @@ export function useAdminRuns({ onRefresh, onError, onClearError }: UseAdminRunsA
   const [runDecisionResult, setRunDecisionResult] = React.useState<RunDecisionResult | null>(null);
   const [runTradePnlResult, setRunTradePnlResult] = React.useState<RunTradePnlResult | null>(null);
 
+  /**
+   * Run the snapshot job now, then refresh read models that depend on it.
+   */
   const runSnapshot = React.useCallback(async () => {
     onClearError();
     setRunResult(null);
@@ -51,6 +60,9 @@ export function useAdminRuns({ onRefresh, onError, onClearError }: UseAdminRunsA
     }
   }, [adminKey, onClearError, onError, onRefresh]);
 
+  /**
+   * Run quote ingestion now. This updates marks/underlying context data.
+   */
   const runQuotes = React.useCallback(async () => {
     onClearError();
     setRunQuotesResult(null);
@@ -64,6 +76,9 @@ export function useAdminRuns({ onRefresh, onError, onClearError }: UseAdminRunsA
     }
   }, [adminKey, onClearError, onError]);
 
+  /**
+   * Run the decision engine now, then refresh panels that show decisions/trades.
+   */
   const runDecision = React.useCallback(async () => {
     onClearError();
     setRunDecisionResult(null);
@@ -77,6 +92,9 @@ export function useAdminRuns({ onRefresh, onError, onClearError }: UseAdminRunsA
     }
   }, [adminKey, onClearError, onError, onRefresh]);
 
+  /**
+   * Run mark-to-market PnL updates now, then refresh the trades panel.
+   */
   const runTradePnl = React.useCallback(async () => {
     onClearError();
     setRunTradePnlResult(null);

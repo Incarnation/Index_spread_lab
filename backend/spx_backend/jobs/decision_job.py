@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -160,11 +161,16 @@ class DecisionJob:
                 await session.commit()
                 return {"skipped": True, "reason": "no_candidates", "now_et": now_et.isoformat()}
 
-            # Pick best candidate by score, then closest delta.
-            candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
-            chosen = candidates[0]
+            selection = await self._select_candidate_with_policy(session=session, now_et=now_et, candidates=candidates)
+            chosen = selection["chosen"]
+            candidate_ref = selection.get("candidate_ref") or {}
+            model_prediction = selection.get("model_prediction")
+            decision_source = str(selection.get("decision_source") or "rules")
+            model_score = model_prediction.get("score_raw") if isinstance(model_prediction, dict) else None
+            expected_value = model_prediction.get("expected_value") if isinstance(model_prediction, dict) else None
+            prediction_id = model_prediction.get("prediction_id") if isinstance(model_prediction, dict) else None
+            model_version_id = model_prediction.get("model_version_id") if isinstance(model_prediction, dict) else None
 
-            candidate_ref = await self._find_candidate_reference(session, now_et, chosen)
             decision_id = await self._insert_decision(
                 session=session,
                 now_et=now_et,
@@ -179,7 +185,11 @@ class DecisionJob:
                 strategy_params_json=chosen["strategy_params_json"],
                 candidate_id=candidate_ref.get("candidate_id"),
                 feature_snapshot_id=candidate_ref.get("feature_snapshot_id"),
-                decision_source="rules",
+                decision_source=decision_source,
+                model_score=(float(model_score) if model_score is not None else None),
+                expected_value=(float(expected_value) if expected_value is not None else None),
+                prediction_id=(int(prediction_id) if prediction_id is not None else None),
+                model_version_id=(int(model_version_id) if model_version_id is not None else None),
             )
             trade_id = await self._create_trade_from_decision(
                 session=session,
@@ -187,6 +197,7 @@ class DecisionJob:
                 now_et=now_et,
                 chosen=chosen,
                 candidate_ref=candidate_ref,
+                model_version_id=(int(model_version_id) if model_version_id is not None else None),
             )
             await session.commit()
 
@@ -328,6 +339,7 @@ class DecisionJob:
             return None
 
         def delta_diff(opt: dict) -> float:
+            """Measure distance between option absolute delta and target delta."""
             return abs(abs(opt["delta"]) - delta_target)
 
         short = min(options, key=delta_diff)
@@ -405,6 +417,137 @@ class DecisionJob:
             "strategy_params_json": strategy_params_json,
         }
 
+    async def _get_hybrid_model_version(self, session) -> dict[str, Any] | None:
+        """Load model version eligible for hybrid selection."""
+        if settings.decision_hybrid_require_active_model:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT model_version_id, model_name, version, rollout_status, is_active
+                        FROM model_versions
+                        WHERE model_name = :model_name
+                          AND is_active = true
+                          AND rollout_status = 'active'
+                        ORDER BY created_at DESC, model_version_id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"model_name": settings.decision_hybrid_model_name},
+                )
+            ).fetchone()
+        else:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT model_version_id, model_name, version, rollout_status, is_active
+                        FROM model_versions
+                        WHERE model_name = :model_name
+                          AND rollout_status IN ('canary', 'active')
+                        ORDER BY created_at DESC, model_version_id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"model_name": settings.decision_hybrid_model_name},
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "model_version_id": int(row.model_version_id),
+            "model_name": str(row.model_name),
+            "version": str(row.version),
+            "rollout_status": str(row.rollout_status),
+            "is_active": bool(row.is_active),
+        }
+
+    async def _get_candidate_prediction(self, session, *, candidate_id: int, model_version_id: int) -> dict[str, Any] | None:
+        """Load latest shadow/hybrid prediction for one candidate."""
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT prediction_id, score_raw, probability_win, expected_value, rank_in_snapshot
+                    FROM model_predictions
+                    WHERE candidate_id = :candidate_id
+                      AND model_version_id = :model_version_id
+                    ORDER BY created_at DESC, prediction_id DESC
+                    LIMIT 1
+                    """
+                ),
+                {"candidate_id": candidate_id, "model_version_id": model_version_id},
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "prediction_id": int(row.prediction_id),
+            "score_raw": float(row.score_raw),
+            "probability_win": (float(row.probability_win) if row.probability_win is not None else None),
+            "expected_value": (float(row.expected_value) if row.expected_value is not None else None),
+            "rank_in_snapshot": (int(row.rank_in_snapshot) if row.rank_in_snapshot is not None else None),
+        }
+
+    async def _select_candidate_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> dict[str, Any]:
+        """Select final candidate with rules-first, model-second hybrid policy."""
+        candidates_sorted = sorted(candidates, key=lambda c: (-c["score"], c["delta_diff"]))
+        chosen_rules = candidates_sorted[0]
+        rules_ref = await self._find_candidate_reference(session, now_et, chosen_rules)
+        selection = {
+            "chosen": chosen_rules,
+            "candidate_ref": rules_ref,
+            "decision_source": "rules",
+            "model_prediction": None,
+        }
+        if not settings.decision_hybrid_enabled:
+            return selection
+
+        model_version = await self._get_hybrid_model_version(session)
+        if model_version is None:
+            return selection
+
+        ranked_by_model: list[tuple[float, float, dict, dict, dict]] = []
+        for candidate in candidates_sorted:
+            candidate_ref = await self._find_candidate_reference(session, now_et, candidate)
+            candidate_id = candidate_ref.get("candidate_id")
+            if candidate_id is None:
+                continue
+            pred = await self._get_candidate_prediction(
+                session,
+                candidate_id=int(candidate_id),
+                model_version_id=int(model_version["model_version_id"]),
+            )
+            if pred is None:
+                continue
+
+            prob = pred.get("probability_win")
+            ev = pred.get("expected_value")
+            if prob is None or ev is None:
+                continue
+            if float(prob) < settings.decision_hybrid_min_probability:
+                continue
+            if float(ev) < settings.decision_hybrid_min_expected_pnl:
+                continue
+            ranked_by_model.append((float(pred["score_raw"]), float(candidate["score"]), candidate, candidate_ref, pred))
+
+        if not ranked_by_model:
+            return selection
+
+        ranked_by_model.sort(key=lambda item: (-item[0], -item[1]))
+        _, _, chosen_model, chosen_ref, chosen_pred = ranked_by_model[0]
+        return {
+            "chosen": chosen_model,
+            "candidate_ref": chosen_ref,
+            "decision_source": "hybrid_model",
+            "model_prediction": {
+                **chosen_pred,
+                "model_version_id": int(model_version["model_version_id"]),
+                "model_name": model_version["model_name"],
+                "model_version": model_version["version"],
+            },
+        }
+
     async def _insert_decision(
         self,
         *,
@@ -421,6 +564,10 @@ class DecisionJob:
         strategy_params_json: dict | None = None,
         candidate_id: int | None = None,
         feature_snapshot_id: int | None = None,
+        model_score: float | None = None,
+        expected_value: float | None = None,
+        prediction_id: int | None = None,
+        model_version_id: int | None = None,
         decision_source: str = "rules",
     ) -> int:
         """Persist a decision row to trade_decisions."""
@@ -430,12 +577,14 @@ class DecisionJob:
                 INSERT INTO trade_decisions (
                   ts, target_dte, entry_slot, delta_target,
                   chosen_legs_json, strategy_params_json, ruleset_version,
-                  score, decision, reason, chain_snapshot_id, feature_snapshot_id, candidate_id, decision_source
+                  score, model_score, expected_value,
+                  decision, reason, chain_snapshot_id, feature_snapshot_id, candidate_id, prediction_id, model_version_id, decision_source
                 )
                 VALUES (
                   :ts, :target_dte, :entry_slot, :delta_target,
                   CAST(:chosen_legs_json AS jsonb), CAST(:strategy_params_json AS jsonb), :ruleset_version,
-                  :score, :decision, :reason, :chain_snapshot_id, :feature_snapshot_id, :candidate_id, :decision_source
+                  :score, :model_score, :expected_value,
+                  :decision, :reason, :chain_snapshot_id, :feature_snapshot_id, :candidate_id, :prediction_id, :model_version_id, :decision_source
                 )
                 RETURNING decision_id
                 """
@@ -449,11 +598,15 @@ class DecisionJob:
                 "strategy_params_json": None if strategy_params_json is None else json_dumps(strategy_params_json),
                 "ruleset_version": settings.decision_ruleset_version,
                 "score": score,
+                "model_score": model_score,
+                "expected_value": expected_value,
                 "decision": decision,
                 "reason": reason,
                 "chain_snapshot_id": chain_snapshot_id,
                 "feature_snapshot_id": feature_snapshot_id,
                 "candidate_id": candidate_id,
+                "prediction_id": prediction_id,
+                "model_version_id": model_version_id,
                 "decision_source": decision_source,
             },
         )
@@ -504,6 +657,7 @@ class DecisionJob:
         now_et: datetime,
         chosen: dict,
         candidate_ref: dict,
+        model_version_id: int | None = None,
     ) -> int:
         """Insert one OPEN trade and its legs from the chosen decision candidate."""
         chosen_legs = chosen.get("chosen_legs_json") or {}
@@ -539,14 +693,14 @@ class DecisionJob:
                 """
                 INSERT INTO trades (
                   decision_id, candidate_id, feature_snapshot_id, entry_snapshot_id,
-                  trade_source, strategy_type, status, underlying, entry_time,
+                  trade_source, strategy_type, status, underlying, model_version_id, entry_time,
                   target_dte, expiration, contracts, contract_multiplier, spread_width_points,
                   entry_credit, max_profit, max_loss, take_profit_target, stop_loss_target,
                   current_exit_cost, current_pnl, realized_pnl
                 )
                 VALUES (
                   :decision_id, :candidate_id, :feature_snapshot_id, :entry_snapshot_id,
-                  :trade_source, :strategy_type, :status, :underlying, :entry_time,
+                  :trade_source, :strategy_type, :status, :underlying, :model_version_id, :entry_time,
                   :target_dte, :expiration, :contracts, :contract_multiplier, :spread_width_points,
                   :entry_credit, :max_profit, :max_loss, :take_profit_target, :stop_loss_target,
                   :current_exit_cost, :current_pnl, :realized_pnl
@@ -563,6 +717,7 @@ class DecisionJob:
                 "strategy_type": f"credit_vertical_{spread_side}",
                 "status": "OPEN",
                 "underlying": settings.snapshot_underlying,
+                "model_version_id": model_version_id,
                 "entry_time": now_utc,
                 "target_dte": chosen.get("target_dte"),
                 "expiration": expiration,

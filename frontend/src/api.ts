@@ -1,5 +1,11 @@
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
 
+/**
+ * Build an API URL relative to the configured frontend base URL.
+ *
+ * This keeps local/dev and deployed environments aligned without changing
+ * call sites throughout the dashboard code.
+ */
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
 }
@@ -13,6 +19,9 @@ export type ChainSnapshot = {
   checksum: string;
 };
 
+/**
+ * Fetch recent chain snapshot metadata for the dashboard table.
+ */
 export async function fetchChainSnapshots(limit = 50): Promise<ChainSnapshot[]> {
   const r = await fetch(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -32,6 +41,9 @@ export type RunSnapshotResult = {
   }>;
 };
 
+/**
+ * Trigger a manual snapshot run through the admin endpoint.
+ */
 export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult> {
   const r = await fetch(apiUrl(`/api/admin/run-snapshot`), {
     method: "POST",
@@ -48,6 +60,9 @@ export type RunQuotesResult = {
   quotes_inserted: number;
 };
 
+/**
+ * Trigger a manual quote ingestion run through the admin endpoint.
+ */
 export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
   const r = await fetch(apiUrl(`/api/admin/run-quotes`), {
     method: "POST",
@@ -65,6 +80,9 @@ export type RunDecisionResult = {
   chosen?: Record<string, unknown>;
 };
 
+/**
+ * Trigger the decision engine immediately through the admin endpoint.
+ */
 export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
   const r = await fetch(apiUrl(`/api/admin/run-decision`), {
     method: "POST",
@@ -83,6 +101,9 @@ export type RunTradePnlResult = {
   marks_written?: number;
 };
 
+/**
+ * Trigger live trade mark-to-market updates immediately.
+ */
 export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult> {
   const r = await fetch(apiUrl(`/api/admin/run-trade-pnl`), {
     method: "POST",
@@ -117,6 +138,9 @@ export type GexExpirationItem = {
   dte_days: number | null;
 };
 
+/**
+ * Fetch recent GEX snapshot aggregates for the panel selector.
+ */
 export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
   const r = await fetch(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -124,6 +148,9 @@ export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
   return data.items;
 }
 
+/**
+ * Fetch available DTE filters for the selected GEX batch.
+ */
 export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
   const r = await fetch(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -131,6 +158,9 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
   return data.dte_days;
 }
 
+/**
+ * Fetch available expirations for the selected GEX batch.
+ */
 export async function fetchGexExpirations(snapshotId: number): Promise<GexExpirationItem[]> {
   const r = await fetch(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -138,6 +168,14 @@ export async function fetchGexExpirations(snapshotId: number): Promise<GexExpira
   return data.items;
 }
 
+/**
+ * Fetch the GEX curve by strike.
+ *
+ * The query supports:
+ * - all expirations in the batch,
+ * - one DTE filter, or
+ * - a custom expiration set.
+ */
 export async function fetchGexCurve(snapshotId: number, dteDays?: number, expirations?: string[]): Promise<GexCurvePoint[]> {
   const params = new URLSearchParams({ snapshot_id: String(snapshotId) });
   if (typeof dteDays === "number") params.set("dte_days", String(dteDays));
@@ -164,6 +202,9 @@ export type TradeDecision = {
   strategy_params_json: Record<string, unknown> | null;
 };
 
+/**
+ * Fetch recent trade decisions for the decision table.
+ */
 export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
   const r = await fetch(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -213,6 +254,9 @@ export type TradeRow = {
   legs: TradeLeg[];
 };
 
+/**
+ * Fetch trades with optional status filter for the live PnL table.
+ */
 export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROLLED"): Promise<TradeRow[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (status) params.set("status", status);
@@ -248,12 +292,122 @@ export type LabelMetricsResponse = {
   by_side: LabelMetricsBySide[];
 };
 
+/**
+ * Fetch TP50/TP100 label metrics for the selected lookback window.
+ */
 export async function fetchLabelMetrics(lookbackDays = 90): Promise<LabelMetricsResponse> {
   const r = await fetch(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as LabelMetricsResponse;
 }
 
+export type StrategyMetricsSummary = {
+  resolved: number;
+  tp50: number;
+  tp100_at_expiry: number;
+  tp50_rate: number | null;
+  tp100_at_expiry_rate: number | null;
+  expectancy: number | null;
+  avg_realized_pnl: number | null;
+  max_drawdown: number | null;
+  tail_loss_proxy: number | null;
+  avg_margin_usage: number | null;
+};
+
+export type StrategyMetricsBySide = {
+  spread_side: string;
+  resolved: number;
+  tp50: number;
+  tp100_at_expiry: number;
+  tp50_rate: number | null;
+  tp100_at_expiry_rate: number | null;
+  expectancy: number | null;
+  avg_realized_pnl: number | null;
+  max_drawdown: number | null;
+  tail_loss_proxy: number | null;
+  avg_margin_usage: number | null;
+};
+
+export type StrategyMetricsResponse = {
+  lookback_days: number;
+  window_start_utc: string;
+  summary: StrategyMetricsSummary;
+  by_side: StrategyMetricsBySide[];
+};
+
+/**
+ * Fetch strategy quality/risk metrics (expectancy, drawdown, tail proxy, margin).
+ */
+export async function fetchStrategyMetrics(lookbackDays = 90): Promise<StrategyMetricsResponse> {
+  const r = await fetch(apiUrl(`/api/strategy-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as StrategyMetricsResponse;
+}
+
+export type ModelOpsGate = {
+  passed: boolean;
+  checks: Record<string, { value: number; threshold: number; pass: boolean }>;
+  summary?: Record<string, number>;
+};
+
+export type ModelOpsModelVersion = {
+  model_version_id: number;
+  version: string;
+  rollout_status: string;
+  is_active: boolean;
+  created_at_utc: string | null;
+  promoted_at_utc: string | null;
+  metrics?: {
+    tp50_rate_test?: number | null;
+    expectancy_test?: number | null;
+    max_drawdown_test?: number | null;
+    tail_loss_proxy_test?: number | null;
+    avg_margin_usage_test?: number | null;
+  };
+};
+
+export type ModelOpsTrainingRun = {
+  training_run_id: number;
+  model_version_id: number;
+  status: string;
+  started_at_utc: string | null;
+  finished_at_utc: string | null;
+  rows_train: number;
+  rows_test: number;
+  notes: string | null;
+  gate: ModelOpsGate | null;
+};
+
+export type ModelOpsResponse = {
+  model_name: string;
+  counts: {
+    model_versions: number;
+    training_runs: number;
+    model_predictions: number;
+    model_predictions_24h: number;
+  };
+  latest_prediction_ts: string | null;
+  latest_model_version: ModelOpsModelVersion | null;
+  active_model_version: ModelOpsModelVersion | null;
+  latest_training_run: ModelOpsTrainingRun | null;
+  warnings: string[];
+};
+
+/**
+ * Fetch model-ops status for monitoring training/gates/prediction activity.
+ */
+export async function fetchModelOps(modelName?: string): Promise<ModelOpsResponse> {
+  const params = new URLSearchParams();
+  if (modelName && modelName.trim()) params.set("model_name", modelName.trim());
+  const query = params.toString();
+  const r = await fetch(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as ModelOpsResponse;
+}
+
+/**
+ * Delete one persisted trade decision by ID.
+ */
 export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
   const r = await fetch(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
     method: "DELETE",

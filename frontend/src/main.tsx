@@ -4,6 +4,7 @@ import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { DashboardApp } from "./DashboardApp";
 
+// Mount the React dashboard into the Vite root element.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <MantineProvider defaultColorScheme="light">

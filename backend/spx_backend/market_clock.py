@@ -14,6 +14,7 @@ from spx_backend.ingestion.tradier_client import TradierClient
 
 
 def is_rth(now_et: datetime) -> bool:
+    """Return True when timestamp falls inside regular US equity trading hours."""
     # MVP: Monday-Friday 09:30-16:00 ET.
     if now_et.weekday() >= 5:
         return False
@@ -30,6 +31,7 @@ class MarketClockCache:
     _cached_state: str | None = None
 
     async def _record(self, now_et: datetime, state: str | None, is_open: bool | None, raw: dict | None, error: str | None) -> None:
+        """Persist one market-clock audit row for observability and troubleshooting."""
         try:
             async with SessionLocal() as session:
                 await session.execute(
@@ -53,6 +55,7 @@ class MarketClockCache:
             logger.warning("market_clock: failed to record audit row")
 
     async def is_open(self, now_et: datetime) -> bool:
+        """Return exchange open/closed status with TTL cache and fallback behavior."""
         if self._cached_at and self._cached_open is not None:
             if (now_et - self._cached_at).total_seconds() < self.ttl_seconds:
                 return self._cached_open

@@ -11,6 +11,12 @@ type AdminControlsCardProps = {
   onRunTradePnl: () => void;
 };
 
+/**
+ * Render manual admin controls for jobs and optional API key input.
+ *
+ * Buttons map directly to backend admin endpoints so operators can trigger
+ * jobs on demand while troubleshooting or validating pipeline state.
+ */
 export function AdminControlsCard({
   adminKey,
   onAdminKeyChange,

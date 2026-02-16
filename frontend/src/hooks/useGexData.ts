@@ -27,6 +27,12 @@ type UseGexDataResult = {
   gexLoading: boolean;
 };
 
+/**
+ * Manage all GEX panel state: snapshots, DTE filters, custom expirations, curve.
+ *
+ * This hook coordinates dependent API calls so the chart always reflects the
+ * currently selected snapshot and expiration filtering mode.
+ */
 export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   const [gexSnapshots, setGexSnapshots] = React.useState<GexSnapshot[]>([]);
   const [selectedGexSnapshot, setSelectedGexSnapshot] = React.useState<GexSnapshot | null>(null);
@@ -37,6 +43,9 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   const [gexCurve, setGexCurve] = React.useState<GexCurvePoint[]>([]);
   const [gexLoading, setGexLoading] = React.useState<boolean>(false);
 
+  /**
+   * Load recent GEX snapshots once on mount and default-select the latest row.
+   */
   React.useEffect(() => {
     let cancelled = false;
     setGexLoading(true);
@@ -59,6 +68,9 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     };
   }, [onError]);
 
+  /**
+   * Load DTE and expiration options whenever selected snapshot changes.
+   */
   React.useEffect(() => {
     if (!selectedGexSnapshot) return;
     let cancelled = false;
@@ -83,6 +95,9 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     };
   }, [onError, selectedGexSnapshot]);
 
+  /**
+   * Load the curve points for current selection mode (all, one DTE, custom dates).
+   */
   React.useEffect(() => {
     if (!selectedGexSnapshot) return;
     let cancelled = false;
@@ -115,6 +130,9 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     };
   }, [onError, selectedCustomExpirations, selectedDte, selectedGexSnapshot]);
 
+  /**
+   * Update DTE mode and clear stale custom selections when leaving custom mode.
+   */
   const handleSelectedDteChange = React.useCallback((value: string) => {
     setSelectedDte(value);
     if (value !== "custom") {

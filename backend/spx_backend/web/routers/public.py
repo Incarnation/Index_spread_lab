@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,7 +9,9 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from spx_backend.config import settings
 from spx_backend.database import get_db_session
+from spx_backend.jobs.modeling import compute_margin_usage_dollars, summarize_strategy_quality
 
 router = APIRouter()
 
@@ -252,6 +255,7 @@ async def get_label_metrics(lookback_days: int = 90, db: AsyncSession = Depends(
     ).fetchall()
 
     def _rate(numerator: int, denominator: int) -> float | None:
+        """Safely compute a ratio, returning None when denominator is zero."""
         if denominator <= 0:
             return None
         return numerator / denominator
@@ -290,6 +294,273 @@ async def get_label_metrics(lookback_days: int = 90, db: AsyncSession = Depends(
             "avg_realized_pnl": total_avg_pnl,
         },
         "by_side": by_side,
+    }
+
+
+@router.get("/api/strategy-metrics")
+async def get_strategy_metrics(lookback_days: int = 90, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return v2 strategy-quality and risk metrics overall + by side."""
+    if lookback_days <= 0 or lookback_days > 3650:
+        raise HTTPException(status_code=400, detail="invalid_lookback_days")
+
+    window_start = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=lookback_days)
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  ts,
+                  realized_pnl,
+                  COALESCE(hit_tp50_before_sl_or_expiry, false) AS hit_tp50,
+                  COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) AS hit_tp100,
+                  COALESCE(candidate_json->>'spread_side', 'unknown') AS spread_side,
+                  max_loss,
+                  COALESCE((candidate_json->>'contracts')::int, 1) AS contracts
+                FROM trade_candidates
+                WHERE label_status = 'resolved'
+                  AND ts >= :window_start
+                  AND realized_pnl IS NOT NULL
+                ORDER BY ts ASC
+                """
+            ),
+            {"window_start": window_start},
+        )
+    ).fetchall()
+
+    realized_pnls: list[float] = []
+    margins: list[float] = []
+    tp50_count = 0
+    tp100_count = 0
+    by_side_data: dict[str, dict[str, object]] = {}
+
+    for row in rows:
+        pnl = float(row.realized_pnl)
+        contracts = int(row.contracts or 1)
+        max_loss_points = float(row.max_loss) if row.max_loss is not None else None
+        margin_usage = compute_margin_usage_dollars(
+            max_loss_points=max_loss_points,
+            contracts=contracts,
+            contract_multiplier=settings.label_contract_multiplier,
+        )
+        realized_pnls.append(pnl)
+        margins.append(margin_usage)
+        if bool(row.hit_tp50):
+            tp50_count += 1
+        if bool(row.hit_tp100):
+            tp100_count += 1
+
+        spread_side = str(row.spread_side or "unknown")
+        bucket = by_side_data.setdefault(spread_side, {"pnls": [], "margins": [], "tp50": 0, "tp100": 0})
+        cast_pnls = bucket["pnls"]
+        cast_margins = bucket["margins"]
+        if isinstance(cast_pnls, list):
+            cast_pnls.append(pnl)
+        if isinstance(cast_margins, list):
+            cast_margins.append(margin_usage)
+        if bool(row.hit_tp50):
+            bucket["tp50"] = int(bucket["tp50"]) + 1
+        if bool(row.hit_tp100):
+            bucket["tp100"] = int(bucket["tp100"]) + 1
+
+    summary = summarize_strategy_quality(
+        realized_pnls=realized_pnls,
+        margin_usages=margins,
+        hit_tp50_count=tp50_count,
+        hit_tp100_count=tp100_count,
+    )
+    by_side = []
+    for spread_side in sorted(by_side_data.keys()):
+        payload = by_side_data[spread_side]
+        side_summary = summarize_strategy_quality(
+            realized_pnls=list(payload["pnls"]) if isinstance(payload["pnls"], list) else [],
+            margin_usages=list(payload["margins"]) if isinstance(payload["margins"], list) else [],
+            hit_tp50_count=int(payload["tp50"]),
+            hit_tp100_count=int(payload["tp100"]),
+        )
+        by_side.append({"spread_side": spread_side, **side_summary})
+
+    return {
+        "lookback_days": lookback_days,
+        "window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
+        "summary": summary,
+        "by_side": by_side,
+    }
+
+
+@router.get("/api/model-ops")
+async def get_model_ops(model_name: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Return latest model/training/gate status for dashboard monitoring."""
+    selected_model_name = model_name.strip() if isinstance(model_name, str) and model_name.strip() else settings.trainer_model_name
+
+    counts_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM model_versions WHERE model_name = :model_name) AS model_versions_count,
+                  (SELECT COUNT(*) FROM training_runs tr
+                    JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
+                    WHERE mv.model_name = :model_name) AS training_runs_count,
+                  (SELECT COUNT(*) FROM model_predictions mp
+                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+                    WHERE mv.model_name = :model_name) AS model_predictions_count,
+                  (SELECT COUNT(*) FROM model_predictions mp
+                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+                    WHERE mv.model_name = :model_name AND mp.created_at >= :since_24h) AS model_predictions_24h_count,
+                  (SELECT MAX(created_at) FROM model_predictions mp
+                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+                    WHERE mv.model_name = :model_name) AS latest_prediction_ts
+                """
+            ),
+            {"model_name": selected_model_name, "since_24h": datetime.now(tz=ZoneInfo("UTC")) - timedelta(hours=24)},
+        )
+    ).fetchone()
+
+    latest_model_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  model_version_id,
+                  version,
+                  rollout_status,
+                  is_active,
+                  created_at,
+                  promoted_at,
+                  metrics_json
+                FROM model_versions
+                WHERE model_name = :model_name
+                ORDER BY created_at DESC, model_version_id DESC
+                LIMIT 1
+                """
+            ),
+            {"model_name": selected_model_name},
+        )
+    ).fetchone()
+
+    latest_training_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  tr.training_run_id,
+                  tr.model_version_id,
+                  tr.status,
+                  tr.started_at,
+                  tr.finished_at,
+                  tr.rows_train,
+                  tr.rows_test,
+                  tr.notes,
+                  tr.metrics_json
+                FROM training_runs tr
+                JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
+                WHERE mv.model_name = :model_name
+                ORDER BY tr.finished_at DESC NULLS LAST, tr.training_run_id DESC
+                LIMIT 1
+                """
+            ),
+            {"model_name": selected_model_name},
+        )
+    ).fetchone()
+
+    active_model_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  model_version_id,
+                  version,
+                  rollout_status,
+                  is_active,
+                  created_at,
+                  promoted_at
+                FROM model_versions
+                WHERE model_name = :model_name
+                  AND is_active = true
+                ORDER BY promoted_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"model_name": selected_model_name},
+        )
+    ).fetchone()
+
+    def _iso(ts: Any) -> str | None:
+        """Convert nullable timestamps into ISO strings for API responses."""
+        return ts.isoformat() if ts is not None else None
+
+    model_metrics = latest_model_row.metrics_json if (latest_model_row is not None and isinstance(latest_model_row.metrics_json, dict)) else {}
+    model_metrics_summary = {
+        "tp50_rate_test": model_metrics.get("tp50_rate_test"),
+        "expectancy_test": model_metrics.get("expectancy_test"),
+        "max_drawdown_test": model_metrics.get("max_drawdown_test"),
+        "tail_loss_proxy_test": model_metrics.get("tail_loss_proxy_test"),
+        "avg_margin_usage_test": model_metrics.get("avg_margin_usage_test"),
+    }
+
+    training_metrics = (
+        latest_training_row.metrics_json if (latest_training_row is not None and isinstance(latest_training_row.metrics_json, dict)) else {}
+    )
+    gate = training_metrics.get("gate") if isinstance(training_metrics.get("gate"), dict) else None
+    warnings: list[str] = []
+    if counts_row is not None:
+        if int(counts_row.model_versions_count or 0) == 0:
+            warnings.append("no_model_versions")
+        if int(counts_row.training_runs_count or 0) == 0:
+            warnings.append("no_training_runs")
+        if int(counts_row.model_predictions_count or 0) == 0:
+            warnings.append("no_model_predictions")
+
+    return {
+        "model_name": selected_model_name,
+        "counts": {
+            "model_versions": int(counts_row.model_versions_count or 0) if counts_row is not None else 0,
+            "training_runs": int(counts_row.training_runs_count or 0) if counts_row is not None else 0,
+            "model_predictions": int(counts_row.model_predictions_count or 0) if counts_row is not None else 0,
+            "model_predictions_24h": int(counts_row.model_predictions_24h_count or 0) if counts_row is not None else 0,
+        },
+        "latest_prediction_ts": (_iso(counts_row.latest_prediction_ts) if counts_row is not None else None),
+        "latest_model_version": (
+            None
+            if latest_model_row is None
+            else {
+                "model_version_id": int(latest_model_row.model_version_id),
+                "version": str(latest_model_row.version),
+                "rollout_status": str(latest_model_row.rollout_status),
+                "is_active": bool(latest_model_row.is_active),
+                "created_at_utc": _iso(latest_model_row.created_at),
+                "promoted_at_utc": _iso(latest_model_row.promoted_at),
+                "metrics": model_metrics_summary,
+            }
+        ),
+        "active_model_version": (
+            None
+            if active_model_row is None
+            else {
+                "model_version_id": int(active_model_row.model_version_id),
+                "version": str(active_model_row.version),
+                "rollout_status": str(active_model_row.rollout_status),
+                "is_active": bool(active_model_row.is_active),
+                "created_at_utc": _iso(active_model_row.created_at),
+                "promoted_at_utc": _iso(active_model_row.promoted_at),
+            }
+        ),
+        "latest_training_run": (
+            None
+            if latest_training_row is None
+            else {
+                "training_run_id": int(latest_training_row.training_run_id),
+                "model_version_id": int(latest_training_row.model_version_id),
+                "status": str(latest_training_row.status),
+                "started_at_utc": _iso(latest_training_row.started_at),
+                "finished_at_utc": _iso(latest_training_row.finished_at),
+                "rows_train": int(latest_training_row.rows_train or 0),
+                "rows_test": int(latest_training_row.rows_test or 0),
+                "notes": latest_training_row.notes,
+                "gate": gate,
+            }
+        ),
+        "warnings": warnings,
     }
 
 

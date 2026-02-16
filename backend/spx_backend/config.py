@@ -72,6 +72,49 @@ class Settings(BaseSettings):
     label_schema_version: str = "label_v1"
     label_contract_multiplier: int = 100
 
+    # Weekly trainer (step 3)
+    trainer_enabled: bool = True
+    trainer_weekday: str = "sat"  # mon..sun accepted by APScheduler cron.
+    trainer_hour: int = 9
+    trainer_minute: int = 0
+    trainer_model_name: str = "cand_bucket_v1"
+    trainer_lookback_days: int = 365
+    trainer_test_days: int = 28
+    trainer_min_rows: int = 200
+    trainer_min_train_rows: int = 100
+    trainer_min_test_rows: int = 50
+    trainer_min_bucket_size: int = 12
+    trainer_prior_strength: float = 8.0
+    trainer_utility_prob_weight: float = 0.35
+    trainer_utility_tail_penalty: float = 0.20
+    trainer_utility_margin_penalty: float = 0.02
+
+    # Shadow inference (step 4)
+    shadow_inference_enabled: bool = True
+    shadow_inference_interval_minutes: int = 15
+    shadow_inference_batch_limit: int = 500
+    shadow_inference_lookback_minutes: int = 1440
+    shadow_inference_model_name: str = "cand_bucket_v1"
+
+    # Promotion gate evaluator (step 5)
+    promotion_gate_enabled: bool = True
+    promotion_gate_interval_minutes: int = 60
+    promotion_gate_model_name: str = "cand_bucket_v1"
+    promotion_gate_min_resolved: int = 100
+    promotion_gate_min_tp50_rate: float = 0.50
+    promotion_gate_min_expectancy: float = 0.0
+    promotion_gate_max_drawdown: float = 15000.0
+    promotion_gate_min_tail_loss_proxy: float = -5000.0
+    promotion_gate_max_avg_margin_usage: float = 5000.0
+    promotion_gate_auto_activate: bool = False
+
+    # Hybrid execution policy (step 6)
+    decision_hybrid_enabled: bool = False
+    decision_hybrid_model_name: str = "cand_bucket_v1"
+    decision_hybrid_min_probability: float = 0.50
+    decision_hybrid_min_expected_pnl: float = 0.0
+    decision_hybrid_require_active_model: bool = True
+
     # Live trade PnL mark-to-market job
     trade_pnl_enabled: bool = True
     trade_pnl_interval_minutes: int = 5
@@ -90,18 +133,22 @@ class Settings(BaseSettings):
     market_clock_cache_seconds: int = 300
 
     def dte_targets_list(self) -> list[int]:
+        """Parse snapshot DTE targets from comma-separated env configuration."""
         parts = [p.strip() for p in self.snapshot_dte_targets.split(",") if p.strip()]
         return [int(p) for p in parts]
 
     def quote_symbols_list(self) -> list[str]:
+        """Parse quote symbol list from comma-separated env configuration."""
         parts = [p.strip() for p in self.quote_symbols.split(",") if p.strip()]
         return parts
 
     def cors_origins_list(self) -> list[str]:
+        """Parse CORS origins into a normalized list for FastAPI middleware."""
         parts = [p.strip() for p in self.cors_origins.split(",") if p.strip()]
         return parts
 
     def decision_entry_times_list(self) -> list[tuple[int, int]]:
+        """Parse decision cron times (HH:MM) into hour/minute tuples."""
         out: list[tuple[int, int]] = []
         for part in self.decision_entry_times.split(","):
             p = part.strip()
@@ -115,10 +162,12 @@ class Settings(BaseSettings):
         return out
 
     def decision_dte_targets_list(self) -> list[int]:
+        """Parse decision DTE targets from comma-separated env configuration."""
         parts = [p.strip() for p in self.decision_dte_targets.split(",") if p.strip()]
         return [int(p) for p in parts]
 
     def decision_delta_targets_list(self) -> list[float]:
+        """Parse decision delta targets from comma-separated env configuration."""
         parts = [p.strip() for p in self.decision_delta_targets.split(",") if p.strip()]
         return [float(p) for p in parts]
 

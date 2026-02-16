@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Database package exports for engine/session/schema helpers."""
+
 from spx_backend.database.connection import SessionLocal, create_engine, engine, get_db_session
 from spx_backend.database.schema import init_db, reset_all_tables, reset_ml_tables
 

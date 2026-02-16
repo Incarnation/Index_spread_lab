@@ -5,13 +5,21 @@ import {
   ChainSnapshotsPanel,
   GexPanel,
   LabelMetricsPanel,
+  ModelOpsPanel,
   RunResultCard,
+  StrategyQualityPanel,
   TradeDecisionDetailsDrawer,
   TradeDecisionsPanel,
   TradesLivePnlPanel,
 } from "./components";
 import { useAdminRuns, useDecisionDeletion, useGexData, useSnapshotsDecisions } from "./hooks";
 
+/**
+ * Render the main SPX dashboard page and wire cross-panel interactions.
+ *
+ * This container composes all major cards/panels and coordinates shared
+ * concerns such as global error display, drawer state, and manual admin runs.
+ */
 export function DashboardApp() {
   const [error, setError] = React.useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
@@ -19,10 +27,12 @@ export function DashboardApp() {
     decision_id: number;
   } | null>(null);
 
+  /** Clear the top-level error banner after successful actions. */
   const clearError = React.useCallback(() => {
     setError(null);
   }, []);
 
+  /** Capture an error message from hooks/actions and show it in the UI. */
   const handleError = React.useCallback((message: string) => {
     setError(message);
   }, []);
@@ -32,10 +42,14 @@ export function DashboardApp() {
     decisions,
     trades,
     labelMetrics,
+    modelOps,
+    strategyMetrics,
     loading,
     decisionsLoading,
     tradesLoading,
     labelMetricsLoading,
+    modelOpsLoading,
+    strategyMetricsLoading,
     refresh,
   } = useSnapshotsDecisions({ onError: handleError });
 
@@ -82,6 +96,7 @@ export function DashboardApp() {
     onClearError: clearError,
   });
 
+  /** Refresh all dashboard datasets while clearing stale error text. */
   const handleRefresh = React.useCallback(() => {
     clearError();
     refresh();
@@ -172,6 +187,8 @@ export function DashboardApp() {
         />
 
         <LabelMetricsPanel metrics={labelMetrics} loading={labelMetricsLoading} error={error} />
+        <ModelOpsPanel ops={modelOps} loading={modelOpsLoading} error={error} />
+        <StrategyQualityPanel metrics={strategyMetrics} loading={strategyMetricsLoading} error={error} />
 
         <TradesLivePnlPanel trades={trades} loading={tradesLoading} error={error} />
 
