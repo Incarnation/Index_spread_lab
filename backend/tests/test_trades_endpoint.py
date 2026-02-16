@@ -109,3 +109,18 @@ async def test_list_trades_shapes_response() -> None:
     assert result["items"][0]["trade_id"] == 101
     assert result["items"][0]["mark_count"] == 2
     assert result["items"][0]["legs"][0]["option_symbol"] == "SPXW260204P05700000"
+
+
+@pytest.mark.asyncio
+async def test_list_trades_without_status_omits_status_bind_param() -> None:
+    session = _FakeSession(row_batches=[[]])
+
+    result = await list_trades(limit=100, status=None, db=session)
+
+    assert result == {"items": []}
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "FROM trades t" in sql
+    assert ":status" not in sql
+    assert "status" not in params
+    assert params["limit"] == 100

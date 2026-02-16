@@ -225,9 +225,15 @@ async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSess
     if normalized_status not in {None, "OPEN", "CLOSED", "ROLLED"}:
         raise HTTPException(status_code=400, detail="invalid_status")
 
+    status_where_clause = ""
+    query_params: dict[str, object] = {"limit": limit}
+    if normalized_status is not None:
+        status_where_clause = "WHERE t.status = :status"
+        query_params["status"] = normalized_status
+
     r = await db.execute(
         text(
-            """
+            f"""
             SELECT
               t.trade_id,
               t.decision_id,
@@ -281,12 +287,12 @@ async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSess
                 '[]'::jsonb
               ) AS legs_json
             FROM trades t
-            WHERE (:status IS NULL OR t.status = :status)
+            {status_where_clause}
             ORDER BY t.entry_time DESC, t.trade_id DESC
             LIMIT :limit
             """
         ),
-        {"status": normalized_status, "limit": limit},
+        query_params,
     )
     rows = r.fetchall()
     return {
