@@ -4,7 +4,8 @@ from spx_backend.backtest.engine import BacktestConfig, BacktestEngine
 
 
 def main() -> None:
-    # Update these paths to match your local Databento downloads.
+    # Update these paths to match your local Databento Parquet downloads.
+    # Optional CSV examples live under `spx_backend/backtest/data/samples/`.
     cfg = BacktestConfig(
         cbbo_parquet_glob="data/cbbo_1m/*.parquet",
         definitions_parquet_glob="data/definitions/*.parquet",

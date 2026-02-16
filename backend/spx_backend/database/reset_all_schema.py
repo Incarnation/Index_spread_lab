@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from spx_backend.db_init import reset_all_tables
+from spx_backend.database.schema import reset_all_tables
 
 
 def main() -> None:
@@ -12,3 +12,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

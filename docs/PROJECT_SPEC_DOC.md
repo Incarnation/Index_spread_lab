@@ -282,7 +282,7 @@ This is specifically to make end-to-end testing possible outside market hours (w
 
 ## Database schema (Postgres)
 
-The backend runs `backend/spx_backend/db_schema.sql` at startup and creates tables if missing.
+The backend runs `backend/spx_backend/database/sql/db_schema.sql` at startup and creates tables if missing.
 
 ### `option_instruments`
 Stores normalized option metadata when/if we start persisting instrument definitions separately.

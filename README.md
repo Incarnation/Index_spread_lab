@@ -87,11 +87,13 @@ Why 3DTE is 2026-02-18:
 - `backend/`
   - `spx_backend/config.py`: env-backed settings.
   - `spx_backend/main.py`: app entrypoint (`PORT` aware for Railway).
-  - `spx_backend/web/app.py`: FastAPI routes + scheduler wiring.
+  - `spx_backend/web/app.py`: FastAPI app + scheduler wiring.
+  - `spx_backend/web/routers/`: public/admin route modules.
+  - `spx_backend/database/`: DB package (`connection.py`, `schema.py`, reset CLIs).
+  - `spx_backend/backtest/`: local backtest engine + sample data docs.
   - `spx_backend/jobs/`: snapshot, quote, gex, decision jobs.
   - `spx_backend/dte.py`: trading-day DTE helper logic.
-  - `spx_backend/db_schema.sql`: schema bootstrap.
-  - `spx_backend/db_init.py`: idempotent schema initialization.
+  - `spx_backend/database/sql/db_schema.sql`: schema bootstrap.
   - `requirements.txt`: runtime dependencies.
   - `requirements-dev.txt`: test dependencies.
   - `tests/`: backend automated tests.
@@ -241,14 +243,14 @@ Destructive ML reset command (keeps ingestion tables):
 
 ```bash
 cd backend
-python -m spx_backend.reset_ml_schema
+python -m spx_backend.database.reset_ml_schema
 ```
 
 Destructive full reset command (drops all app tables):
 
 ```bash
 cd backend
-python -m spx_backend.reset_all_schema
+python -m spx_backend.database.reset_all_schema
 ```
 
 ---

@@ -32,7 +32,7 @@ And exposes APIs for:
 
 Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
-2) Initialize database schema from `spx_backend/db_schema.sql`.
+2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
 3) Build Tradier client + market clock cache.
 4) Start APScheduler jobs for quote/snapshot/gex/decision/feature-builder/labeler/trade-pnl.
 5) Optionally run immediate first cycles to warm data.
@@ -49,7 +49,15 @@ Entrypoint:
 ## 3) Core Modules
 
 - `spx_backend/web/app.py`
-  - FastAPI app, route handlers, scheduler wiring, auth guard.
+  - FastAPI app and scheduler wiring.
+- `spx_backend/web/routers/`
+  - `public.py`: public dashboard/data endpoints.
+  - `admin.py`: admin run/delete/preflight endpoints.
+- `spx_backend/database/`
+  - `connection.py`: async engine/session dependency.
+  - `schema.py`: schema init/reset helpers.
+  - `sql/`: schema and reset SQL files.
+  - `reset_ml_schema.py`, `reset_all_schema.py`: DB reset CLIs.
 - `spx_backend/jobs/snapshot_job.py`
   - Pulls expirations/chains, applies DTE policy, stores snapshots + rows.
 - `spx_backend/jobs/quote_job.py`
@@ -60,9 +68,11 @@ Entrypoint:
   - Builds/scoring candidate spreads and writes TRADE/SKIP rows.
 - `spx_backend/market_clock.py`
   - Tradier clock cache with DB audit rows and fallback behavior.
+- `spx_backend/backtest/`
+  - Local backtest engine code (`engine.py`, `run_backtest.py`) and `data/samples/`.
 - `spx_backend/dte.py`
   - Trading-session DTE lookup and expiration chooser helpers.
-- `spx_backend/db_schema.sql`
+- `spx_backend/database/sql/db_schema.sql`
   - Complete schema bootstrap for ingestion, decision, ML scaffolding.
 
 ---
@@ -301,7 +311,7 @@ High-impact settings:
 ## 8) Database Schema Guide
 
 Schema file:
-- `spx_backend/db_schema.sql`
+- `spx_backend/database/sql/db_schema.sql`
 
 Logical groups:
 
@@ -339,13 +349,13 @@ Initialization behavior:
 - ML tables now include explicit schema-version and labeling fields to support feature/candidate/prediction lineage.
 
 Destructive ML reset:
-- reset SQL: `spx_backend/db_reset_ml_tables.sql`
-- CLI: `python -m spx_backend.reset_ml_schema`
+- reset SQL: `spx_backend/database/sql/db_reset_ml_tables.sql`
+- CLI: `python -m spx_backend.database.reset_ml_schema`
 - This drops and recreates ML/decision/trade tables only (market-data ingestion tables are preserved).
 
 Destructive full reset:
-- reset SQL: `spx_backend/db_reset_all_tables.sql`
-- CLI: `python -m spx_backend.reset_all_schema`
+- reset SQL: `spx_backend/database/sql/db_reset_all_tables.sql`
+- CLI: `python -m spx_backend.database.reset_all_schema`
 - This drops and recreates all app tables, including market-data ingestion history.
 
 ---
@@ -366,14 +376,14 @@ Reset ML schema (destructive; keeps snapshots/quotes/GEX tables):
 
 ```bash
 cd backend
-python -m spx_backend.reset_ml_schema
+python -m spx_backend.database.reset_ml_schema
 ```
 
 Reset all schema (destructive; drops all app tables):
 
 ```bash
 cd backend
-python -m spx_backend.reset_all_schema
+python -m spx_backend.database.reset_all_schema
 ```
 
 Smoke test:

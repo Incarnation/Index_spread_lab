@@ -8,7 +8,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from spx_backend.config import settings
-from spx_backend.db import SessionLocal
+from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
 
 

@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from spx_backend.config import settings
+from spx_backend.database import get_db_session
+from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
+from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
+from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
+from spx_backend.jobs.gex_job import GexJob
+from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
+from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
+from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
+from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
+
+router = APIRouter()
+
+
+def _require_admin(x_api_key: str | None = Header(default=None)) -> None:
+    """Enforce admin API key if configured."""
+    # If ADMIN_API_KEY is not set, allow local/dev usage without auth.
+    if settings.admin_api_key:
+        if not x_api_key or x_api_key != settings.admin_api_key:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@router.post("/api/admin/run-snapshot")
+async def admin_run_snapshot(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a snapshot run immediately."""
+    # Force run once even outside RTH (useful for testing).
+    job: SnapshotJob = getattr(request.app.state, "snapshot_job", build_snapshot_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-quotes")
+async def admin_run_quotes(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a quote run immediately."""
+    job: QuoteJob = getattr(request.app.state, "quote_job", build_quote_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-gex")
+async def admin_run_gex(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a GEX run immediately."""
+    job: GexJob = getattr(request.app.state, "gex_job", GexJob())
+    result = await job.run_once()
+    return result
+
+
+@router.post("/api/admin/run-decision")
+async def admin_run_decision(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force a decision run immediately."""
+    job: DecisionJob = getattr(request.app.state, "decision_job", build_decision_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-feature-builder")
+async def admin_run_feature_builder(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force feature builder run immediately."""
+    job: FeatureBuilderJob = getattr(request.app.state, "feature_builder_job", build_feature_builder_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-labeler")
+async def admin_run_labeler(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force labeler run immediately."""
+    job: LabelerJob = getattr(request.app.state, "labeler_job", build_labeler_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-trade-pnl")
+async def admin_run_trade_pnl(request: Request, _: None = Depends(_require_admin)) -> dict:
+    """Force trade mark-to-market run immediately."""
+    job: TradePnlJob = getattr(request.app.state, "trade_pnl_job", build_trade_pnl_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.delete("/api/admin/trade-decisions/{decision_id}")
+async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+    """Delete one trade decision row by ID."""
+    r = await db.execute(
+        text(
+            """
+            DELETE FROM trade_decisions
+            WHERE decision_id = :decision_id
+            RETURNING decision_id
+            """
+        ),
+        {"decision_id": decision_id},
+    )
+    row = r.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="trade_decision_not_found")
+    await db.commit()
+    return {"deleted": True, "decision_id": row.decision_id}
+
+
+@router.get("/api/admin/expirations")
+async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None = Depends(_require_admin)) -> dict:
+    """List expirations from Tradier for debugging."""
+    client: TradierClient = getattr(request.app.state, "tradier", get_tradier_client())
+    resp = await client.get_option_expirations(symbol)
+    exps = _parse_expirations(resp)
+    return {"symbol": symbol, "expirations": [e.isoformat() for e in exps]}
+
+
+@router.get("/api/admin/preflight")
+async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+    """Return one-call pipeline health summary."""
+
+    def _iso(ts) -> str | None:
+        return ts.isoformat() if ts is not None else None
+
+    r = await db.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM underlying_quotes) AS quotes_count,
+              (SELECT COUNT(*) FROM chain_snapshots) AS snapshots_count,
+              (SELECT COUNT(*) FROM option_chain_rows) AS chain_rows_count,
+              (SELECT COUNT(*) FROM gex_snapshots) AS gex_snapshots_count,
+              (SELECT COUNT(*) FROM trade_decisions) AS decisions_count,
+              (SELECT COUNT(*) FROM feature_snapshots) AS feature_snapshots_count,
+              (SELECT COUNT(*) FROM trade_candidates) AS trade_candidates_count,
+              (SELECT COUNT(*) FROM trade_candidates WHERE label_status = 'resolved') AS labeled_candidates_count,
+              (SELECT COUNT(*) FROM trades) AS trades_count,
+              (SELECT COUNT(*) FROM trades WHERE status = 'OPEN') AS open_trades_count,
+              (SELECT COUNT(*) FROM trades WHERE status = 'CLOSED') AS closed_trades_count,
+              (SELECT MAX(ts) FROM underlying_quotes) AS latest_quote_ts,
+              (SELECT MAX(ts) FROM chain_snapshots) AS latest_snapshot_ts,
+              (SELECT MAX(ts) FROM gex_snapshots) AS latest_gex_ts,
+              (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
+              (SELECT MAX(ts) FROM feature_snapshots) AS latest_feature_ts,
+              (SELECT MAX(ts) FROM trade_candidates) AS latest_candidate_ts,
+              (SELECT MAX(last_mark_ts) FROM trades) AS latest_trade_mark_ts,
+              (SELECT MAX(entry_time) FROM trades) AS latest_trade_entry_ts,
+              (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
+            """
+        )
+    )
+    summary = r.fetchone()
+
+    latest_snapshot_row = (
+        await db.execute(
+            text(
+                """
+                SELECT snapshot_id, ts, target_dte, expiration
+                FROM chain_snapshots
+                ORDER BY ts DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_gex_row = (
+        await db.execute(
+            text(
+                """
+                SELECT snapshot_id, ts, gex_net, zero_gamma_level, method
+                FROM gex_snapshots
+                ORDER BY ts DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_decision_row = (
+        await db.execute(
+            text(
+                """
+                SELECT decision_id, ts, decision, reason, score, target_dte, delta_target, chain_snapshot_id, decision_source
+                FROM trade_decisions
+                ORDER BY ts DESC, decision_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+
+    latest_quotes = (
+        await db.execute(
+            text(
+                """
+                SELECT DISTINCT ON (symbol) symbol, ts, last
+                FROM underlying_quotes
+                ORDER BY symbol, ts DESC
+                """
+            )
+        )
+    ).fetchall()
+
+    counts = {
+        "underlying_quotes": int(summary.quotes_count or 0),
+        "chain_snapshots": int(summary.snapshots_count or 0),
+        "option_chain_rows": int(summary.chain_rows_count or 0),
+        "gex_snapshots": int(summary.gex_snapshots_count or 0),
+        "trade_decisions": int(summary.decisions_count or 0),
+        "feature_snapshots": int(summary.feature_snapshots_count or 0),
+        "trade_candidates": int(summary.trade_candidates_count or 0),
+        "labeled_candidates": int(summary.labeled_candidates_count or 0),
+        "trades": int(summary.trades_count or 0),
+        "open_trades": int(summary.open_trades_count or 0),
+        "closed_trades": int(summary.closed_trades_count or 0),
+    }
+    latest = {
+        "quote_ts": _iso(summary.latest_quote_ts),
+        "snapshot_ts": _iso(summary.latest_snapshot_ts),
+        "gex_ts": _iso(summary.latest_gex_ts),
+        "decision_ts": _iso(summary.latest_decision_ts),
+        "feature_ts": _iso(summary.latest_feature_ts),
+        "candidate_ts": _iso(summary.latest_candidate_ts),
+        "trade_mark_ts": _iso(summary.latest_trade_mark_ts),
+        "trade_entry_ts": _iso(summary.latest_trade_entry_ts),
+        "market_clock_ts": _iso(summary.latest_market_clock_ts),
+    }
+
+    warnings: list[str] = []
+    if counts["chain_snapshots"] == 0:
+        warnings.append("no_chain_snapshots")
+    if counts["gex_snapshots"] == 0:
+        warnings.append("no_gex_snapshots")
+    if counts["trade_decisions"] == 0:
+        warnings.append("no_trade_decisions")
+    if counts["feature_snapshots"] == 0:
+        warnings.append("no_feature_snapshots")
+    if counts["trade_candidates"] == 0:
+        warnings.append("no_trade_candidates")
+    if counts["trades"] == 0:
+        warnings.append("no_trades")
+
+    return {
+        "now_utc": f"{datetime.utcnow().isoformat()}Z",
+        "counts": counts,
+        "latest": latest,
+        "latest_snapshot": (
+            None
+            if latest_snapshot_row is None
+            else {
+                "snapshot_id": latest_snapshot_row.snapshot_id,
+                "ts": _iso(latest_snapshot_row.ts),
+                "target_dte": latest_snapshot_row.target_dte,
+                "expiration": str(latest_snapshot_row.expiration),
+            }
+        ),
+        "latest_gex": (
+            None
+            if latest_gex_row is None
+            else {
+                "snapshot_id": latest_gex_row.snapshot_id,
+                "ts": _iso(latest_gex_row.ts),
+                "gex_net": latest_gex_row.gex_net,
+                "zero_gamma_level": latest_gex_row.zero_gamma_level,
+                "method": latest_gex_row.method,
+            }
+        ),
+        "latest_decision": (
+            None
+            if latest_decision_row is None
+            else {
+                "decision_id": latest_decision_row.decision_id,
+                "ts": _iso(latest_decision_row.ts),
+                "decision": latest_decision_row.decision,
+                "reason": latest_decision_row.reason,
+                "score": latest_decision_row.score,
+                "target_dte": latest_decision_row.target_dte,
+                "delta_target": latest_decision_row.delta_target,
+                "chain_snapshot_id": latest_decision_row.chain_snapshot_id,
+                "decision_source": latest_decision_row.decision_source,
+            }
+        ),
+        "latest_quotes_by_symbol": [
+            {"symbol": row.symbol, "ts": _iso(row.ts), "last": row.last}
+            for row in latest_quotes
+        ],
+        "warnings": warnings,
+    }
+

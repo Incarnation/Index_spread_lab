@@ -6,6 +6,7 @@ from spx_backend.config import settings
 
 
 def create_engine() -> AsyncEngine:
+    """Create shared async SQLAlchemy engine."""
     return create_async_engine(
         settings.database_url,
         pool_pre_ping=True,
@@ -24,6 +25,7 @@ SessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def get_db_session() -> AsyncSession:
+    """FastAPI dependency that yields one async DB session."""
     async with SessionLocal() as session:
         yield session
 

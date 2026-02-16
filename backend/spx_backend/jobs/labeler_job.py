@@ -9,7 +9,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from spx_backend.config import settings
-from spx_backend.db import SessionLocal
+from spx_backend.database import SessionLocal
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
