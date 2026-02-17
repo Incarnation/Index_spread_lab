@@ -51,14 +51,26 @@ class RegisterBody(BaseModel):
     password: str = Field(..., min_length=PASSWORD_MIN)
 
 
+# Bcrypt truncates at 72 bytes; pass through consistently for hash and verify.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def _truncate_password_for_bcrypt(password: str) -> str:
+    """Return password truncated to 72 utf-8 bytes so bcrypt never raises ValueError."""
+    encoded = password.encode("utf-8")
+    if len(encoded) <= BCRYPT_MAX_PASSWORD_BYTES:
+        return password
+    return encoded[:BCRYPT_MAX_PASSWORD_BYTES].decode("utf-8", errors="ignore")
+
+
 def _hash_password(password: str) -> str:
     """Return bcrypt hash of password."""
-    return pwd_ctx.hash(password)
+    return pwd_ctx.hash(_truncate_password_for_bcrypt(password))
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
     """Return True if plain password matches hash."""
-    return pwd_ctx.verify(plain, hashed)
+    return pwd_ctx.verify(_truncate_password_for_bcrypt(plain), hashed)
 
 
 def _issue_token(user_id: int) -> str:
