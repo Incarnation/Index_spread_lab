@@ -4,11 +4,24 @@ import { parseJsonRecord } from "./format";
 export type DecisionSummary = {
   shortStrike?: number;
   longStrike?: number;
+  spreadSide?: "put" | "call";
   credit?: number;
   gexNet?: number;
   zeroGamma?: number;
   vix?: number;
 };
+
+/**
+ * Infer spread side from explicit payload fields or option-right fallbacks.
+ */
+function inferSpreadSide(data: Record<string, unknown>, shortLeg: Record<string, unknown> | undefined): "put" | "call" | undefined {
+  const explicitSide = data["spread_side"];
+  if (explicitSide === "put" || explicitSide === "call") return explicitSide;
+  const optionRight = shortLeg?.["option_right"];
+  if (optionRight === "P") return "put";
+  if (optionRight === "C") return "call";
+  return undefined;
+}
 
 /**
  * Parse the decision JSON payload into table-friendly numeric fields.
@@ -30,6 +43,7 @@ export function getDecisionSummary(row: TradeDecision): DecisionSummary | null {
   return {
     shortStrike: short["strike"] as number | undefined,
     longStrike: long["strike"] as number | undefined,
+    spreadSide: inferSpreadSide(data, short),
     credit: typeof credit === "number" ? credit : undefined,
     gexNet: typeof context?.["gex_net"] === "number" ? (context["gex_net"] as number) : undefined,
     zeroGamma: typeof context?.["zero_gamma_level"] === "number" ? (context["zero_gamma_level"] as number) : undefined,

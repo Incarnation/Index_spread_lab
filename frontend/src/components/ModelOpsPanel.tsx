@@ -73,7 +73,7 @@ export function ModelOpsPanel({ ops, loading, error }: ModelOpsPanelProps) {
         </Badge>
       </Group>
 
-      <Table striped highlightOnHover withTableBorder withColumnBorders>
+      <Table striped highlightOnHover withTableBorder withColumnBorders stickyHeader stickyHeaderOffset={0}>
         <Table.Thead>
           <Table.Tr>
             <Table.Th>Item</Table.Th>
@@ -118,7 +118,8 @@ export function ModelOpsPanel({ ops, loading, error }: ModelOpsPanelProps) {
 
       {(ops?.warnings?.length ?? 0) > 0 && !loading && !error && (
         <Text mt="sm" c="dimmed" size="sm">
-          Warnings: {ops?.warnings.join(", ")}
+          Warnings: {ops?.warnings.join(", ")}. If models are missing, continue running feature-builder + labeler until enough
+          resolved rows are available for trainer.
         </Text>
       )}
     </Card>

@@ -1,4 +1,4 @@
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 /**
  * Build an API URL relative to the configured frontend base URL.
@@ -8,6 +8,13 @@ const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.repl
  */
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
+}
+
+/**
+ * Build admin auth headers when an API key is provided.
+ */
+function adminHeaders(apiKey?: string): HeadersInit | undefined {
+  return apiKey ? { "X-API-Key": apiKey } : undefined;
 }
 
 export type ChainSnapshot = {
@@ -47,7 +54,7 @@ export type RunSnapshotResult = {
 export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult> {
   const r = await fetch(apiUrl(`/api/admin/run-snapshot`), {
     method: "POST",
-    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+    headers: adminHeaders(apiKey),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunSnapshotResult;
@@ -66,7 +73,7 @@ export type RunQuotesResult = {
 export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
   const r = await fetch(apiUrl(`/api/admin/run-quotes`), {
     method: "POST",
-    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+    headers: adminHeaders(apiKey),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunQuotesResult;
@@ -86,7 +93,7 @@ export type RunDecisionResult = {
 export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
   const r = await fetch(apiUrl(`/api/admin/run-decision`), {
     method: "POST",
-    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+    headers: adminHeaders(apiKey),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunDecisionResult;
@@ -107,10 +114,90 @@ export type RunTradePnlResult = {
 export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult> {
   const r = await fetch(apiUrl(`/api/admin/run-trade-pnl`), {
     method: "POST",
-    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+    headers: adminHeaders(apiKey),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunTradePnlResult;
+}
+
+export type GenericAdminRunResult = {
+  ok?: boolean;
+  skipped?: boolean;
+  reason?: string | null;
+  status?: string;
+  [key: string]: unknown;
+};
+
+/**
+ * Trigger a manual GEX computation run.
+ */
+export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-gex`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
+}
+
+/**
+ * Trigger a manual feature-builder run.
+ */
+export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-feature-builder`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
+}
+
+/**
+ * Trigger a manual labeler run.
+ */
+export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-labeler`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
+}
+
+/**
+ * Trigger a manual trainer run.
+ */
+export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-trainer`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
+}
+
+/**
+ * Trigger a manual shadow-inference run.
+ */
+export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-shadow-inference`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
+}
+
+/**
+ * Trigger a manual promotion-gate run.
+ */
+export async function runPromotionGatesNow(apiKey?: string): Promise<GenericAdminRunResult> {
+  const r = await fetch(apiUrl(`/api/admin/run-promotion-gates`), {
+    method: "POST",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as GenericAdminRunResult;
 }
 
 export type GexSnapshot = {
@@ -405,13 +492,101 @@ export async function fetchModelOps(modelName?: string): Promise<ModelOpsRespons
   return (await r.json()) as ModelOpsResponse;
 }
 
+export type AdminPreflightCounts = {
+  underlying_quotes: number;
+  chain_snapshots: number;
+  option_chain_rows: number;
+  gex_snapshots: number;
+  trade_decisions: number;
+  feature_snapshots: number;
+  trade_candidates: number;
+  labeled_candidates: number;
+  model_versions: number;
+  training_runs: number;
+  model_predictions: number;
+  trades: number;
+  open_trades: number;
+  closed_trades: number;
+};
+
+export type AdminPreflightLatest = {
+  quote_ts: string | null;
+  snapshot_ts: string | null;
+  gex_ts: string | null;
+  decision_ts: string | null;
+  feature_ts: string | null;
+  candidate_ts: string | null;
+  model_version_ts: string | null;
+  training_run_ts: string | null;
+  prediction_ts: string | null;
+  trade_mark_ts: string | null;
+  trade_entry_ts: string | null;
+  market_clock_ts: string | null;
+};
+
+export type AdminPreflightSnapshot = {
+  snapshot_id: number;
+  ts: string | null;
+  target_dte: number | null;
+  expiration: string | null;
+};
+
+export type AdminPreflightGex = {
+  snapshot_id: number;
+  ts: string | null;
+  gex_net: number | null;
+  zero_gamma_level: number | null;
+  method: string | null;
+};
+
+export type AdminPreflightDecision = {
+  decision_id: number;
+  ts: string | null;
+  decision: string | null;
+  reason: string | null;
+  score: number | null;
+  target_dte: number | null;
+  delta_target: number | null;
+  chain_snapshot_id: number | null;
+  decision_source: string | null;
+};
+
+export type AdminPreflightQuote = {
+  symbol: string;
+  ts: string | null;
+  last: number | null;
+};
+
+export type AdminPreflightResponse = {
+  now_utc: string;
+  counts: AdminPreflightCounts;
+  latest: AdminPreflightLatest;
+  latest_snapshot: AdminPreflightSnapshot | null;
+  latest_gex: AdminPreflightGex | null;
+  latest_decision: AdminPreflightDecision | null;
+  latest_quotes_by_symbol: AdminPreflightQuote[];
+  warnings: string[];
+};
+
+/**
+ * Fetch admin preflight diagnostics for pipeline freshness and warning state.
+ */
+export async function fetchAdminPreflight(apiKey?: string): Promise<AdminPreflightResponse> {
+  const r = await fetch(apiUrl(`/api/admin/preflight`), {
+    method: "GET",
+    headers: adminHeaders(apiKey),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as AdminPreflightResponse;
+}
+
 /**
  * Delete one persisted trade decision by ID.
  */
 export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
   const r = await fetch(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
     method: "DELETE",
-    headers: apiKey ? { "X-API-Key": apiKey } : undefined,
+    headers: adminHeaders(apiKey),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as { deleted: boolean; decision_id: number };

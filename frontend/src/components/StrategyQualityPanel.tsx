@@ -68,17 +68,17 @@ export function StrategyQualityPanel({ metrics, loading, error }: StrategyQualit
       </Group>
 
       <ScrollArea type="auto">
-        <Table striped highlightOnHover withTableBorder withColumnBorders>
+        <Table striped highlightOnHover withTableBorder withColumnBorders stickyHeader stickyHeaderOffset={0}>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Side</Table.Th>
-              <Table.Th>Resolved</Table.Th>
-              <Table.Th>Win50</Table.Th>
-              <Table.Th>Win100 @ expiry</Table.Th>
-              <Table.Th>Expectancy</Table.Th>
-              <Table.Th>Drawdown</Table.Th>
-              <Table.Th>Tail loss proxy</Table.Th>
-              <Table.Th>Avg margin usage</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Resolved</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Win50</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Win100 @ expiry</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Expectancy</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Drawdown</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Tail loss proxy</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Avg margin usage</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -87,19 +87,21 @@ export function StrategyQualityPanel({ metrics, loading, error }: StrategyQualit
                 <Table.Td>
                   <Badge variant="light">{row.spread_side.toUpperCase()}</Badge>
                 </Table.Td>
-                <Table.Td>{row.resolved}</Table.Td>
-                <Table.Td>{formatPct(row.tp50_rate)}</Table.Td>
-                <Table.Td>{formatPct(row.tp100_at_expiry_rate)}</Table.Td>
-                <Table.Td>{formatMoney(row.expectancy)}</Table.Td>
-                <Table.Td>{formatMoney(row.max_drawdown)}</Table.Td>
-                <Table.Td>{formatMoney(row.tail_loss_proxy)}</Table.Td>
-                <Table.Td>{formatMoney(row.avg_margin_usage)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{row.resolved}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatPct(row.tp50_rate)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatPct(row.tp100_at_expiry_rate)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatMoney(row.expectancy)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatMoney(row.max_drawdown)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatMoney(row.tail_loss_proxy)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatMoney(row.avg_margin_usage)}</Table.Td>
               </Table.Tr>
             ))}
             {(metrics?.by_side ?? []).length === 0 && !loading && !error && (
               <Table.Tr>
                 <Table.Td colSpan={8}>
-                  <Text c="dimmed">No resolved labels yet. Run feature-builder + labeler first.</Text>
+                  <Text c="dimmed">
+                    No resolved labels yet. Build candidates and labels first, then rerun this panel after resolution windows pass.
+                  </Text>
                 </Table.Td>
               </Table.Tr>
             )}

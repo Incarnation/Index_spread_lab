@@ -49,6 +49,31 @@ type HeatmapRow = {
   byStrike: Map<number, number>;
 };
 
+const GEX_VIEW_STORAGE_KEY = "dashboard.gex.chartView";
+
+/**
+ * Load the persisted GEX chart view, defaulting to composed mode.
+ */
+function readStoredGexView(): ChartView {
+  try {
+    const raw = window.localStorage.getItem(GEX_VIEW_STORAGE_KEY);
+    return raw === "heatmap" ? "heatmap" : "composed";
+  } catch {
+    return "composed";
+  }
+}
+
+/**
+ * Save the currently selected GEX chart view.
+ */
+function writeStoredGexView(value: ChartView): void {
+  try {
+    window.localStorage.setItem(GEX_VIEW_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage write errors.
+  }
+}
+
 /** Coerce nullable numeric fields from API rows into chart-safe numbers. */
 function toNumeric(value: number | null): number {
   return typeof value === "number" ? value : 0;
@@ -90,6 +115,36 @@ function heatmapColor(value: number | undefined, maxAbs: number): string {
 }
 
 /**
+ * Render an enriched tooltip for strike-level call/put/net values.
+ */
+function renderTooltipContent(
+  payload: Array<{ name?: string; value?: number }> | undefined,
+  label: number | string | undefined,
+): React.ReactNode {
+  if (!payload || payload.length === 0) return null;
+  const net = payload.find((row) => row.name === "Net GEX")?.value;
+  const calls = payload.find((row) => row.name === "Calls GEX")?.value;
+  const puts = payload.find((row) => row.name === "Puts GEX")?.value;
+
+  return (
+    <div style={{ background: "white", border: "1px solid #dee2e6", borderRadius: 8, padding: 10 }}>
+      <Text fw={600} size="sm" mb={4}>
+        Strike {label == null ? "—" : String(label)}
+      </Text>
+      <Text size="xs" c="#1c7ed6">
+        Net: {typeof net === "number" ? `${formatCompactNumber(net)} (${net.toFixed(0)})` : "—"}
+      </Text>
+      <Text size="xs" c="#2b8a3e">
+        Calls: {typeof calls === "number" ? `${formatCompactNumber(calls)} (${calls.toFixed(0)})` : "—"}
+      </Text>
+      <Text size="xs" c="#c92a2a">
+        Puts: {typeof puts === "number" ? `${formatCompactNumber(puts)} (${puts.toFixed(0)})` : "—"}
+      </Text>
+    </div>
+  );
+}
+
+/**
  * Render GEX analytics with two chart modes:
  * - composed chart for stacked calls/puts + net line
  * - strike/expiration heatmap for cross-expiry structure
@@ -107,7 +162,7 @@ export function GexPanel({
   loading,
   curve,
 }: GexPanelProps) {
-  const [chartView, setChartView] = React.useState<ChartView>("composed");
+  const [chartView, setChartView] = React.useState<ChartView>(() => readStoredGexView());
   const [heatmapRows, setHeatmapRows] = React.useState<HeatmapRow[]>([]);
   const [heatmapStrikes, setHeatmapStrikes] = React.useState<number[]>([]);
   const [heatmapMaxAbs, setHeatmapMaxAbs] = React.useState<number>(0);
@@ -192,6 +247,13 @@ export function GexPanel({
     if (heatmapStrikes.length <= 12) return 1;
     return Math.ceil(heatmapStrikes.length / 12);
   }, [heatmapStrikes.length]);
+
+  /**
+   * Persist selected chart view between reloads for analyst convenience.
+   */
+  React.useEffect(() => {
+    writeStoredGexView(chartView);
+  }, [chartView]);
 
   /**
    * Load per-expiration curves for heatmap mode and normalize them into a
@@ -351,24 +413,19 @@ export function GexPanel({
               <XAxis dataKey="strike" tick={{ fontSize: 12 }} />
               <YAxis tick={{ fontSize: 12 }} tickFormatter={(value: number) => formatCompactNumber(value)} />
               <Tooltip
-                formatter={(value: number | string | undefined) => {
-                  if (typeof value === "number") return formatCompactNumber(value);
-                  const parsed = Number(value);
-                  return Number.isFinite(parsed) ? formatCompactNumber(parsed) : String(value ?? "");
-                }}
-                labelFormatter={(value) => `Strike ${String(value ?? "")}`}
+                content={({ payload, label }) => renderTooltipContent(payload as Array<{ name?: string; value?: number }> | undefined, label)}
               />
               <Legend />
-              <ReferenceLine y={0} stroke="#868e96" />
+              <ReferenceLine y={0} stroke="#495057" strokeWidth={2} />
               {nearestSpotStrike != null && (
                 <ReferenceLine x={nearestSpotStrike} stroke="#495057" strokeDasharray="4 4" label="Spot" />
               )}
               {nearestZeroGammaStrike != null && (
                 <ReferenceLine x={nearestZeroGammaStrike} stroke="#f08c00" strokeDasharray="4 4" label="Zero Gamma" />
               )}
-              <Bar dataKey="gex_calls" name="Calls GEX" stackId="gex" fill="#2f9e44" />
-              <Bar dataKey="gex_puts" name="Puts GEX" stackId="gex" fill="#e03131" />
-              <Line type="monotone" dataKey="gex_net" name="Net GEX" stroke="#228be6" strokeWidth={2} dot={false} />
+              <Bar dataKey="gex_calls" name="Calls GEX" stackId="gex" fill="#2b8a3e" />
+              <Bar dataKey="gex_puts" name="Puts GEX" stackId="gex" fill="#c92a2a" />
+              <Line type="monotone" dataKey="gex_net" name="Net GEX" stroke="#1c7ed6" strokeWidth={2} dot={false} />
             </ComposedChart>
           </ResponsiveContainer>
         </div>

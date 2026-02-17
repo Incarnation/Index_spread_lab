@@ -63,16 +63,16 @@ export function LabelMetricsPanel({ metrics, loading, error }: LabelMetricsPanel
       </Group>
 
       <ScrollArea type="auto">
-        <Table striped highlightOnHover withTableBorder withColumnBorders>
+        <Table striped highlightOnHover withTableBorder withColumnBorders stickyHeader stickyHeaderOffset={0}>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Spread side</Table.Th>
-              <Table.Th>Resolved</Table.Th>
-              <Table.Th>TP50</Table.Th>
-              <Table.Th>TP50 rate</Table.Th>
-              <Table.Th>TP100 @ expiry</Table.Th>
-              <Table.Th>TP100 @ expiry rate</Table.Th>
-              <Table.Th>Avg realized PnL</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Resolved</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>TP50</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>TP50 rate</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>TP100 @ expiry</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>TP100 @ expiry rate</Table.Th>
+              <Table.Th style={{ textAlign: "right" }}>Avg realized PnL</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -81,18 +81,21 @@ export function LabelMetricsPanel({ metrics, loading, error }: LabelMetricsPanel
                 <Table.Td>
                   <Badge variant="light">{row.spread_side.toUpperCase()}</Badge>
                 </Table.Td>
-                <Table.Td>{row.resolved}</Table.Td>
-                <Table.Td>{row.tp50}</Table.Td>
-                <Table.Td>{formatPct(row.tp50_rate)}</Table.Td>
-                <Table.Td>{row.tp100_at_expiry}</Table.Td>
-                <Table.Td>{formatPct(row.tp100_at_expiry_rate)}</Table.Td>
-                <Table.Td>{formatMoney(row.avg_realized_pnl)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{row.resolved}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{row.tp50}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatPct(row.tp50_rate)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{row.tp100_at_expiry}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatPct(row.tp100_at_expiry_rate)}</Table.Td>
+                <Table.Td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{formatMoney(row.avg_realized_pnl)}</Table.Td>
               </Table.Tr>
             ))}
             {(metrics?.by_side ?? []).length === 0 && !loading && !error && (
               <Table.Tr>
                 <Table.Td colSpan={7}>
-                  <Text c="dimmed">No resolved labels yet. Run feature-builder + decision + labeler first.</Text>
+                  <Text c="dimmed">
+                    No resolved labels yet. Recommended sequence: run full pipeline, then rerun labeler after trades age enough
+                    for outcome resolution.
+                  </Text>
                 </Table.Td>
               </Table.Tr>
             )}

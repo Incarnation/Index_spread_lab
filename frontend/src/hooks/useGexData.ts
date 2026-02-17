@@ -13,6 +13,57 @@ type UseGexDataArgs = {
   onError: (message: string) => void;
 };
 
+const GEX_DTE_STORAGE_KEY = "dashboard.gex.selectedDte";
+const GEX_CUSTOM_EXP_STORAGE_KEY = "dashboard.gex.selectedCustomExpirations";
+const GEX_SNAPSHOT_STORAGE_KEY = "dashboard.gex.selectedSnapshotId";
+
+/**
+ * Read one localStorage string value, guarding browsers where storage is unavailable.
+ */
+function readStorageString(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read one JSON string-array value from localStorage.
+ */
+function readStorageStringArray(key: string): string[] {
+  const raw = readStorageString(key);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist one string value to localStorage.
+ */
+function writeStorageString(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage write errors (e.g., private mode limits).
+  }
+}
+
+/**
+ * Persist one string-array value to localStorage.
+ */
+function writeStorageStringArray(key: string, value: string[]): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage write errors (e.g., private mode limits).
+  }
+}
+
 type UseGexDataResult = {
   gexSnapshots: GexSnapshot[];
   selectedGexSnapshot: GexSnapshot | null;
@@ -38,8 +89,10 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   const [selectedGexSnapshot, setSelectedGexSnapshot] = React.useState<GexSnapshot | null>(null);
   const [gexDtes, setGexDtes] = React.useState<number[]>([]);
   const [gexExpirations, setGexExpirations] = React.useState<GexExpirationItem[]>([]);
-  const [selectedDte, setSelectedDte] = React.useState<string>("all");
-  const [selectedCustomExpirations, setSelectedCustomExpirations] = React.useState<string[]>([]);
+  const [selectedDte, setSelectedDte] = React.useState<string>(() => readStorageString(GEX_DTE_STORAGE_KEY) ?? "all");
+  const [selectedCustomExpirations, setSelectedCustomExpirations] = React.useState<string[]>(() =>
+    readStorageStringArray(GEX_CUSTOM_EXP_STORAGE_KEY),
+  );
   const [gexCurve, setGexCurve] = React.useState<GexCurvePoint[]>([]);
   const [gexLoading, setGexLoading] = React.useState<boolean>(false);
 
@@ -54,7 +107,13 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
         if (cancelled) return;
         setGexSnapshots(rows);
         if (rows.length > 0) {
-          setSelectedGexSnapshot(rows[0]);
+          const persistedSnapshotIdRaw = readStorageString(GEX_SNAPSHOT_STORAGE_KEY);
+          const persistedSnapshotId = persistedSnapshotIdRaw ? Number(persistedSnapshotIdRaw) : null;
+          const preferredSnapshot =
+            persistedSnapshotId != null && Number.isFinite(persistedSnapshotId)
+              ? rows.find((row) => row.snapshot_id === persistedSnapshotId) ?? null
+              : null;
+          setSelectedGexSnapshot(preferredSnapshot ?? rows[0]);
         }
       })
       .catch((e: unknown) => {
@@ -129,6 +188,22 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
       cancelled = true;
     };
   }, [onError, selectedCustomExpirations, selectedDte, selectedGexSnapshot]);
+
+  /**
+   * Persist key GEX selector state so analysts keep context after page refresh.
+   */
+  React.useEffect(() => {
+    writeStorageString(GEX_DTE_STORAGE_KEY, selectedDte);
+  }, [selectedDte]);
+
+  React.useEffect(() => {
+    writeStorageStringArray(GEX_CUSTOM_EXP_STORAGE_KEY, selectedCustomExpirations);
+  }, [selectedCustomExpirations]);
+
+  React.useEffect(() => {
+    if (!selectedGexSnapshot) return;
+    writeStorageString(GEX_SNAPSHOT_STORAGE_KEY, String(selectedGexSnapshot.snapshot_id));
+  }, [selectedGexSnapshot]);
 
   /**
    * Update DTE mode and clear stale custom selections when leaving custom mode.
