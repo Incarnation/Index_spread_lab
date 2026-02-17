@@ -7,7 +7,12 @@ import pytest
 
 import spx_backend.jobs.snapshot_job as snapshot_module
 from spx_backend.config import settings
-from spx_backend.jobs.snapshot_job import SnapshotJob, SnapshotJobConfig, _select_strikes_near_spot
+from spx_backend.jobs.snapshot_job import (
+    SnapshotJob,
+    SnapshotJobConfig,
+    _parse_chain_options,
+    _select_strikes_near_spot,
+)
 
 
 def test_select_strikes_near_spot_balances_below_and_above() -> None:
@@ -22,6 +27,20 @@ def test_select_strikes_near_spot_returns_empty_when_no_strikes() -> None:
     selected = _select_strikes_near_spot(options=[{"strike": None}], spot=6835.0, each_side=2)
 
     assert selected == set()
+
+
+def test_parse_chain_options_returns_empty_when_options_container_is_none() -> None:
+    """Tradier edge payload ``{\"options\": None}`` should not raise."""
+    parsed = _parse_chain_options({"options": None})
+
+    assert parsed == []
+
+
+def test_parse_chain_options_filters_non_dict_entries() -> None:
+    """Parser keeps only dict rows when payload list contains malformed entries."""
+    parsed = _parse_chain_options({"options": {"option": [{"symbol": "A"}, None, "bad", {"symbol": "B"}]}})
+
+    assert parsed == [{"symbol": "A"}, {"symbol": "B"}]
 
 
 class _FakeExecResult:

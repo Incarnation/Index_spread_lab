@@ -41,13 +41,33 @@ def _parse_expirations(resp: dict) -> list[date]:
 
 
 def _parse_chain_options(chain: dict) -> list[dict]:
-    """Normalize Tradier chain options payload to a list."""
-    options = chain.get("options", {}).get("option")
+    """Normalize Tradier chain payload into a validated option-row list.
+
+    Parameters
+    ----------
+    chain:
+        One Tradier option-chain payload as returned by ``get_option_chain``.
+        Some edge responses use ``{"options": None}`` or malformed shapes
+        rather than a nested dict/list, especially for sparse expirations.
+
+    Returns
+    -------
+    list[dict]
+        A list of option-row dictionaries safe for downstream processing.
+        Non-dict payload fragments are discarded so snapshot ingestion can
+        continue without raising during startup warmup or scheduler runs.
+    """
+    options_container = chain.get("options")
+    if not isinstance(options_container, dict):
+        return []
+    options = options_container.get("option")
     if options is None:
         return []
     if isinstance(options, list):
-        return options
-    return [options]
+        return [opt for opt in options if isinstance(opt, dict)]
+    if isinstance(options, dict):
+        return [options]
+    return []
 
 
 def _normalize_option_right(opt: dict) -> str | None:
@@ -403,6 +423,10 @@ class SnapshotJob:
                                     exp.isoformat(),
                                 )
                         for opt in options:
+                            # Tradier occasionally emits malformed list items;
+                            # skip non-dict entries to keep ingestion resilient.
+                            if not isinstance(opt, dict):
+                                continue
                             symbol = opt.get("symbol")
                             if not symbol:
                                 continue
