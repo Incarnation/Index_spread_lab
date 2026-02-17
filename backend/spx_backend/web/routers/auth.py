@@ -26,8 +26,8 @@ from spx_backend.config import settings
 from spx_backend.database import get_db_session
 
 # Free IP-to-country/region API (no key). 45 req/min limit; we only call on auth events.
-# No fields param = full response (continent, country, regionName, city, zip, lat, lon, timezone, isp, org, etc.).
-GEOIP_API_URL = "https://ip-api.com/json/{ip}"
+# Free tier is HTTP only; HTTPS requires their pro service. No fields param = full JSON response.
+GEOIP_API_URL = "http://ip-api.com/json/{ip}"
 GEOIP_TIMEOUT_SEC = 2
 
 # Map 2-letter codes to full country names when we get country from proxy header (e.g. CF-IPCountry).
