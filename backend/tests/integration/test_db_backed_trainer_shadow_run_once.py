@@ -264,6 +264,60 @@ async def test_trainer_run_once_persists_model_and_training_run(
 
 
 @pytest.mark.asyncio
+async def test_trainer_sparse_cv_mode_persists_fold_diagnostics(
+    integration_db_session,
+    monkeypatch,
+) -> None:
+    """Trainer should use sparse CV mode and persist fold diagnostics when rows are limited."""
+    monkeypatch.setattr(settings, "trainer_min_rows", 100)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_enabled", True)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_min_rows", 4)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_folds", 3)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_min_train_rows", 2)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_min_test_rows", 1)
+    monkeypatch.setattr(settings, "trainer_min_bucket_size", 1)
+    monkeypatch.setattr(settings, "trainer_adaptive_prior_enabled", True)
+    monkeypatch.setattr(settings, "trainer_adaptive_prior_reference_rows", 200)
+    monkeypatch.setattr(settings, "trainer_adaptive_prior_min", 2.0)
+    monkeypatch.setattr(settings, "trainer_adaptive_prior_max", 24.0)
+
+    session_factory = async_sessionmaker(
+        bind=integration_db_session.bind,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(trainer_module, "SessionLocal", session_factory)
+
+    now_utc = datetime.now(tz=timezone.utc)
+    await _seed_resolved_candidates_for_trainer(session=integration_db_session, now_utc=now_utc)
+
+    result = await TrainerJob().run_once(force=True)
+    assert result["skipped"] is False
+    assert result["evaluation_mode"] == "sparse_time_series_cv"
+    assert result["metrics"]["evaluation_mode"] == "sparse_time_series_cv"
+    assert int(result["metrics"]["cv_folds_used"]) >= 2
+    assert isinstance(result["metrics"]["cv_fold_metrics"], list)
+
+    run_row = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT walkforward_fold, metrics_json, notes
+                FROM training_runs
+                WHERE training_run_id = :training_run_id
+                """
+            ),
+            {"training_run_id": int(result["training_run_id"])},
+        )
+    ).fetchone()
+    assert run_row is not None
+    assert int(run_row.walkforward_fold or 0) >= 2
+    assert run_row.notes == "completed_sparse_cv"
+    assert run_row.metrics_json["evaluation_mode"] == "sparse_time_series_cv"
+
+
+@pytest.mark.asyncio
 async def test_shadow_inference_run_once_writes_predictions(
     integration_db_session,
     monkeypatch,
@@ -273,6 +327,8 @@ async def test_shadow_inference_run_once_writes_predictions(
     monkeypatch.setattr(settings, "shadow_inference_lookback_minutes", 7 * 24 * 60)
     monkeypatch.setattr(settings, "decision_hybrid_min_probability", 0.5)
     monkeypatch.setattr(settings, "decision_hybrid_min_expected_pnl", 0.0)
+    monkeypatch.setattr(settings, "decision_hybrid_min_bucket_count", 0)
+    monkeypatch.setattr(settings, "decision_hybrid_max_pnl_std", 10_000.0)
 
     session_factory = async_sessionmaker(
         bind=integration_db_session.bind,
@@ -295,7 +351,7 @@ async def test_shadow_inference_run_once_writes_predictions(
         await integration_db_session.execute(
             text(
                 """
-                SELECT model_version_id, probability_win, expected_value, decision
+                SELECT model_version_id, probability_win, expected_value, decision, meta_json
                 FROM model_predictions
                 ORDER BY prediction_id ASC
                 """
@@ -307,3 +363,5 @@ async def test_shadow_inference_run_once_writes_predictions(
     assert all(float(row.probability_win) > 0.0 for row in prediction_rows)
     assert all(float(row.expected_value) >= 0.0 for row in prediction_rows)
     assert {str(row.decision) for row in prediction_rows} == {"TRADE"}
+    assert all(isinstance(row.meta_json, dict) for row in prediction_rows)
+    assert all("uncertainty_level" in row.meta_json for row in prediction_rows)

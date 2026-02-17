@@ -21,8 +21,78 @@ def _to_json(value: dict | None) -> str | None:
     return json.dumps(value, default=str)
 
 
-def classify_prediction(*, probability_win: float, expected_pnl: float) -> str:
-    """Map predicted probability/EV into a trade/skip suggestion."""
+def compute_uncertainty_penalty(*, bucket_count: int, pnl_std: float) -> float:
+    """Compute score penalty for low-support or high-variance predictions.
+
+    Parameters
+    ----------
+    bucket_count:
+        Number of historical rows supporting the selected prediction bucket.
+    pnl_std:
+        Historical PnL standard deviation for the selected bucket.
+
+    Returns
+    -------
+    float
+        Non-negative penalty subtracted from raw utility score.
+    """
+    min_count = max(settings.decision_hybrid_min_bucket_count, 0)
+    max_std = max(float(settings.decision_hybrid_max_pnl_std), 0.0)
+    penalty = 0.0
+    if bucket_count < min_count:
+        penalty += (min_count - bucket_count) * 0.25
+    if max_std > 0.0 and pnl_std > max_std:
+        penalty += (pnl_std - max_std) * 0.01
+    return penalty
+
+
+def classify_uncertainty_level(*, bucket_count: int, pnl_std: float) -> str:
+    """Classify prediction confidence into low/medium/high uncertainty buckets.
+
+    Parameters
+    ----------
+    bucket_count:
+        Number of historical rows supporting the selected prediction bucket.
+    pnl_std:
+        Historical PnL standard deviation for the selected bucket.
+
+    Returns
+    -------
+    str
+        Uncertainty label used for explainability metadata.
+    """
+    min_count = max(settings.decision_hybrid_min_bucket_count, 0)
+    max_std = max(float(settings.decision_hybrid_max_pnl_std), 0.0)
+    if bucket_count < min_count or (max_std > 0.0 and pnl_std > max_std):
+        return "high"
+    if bucket_count < max(min_count * 2, 1):
+        return "medium"
+    return "low"
+
+
+def classify_prediction(*, probability_win: float, expected_pnl: float, bucket_count: int, pnl_std: float) -> str:
+    """Map predicted probability, EV, and uncertainty into trade/skip.
+
+    Parameters
+    ----------
+    probability_win:
+        Predicted win probability for TP50 outcome.
+    expected_pnl:
+        Predicted expected value in dollars.
+    bucket_count:
+        Historical support count for selected bucket stats.
+    pnl_std:
+        Historical PnL volatility proxy for selected bucket stats.
+
+    Returns
+    -------
+    str
+        `TRADE` when signal thresholds and uncertainty gates pass, else `SKIP`.
+    """
+    if bucket_count < settings.decision_hybrid_min_bucket_count:
+        return "SKIP"
+    if pnl_std > settings.decision_hybrid_max_pnl_std:
+        return "SKIP"
     if probability_win < settings.decision_hybrid_min_probability:
         return "SKIP"
     if expected_pnl < settings.decision_hybrid_min_expected_pnl:
@@ -71,7 +141,7 @@ class ShadowInferenceJob:
         }
 
     async def run_once(self, *, force: bool = False) -> dict[str, Any]:
-        """Run one shadow-inference cycle."""
+        """Run one shadow-inference cycle with uncertainty-aware metadata."""
         now_utc = datetime.now(tz=ZoneInfo("UTC"))
         if (not force) and (not settings.shadow_inference_enabled):
             return {"skipped": True, "reason": "shadow_inference_disabled", "now_utc": now_utc.isoformat()}
@@ -123,8 +193,18 @@ class ShadowInferenceJob:
                 pred = predict_with_bucket_model(model_payload=model["model_payload"], features=features)
                 probability_win = float(pred["probability_win"])
                 expected_pnl = float(pred["expected_pnl"])
-                score_raw = float(pred["utility_score"])
-                decision_hint = classify_prediction(probability_win=probability_win, expected_pnl=expected_pnl)
+                bucket_count = int(pred.get("bucket_count") or 0)
+                pnl_std = float(pred.get("pnl_std") or 0.0)
+                raw_utility = float(pred["utility_score"])
+                uncertainty_penalty = compute_uncertainty_penalty(bucket_count=bucket_count, pnl_std=pnl_std)
+                score_raw = raw_utility - uncertainty_penalty
+                uncertainty_level = classify_uncertainty_level(bucket_count=bucket_count, pnl_std=pnl_std)
+                decision_hint = classify_prediction(
+                    probability_win=probability_win,
+                    expected_pnl=expected_pnl,
+                    bucket_count=bucket_count,
+                    pnl_std=pnl_std,
+                )
 
                 meta_json = {
                     "model_name": model["model_name"],
@@ -132,10 +212,16 @@ class ShadowInferenceJob:
                     "rollout_status": model["rollout_status"],
                     "scoring_source": pred.get("source"),
                     "bucket_key": pred.get("bucket_key"),
-                    "bucket_count": pred.get("bucket_count"),
+                    "bucket_level": pred.get("bucket_level"),
+                    "bucket_count": bucket_count,
                     "tail_loss_proxy": pred.get("tail_loss_proxy"),
-                    "pnl_std": pred.get("pnl_std"),
+                    "pnl_std": pnl_std,
                     "margin_usage": pred.get("margin_usage"),
+                    "uncertainty_level": uncertainty_level,
+                    "uncertainty_penalty": uncertainty_penalty,
+                    "raw_utility": raw_utility,
+                    "min_bucket_count_threshold": settings.decision_hybrid_min_bucket_count,
+                    "max_pnl_std_threshold": settings.decision_hybrid_max_pnl_std,
                 }
                 await session.execute(
                     text(

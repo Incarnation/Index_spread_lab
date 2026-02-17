@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from spx_backend.jobs.modeling import (
     build_bucket_key,
+    build_bucket_key_levels,
+    build_legacy_bucket_key,
     extract_candidate_features,
     predict_with_bucket_model,
     summarize_strategy_quality,
@@ -10,6 +12,7 @@ from spx_backend.jobs.modeling import (
 
 
 def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
+    """Training/prediction should emit utility and hierarchy metadata."""
     rows = [
         {
             "features": {
@@ -18,6 +21,11 @@ def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
                 "delta_bucket": 0.15,
                 "credit_bucket": 0.10,
                 "context_regime": "support",
+                "vix_regime": "normal",
+                "term_structure_regime": "flat",
+                "spy_spx_ratio_regime": "parity",
+                "vix_delta_interaction_bucket": "normal:0.15",
+                "dte_credit_interaction_bucket": "3:0.10",
                 "margin_usage": 1200.0,
             },
             "realized_pnl": 55.0,
@@ -31,6 +39,11 @@ def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
                 "delta_bucket": 0.15,
                 "credit_bucket": 0.10,
                 "context_regime": "support",
+                "vix_regime": "normal",
+                "term_structure_regime": "flat",
+                "spy_spx_ratio_regime": "parity",
+                "vix_delta_interaction_bucket": "normal:0.15",
+                "dte_credit_interaction_bucket": "3:0.10",
                 "margin_usage": 1300.0,
             },
             "realized_pnl": 35.0,
@@ -44,6 +57,11 @@ def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
                 "delta_bucket": 0.20,
                 "credit_bucket": 0.05,
                 "context_regime": "headwind",
+                "vix_regime": "high",
+                "term_structure_regime": "backwardation",
+                "spy_spx_ratio_regime": "premium",
+                "vix_delta_interaction_bucket": "high:0.20",
+                "dte_credit_interaction_bucket": "5:0.05",
                 "margin_usage": 1500.0,
             },
             "realized_pnl": -20.0,
@@ -51,7 +69,15 @@ def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
             "margin_usage": 1500.0,
         },
     ]
-    model = train_bucket_model(rows=rows, min_bucket_size=1, prior_strength=2.0)
+    model = train_bucket_model(
+        rows=rows,
+        min_bucket_size=1,
+        prior_strength=2.0,
+        adaptive_prior_enabled=True,
+        adaptive_prior_reference_rows=200,
+        adaptive_prior_min=2.0,
+        adaptive_prior_max=24.0,
+    )
     pred = predict_with_bucket_model(
         model_payload=model,
         features={
@@ -60,16 +86,26 @@ def test_train_bucket_model_and_predict_returns_prob_ev_and_utility() -> None:
             "delta_bucket": 0.15,
             "credit_bucket": 0.10,
             "context_regime": "support",
+            "vix_regime": "normal",
+            "term_structure_regime": "flat",
+            "spy_spx_ratio_regime": "parity",
+            "vix_delta_interaction_bucket": "normal:0.15",
+            "dte_credit_interaction_bucket": "3:0.10",
             "margin_usage": 1200.0,
         },
     )
+    assert "bucket_hierarchy" in model
+    assert model["prior_strength"] >= 2.0
+    assert model["prior_strength_base"] == 2.0
     assert 0.0 <= pred["probability_win"] <= 1.0
     assert isinstance(pred["expected_pnl"], float)
     assert isinstance(pred["utility_score"], float)
-    assert pred["source"] in {"bucket", "bucket_low_sample", "global_fallback"}
+    assert pred["source"] in {"full_bucket", "full_low_sample", "global_fallback"}
+    assert pred["bucket_level"] in {"full", "relaxed_market", "core", "global", "legacy_full"}
 
 
 def test_extract_candidate_features_and_quality_summary() -> None:
+    """Feature extraction should include sparse-data interaction buckets."""
     features = extract_candidate_features(
         candidate_json={
             "spread_side": "put",
@@ -91,8 +127,15 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert features["vix_regime"] == "high"
     assert features["term_structure_regime"] == "backwardation"
     assert features["spy_spx_ratio_regime"] == "parity"
+    assert features["vix_delta_interaction_bucket"] == "high:0.20"
+    assert features["dte_credit_interaction_bucket"] == "5:0.10"
     assert features["margin_usage"] == 850.0
-    assert build_bucket_key(features).endswith("support|high|backwardation|parity")
+    bucket_key = build_bucket_key(features)
+    assert "support|high|backwardation|parity" in bucket_key
+    assert bucket_key.endswith("high:0.20|5:0.10")
+    assert build_legacy_bucket_key(features).endswith("support|high|backwardation|parity")
+    levels = build_bucket_key_levels(features)
+    assert set(levels.keys()) == {"full", "relaxed_market", "core"}
 
     summary = summarize_strategy_quality(
         realized_pnls=[40.0, -20.0, 25.0, -10.0],
@@ -105,3 +148,47 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert summary["tp100_at_expiry"] == 1
     assert isinstance(summary["expectancy"], float)
     assert isinstance(summary["max_drawdown"], float)
+
+
+def test_predict_with_bucket_model_uses_relaxed_hierarchy_before_global() -> None:
+    """Prediction should use relaxed hierarchy when full key has no support."""
+    rows = [
+        {
+            "features": {
+                "spread_side": "put",
+                "target_dte": 3,
+                "delta_bucket": 0.15,
+                "credit_bucket": 0.10,
+                "context_regime": "support",
+                "vix_regime": "normal",
+                "term_structure_regime": "flat",
+                "spy_spx_ratio_regime": "parity",
+                "vix_delta_interaction_bucket": "normal:0.15",
+                "dte_credit_interaction_bucket": "3:0.10",
+                "margin_usage": 1200.0,
+            },
+            "realized_pnl": 30.0,
+            "hit_tp50": True,
+            "margin_usage": 1200.0,
+        }
+    ]
+    model = train_bucket_model(rows=rows, min_bucket_size=1, prior_strength=2.0)
+    pred = predict_with_bucket_model(
+        model_payload=model,
+        features={
+            "spread_side": "put",
+            "target_dte": 3,
+            "delta_bucket": 0.15,
+            "credit_bucket": 0.10,
+            "context_regime": "support",
+            "vix_regime": "normal",
+            # Switch market regimes to make full key miss, but relaxed key match.
+            "term_structure_regime": "backwardation",
+            "spy_spx_ratio_regime": "premium",
+            "vix_delta_interaction_bucket": "normal:0.15",
+            "dte_credit_interaction_bucket": "3:0.10",
+            "margin_usage": 1100.0,
+        },
+    )
+    assert pred["bucket_level"] in {"relaxed_market", "core", "global"}
+    assert pred["bucket_level"] != "full"

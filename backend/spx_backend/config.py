@@ -107,8 +107,17 @@ class Settings(BaseSettings):
     trainer_min_rows: int = 200
     trainer_min_train_rows: int = 100
     trainer_min_test_rows: int = 50
+    trainer_sparse_cv_enabled: bool = True
+    trainer_sparse_cv_min_rows: int = 30
+    trainer_sparse_cv_folds: int = 4
+    trainer_sparse_cv_min_train_rows: int = 12
+    trainer_sparse_cv_min_test_rows: int = 6
     trainer_min_bucket_size: int = 12
     trainer_prior_strength: float = 8.0
+    trainer_adaptive_prior_enabled: bool = True
+    trainer_adaptive_prior_reference_rows: int = 200
+    trainer_adaptive_prior_min: float = 2.0
+    trainer_adaptive_prior_max: float = 24.0
     trainer_utility_prob_weight: float = 0.35
     trainer_utility_tail_penalty: float = 0.20
     trainer_utility_margin_penalty: float = 0.02
@@ -137,6 +146,8 @@ class Settings(BaseSettings):
     decision_hybrid_model_name: str = "cand_bucket_v1"
     decision_hybrid_min_probability: float = 0.50
     decision_hybrid_min_expected_pnl: float = 0.0
+    decision_hybrid_min_bucket_count: int = 8
+    decision_hybrid_max_pnl_std: float = 250.0
     decision_hybrid_require_active_model: bool = True
 
     # Live trade PnL mark-to-market job

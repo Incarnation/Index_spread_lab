@@ -7,6 +7,88 @@ import statistics
 from typing import Any
 
 
+FULL_BUCKET_DIMENSIONS: tuple[str, ...] = (
+    "spread_side",
+    "target_dte",
+    "delta_bucket",
+    "credit_bucket",
+    "context_regime",
+    "vix_regime",
+    "term_structure_regime",
+    "spy_spx_ratio_regime",
+    "vix_delta_interaction_bucket",
+    "dte_credit_interaction_bucket",
+)
+LEGACY_BUCKET_DIMENSIONS: tuple[str, ...] = (
+    "spread_side",
+    "target_dte",
+    "delta_bucket",
+    "credit_bucket",
+    "context_regime",
+    "vix_regime",
+    "term_structure_regime",
+    "spy_spx_ratio_regime",
+)
+RELAXED_MARKET_BUCKET_DIMENSIONS: tuple[str, ...] = (
+    "spread_side",
+    "target_dte",
+    "delta_bucket",
+    "credit_bucket",
+    "context_regime",
+    "vix_regime",
+    "vix_delta_interaction_bucket",
+    "dte_credit_interaction_bucket",
+)
+CORE_BUCKET_DIMENSIONS: tuple[str, ...] = (
+    "spread_side",
+    "target_dte",
+    "delta_bucket",
+    "credit_bucket",
+    "vix_delta_interaction_bucket",
+    "dte_credit_interaction_bucket",
+)
+BUCKET_HIERARCHY_ORDER: tuple[str, ...] = ("full", "relaxed_market", "core", "global")
+
+
+def _bucket_token(features: dict[str, Any], key: str) -> str:
+    """Format one bucket dimension value into a deterministic string token.
+
+    Parameters
+    ----------
+    features:
+        Feature payload used by training or inference.
+    key:
+        Feature key to serialize into a stable bucket token.
+
+    Returns
+    -------
+    str
+        Stable token representation where missing values become `"na"`.
+    """
+    value = features.get(key)
+    if value is None:
+        return "na"
+    return str(value)
+
+
+def _build_bucket_key_for_dimensions(features: dict[str, Any], dimensions: tuple[str, ...]) -> str:
+    """Build a deterministic key from an explicit ordered dimension list.
+
+    Parameters
+    ----------
+    features:
+        Candidate feature dictionary.
+    dimensions:
+        Ordered feature keys to include in the serialized key.
+
+    Returns
+    -------
+    str
+        Pipe-delimited bucket key used for grouped empirical statistics.
+    """
+    return "|".join(_bucket_token(features, key) for key in dimensions)
+
+
 def _as_float(value: Any) -> float | None:
     """Best-effort float coercion for JSON-derived payloads."""
     if value is None:
@@ -148,7 +230,23 @@ def extract_candidate_features(
     max_loss_points: float | None,
     contract_multiplier: int = 100,
 ) -> dict[str, Any]:
-    """Extract normalized model features from candidate payload."""
+    """Extract normalized model features from a candidate payload.
+
+    Parameters
+    ----------
+    candidate_json:
+        Raw candidate payload persisted by feature-builder/decision steps.
+    max_loss_points:
+        Candidate max loss in spread points, used to derive margin usage.
+    contract_multiplier:
+        Contract multiplier used to convert points into dollar risk.
+
+    Returns
+    -------
+    dict[str, Any]
+        Normalized feature dictionary with base dimensions and sparse-data
+        interaction buckets for model training and inference.
+    """
     spread_side = str(candidate_json.get("spread_side") or "unknown").lower()
     target_dte = _as_int(candidate_json.get("target_dte"))
     delta_target = _as_float(candidate_json.get("delta_target"))
@@ -209,6 +307,12 @@ def extract_candidate_features(
     )
     delta_bucket = _bucket(delta_target, step=0.05)
     credit_bucket = _bucket(credit_to_width, step=0.05)
+    vix_delta_interaction_bucket = (
+        None if delta_bucket is None else f"{vix_regime}:{delta_bucket:.2f}"
+    )
+    dte_credit_interaction_bucket = (
+        None if target_dte is None or credit_bucket is None else f"{target_dte}:{credit_bucket:.2f}"
+    )
 
     return {
         "spread_side": spread_side,
@@ -223,23 +327,63 @@ def extract_candidate_features(
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,
         "credit_bucket": credit_bucket,
+        "vix_delta_interaction_bucket": vix_delta_interaction_bucket,
+        "dte_credit_interaction_bucket": dte_credit_interaction_bucket,
     }
 
 
 def build_bucket_key(features: dict[str, Any]) -> str:
-    """Build deterministic bucket key for empirical model stats."""
-    return "|".join(
-        [
-            str(features.get("spread_side") or "unknown"),
-            str(features.get("target_dte") if features.get("target_dte") is not None else "na"),
-            str(features.get("delta_bucket") if features.get("delta_bucket") is not None else "na"),
-            str(features.get("credit_bucket") if features.get("credit_bucket") is not None else "na"),
-            str(features.get("context_regime") or "neutral"),
-            str(features.get("vix_regime") or "unknown"),
-            str(features.get("term_structure_regime") or "unknown"),
-            str(features.get("spy_spx_ratio_regime") or "unknown"),
-        ]
-    )
+    """Build the full deterministic bucket key used by the latest model.
+
+    Parameters
+    ----------
+    features:
+        Candidate feature dictionary generated by `extract_candidate_features`.
+
+    Returns
+    -------
+    str
+        Full bucket key including interaction dimensions.
+    """
+    return _build_bucket_key_for_dimensions(features, FULL_BUCKET_DIMENSIONS)
+
+
+def build_legacy_bucket_key(features: dict[str, Any]) -> str:
+    """Build the pre-interaction bucket key for backward compatibility.
+
+    Parameters
+    ----------
+    features:
+        Candidate feature dictionary generated by `extract_candidate_features`.
+
+    Returns
+    -------
+    str
+        Legacy bucket key matching model payloads trained before interaction
+        dimensions were introduced.
+    """
+    return _build_bucket_key_for_dimensions(features, LEGACY_BUCKET_DIMENSIONS)
+
+
+def build_bucket_key_levels(features: dict[str, Any]) -> dict[str, str]:
+    """Build all hierarchy bucket keys for staged fallback lookups.
+
+    Parameters
+    ----------
+    features:
+        Candidate feature dictionary generated by `extract_candidate_features`.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping from hierarchy level (`full`, `relaxed_market`, `core`) to
+        deterministic key strings.
+    """
+    return {
+        "full": _build_bucket_key_for_dimensions(features, FULL_BUCKET_DIMENSIONS),
+        "relaxed_market": _build_bucket_key_for_dimensions(features, RELAXED_MARKET_BUCKET_DIMENSIONS),
+        "core": _build_bucket_key_for_dimensions(features, CORE_BUCKET_DIMENSIONS),
+    }
 
 
 def _stats_for_rows(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
@@ -268,77 +412,221 @@ def _stats_for_rows(rows: list[dict[str, Any]]) -> dict[str, float | int | None]
     }
 
 
-def train_bucket_model(
+def _adaptive_prior_strength(
     *,
-    rows: list[dict[str, Any]],
-    min_bucket_size: int = 12,
-    prior_strength: float = 8.0,
-    utility_prob_weight: float = 0.35,
-    utility_tail_penalty: float = 0.20,
-    utility_margin_penalty: float = 0.02,
+    base_prior_strength: float,
+    total_rows: int,
+    reference_rows: int,
+    min_prior_strength: float,
+    max_prior_strength: float,
+) -> float:
+    """Scale prior strength based on sample size for sparse-data robustness.
+
+    Parameters
+    ----------
+    base_prior_strength:
+        User-configured baseline Bayesian prior strength.
+    total_rows:
+        Number of usable labeled rows available for training.
+    reference_rows:
+        Row-count reference where prior remains near the base value.
+    min_prior_strength:
+        Lower clamp to avoid near-zero smoothing on large samples.
+    max_prior_strength:
+        Upper clamp to avoid over-smoothing on tiny samples.
+
+    Returns
+    -------
+    float
+        Effective prior strength used for bucket smoothing in this run.
+    """
+    safe_base = max(float(base_prior_strength), 0.0)
+    safe_reference = max(int(reference_rows), 1)
+    safe_total = max(int(total_rows), 1)
+    scaled = safe_base * (safe_reference / float(safe_total))
+    lower = max(float(min_prior_strength), 0.0)
+    upper = max(float(max_prior_strength), lower)
+    return min(max(scaled, lower), upper)
+
+
+def _build_hierarchical_groups(rows: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Group rows by each hierarchy level key for fallback-friendly training.
+
+    Parameters
+    ----------
+    rows:
+        Training rows containing `features`, realized PnL, and hit flags.
+
+    Returns
+    -------
+    dict[str, dict[str, list[dict[str, Any]]]]
+        Nested map keyed by hierarchy level, then by deterministic bucket key.
+    """
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
+        "full": defaultdict(list),
+        "relaxed_market": defaultdict(list),
+        "core": defaultdict(list),
+    }
+    for row in rows:
+        level_keys = build_bucket_key_levels(row["features"])
+        for level_name, key in level_keys.items():
+            grouped[level_name][key].append(row)
+    return grouped
+
+
+def _smoothed_bucket_stats(
+    *,
+    bucket_rows: list[dict[str, Any]],
+    global_stats: dict[str, float | int | None],
+    prior_strength: float,
+    min_bucket_size: int,
+    level_name: str,
 ) -> dict[str, Any]:
-    """Train a lightweight empirical bucket model for TP50 + expected PnL."""
-    usable = [r for r in rows if r.get("realized_pnl") is not None and r.get("features")]
-    global_stats = _stats_for_rows(usable)
+    """Compute smoothed bucket stats for one hierarchy level group.
 
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in usable:
-        key = build_bucket_key(row["features"])
-        groups[key].append(row)
+    Parameters
+    ----------
+    bucket_rows:
+        Rows assigned to this grouped key.
+    global_stats:
+        Global baseline stats used as Bayesian prior anchor.
+    prior_strength:
+        Effective prior mass used for smoothing.
+    min_bucket_size:
+        Minimum count treated as well-supported.
+    level_name:
+        Hierarchy level name (`full`, `relaxed_market`, or `core`).
 
-    bucket_stats: dict[str, dict[str, Any]] = {}
+    Returns
+    -------
+    dict[str, Any]
+        Smoothed bucket statistics with support-aware source labeling.
+    """
+    raw = _stats_for_rows(bucket_rows)
+    count = int(raw["count"] or 0)
+    wins = int(raw["wins"] or 0)
+    pnl_sum = sum(float(r["realized_pnl"]) for r in bucket_rows)
+    margin_sum = sum(float(r.get("margin_usage", 0.0)) for r in bucket_rows)
+
     global_prob = float(global_stats["prob_tp50"] or 0.0)
     global_exp = float(global_stats["expected_pnl"] or 0.0)
     global_tail = float(global_stats["tail_loss_proxy"] or 0.0)
     global_margin = float(global_stats["avg_margin_usage"] or 0.0)
     global_std = float(global_stats["pnl_std"] or 0.0)
+    smooth_denom = count + max(prior_strength, 0.0)
+    if smooth_denom <= 0:
+        smooth_denom = 1.0
 
-    for key, bucket_rows in groups.items():
-        raw = _stats_for_rows(bucket_rows)
-        count = int(raw["count"] or 0)
-        if count <= 0:
-            continue
-        wins = int(raw["wins"] or 0)
-        pnl_sum = sum(float(r["realized_pnl"]) for r in bucket_rows)
-        margin_sum = sum(float(r.get("margin_usage", 0.0)) for r in bucket_rows)
+    prob = (wins + global_prob * prior_strength) / smooth_denom
+    exp = (pnl_sum + global_exp * prior_strength) / smooth_denom
+    tail = ((float(raw["tail_loss_proxy"] or 0.0) * count) + (global_tail * prior_strength)) / smooth_denom
+    std = ((float(raw["pnl_std"] or 0.0) * count) + (global_std * prior_strength)) / smooth_denom
+    avg_margin = (margin_sum + global_margin * prior_strength) / smooth_denom
+    support_state = "bucket" if count >= min_bucket_size else "low_sample"
+    return {
+        "count": count,
+        "prob_tp50": prob,
+        "expected_pnl": exp,
+        "tail_loss_proxy": tail,
+        "pnl_std": std,
+        "avg_margin_usage": avg_margin,
+        "level": level_name,
+        "source": f"{level_name}_{support_state}",
+    }
 
-        smooth_denom = count + max(prior_strength, 0.0)
-        prob = ((wins + global_prob * prior_strength) / smooth_denom) if smooth_denom > 0 else global_prob
-        exp = ((pnl_sum + global_exp * prior_strength) / smooth_denom) if smooth_denom > 0 else global_exp
-        tail = (
-            ((float(raw["tail_loss_proxy"] or 0.0) * count) + (global_tail * prior_strength)) / smooth_denom
-            if smooth_denom > 0
-            else global_tail
+
+def train_bucket_model(
+    *,
+    rows: list[dict[str, Any]],
+    min_bucket_size: int = 12,
+    prior_strength: float = 8.0,
+    adaptive_prior_enabled: bool = True,
+    adaptive_prior_reference_rows: int = 200,
+    adaptive_prior_min: float = 2.0,
+    adaptive_prior_max: float = 24.0,
+    utility_prob_weight: float = 0.35,
+    utility_tail_penalty: float = 0.20,
+    utility_margin_penalty: float = 0.02,
+) -> dict[str, Any]:
+    """Train a smoothed empirical bucket model with hierarchical fallback stats.
+
+    Parameters
+    ----------
+    rows:
+        Labeled candidate rows with extracted features and realized outcomes.
+    min_bucket_size:
+        Minimum bucket support treated as high-confidence.
+    prior_strength:
+        Baseline Bayesian prior mass for bucket smoothing.
+    adaptive_prior_enabled:
+        Enables sample-size aware scaling of prior strength.
+    adaptive_prior_reference_rows:
+        Reference row count for adaptive prior scaling.
+    adaptive_prior_min:
+        Lower clamp for effective adaptive prior.
+    adaptive_prior_max:
+        Upper clamp for effective adaptive prior.
+    utility_prob_weight:
+        Weight applied to probability component in utility score.
+    utility_tail_penalty:
+        Penalty weight for adverse tail-risk proxy.
+    utility_margin_penalty:
+        Penalty weight for margin usage.
+
+    Returns
+    -------
+    dict[str, Any]
+        Model payload containing global stats, hierarchy bucket stats, utility
+        weights, and fallback order metadata.
+    """
+    usable = [r for r in rows if r.get("realized_pnl") is not None and r.get("features")]
+    global_stats = _stats_for_rows(usable)
+    effective_prior = float(prior_strength)
+    if adaptive_prior_enabled:
+        effective_prior = _adaptive_prior_strength(
+            base_prior_strength=prior_strength,
+            total_rows=len(usable),
+            reference_rows=adaptive_prior_reference_rows,
+            min_prior_strength=adaptive_prior_min,
+            max_prior_strength=adaptive_prior_max,
         )
-        std = (
-            ((float(raw["pnl_std"] or 0.0) * count) + (global_std * prior_strength)) / smooth_denom
-            if smooth_denom > 0
-            else global_std
-        )
-        avg_margin = ((margin_sum + global_margin * prior_strength) / smooth_denom) if smooth_denom > 0 else global_margin
 
-        bucket_stats[key] = {
-            "count": count,
-            "prob_tp50": prob,
-            "expected_pnl": exp,
-            "tail_loss_proxy": tail,
-            "pnl_std": std,
-            "avg_margin_usage": avg_margin,
-            "source": ("bucket" if count >= min_bucket_size else "bucket_low_sample"),
-        }
+    grouped = _build_hierarchical_groups(usable)
+    bucket_hierarchy: dict[str, dict[str, dict[str, Any]]] = {}
+    for level_name in ("full", "relaxed_market", "core"):
+        level_groups = grouped[level_name]
+        level_stats: dict[str, dict[str, Any]] = {}
+        for key, bucket_rows in level_groups.items():
+            if not bucket_rows:
+                continue
+            level_stats[key] = _smoothed_bucket_stats(
+                bucket_rows=bucket_rows,
+                global_stats=global_stats,
+                prior_strength=effective_prior,
+                min_bucket_size=min_bucket_size,
+                level_name=level_name,
+            )
+        bucket_hierarchy[level_name] = level_stats
 
     return {
         "model_type": "bucket_empirical_v1",
         "trained_at_utc": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
         "min_bucket_size": min_bucket_size,
-        "prior_strength": prior_strength,
+        "prior_strength": effective_prior,
+        "prior_strength_base": float(prior_strength),
+        "adaptive_prior_enabled": adaptive_prior_enabled,
+        "adaptive_prior_reference_rows": adaptive_prior_reference_rows,
+        "adaptive_prior_min": adaptive_prior_min,
+        "adaptive_prior_max": adaptive_prior_max,
         "utility_weights": {
             "prob_weight": utility_prob_weight,
             "tail_penalty": utility_tail_penalty,
             "margin_penalty": utility_margin_penalty,
         },
         "global": global_stats,
-        "buckets": bucket_stats,
+        "buckets": bucket_hierarchy.get("full", {}),
+        "bucket_hierarchy": bucket_hierarchy,
+        "fallback_order": list(BUCKET_HIERARCHY_ORDER),
     }
 
 
@@ -360,24 +648,105 @@ def compute_utility_score(
     return ev_component + prob_component - tail_component - margin_component
 
 
-def predict_with_bucket_model(*, model_payload: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
-    """Score one candidate using the trained empirical bucket model."""
-    bucket_key = build_bucket_key(features)
-    global_stats = model_payload.get("global") or {}
-    buckets = model_payload.get("buckets") or {}
-    min_bucket_size = int(model_payload.get("min_bucket_size") or 0)
+def _resolve_bucket_stats(model_payload: dict[str, Any], features: dict[str, Any], min_bucket_size: int) -> tuple[dict[str, Any], str, str]:
+    """Resolve prediction stats via hierarchy fallbacks, then global fallback.
 
-    stats = buckets.get(bucket_key)
-    if stats is None or int(stats.get("count") or 0) < min_bucket_size:
-        stats = {
-            "count": int((stats or {}).get("count") or 0),
+    Parameters
+    ----------
+    model_payload:
+        Trained model payload returned by `train_bucket_model`.
+    features:
+        Candidate feature dictionary for scoring.
+    min_bucket_size:
+        Minimum support threshold used to classify low-sample buckets.
+
+    Returns
+    -------
+    tuple[dict[str, Any], str, str]
+        Selected stats payload, selected hierarchy level, and selected key.
+    """
+    fallback_order_raw = model_payload.get("fallback_order")
+    fallback_order = (
+        [str(level) for level in fallback_order_raw]
+        if isinstance(fallback_order_raw, list) and fallback_order_raw
+        else list(BUCKET_HIERARCHY_ORDER)
+    )
+    hierarchy = model_payload.get("bucket_hierarchy")
+    level_keys = build_bucket_key_levels(features)
+    low_sample_candidate: tuple[dict[str, Any], str, str] | None = None
+    if isinstance(hierarchy, dict):
+        for level_name in fallback_order:
+            if level_name == "global":
+                continue
+            level_key = level_keys.get(level_name)
+            if not level_key:
+                continue
+            level_map = hierarchy.get(level_name)
+            if not isinstance(level_map, dict):
+                continue
+            stats = level_map.get(level_key)
+            if not isinstance(stats, dict):
+                continue
+            count = int(stats.get("count") or 0)
+            if count >= min_bucket_size:
+                return stats, level_name, level_key
+            if count > 0 and low_sample_candidate is None:
+                low_sample_candidate = (stats, level_name, level_key)
+        if low_sample_candidate is not None:
+            return low_sample_candidate
+
+    buckets = model_payload.get("buckets")
+    if isinstance(buckets, dict):
+        for key, level_name in (
+            (build_bucket_key(features), "full"),
+            (build_legacy_bucket_key(features), "legacy_full"),
+        ):
+            stats = buckets.get(key)
+            if not isinstance(stats, dict):
+                continue
+            count = int(stats.get("count") or 0)
+            if count >= min_bucket_size:
+                return stats, level_name, key
+            if count > 0 and low_sample_candidate is None:
+                low_sample_candidate = (stats, level_name, key)
+        if low_sample_candidate is not None:
+            return low_sample_candidate
+
+    global_stats = model_payload.get("global") or {}
+    return (
+        {
+            "count": 0,
             "prob_tp50": float(global_stats.get("prob_tp50") or 0.0),
             "expected_pnl": float(global_stats.get("expected_pnl") or 0.0),
             "tail_loss_proxy": float(global_stats.get("tail_loss_proxy") or 0.0),
             "pnl_std": float(global_stats.get("pnl_std") or 0.0),
             "avg_margin_usage": float(global_stats.get("avg_margin_usage") or 0.0),
             "source": "global_fallback",
-        }
+            "level": "global",
+        },
+        "global",
+        "global",
+    )
+
+
+def predict_with_bucket_model(*, model_payload: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
+    """Score one candidate with hierarchical bucket fallback.
+
+    Parameters
+    ----------
+    model_payload:
+        Trained payload containing global stats and bucket hierarchy maps.
+    features:
+        Candidate features produced by `extract_candidate_features`.
+
+    Returns
+    -------
+    dict[str, Any]
+        Prediction payload with probabilities, expected PnL, utility score,
+        and selected fallback level metadata.
+    """
+    min_bucket_size = int(model_payload.get("min_bucket_size") or 0)
+    stats, bucket_level, bucket_key = _resolve_bucket_stats(model_payload, features, min_bucket_size)
 
     probability_win = float(stats.get("prob_tp50") or 0.0)
     expected_pnl = float(stats.get("expected_pnl") or 0.0)
@@ -401,6 +770,7 @@ def predict_with_bucket_model(*, model_payload: dict[str, Any], features: dict[s
     )
     return {
         "bucket_key": bucket_key,
+        "bucket_level": bucket_level,
         "bucket_count": int(stats.get("count") or 0),
         "source": stats.get("source") or "unknown",
         "probability_win": probability_win,
