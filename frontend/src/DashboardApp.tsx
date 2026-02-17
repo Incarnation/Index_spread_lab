@@ -1,5 +1,5 @@
 import React from "react";
-import { Alert, Badge, Box, Container, Stack, Text, Title } from "@mantine/core";
+import { Alert, Badge, Box, Container, Stack, Text, TextInput, Title } from "@mantine/core";
 import { API_BASE } from "./api";
 import {
   ChainSnapshotsPanel,
@@ -61,6 +61,26 @@ function deriveEnvironmentInfo(apiBase: string): EnvironmentInfo {
 }
 
 /**
+ * Read frontend admin key from Vite env and normalize optional wrapping quotes.
+ */
+function readFrontendAdminKey(): string {
+  const raw = (import.meta.env.VITE_ADMIN_API_KEY as string | undefined)?.trim() ?? "";
+  if (raw.length >= 2 && ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))) {
+    return raw.slice(1, -1).trim();
+  }
+  return raw;
+}
+
+/**
+ * Mask secret values for read-only display in the UI.
+ */
+function maskSecret(value: string): string {
+  if (!value) return "Not configured";
+  if (value.length <= 6) return `${"*".repeat(Math.max(0, value.length - 2))}${value.slice(-2)}`;
+  return `${value.slice(0, 2)}${"*".repeat(value.length - 4)}${value.slice(-2)}`;
+}
+
+/**
  * Render the main IndexSpreadLab dashboard page and wire cross-panel interactions.
  *
  * This container composes all major cards/panels and coordinates shared
@@ -68,6 +88,7 @@ function deriveEnvironmentInfo(apiBase: string): EnvironmentInfo {
  */
 export function DashboardApp() {
   const [error, setError] = React.useState<string | null>(null);
+  const adminKey = React.useMemo(() => readFrontendAdminKey(), []);
   const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
   const [drawerDecision, setDrawerDecision] = React.useState<{
     decision_id: number;
@@ -101,7 +122,7 @@ export function DashboardApp() {
     preflightLoading,
     preflightAuthRequired,
     refresh,
-  } = useSnapshotsDecisions({ adminKey: "", onError: handleError });
+  } = useSnapshotsDecisions({ adminKey, onError: handleError });
 
   const {
     gexSnapshots,
@@ -116,12 +137,6 @@ export function DashboardApp() {
     gexCurve,
     gexLoading,
   } = useGexData({ onError: handleError });
-
-  /** Refresh all dashboard datasets while clearing stale error text. */
-  const handleRefresh = React.useCallback(() => {
-    clearError();
-    refresh();
-  }, [clearError, refresh]);
 
   return (
     <Box bg="gray.0" mih="100vh" py="xl">

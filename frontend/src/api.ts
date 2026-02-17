@@ -14,7 +14,15 @@ function apiUrl(path: string): string {
  * Build admin auth headers when an API key is provided.
  */
 function adminHeaders(apiKey?: string): HeadersInit | undefined {
-  return apiKey ? { "X-API-Key": apiKey } : undefined;
+  if (!apiKey) return undefined;
+  const trimmed = apiKey.trim();
+  if (!trimmed) return undefined;
+  const normalized =
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))
+      ? trimmed.slice(1, -1).trim()
+      : trimmed;
+  return normalized ? { "X-API-Key": normalized } : undefined;
 }
 
 export type ChainSnapshot = {
