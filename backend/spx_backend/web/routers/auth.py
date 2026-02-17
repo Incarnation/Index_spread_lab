@@ -9,9 +9,11 @@ Auth events (login success/failure, logout, session_expiry) are written to auth_
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from datetime import datetime, timezone, timedelta
 
+import httpx
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from passlib.context import CryptContext
@@ -22,6 +24,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
 from spx_backend.database import get_db_session
+
+# Free IP-to-country/region API (no key). 45 req/min limit; we only call on auth events.
+# No fields param = full response (continent, country, regionName, city, zip, lat, lon, timezone, isp, org, etc.).
+GEOIP_API_URL = "https://ip-api.com/json/{ip}"
+GEOIP_TIMEOUT_SEC = 2
+
+# Map 2-letter codes to full country names when we get country from proxy header (e.g. CF-IPCountry).
+COUNTRY_CODE_TO_NAME: dict[str, str] = {
+    "US": "United States",
+    "CA": "Canada",
+    "GB": "United Kingdom",
+    "AU": "Australia",
+    "DE": "Germany",
+    "FR": "France",
+    "IN": "India",
+    "JP": "Japan",
+    "CN": "China",
+    "BR": "Brazil",
+    "MX": "Mexico",
+    "ES": "Spain",
+    "IT": "Italy",
+    "NL": "Netherlands",
+    "KR": "South Korea",
+    "SG": "Singapore",
+    "TW": "Taiwan",
+    "HK": "Hong Kong",
+}
 
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -107,7 +136,7 @@ def _issue_token(user_id: int) -> str:
 def _request_metadata(request: Request) -> dict:
     """
     Extract IP, User-Agent, and country from request for audit logging.
-    Country uses CF-IPCountry (Cloudflare) or X-Geo-Country if present.
+    Country uses CF-IPCountry (Cloudflare) or X-Geo-Country if present; otherwise use geo lookup (see _request_metadata_with_geo).
     """
     # Prefer forwarded-for first proxy; client.host is direct client.
     forwarded = request.headers.get("x-forwarded-for")
@@ -115,6 +144,79 @@ def _request_metadata(request: Request) -> dict:
     user_agent = request.headers.get("user-agent")
     country = request.headers.get("cf-ipcountry") or request.headers.get("x-geo-country")
     return {"ip": ip_raw, "user_agent": user_agent, "country": country}
+
+
+def _normalize_ip(ip: str | None) -> str | None:
+    """Return IP string without CIDR suffix (e.g. 73.83.187.53/32 -> 73.83.187.53), or None if invalid."""
+    if not ip or not ip.strip():
+        return None
+    s = ip.strip().split("/")[0].strip()
+    return s if s else None
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    """Return True if the IP is private or loopback (no point querying geo API)."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return addr.is_private or addr.is_loopback
+    except ValueError:
+        return True
+
+
+def _lookup_geo_by_ip_result(data: dict) -> tuple[str | None, str | None, dict | None]:
+    """
+    Extract (country name, region name, full response) from ip-api.com response.
+    Full response is stored in auth_audit_log.geo_json for UI display.
+    """
+    if data.get("status") != "success":
+        return (None, None, None)
+    country = (data.get("country") or "").strip() or None
+    region = (data.get("regionName") or "").strip() or None
+    # Store full JSON for audit (exclude internal keys if any; ip-api returns query, status, country, etc.)
+    return (country, region, dict(data))
+
+
+async def _lookup_geo_by_ip(ip: str) -> tuple[str | None, str | None, dict | None]:
+    """
+    Resolve country, region, and full geo JSON for a public IP using ip-api.com (free, no key).
+    Returns (country, region, full_geo_dict) or (None, None, None). Does not raise.
+    """
+    if _is_private_ip(ip):
+        return (None, None, None)
+    url = GEOIP_API_URL.format(ip=ip)
+    try:
+        async with httpx.AsyncClient(timeout=GEOIP_TIMEOUT_SEC) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return (None, None, None)
+            data = r.json()
+            return _lookup_geo_by_ip_result(data)
+    except Exception:
+        return (None, None, None)
+
+
+async def _request_metadata_with_geo(request: Request) -> dict:
+    """
+    Like _request_metadata but fills country (full name) and region (state) from IP when
+    CF-IPCountry / X-Geo-Country are missing. Uses free ip-api.com; best-effort.
+    When country comes from header as 2-letter code, expand to full name via COUNTRY_CODE_TO_NAME.
+    """
+    meta = _request_metadata(request)
+    header_country = meta.get("country")
+    if header_country:
+        # Expand 2-letter code to full name if we have it; otherwise keep as-is.
+        code = (header_country or "").strip().upper()
+        if len(code) == 2 and code in COUNTRY_CODE_TO_NAME:
+            meta["country"] = COUNTRY_CODE_TO_NAME[code]
+        return meta
+    ip = _normalize_ip(meta.get("ip"))
+    if ip:
+        country, region, geo_details = await _lookup_geo_by_ip(ip)
+        if country:
+            meta["country"] = country
+        if geo_details:
+            meta["geo_details"] = geo_details
+    return meta
 
 
 async def _insert_audit_event(
@@ -126,16 +228,19 @@ async def _insert_audit_event(
     ip: str | None = None,
     user_agent: str | None = None,
     country: str | None = None,
+    geo_json: dict | None = None,
     details: dict | None = None,
 ) -> None:
     """
     Insert one row into auth_audit_log. Does not commit; caller must commit.
+    geo_json: full ip-api.com response (continent, country, city, lat, lon, isp, etc.).
     """
     details_json = json.dumps(details) if details else None
+    geo_json_str = json.dumps(geo_json) if geo_json else None
     await db.execute(
         text("""
-            INSERT INTO auth_audit_log (event_type, user_id, username, ip_address, user_agent, country, details)
-            VALUES (:event_type, :user_id, :username, CAST(:ip AS inet), :user_agent, :country, CAST(:details AS jsonb))
+            INSERT INTO auth_audit_log (event_type, user_id, username, ip_address, user_agent, country, geo_json, details)
+            VALUES (:event_type, :user_id, :username, CAST(:ip AS inet), :user_agent, :country, CAST(:geo_json AS jsonb), CAST(:details AS jsonb))
         """),
         {
             "event_type": event_type,
@@ -144,6 +249,7 @@ async def _insert_audit_event(
             "ip": ip or None,
             "user_agent": user_agent or None,
             "country": country or None,
+            "geo_json": geo_json_str,
             "details": details_json,
         },
     )
@@ -187,7 +293,7 @@ async def get_current_user(
         # Record session_expiry for audit (user unknown from invalid/expired token).
         # Best-effort: if table missing or insert fails, still raise 401.
         try:
-            meta = _request_metadata(request)
+            meta = await _request_metadata_with_geo(request)
             await _insert_audit_event(
                 db,
                 EVENT_SESSION_EXPIRY,
@@ -196,6 +302,7 @@ async def get_current_user(
                 ip=meta.get("ip"),
                 user_agent=meta.get("user_agent"),
                 country=meta.get("country"),
+                geo_json=meta.get("geo_details"),
             )
             await db.commit()
         except Exception:
@@ -234,7 +341,7 @@ async def login(
     Authenticate by username and password; return JWT and user info.
     Records login_success or login_failure in auth_audit_log. Returns 401 on invalid credentials.
     """
-    meta = _request_metadata(request)
+    meta = await _request_metadata_with_geo(request)
     username_clean = body.username.strip()
     r = await db.execute(
         text("SELECT id, username, password_hash, COALESCE(is_admin, false) AS is_admin FROM users WHERE username = :username"),
@@ -249,6 +356,7 @@ async def login(
             ip=meta.get("ip"),
             user_agent=meta.get("user_agent"),
             country=meta.get("country"),
+            geo_json=meta.get("geo_details"),
         )
         await db.commit()
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -263,6 +371,7 @@ async def login(
         ip=meta.get("ip"),
         user_agent=meta.get("user_agent"),
         country=meta.get("country"),
+        geo_json=meta.get("geo_details"),
     )
     await db.commit()
     access_token = _issue_token(user_id)
@@ -334,7 +443,7 @@ async def logout(
     Record logout in auth_audit_log. Call this before clearing the token on the client.
     Returns 204 No Content.
     """
-    meta = _request_metadata(request)
+    meta = await _request_metadata_with_geo(request)
     await _insert_audit_event(
         db,
         EVENT_LOGOUT,
@@ -343,6 +452,7 @@ async def logout(
         ip=meta.get("ip"),
         user_agent=meta.get("user_agent"),
         country=meta.get("country"),
+        geo_json=meta.get("geo_details"),
     )
     await db.commit()
     from fastapi.responses import Response

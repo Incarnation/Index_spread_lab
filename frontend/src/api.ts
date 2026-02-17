@@ -641,6 +641,8 @@ export type AuthAuditEvent = {
   ip_address: string | null;
   user_agent: string | null;
   country: string | null;
+  /** Full ip-api.com geo lookup response (continent, country, city, lat, lon, isp, etc.). */
+  geo_json: Record<string, unknown> | null;
   details: Record<string, unknown> | null;
 };
 

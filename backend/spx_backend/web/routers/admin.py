@@ -230,7 +230,7 @@ async def admin_auth_audit(
     r_count = await db.execute(text(count_sql), params)
     total = r_count.scalar_one()
     list_sql = f"""
-        SELECT id, event_type, user_id, username, occurred_at, ip_address::text, user_agent, country, details
+        SELECT id, event_type, user_id, username, occurred_at, ip_address::text, user_agent, country, geo_json, details
         FROM auth_audit_log
         {where_sql}
         ORDER BY occurred_at DESC
@@ -248,6 +248,7 @@ async def admin_auth_audit(
             "ip_address": str(row.ip_address) if row.ip_address else None,
             "user_agent": row.user_agent,
             "country": row.country,
+            "geo_json": getattr(row, "geo_json", None),
             "details": row.details,
         }
         for row in rows

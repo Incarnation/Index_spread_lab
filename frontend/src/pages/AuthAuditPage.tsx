@@ -5,7 +5,7 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Alert, Box, Button, Container, Group, Loader, Table, Text, Title } from "@mantine/core";
+import { Alert, Box, Button, Code, Container, Group, Loader, Modal, Stack, Table, Text, Title } from "@mantine/core";
 import { useAuth } from "../contexts/AuthContext";
 import { fetchAuthAudit, type AuthAuditEvent, type AuthAuditResponse } from "../api";
 
@@ -55,6 +55,7 @@ export function AuthAuditPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(0);
+  const [detailsModalEvent, setDetailsModalEvent] = useState<AuthAuditEvent | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -123,6 +124,7 @@ export function AuthAuditPage() {
                   <Table.Th>IP</Table.Th>
                   <Table.Th>Country</Table.Th>
                   <Table.Th>Browser</Table.Th>
+                  <Table.Th></Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -138,10 +140,61 @@ export function AuthAuditPage() {
                         {formatUserAgentShort(ev.user_agent)}
                       </Text>
                     </Table.Td>
+                    <Table.Td>
+                      <Button
+                        variant="subtle"
+                        size="xs"
+                        onClick={() => setDetailsModalEvent(ev)}
+                      >
+                        View details
+                      </Button>
+                    </Table.Td>
                   </Table.Tr>
                 ))}
               </Table.Tbody>
             </Table>
+
+            <Modal
+              title="Event details"
+              opened={detailsModalEvent !== null}
+              onClose={() => setDetailsModalEvent(null)}
+              size="lg"
+            >
+              {detailsModalEvent && (
+                <Stack gap="md">
+                  <Text size="sm" c="dimmed">
+                    {formatAuditTime(detailsModalEvent.occurred_at)} · {detailsModalEvent.event_type} · {detailsModalEvent.username ?? "—"}
+                  </Text>
+                  {(detailsModalEvent.geo_json && Object.keys(detailsModalEvent.geo_json).length > 0) ||
+                   (detailsModalEvent.details && Object.keys(detailsModalEvent.details).length > 0) ? (
+                    <>
+                      {(detailsModalEvent.geo_json ?? (detailsModalEvent.details as { geo?: Record<string, unknown> })?.geo) && (
+                        <>
+                          <Text size="sm" fw={600}>Geo / IP lookup (full)</Text>
+                          <Code block style={{ whiteSpace: "pre", maxHeight: 360, overflow: "auto" }}>
+                            {JSON.stringify(
+                              detailsModalEvent.geo_json ?? (detailsModalEvent.details as { geo?: Record<string, unknown> })?.geo,
+                              null,
+                              2
+                            )}
+                          </Code>
+                        </>
+                      )}
+                      {detailsModalEvent.details && Object.keys(detailsModalEvent.details).filter((k) => k !== "geo").length > 0 && (
+                        <>
+                          <Text size="sm" fw={600}>Other details</Text>
+                          <Code block style={{ whiteSpace: "pre", maxHeight: 200, overflow: "auto" }}>
+                            {JSON.stringify(detailsModalEvent.details, null, 2)}
+                          </Code>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <Text size="sm" c="dimmed">No additional details stored for this event.</Text>
+                  )}
+                </Stack>
+              )}
+            </Modal>
             <Group mt="md" gap="xs">
               <Button
                 variant="light"

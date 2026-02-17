@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS auth_audit_log (
   ip_address INET NULL,
   user_agent TEXT NULL,
   country TEXT NULL,
+  geo_json JSONB NULL,
   details JSONB NULL
 );
 
