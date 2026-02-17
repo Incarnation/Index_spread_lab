@@ -8,7 +8,7 @@ import { useNavigate } from "react-router-dom";
 import * as authStorage from "../auth";
 import { API_BASE } from "../api";
 
-export type AuthUser = { id: number; username: string };
+export type AuthUser = { id: number; username: string; is_admin: boolean };
 
 type AuthState = {
   token: string | null;
@@ -37,7 +37,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const clearError = useCallback(() => setError(null), []);
 
-  const logout = useCallback(() => {
+  /** Log out: call backend to record logout event, then clear token and redirect. */
+  const logout = useCallback(async () => {
+    const t = authStorage.getToken();
+    if (t) {
+      try {
+        await fetch(apiUrl("/api/auth/logout"), {
+          method: "POST",
+          headers: { Authorization: `Bearer ${t}` },
+        });
+      } catch {
+        // Ignore network errors; still clear local state.
+      }
+    }
     authStorage.clearToken();
     setTokenState(null);
     setUser(null);

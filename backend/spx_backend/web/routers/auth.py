@@ -1,17 +1,19 @@
 """
-Auth router: login, registration, and JWT-based current-user dependency.
+Auth router: login, registration, logout, and JWT-based current-user dependency.
 
 Public endpoints: POST /api/auth/login, POST /api/auth/register.
-Protected: GET /api/auth/me (requires valid Bearer token).
+Protected: GET /api/auth/me, POST /api/auth/logout (require valid Bearer token).
 get_current_user is reused by public and admin routers to protect all other /api/* routes.
+Auth events (login success/failure, logout, session_expiry) are written to auth_audit_log.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone, timedelta
 
 import jwt
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -24,6 +26,12 @@ from spx_backend.database import get_db_session
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Event types for auth_audit_log.
+EVENT_LOGIN_SUCCESS = "login_success"
+EVENT_LOGIN_FAILURE = "login_failure"
+EVENT_LOGOUT = "logout"
+EVENT_SESSION_EXPIRY = "session_expiry"
+
 # Minimum lengths for validation.
 USERNAME_MIN = 3
 USERNAME_MAX = 64
@@ -35,6 +43,7 @@ class UserOut(BaseModel):
 
     id: int
     username: str
+    is_admin: bool = False
 
 
 class LoginBody(BaseModel):
@@ -95,25 +104,71 @@ def _issue_token(user_id: int) -> str:
     # PyJWT 2.x returns str; no need for decode if we pass str to frontend.
 
 
+def _request_metadata(request: Request) -> dict:
+    """
+    Extract IP, User-Agent, and country from request for audit logging.
+    Country uses CF-IPCountry (Cloudflare) or X-Geo-Country if present.
+    """
+    # Prefer forwarded-for first proxy; client.host is direct client.
+    forwarded = request.headers.get("x-forwarded-for")
+    ip_raw = (forwarded.split(",")[0].strip()) if forwarded else request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+    country = request.headers.get("cf-ipcountry") or request.headers.get("x-geo-country")
+    return {"ip": ip_raw, "user_agent": user_agent, "country": country}
+
+
+async def _insert_audit_event(
+    db: AsyncSession,
+    event_type: str,
+    *,
+    user_id: int | None = None,
+    username: str | None = None,
+    ip: str | None = None,
+    user_agent: str | None = None,
+    country: str | None = None,
+    details: dict | None = None,
+) -> None:
+    """
+    Insert one row into auth_audit_log. Does not commit; caller must commit.
+    """
+    details_json = json.dumps(details) if details else None
+    await db.execute(
+        text("""
+            INSERT INTO auth_audit_log (event_type, user_id, username, ip_address, user_agent, country, details)
+            VALUES (:event_type, :user_id, :username, CAST(:ip AS inet), :user_agent, :country, CAST(:details AS jsonb))
+        """),
+        {
+            "event_type": event_type,
+            "user_id": user_id,
+            "username": username or None,
+            "ip": ip or None,
+            "user_agent": user_agent or None,
+            "country": country or None,
+            "details": details_json,
+        },
+    )
+
+
 async def _get_user_by_id(db: AsyncSession, user_id: int) -> UserOut | None:
     """Load user by id from DB; return None if not found."""
     r = await db.execute(
-        text("SELECT id, username FROM users WHERE id = :id"),
+        text("SELECT id, username, COALESCE(is_admin, false) AS is_admin FROM users WHERE id = :id"),
         {"id": user_id},
     )
     row = r.fetchone()
     if not row:
         return None
-    return UserOut(id=row.id, username=row.username)
+    return UserOut(id=row.id, username=row.username, is_admin=getattr(row, "is_admin", False))
 
 
 async def get_current_user(
+    request: Request,
     authorization: str | None = Header(default=None, alias="Authorization"),
     db: AsyncSession = Depends(get_db_session),
 ) -> UserOut:
     """
     Dependency: parse Authorization Bearer token, decode JWT, load user from DB.
-    Raises 401 if missing or invalid.
+    On invalid or expired token, records session_expiry in auth_audit_log then raises 401.
     """
     if not authorization or not authorization.strip().lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -129,6 +184,22 @@ async def get_current_user(
             algorithms=[settings.jwt_algorithm],
         )
     except jwt.InvalidTokenError:
+        # Record session_expiry for audit (user unknown from invalid/expired token).
+        # Best-effort: if table missing or insert fails, still raise 401.
+        try:
+            meta = _request_metadata(request)
+            await _insert_audit_event(
+                db,
+                EVENT_SESSION_EXPIRY,
+                user_id=None,
+                username=None,
+                ip=meta.get("ip"),
+                user_agent=meta.get("user_agent"),
+                country=meta.get("country"),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     sub = payload.get("sub")
     if not sub:
@@ -143,29 +214,62 @@ async def get_current_user(
     return user
 
 
+async def require_admin(current_user: UserOut = Depends(get_current_user)) -> UserOut:
+    """
+    Dependency: requires current user to have is_admin True.
+    Raises 403 if the user is not an admin. Use for admin-only endpoints (e.g. auth audit).
+    """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return current_user
+
+
 @router.post("/api/auth/login")
 async def login(
+    request: Request,
     body: LoginBody,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
     Authenticate by username and password; return JWT and user info.
-    Returns 401 on invalid credentials.
+    Records login_success or login_failure in auth_audit_log. Returns 401 on invalid credentials.
     """
+    meta = _request_metadata(request)
+    username_clean = body.username.strip()
     r = await db.execute(
-        text("SELECT id, username, password_hash FROM users WHERE username = :username"),
-        {"username": body.username.strip()},
+        text("SELECT id, username, password_hash, COALESCE(is_admin, false) AS is_admin FROM users WHERE username = :username"),
+        {"username": username_clean},
     )
     row = r.fetchone()
     if not row or not _verify_password(body.password, row.password_hash):
+        await _insert_audit_event(
+            db,
+            EVENT_LOGIN_FAILURE,
+            username=username_clean,
+            ip=meta.get("ip"),
+            user_agent=meta.get("user_agent"),
+            country=meta.get("country"),
+        )
+        await db.commit()
         raise HTTPException(status_code=401, detail="Invalid username or password")
     user_id = row.id
     username = row.username
+    is_admin = getattr(row, "is_admin", False)
+    await _insert_audit_event(
+        db,
+        EVENT_LOGIN_SUCCESS,
+        user_id=user_id,
+        username=username,
+        ip=meta.get("ip"),
+        user_agent=meta.get("user_agent"),
+        country=meta.get("country"),
+    )
+    await db.commit()
     access_token = _issue_token(user_id)
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {"id": user_id, "username": username},
+        "user": {"id": user_id, "username": username, "is_admin": is_admin},
     }
 
 
@@ -198,18 +302,19 @@ async def register(
     except IntegrityError:
         raise HTTPException(status_code=409, detail="Username already taken")
     r = await db.execute(
-        text("SELECT id, username FROM users WHERE username = :username"),
+        text("SELECT id, username, COALESCE(is_admin, false) AS is_admin FROM users WHERE username = :username"),
         {"username": username},
     )
     row = r.fetchone()
     if not row:
         raise HTTPException(status_code=500, detail="User created but not found")
-    user_id, _ = row
+    user_id = row.id
+    is_admin = getattr(row, "is_admin", False)
     access_token = _issue_token(user_id)
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {"id": user_id, "username": username},
+        "user": {"id": user_id, "username": username, "is_admin": is_admin},
     }
 
 
@@ -217,3 +322,28 @@ async def register(
 async def me(current_user: UserOut = Depends(get_current_user)) -> UserOut:
     """Return the current authenticated user."""
     return current_user
+
+
+@router.post("/api/auth/logout")
+async def logout(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> None:
+    """
+    Record logout in auth_audit_log. Call this before clearing the token on the client.
+    Returns 204 No Content.
+    """
+    meta = _request_metadata(request)
+    await _insert_audit_event(
+        db,
+        EVENT_LOGOUT,
+        user_id=current_user.id,
+        username=current_user.username,
+        ip=meta.get("ip"),
+        user_agent=meta.get("user_agent"),
+        country=meta.get("country"),
+    )
+    await db.commit()
+    from fastapi.responses import Response
+    return Response(status_code=204)

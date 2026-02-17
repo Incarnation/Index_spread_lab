@@ -5,6 +5,7 @@ import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { AuthProvider } from "./contexts/AuthContext";
 import { DashboardApp } from "./DashboardApp";
+import { AuthAuditPage } from "./pages/AuthAuditPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 
@@ -16,6 +17,14 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <AuthProvider>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
+            <Route
+              path="/admin/auth-audit"
+              element={
+                <ProtectedRoute>
+                  <AuthAuditPage />
+                </ProtectedRoute>
+              }
+            />
             <Route
               path="/*"
               element={

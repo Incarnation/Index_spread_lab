@@ -55,6 +55,10 @@ async def integration_db_session(database_url_test: str) -> AsyncSession:
     sql_dir = Path(__file__).resolve().parents[2] / "spx_backend" / "database" / "sql"
     await _execute_sql_file(engine, sql_dir / "db_reset_all_tables.sql")
     await _execute_sql_file(engine, sql_dir / "db_schema.sql")
+    mig_dir = sql_dir / "migrations"
+    if mig_dir.exists():
+        for path in sorted(mig_dir.glob("*.sql")):
+            await _execute_sql_file(engine, path)
 
     session_factory = async_sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     session = session_factory()

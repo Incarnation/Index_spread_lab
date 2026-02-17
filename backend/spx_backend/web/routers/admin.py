@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
-from spx_backend.web.routers.auth import UserOut, get_current_user
+from spx_backend.web.routers.auth import UserOut, get_current_user, require_admin
 from spx_backend.database import get_db_session
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
@@ -197,6 +197,62 @@ async def admin_list_expirations(
     resp = await client.get_option_expirations(symbol)
     exps = _parse_expirations(resp)
     return {"symbol": symbol, "expirations": [e.isoformat() for e in exps]}
+
+
+@router.get("/api/admin/auth-audit")
+async def admin_auth_audit(
+    current_user: UserOut = Depends(require_admin),
+    db: AsyncSession = Depends(get_db_session),
+    limit: int = 100,
+    offset: int = 0,
+    event_type: str | None = None,
+    user_id: int | None = None,
+) -> dict:
+    """
+    List auth audit log entries (login success/failure, logout, session_expiry).
+    Admin-only. Supports pagination and optional filters by event_type and user_id.
+    """
+    if limit <= 0 or limit > 500:
+        limit = 100
+    if offset < 0:
+        offset = 0
+    # Build WHERE clause from optional filters.
+    conditions = []
+    params: dict = {"limit": limit, "offset": offset}
+    if event_type:
+        conditions.append("event_type = :event_type")
+        params["event_type"] = event_type
+    if user_id is not None:
+        conditions.append("user_id = :user_id")
+        params["user_id"] = user_id
+    where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    count_sql = f"SELECT COUNT(*) FROM auth_audit_log{where_sql}"
+    r_count = await db.execute(text(count_sql), params)
+    total = r_count.scalar_one()
+    list_sql = f"""
+        SELECT id, event_type, user_id, username, occurred_at, ip_address::text, user_agent, country, details
+        FROM auth_audit_log
+        {where_sql}
+        ORDER BY occurred_at DESC
+        LIMIT :limit OFFSET :offset
+    """
+    r_list = await db.execute(text(list_sql), params)
+    rows = r_list.fetchall()
+    events = [
+        {
+            "id": row.id,
+            "event_type": row.event_type,
+            "user_id": row.user_id,
+            "username": row.username,
+            "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+            "ip_address": str(row.ip_address) if row.ip_address else None,
+            "user_agent": row.user_agent,
+            "country": row.country,
+            "details": row.details,
+        }
+        for row in rows
+    ]
+    return {"total": total, "limit": limit, "offset": offset, "events": events}
 
 
 @router.get("/api/admin/preflight")

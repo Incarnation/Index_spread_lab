@@ -45,12 +45,18 @@ async def integration_client_with_auth(integration_db_session, database_url_test
 
     app.dependency_overrides[get_db_session] = _override_db
 
-    # Seed user for login test
+    # Seed users: testuser (admin for auth-audit tests) and otheruser (non-admin for 403 test).
     await integration_db_session.execute(
         text(
-            "INSERT INTO users (username, password_hash) VALUES (:u, :h)"
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (:u, :h, :admin)"
         ),
-        {"u": "testuser", "h": pwd_ctx.hash("testpass123")},
+        {"u": "testuser", "h": pwd_ctx.hash("testpass123"), "admin": True},
+    )
+    await integration_db_session.execute(
+        text(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (:u, :h, :admin)"
+        ),
+        {"u": "otheruser", "h": pwd_ctx.hash("otherpass123"), "admin": False},
     )
     await integration_db_session.commit()
 
@@ -75,7 +81,7 @@ async def test_health_remains_public(integration_client_with_auth: AsyncClient) 
 
 @pytest.mark.asyncio
 async def test_login_success_returns_token(integration_client_with_auth: AsyncClient) -> None:
-    """POST /api/auth/login with valid credentials returns 200 and access_token."""
+    """POST /api/auth/login with valid credentials returns 200 and access_token with is_admin."""
     r = await integration_client_with_auth.post(
         "/api/auth/login",
         json={"username": "testuser", "password": "testpass123"},
@@ -85,6 +91,7 @@ async def test_login_success_returns_token(integration_client_with_auth: AsyncCl
     assert "access_token" in data
     assert data.get("token_type") == "bearer"
     assert data.get("user", {}).get("username") == "testuser"
+    assert data.get("user", {}).get("is_admin") is True
 
 
 @pytest.mark.asyncio
@@ -122,3 +129,108 @@ async def test_register_success_then_login(integration_client_with_auth: AsyncCl
     )
     assert r2.status_code == 200
     assert r2.json().get("user", {}).get("username") == "newuser"
+
+
+@pytest.mark.asyncio
+async def test_login_success_records_audit_event(integration_client_with_auth: AsyncClient) -> None:
+    """After successful login, GET /api/admin/auth-audit (as admin) returns at least one login_success event."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "testpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/auth-audit",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    events = data.get("events") or []
+    assert any(e.get("event_type") == "login_success" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_login_failure_records_audit_event(integration_client_with_auth: AsyncClient) -> None:
+    """Failed login records login_failure; admin can see it via auth-audit."""
+    await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "wrongpassword"},
+    )
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "testpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/auth-audit",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    events = r.json().get("events") or []
+    assert any(e.get("event_type") == "login_failure" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_logout_records_audit_event(integration_client_with_auth: AsyncClient) -> None:
+    """POST /api/auth/logout records logout event; admin can see it via auth-audit."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "testpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    logout_r = await integration_client_with_auth.post(
+        "/api/auth/logout",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert logout_r.status_code == 204
+    login_r2 = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "testpass123"},
+    )
+    token2 = login_r2.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/auth-audit",
+        headers={"Authorization": f"Bearer {token2}"},
+    )
+    assert r.status_code == 200
+    events = r.json().get("events") or []
+    assert any(e.get("event_type") == "logout" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_auth_audit_returns_403_for_non_admin(integration_client_with_auth: AsyncClient) -> None:
+    """GET /api/admin/auth-audit as non-admin user returns 403."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "otheruser", "password": "otherpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/auth-audit",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_auth_audit_returns_200_for_admin(integration_client_with_auth: AsyncClient) -> None:
+    """GET /api/admin/auth-audit as admin returns 200 with total and events list."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "testuser", "password": "testpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/auth-audit",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert "total" in data
+    assert "events" in data
+    assert isinstance(data["events"], list)

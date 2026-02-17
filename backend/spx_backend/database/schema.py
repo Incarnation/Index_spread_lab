@@ -9,6 +9,7 @@ from spx_backend.database.connection import engine
 # All application tables (order matches db_schema / reset scripts).
 ALL_APP_TABLES = [
     "users",
+    "auth_audit_log",
     "option_instruments",
     "chain_snapshots",
     "option_chain_rows",
@@ -72,10 +73,26 @@ async def _execute_sql_file(path: Path) -> None:
             await conn.exec_driver_sql(stmt)
 
 
+def _migrations_dir() -> Path:
+    """Return path to sql/migrations/."""
+    return _sql_dir() / "migrations"
+
+
+async def _run_migrations() -> None:
+    """Run all migration SQL files in order (001_*.sql, 002_*.sql, ...)."""
+    mig_dir = _migrations_dir()
+    if not mig_dir.exists():
+        return
+    paths = sorted(mig_dir.glob("*.sql"))
+    for path in paths:
+        await _execute_sql_file(path)
+
+
 async def init_db() -> None:
-    """Initialize full schema (idempotent creates)."""
+    """Initialize full schema (idempotent creates) and run migrations."""
     schema_path = _sql_dir() / "db_schema.sql"
     await _execute_sql_file(schema_path)
+    await _run_migrations()
 
 
 async def reset_ml_tables() -> None:

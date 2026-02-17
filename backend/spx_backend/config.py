@@ -9,6 +9,8 @@ class Settings(BaseSettings):
 
     app_env: str = "local"
     log_level: str = "INFO"
+    """If True, skip running quote/snapshot/gex jobs once on startup (server becomes ready immediately). Scheduler still runs jobs on their intervals."""
+    skip_startup_warmup: bool = False
     tz: str = "America/New_York"
 
     database_url: str

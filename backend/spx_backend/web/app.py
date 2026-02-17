@@ -228,23 +228,26 @@ async def lifespan(app: FastAPI):
     app.state.shadow_inference_job = shadow_inference_job
     app.state.promotion_gate_job = promotion_gate_job
 
-    # Run ingestion jobs once immediately on boot and log every failure explicitly.
-    warmup_jobs: list[tuple[str, Any]] = [
-        ("quote_job", quote_job.run_once),
-        ("snapshot_job", snapshot_job.run_once),
-    ]
-    if spy_snapshot_job is not None:
-        warmup_jobs.append(("snapshot_job_spy", spy_snapshot_job.run_once))
-    if vix_snapshot_job is not None:
-        warmup_jobs.append(("snapshot_job_vix", vix_snapshot_job.run_once))
-    warmup_jobs.append(("gex_job", gex_job.run_once))
-    for job_name, run_once_callable in warmup_jobs:
-        try:
-            await run_once_callable()
-            logger.info("startup_warmup: job_id={} status=ok", job_name)
-        except Exception as exc:
-            # Do not crash startup, but always emit actionable diagnostics.
-            logger.exception("startup_warmup: job_id={} status=failed error={}", job_name, exc)
+    # Run ingestion jobs once immediately on boot (unless skip_startup_warmup). Log every failure explicitly.
+    if not settings.skip_startup_warmup:
+        warmup_jobs: list[tuple[str, Any]] = [
+            ("quote_job", quote_job.run_once),
+            ("snapshot_job", snapshot_job.run_once),
+        ]
+        if spy_snapshot_job is not None:
+            warmup_jobs.append(("snapshot_job_spy", spy_snapshot_job.run_once))
+        if vix_snapshot_job is not None:
+            warmup_jobs.append(("snapshot_job_vix", vix_snapshot_job.run_once))
+        warmup_jobs.append(("gex_job", gex_job.run_once))
+        for job_name, run_once_callable in warmup_jobs:
+            try:
+                await run_once_callable()
+                logger.info("startup_warmup: job_id={} status=ok", job_name)
+            except Exception as exc:
+                # Do not crash startup, but always emit actionable diagnostics.
+                logger.exception("startup_warmup: job_id={} status=failed error={}", job_name, exc)
+    else:
+        logger.info("startup_warmup: skipped (SKIP_STARTUP_WARMUP=true)")
 
     yield
 

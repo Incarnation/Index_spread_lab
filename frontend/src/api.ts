@@ -631,3 +631,40 @@ export async function deleteTradeDecision(decisionId: number, apiKey?: string): 
   return (await r.json()) as { deleted: boolean; decision_id: number };
 }
 
+/** Single auth audit log entry (admin-only). */
+export type AuthAuditEvent = {
+  id: number;
+  event_type: string;
+  user_id: number | null;
+  username: string | null;
+  occurred_at: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  country: string | null;
+  details: Record<string, unknown> | null;
+};
+
+export type AuthAuditResponse = {
+  total: number;
+  limit: number;
+  offset: number;
+  events: AuthAuditEvent[];
+};
+
+/**
+ * Fetch auth audit log entries. Admin-only; returns 403 for non-admins.
+ */
+export async function fetchAuthAudit(
+  limit = 100,
+  offset = 0,
+  eventType?: string | null,
+  userId?: number | null
+): Promise<AuthAuditResponse> {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (eventType && eventType.trim()) params.set("event_type", eventType.trim());
+  if (userId != null) params.set("user_id", String(userId));
+  const r = await fetchWithAuth(apiUrl(`/api/admin/auth-audit?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as AuthAuditResponse;
+}
+

@@ -375,6 +375,9 @@ class _RouterAwareSession:
                 ]
             )
 
+        if "INSERT INTO auth_audit_log" in sql:
+            return _FakeExecResult([])
+
         raise AssertionError(f"Unhandled SQL in e2e test fake session: {sql}")
 
     async def commit(self):

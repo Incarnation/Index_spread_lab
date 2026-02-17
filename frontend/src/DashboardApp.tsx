@@ -1,4 +1,5 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { Alert, Badge, Box, Button, Container, Group, Stack, Text, TextInput, Title } from "@mantine/core";
 import { API_BASE } from "./api";
 import {
@@ -165,6 +166,11 @@ export function DashboardApp() {
             </Stack>
           </Box>
           <Group gap="xs">
+            {user?.is_admin && (
+              <Button variant="subtle" size="xs" component={Link} to="/admin/auth-audit">
+                Auth Audit
+              </Button>
+            )}
             {user && (
               <Badge variant="outline" size="sm">
                 {user.username}
