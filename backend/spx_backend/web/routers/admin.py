@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
+from spx_backend.web.routers.auth import UserOut, get_current_user
 from spx_backend.database import get_db_session
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
@@ -50,16 +51,11 @@ def _is_stale(age_minutes: float | None, threshold_minutes: float) -> bool:
     return age_minutes is not None and age_minutes > threshold_minutes
 
 
-def _require_admin(x_api_key: str | None = Header(default=None)) -> None:
-    """Enforce admin API key if configured."""
-    # If ADMIN_API_KEY is not set, allow local/dev usage without auth.
-    if settings.admin_api_key:
-        if not x_api_key or x_api_key != settings.admin_api_key:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 @router.post("/api/admin/run-snapshot")
-async def admin_run_snapshot(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_snapshot(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force a snapshot run immediately."""
     # Force run once even outside RTH (useful for testing).
     job: SnapshotJob = getattr(request.app.state, "snapshot_job", build_snapshot_job())
@@ -68,7 +64,10 @@ async def admin_run_snapshot(request: Request, _: None = Depends(_require_admin)
 
 
 @router.post("/api/admin/run-quotes")
-async def admin_run_quotes(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_quotes(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force a quote run immediately."""
     job: QuoteJob = getattr(request.app.state, "quote_job", build_quote_job())
     result = await job.run_once(force=True)
@@ -76,7 +75,10 @@ async def admin_run_quotes(request: Request, _: None = Depends(_require_admin)) 
 
 
 @router.post("/api/admin/run-gex")
-async def admin_run_gex(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_gex(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force a GEX run immediately."""
     job: GexJob = getattr(request.app.state, "gex_job", GexJob())
     result = await job.run_once()
@@ -84,7 +86,10 @@ async def admin_run_gex(request: Request, _: None = Depends(_require_admin)) -> 
 
 
 @router.post("/api/admin/run-decision")
-async def admin_run_decision(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_decision(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force a decision run immediately."""
     job: DecisionJob = getattr(request.app.state, "decision_job", build_decision_job())
     result = await job.run_once(force=True)
@@ -92,7 +97,10 @@ async def admin_run_decision(request: Request, _: None = Depends(_require_admin)
 
 
 @router.post("/api/admin/run-feature-builder")
-async def admin_run_feature_builder(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_feature_builder(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force feature builder run immediately."""
     job: FeatureBuilderJob = getattr(request.app.state, "feature_builder_job", build_feature_builder_job())
     result = await job.run_once(force=True)
@@ -100,7 +108,10 @@ async def admin_run_feature_builder(request: Request, _: None = Depends(_require
 
 
 @router.post("/api/admin/run-labeler")
-async def admin_run_labeler(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_labeler(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force labeler run immediately."""
     job: LabelerJob = getattr(request.app.state, "labeler_job", build_labeler_job())
     result = await job.run_once(force=True)
@@ -108,7 +119,10 @@ async def admin_run_labeler(request: Request, _: None = Depends(_require_admin))
 
 
 @router.post("/api/admin/run-trade-pnl")
-async def admin_run_trade_pnl(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_trade_pnl(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force trade mark-to-market run immediately."""
     job: TradePnlJob = getattr(request.app.state, "trade_pnl_job", build_trade_pnl_job())
     result = await job.run_once(force=True)
@@ -116,7 +130,10 @@ async def admin_run_trade_pnl(request: Request, _: None = Depends(_require_admin
 
 
 @router.post("/api/admin/run-trainer")
-async def admin_run_trainer(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_trainer(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force weekly trainer run immediately."""
     job: TrainerJob = getattr(request.app.state, "trainer_job", build_trainer_job())
     result = await job.run_once(force=True)
@@ -124,7 +141,10 @@ async def admin_run_trainer(request: Request, _: None = Depends(_require_admin))
 
 
 @router.post("/api/admin/run-shadow-inference")
-async def admin_run_shadow_inference(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_shadow_inference(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force shadow inference run immediately."""
     job: ShadowInferenceJob = getattr(request.app.state, "shadow_inference_job", build_shadow_inference_job())
     result = await job.run_once(force=True)
@@ -132,7 +152,10 @@ async def admin_run_shadow_inference(request: Request, _: None = Depends(_requir
 
 
 @router.post("/api/admin/run-promotion-gates")
-async def admin_run_promotion_gates(request: Request, _: None = Depends(_require_admin)) -> dict:
+async def admin_run_promotion_gates(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """Force promotion gate evaluation immediately."""
     job: PromotionGateJob = getattr(request.app.state, "promotion_gate_job", build_promotion_gate_job())
     result = await job.run_once(force=True)
@@ -140,7 +163,11 @@ async def admin_run_promotion_gates(request: Request, _: None = Depends(_require
 
 
 @router.delete("/api/admin/trade-decisions/{decision_id}")
-async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+async def admin_delete_trade_decision(
+    decision_id: int,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Delete one trade decision row by ID."""
     r = await db.execute(
         text(
@@ -160,7 +187,11 @@ async def admin_delete_trade_decision(decision_id: int, db: AsyncSession = Depen
 
 
 @router.get("/api/admin/expirations")
-async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None = Depends(_require_admin)) -> dict:
+async def admin_list_expirations(
+    request: Request,
+    symbol: str = "SPX",
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
     """List expirations from Tradier for debugging."""
     client: TradierClient = getattr(request.app.state, "tradier", get_tradier_client())
     resp = await client.get_option_expirations(symbol)
@@ -169,7 +200,10 @@ async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None 
 
 
 @router.get("/api/admin/preflight")
-async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
+async def admin_preflight(
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return one-call pipeline health summary with freshness diagnostics."""
 
     def _iso(ts) -> str | None:

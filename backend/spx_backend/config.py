@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     admin_api_key: str | None = None
     market_clock_cache_seconds: int = 300
 
+    # Auth: JWT and user registration (multiple users, in-house auth).
+    jwt_secret: str = ""  # set JWT_SECRET in env for auth; auth endpoints error if empty
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24  # 24h
+    auth_register_enabled: bool = False  # only allowed (pre-created) users can log in
+
     def _parse_int_csv(self, value: str) -> list[int]:
         """Parse comma-separated integer values, ignoring malformed items."""
         out: list[int] = []

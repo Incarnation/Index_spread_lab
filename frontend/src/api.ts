@@ -1,3 +1,5 @@
+import * as authStorage from "./auth";
+
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 /**
@@ -11,7 +13,29 @@ function apiUrl(path: string): string {
 }
 
 /**
- * Build admin auth headers when an API key is provided.
+ * Headers for JWT auth (Bearer token). Used for all protected /api/* requests.
+ */
+function authHeaders(): HeadersInit {
+  const token = authStorage.getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Fetch with auth header and 401 handling: on 401 clears token and redirects to /login.
+ */
+async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = { ...authHeaders(), ...(init.headers as Record<string, string>) };
+  const r = await fetch(url, { ...init, headers });
+  if (r.status === 401) {
+    authStorage.clearToken();
+    window.location.href = "/login";
+    throw new Error("Unauthorized");
+  }
+  return r;
+}
+
+/**
+ * Build admin auth headers when an API key is provided (optional; JWT is primary).
  */
 function adminHeaders(apiKey?: string): HeadersInit | undefined {
   if (!apiKey) return undefined;
@@ -38,7 +62,7 @@ export type ChainSnapshot = {
  * Fetch recent chain snapshot metadata for the dashboard table.
  */
 export async function fetchChainSnapshots(limit = 50): Promise<ChainSnapshot[]> {
-  const r = await fetch(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: ChainSnapshot[] };
   return data.items;
@@ -60,9 +84,9 @@ export type RunSnapshotResult = {
  * Trigger a manual snapshot run through the admin endpoint.
  */
 export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-snapshot`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-snapshot`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunSnapshotResult;
@@ -79,9 +103,9 @@ export type RunQuotesResult = {
  * Trigger a manual quote ingestion run through the admin endpoint.
  */
 export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-quotes`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-quotes`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunQuotesResult;
@@ -99,9 +123,9 @@ export type RunDecisionResult = {
  * Trigger the decision engine immediately through the admin endpoint.
  */
 export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-decision`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-decision`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunDecisionResult;
@@ -120,9 +144,9 @@ export type RunTradePnlResult = {
  * Trigger live trade mark-to-market updates immediately.
  */
 export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-trade-pnl`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-trade-pnl`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as RunTradePnlResult;
@@ -140,9 +164,9 @@ export type GenericAdminRunResult = {
  * Trigger a manual GEX computation run.
  */
 export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-gex`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-gex`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -152,9 +176,9 @@ export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult>
  * Trigger a manual feature-builder run.
  */
 export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-feature-builder`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-feature-builder`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -164,9 +188,9 @@ export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdmi
  * Trigger a manual labeler run.
  */
 export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-labeler`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-labeler`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -176,9 +200,9 @@ export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunRes
  * Trigger a manual trainer run.
  */
 export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-trainer`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-trainer`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -188,9 +212,9 @@ export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunRes
  * Trigger a manual shadow-inference run.
  */
 export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-shadow-inference`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-shadow-inference`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -200,9 +224,9 @@ export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdm
  * Trigger a manual promotion-gate run.
  */
 export async function runPromotionGatesNow(apiKey?: string): Promise<GenericAdminRunResult> {
-  const r = await fetch(apiUrl(`/api/admin/run-promotion-gates`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-promotion-gates`), {
     method: "POST",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as GenericAdminRunResult;
@@ -237,7 +261,7 @@ export type GexExpirationItem = {
  * Fetch recent GEX snapshot aggregates for the panel selector.
  */
 export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
-  const r = await fetch(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: GexSnapshot[] };
   return data.items;
@@ -247,7 +271,7 @@ export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
  * Fetch available DTE filters for the selected GEX batch.
  */
 export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
-  const r = await fetch(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { dte_days: number[] };
   return data.dte_days;
@@ -257,7 +281,7 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
  * Fetch available expirations for the selected GEX batch.
  */
 export async function fetchGexExpirations(snapshotId: number): Promise<GexExpirationItem[]> {
-  const r = await fetch(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: GexExpirationItem[] };
   return data.items;
@@ -275,7 +299,7 @@ export async function fetchGexCurve(snapshotId: number, dteDays?: number, expira
   const params = new URLSearchParams({ snapshot_id: String(snapshotId) });
   if (typeof dteDays === "number") params.set("dte_days", String(dteDays));
   if (expirations && expirations.length > 0) params.set("expirations_csv", expirations.join(","));
-  const r = await fetch(apiUrl(`/api/gex/curve?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/curve?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { points: GexCurvePoint[] };
   return data.points;
@@ -301,7 +325,7 @@ export type TradeDecision = {
  * Fetch recent trade decisions for the decision table.
  */
 export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
-  const r = await fetch(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: TradeDecision[] };
   return data.items;
@@ -355,7 +379,7 @@ export type TradeRow = {
 export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROLLED"): Promise<TradeRow[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (status) params.set("status", status);
-  const r = await fetch(apiUrl(`/api/trades?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/trades?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: TradeRow[] };
   return data.items;
@@ -391,7 +415,7 @@ export type LabelMetricsResponse = {
  * Fetch TP50/TP100 label metrics for the selected lookback window.
  */
 export async function fetchLabelMetrics(lookbackDays = 90): Promise<LabelMetricsResponse> {
-  const r = await fetch(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as LabelMetricsResponse;
 }
@@ -434,7 +458,7 @@ export type StrategyMetricsResponse = {
  * Fetch strategy quality/risk metrics (expectancy, drawdown, tail proxy, margin).
  */
 export async function fetchStrategyMetrics(lookbackDays = 90): Promise<StrategyMetricsResponse> {
-  const r = await fetch(apiUrl(`/api/strategy-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
+  const r = await fetchWithAuth(apiUrl(`/api/strategy-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as StrategyMetricsResponse;
 }
@@ -495,7 +519,7 @@ export async function fetchModelOps(modelName?: string): Promise<ModelOpsRespons
   const params = new URLSearchParams();
   if (modelName && modelName.trim()) params.set("model_name", modelName.trim());
   const query = params.toString();
-  const r = await fetch(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as ModelOpsResponse;
 }
@@ -580,9 +604,9 @@ export type AdminPreflightResponse = {
  * Fetch admin preflight diagnostics for pipeline freshness and warning state.
  */
 export async function fetchAdminPreflight(apiKey?: string): Promise<AdminPreflightResponse> {
-  const r = await fetch(apiUrl(`/api/admin/preflight`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`), {
     method: "GET",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as AdminPreflightResponse;
@@ -592,9 +616,9 @@ export async function fetchAdminPreflight(apiKey?: string): Promise<AdminPreflig
  * Delete one persisted trade decision by ID.
  */
 export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
-  const r = await fetch(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
     method: "DELETE",
-    headers: adminHeaders(apiKey),
+    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as { deleted: boolean; decision_id: number };

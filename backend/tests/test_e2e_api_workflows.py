@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from spx_backend.config import settings
-from spx_backend.web.routers import admin, public
+from spx_backend.web.routers import admin, auth, public
 
 pytestmark = pytest.mark.e2e
 
@@ -38,6 +38,24 @@ class _RouterAwareSession:
         sql = str(stmt)
         query_params = params or {}
         self.calls.append((sql, query_params))
+
+        # Auth: login and get_current_user lookups (e2e uses testuser / testpass123).
+        if "FROM users" in sql:
+            if "password_hash" in sql and "username" in sql:
+                from spx_backend.web.routers.auth import pwd_ctx
+                return _FakeExecResult(
+                    [
+                        SimpleNamespace(
+                            id=1,
+                            username="testuser",
+                            password_hash=pwd_ctx.hash("testpass123"),
+                        )
+                    ]
+                )
+            if "id" in sql and "username" in sql and "WHERE id" in sql:
+                return _FakeExecResult(
+                    [SimpleNamespace(id=1, username="testuser")]
+                )
 
         if "FROM chain_snapshots" in sql and "checksum" in sql and "LIMIT :limit" in sql:
             return _FakeExecResult(
@@ -383,7 +401,11 @@ class _FakeTradier:
 
 
 def _build_test_client(monkeypatch):
+    monkeypatch.setattr(settings, "jwt_secret", "e2e-test-secret")
+    monkeypatch.setattr(settings, "auth_register_enabled", True)
+
     test_app = FastAPI()
+    test_app.include_router(auth.router)
     test_app.include_router(public.router)
     test_app.include_router(admin.router)
 
@@ -408,8 +430,15 @@ def _build_test_client(monkeypatch):
     test_app.state.promotion_gate_job = _FakeJob("promotion_gate")
     test_app.state.tradier = _FakeTradier()
 
-    monkeypatch.setattr(settings, "admin_api_key", "secret-key")
     return TestClient(test_app), fake_session
+
+
+def _e2e_auth_headers(client: TestClient) -> dict[str, str]:
+    """Log in and return Authorization Bearer headers for e2e tests."""
+    r = client.post("/api/auth/login", json={"username": "testuser", "password": "testpass123"})
+    assert r.status_code == 200, r.text
+    token = r.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_e2e_public_api_surface(monkeypatch) -> None:
@@ -418,61 +447,62 @@ def test_e2e_public_api_surface(monkeypatch) -> None:
 
     assert client.get("/health").status_code == 200
 
-    snapshots = client.get("/api/chain-snapshots?limit=2")
+    headers = _e2e_auth_headers(client)
+    snapshots = client.get("/api/chain-snapshots?limit=2", headers=headers)
     assert snapshots.status_code == 200
     assert len(snapshots.json()["items"]) == 2
     assert {item["underlying"] for item in snapshots.json()["items"]} == {"SPX", "SPY"}
 
-    decisions = client.get("/api/trade-decisions?limit=1")
+    decisions = client.get("/api/trade-decisions?limit=1", headers=headers)
     assert decisions.status_code == 200
     assert decisions.json()["items"][0]["decision"] == "TRADE"
 
-    trades = client.get("/api/trades?status=OPEN&limit=1")
+    trades = client.get("/api/trades?status=OPEN&limit=1", headers=headers)
     assert trades.status_code == 200
     assert trades.json()["items"][0]["status"] == "OPEN"
     assert len(trades.json()["items"][0]["legs"]) == 2
 
-    label_metrics = client.get("/api/label-metrics?lookback_days=90")
+    label_metrics = client.get("/api/label-metrics?lookback_days=90", headers=headers)
     assert label_metrics.status_code == 200
     assert label_metrics.json()["summary"]["resolved"] == 10
 
-    strategy_metrics = client.get("/api/strategy-metrics?lookback_days=90")
+    strategy_metrics = client.get("/api/strategy-metrics?lookback_days=90", headers=headers)
     assert strategy_metrics.status_code == 200
     assert strategy_metrics.json()["summary"]["resolved"] == 2
 
-    model_ops = client.get("/api/model-ops")
+    model_ops = client.get("/api/model-ops", headers=headers)
     assert model_ops.status_code == 200
     assert model_ops.json()["counts"]["model_versions"] == 2
 
-    gex_snapshots = client.get("/api/gex/snapshots?limit=1")
+    gex_snapshots = client.get("/api/gex/snapshots?limit=1", headers=headers)
     assert gex_snapshots.status_code == 200
     assert gex_snapshots.json()["items"][0]["underlying"] == "SPX"
 
-    gex_dtes = client.get("/api/gex/dtes?snapshot_id=101")
+    gex_dtes = client.get("/api/gex/dtes?snapshot_id=101", headers=headers)
     assert gex_dtes.status_code == 200
     assert gex_dtes.json()["dte_days"] == [3, 5]
 
-    gex_exps = client.get("/api/gex/expirations?snapshot_id=101")
+    gex_exps = client.get("/api/gex/expirations?snapshot_id=101", headers=headers)
     assert gex_exps.status_code == 200
     assert len(gex_exps.json()["items"]) == 2
 
-    gex_curve = client.get("/api/gex/curve?snapshot_id=101&dte_days=3")
+    gex_curve = client.get("/api/gex/curve?snapshot_id=101&dte_days=3", headers=headers)
     assert gex_curve.status_code == 200
     assert len(gex_curve.json()["points"]) == 2
 
-    home = client.get("/")
+    home = client.get("/", headers=headers)
     assert home.status_code == 200
     assert "IndexSpreadLab (Backend)" in home.text
 
 
 def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
-    """Validate admin auth, run endpoints, expirations, preflight, and delete flows."""
+    """Validate JWT auth: no token -> 401; with token run endpoints, expirations, preflight, delete."""
     client, fake_session = _build_test_client(monkeypatch)
 
     unauthorized = client.post("/api/admin/run-snapshot")
     assert unauthorized.status_code == 401
 
-    headers = {"X-API-Key": "secret-key"}
+    headers = _e2e_auth_headers(client)
     run_paths = [
         "/api/admin/run-snapshot",
         "/api/admin/run-quotes",

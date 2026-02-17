@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from spx_backend.config import settings
 from spx_backend.database import get_db_session
 from spx_backend.jobs.modeling import compute_margin_usage_dollars, summarize_strategy_quality
+from spx_backend.web.routers.auth import UserOut, get_current_user
 
 router = APIRouter()
 
@@ -23,7 +24,11 @@ async def health() -> dict[str, str]:
 
 
 @router.get("/api/chain-snapshots")
-async def list_chain_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_chain_snapshots(
+    limit: int = 50,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return recent chain snapshot metadata."""
     limit = max(1, min(limit, 500))
     r = await db.execute(
@@ -54,7 +59,11 @@ async def list_chain_snapshots(limit: int = 50, db: AsyncSession = Depends(get_d
 
 
 @router.get("/api/trade-decisions")
-async def list_trade_decisions(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_trade_decisions(
+    limit: int = 50,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return recent trade decisions."""
     limit = max(1, min(limit, 500))
     r = await db.execute(
@@ -94,7 +103,12 @@ async def list_trade_decisions(limit: int = 50, db: AsyncSession = Depends(get_d
 
 
 @router.get("/api/trades")
-async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_trades(
+    limit: int = 100,
+    status: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return recent trades with live PnL fields and leg metadata."""
     limit = max(1, min(limit, 500))
     normalized_status = status.strip().upper() if status is not None else None
@@ -208,7 +222,11 @@ async def list_trades(limit: int = 100, status: str | None = None, db: AsyncSess
 
 
 @router.get("/api/label-metrics")
-async def get_label_metrics(lookback_days: int = 90, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def get_label_metrics(
+    lookback_days: int = 90,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return TP50/TP100 label metrics overall and by spread side."""
     if lookback_days <= 0 or lookback_days > 3650:
         raise HTTPException(status_code=400, detail="invalid_lookback_days")
@@ -298,7 +316,11 @@ async def get_label_metrics(lookback_days: int = 90, db: AsyncSession = Depends(
 
 
 @router.get("/api/strategy-metrics")
-async def get_strategy_metrics(lookback_days: int = 90, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def get_strategy_metrics(
+    lookback_days: int = 90,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return v2 strategy-quality and risk metrics overall + by side."""
     if lookback_days <= 0 or lookback_days > 3650:
         raise HTTPException(status_code=400, detail="invalid_lookback_days")
@@ -388,7 +410,11 @@ async def get_strategy_metrics(lookback_days: int = 90, db: AsyncSession = Depen
 
 
 @router.get("/api/model-ops")
-async def get_model_ops(model_name: str | None = None, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def get_model_ops(
+    model_name: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return latest model/training/gate status for dashboard monitoring."""
     selected_model_name = model_name.strip() if isinstance(model_name, str) and model_name.strip() else settings.trainer_model_name
 
@@ -565,7 +591,11 @@ async def get_model_ops(model_name: str | None = None, db: AsyncSession = Depend
 
 
 @router.get("/api/gex/snapshots")
-async def list_gex_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_gex_snapshots(
+    limit: int = 50,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return recent GEX snapshot aggregates."""
     limit = max(1, min(limit, 500))
     r = await db.execute(
@@ -600,7 +630,11 @@ async def list_gex_snapshots(limit: int = 50, db: AsyncSession = Depends(get_db_
 
 
 @router.get("/api/gex/dtes")
-async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_gex_dtes(
+    snapshot_id: int,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return available DTEs for a GEX snapshot batch (same ts + underlying)."""
     r = await db.execute(
         text(
@@ -629,7 +663,11 @@ async def list_gex_dtes(snapshot_id: int, db: AsyncSession = Depends(get_db_sess
 
 
 @router.get("/api/gex/expirations")
-async def list_gex_expirations(snapshot_id: int, db: AsyncSession = Depends(get_db_session)) -> dict:
+async def list_gex_expirations(
+    snapshot_id: int,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
     """Return available expirations for a GEX snapshot batch (same ts + underlying)."""
     r = await db.execute(
         text(
@@ -670,6 +708,7 @@ async def get_gex_curve(
     snapshot_id: int,
     dte_days: int | None = None,
     expirations_csv: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Return GEX curve by strike for a snapshot batch (optional DTE/custom expirations)."""
@@ -799,7 +838,10 @@ async def get_gex_curve(
 
 
 @router.get("/", response_class=HTMLResponse)
-async def home(db: AsyncSession = Depends(get_db_session)) -> HTMLResponse:
+async def home(
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> HTMLResponse:
     """Small HTML page listing recent snapshots."""
     r = await db.execute(
         text(

@@ -21,7 +21,7 @@ from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
-from spx_backend.web.routers import admin, public
+from spx_backend.web.routers import admin, auth, public
 from spx_backend.web.routers.public import (
     get_gex_curve,
     get_label_metrics,
@@ -265,6 +265,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(public.router)
 app.include_router(admin.router)
 

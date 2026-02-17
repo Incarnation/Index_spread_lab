@@ -1,5 +1,5 @@
 import React from "react";
-import { Alert, Badge, Box, Container, Stack, Text, TextInput, Title } from "@mantine/core";
+import { Alert, Badge, Box, Button, Container, Group, Stack, Text, TextInput, Title } from "@mantine/core";
 import { API_BASE } from "./api";
 import {
   ChainSnapshotsPanel,
@@ -12,6 +12,7 @@ import {
   TradeDecisionsPanel,
   TradesLivePnlPanel,
 } from "./components";
+import { useAuth } from "./contexts/AuthContext";
 import { useGexData, useSnapshotsDecisions } from "./hooks";
 
 type EnvironmentInfo = {
@@ -87,6 +88,7 @@ function maskSecret(value: string): string {
  * concerns such as global error display and decision drawer state.
  */
 export function DashboardApp() {
+  const { user, logout } = useAuth();
   const [error, setError] = React.useState<string | null>(null);
   const adminKey = React.useMemo(() => readFrontendAdminKey(), []);
   const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
@@ -147,18 +149,30 @@ export function DashboardApp() {
           decision={decisions.find((d) => d.decision_id === drawerDecision?.decision_id) ?? null}
         />
 
-        <Box>
-          <Title order={2}>IndexSpreadLab</Title>
-          <Text c="dimmed" mt={4}>
-            React dashboard (MVP)
-          </Text>
-          <Stack mt="xs" gap={6}>
-            <Badge variant="light">Snapshots</Badge>
-            <Text size="sm" c="dimmed">
-              API target: {environmentInfo.apiTargetLabel}
+        <Group justify="space-between" align="flex-start">
+          <Box>
+            <Title order={2}>IndexSpreadLab</Title>
+            <Text c="dimmed" mt={4}>
+              React dashboard (MVP)
             </Text>
-          </Stack>
-        </Box>
+            <Stack mt="xs" gap={6}>
+              <Badge variant="light">Snapshots</Badge>
+              <Text size="sm" c="dimmed">
+                API target: {environmentInfo.apiTargetLabel}
+              </Text>
+            </Stack>
+          </Box>
+          <Group gap="xs">
+            {user && (
+              <Badge variant="outline" size="sm">
+                {user.username}
+              </Badge>
+            )}
+            <Button variant="subtle" size="xs" onClick={logout}>
+              Log out
+            </Button>
+          </Group>
+        </Group>
 
         <PipelineStatusBar preflight={preflight} loading={preflightLoading} authRequired={preflightAuthRequired} />
 

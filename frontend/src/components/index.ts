@@ -7,6 +7,7 @@ export { LabelMetricsPanel } from "./LabelMetricsPanel";
 export { ModelOpsPanel } from "./ModelOpsPanel";
 export { PipelineRunStepperCard } from "./PipelineRunStepperCard";
 export { PipelineStatusBar } from "./PipelineStatusBar";
+export { ProtectedRoute } from "./ProtectedRoute";
 export { RunResultCard } from "./RunResultCard";
 export { StrategyQualityPanel } from "./StrategyQualityPanel";
 export { TradeDecisionDetailsDrawer } from "./TradeDecisionDetailsDrawer";

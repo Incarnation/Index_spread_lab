@@ -23,7 +23,7 @@ from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
 from spx_backend.jobs.snapshot_job import SnapshotJob, SnapshotJobConfig, build_snapshot_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.jobs.trainer_job import TrainerJob
-from spx_backend.web.routers import admin, public
+from spx_backend.web.routers import admin, auth, public
 
 import spx_backend.jobs.decision_job as decision_module
 import spx_backend.jobs.feature_builder_job as feature_builder_module
@@ -304,8 +304,12 @@ async def _build_workflow_client(*, integration_db_session, monkeypatch, tradier
     async def _override_db():
         yield integration_db_session
 
+    async def _override_current_user():
+        return auth.UserOut(id=1, username="test")
+
     app.dependency_overrides[public.get_db_session] = _override_db
     app.dependency_overrides[admin.get_db_session] = _override_db
+    app.dependency_overrides[auth.get_current_user] = _override_current_user
     app.state.tradier = tradier
     app.state.quote_job = QuoteJob(tradier=tradier)
     app.state.snapshot_job = build_snapshot_job(tradier=tradier)

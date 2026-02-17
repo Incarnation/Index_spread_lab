@@ -1,6 +1,15 @@
 -- Minimal schema for MVP (expand as needed).
 -- Safe to run multiple times (IF NOT EXISTS used).
 
+CREATE TABLE IF NOT EXISTS users (
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+
 CREATE TABLE IF NOT EXISTS option_instruments (
   option_symbol TEXT PRIMARY KEY,
   root TEXT NOT NULL,

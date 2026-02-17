@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from spx_backend.config import settings
-from spx_backend.web.routers import admin, public
+from spx_backend.web.routers import admin, auth, public
 
 
 def _ensure_safe_test_database_url(url: str) -> None:
@@ -82,8 +82,12 @@ async def integration_client(integration_db_session: AsyncSession):
     async def _override_db():
         yield integration_db_session
 
+    async def _override_current_user():
+        return auth.UserOut(id=1, username="test")
+
     app.dependency_overrides[public.get_db_session] = _override_db
     app.dependency_overrides[admin.get_db_session] = _override_db
+    app.dependency_overrides[auth.get_current_user] = _override_current_user
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client

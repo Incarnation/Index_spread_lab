@@ -8,6 +8,7 @@ from spx_backend.database.connection import engine
 
 # All application tables (order matches db_schema / reset scripts).
 ALL_APP_TABLES = [
+    "users",
     "option_instruments",
     "chain_snapshots",
     "option_chain_rows",
