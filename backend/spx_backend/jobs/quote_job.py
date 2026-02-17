@@ -47,8 +47,21 @@ class QuoteJob:
         return is_rth(now_et)
 
     async def run_once(self, *, force: bool = False) -> dict:
-        """Run one quote capture cycle and store context."""
+        """Run one quote capture cycle and store quote/context records.
+
+        Parameters
+        ----------
+        force:
+            When true, bypasses regular-trading-hours gating.
+
+        Returns
+        -------
+        dict
+            Job result payload containing skip reason (if any), run timestamp,
+            and insert/failure counters for quote rows.
+        """
         tz = ZoneInfo(settings.tz)
+        utc = ZoneInfo("UTC")
         now_et = datetime.now(tz=tz)
         logger.info("quote_job: start force={} now_et={}", force, now_et.isoformat())
 
@@ -64,8 +77,8 @@ class QuoteJob:
         try:
             quote_resp = await self.tradier.get_quotes(quote_symbols)
             quotes = _parse_quotes(quote_resp)
-        except Exception:
-            logger.warning("quote_job: failed to fetch quotes for {}", quote_symbols)
+        except Exception as exc:
+            logger.exception("quote_job: failed to fetch quotes symbols={} error={}", quote_symbols, exc)
             return {"skipped": True, "reason": "quote_fetch_failed", "now_et": now_et.isoformat(), "quotes_inserted": 0}
 
         if not quotes:
@@ -73,80 +86,117 @@ class QuoteJob:
 
         by_symbol = _quotes_by_symbol(quotes)
         quotes_inserted = 0
+        quotes_failed = 0
 
         async with SessionLocal() as session:
-            for q in quotes:
+            try:
+                # Isolate per-symbol insert failures with savepoints so one bad
+                # record does not abort the entire ingestion run.
+                for q in quotes:
+                    try:
+                        async with session.begin_nested():
+                            await session.execute(
+                                text(
+                                    """
+                                    INSERT INTO underlying_quotes (
+                                      ts, symbol, last, bid, ask, open, high, low, close,
+                                      volume, change, change_percent, prevclose, source, raw_json
+                                    )
+                                    VALUES (
+                                      :ts, :symbol, :last, :bid, :ask, :open, :high, :low, :close,
+                                      :volume, :change, :change_percent, :prevclose, :source, CAST(:raw_json AS jsonb)
+                                    )
+                                    """
+                                ),
+                                {
+                                    "ts": now_et.astimezone(utc),
+                                    "symbol": q.get("symbol"),
+                                    "last": q.get("last"),
+                                    "bid": q.get("bid"),
+                                    "ask": q.get("ask"),
+                                    "open": q.get("open"),
+                                    "high": q.get("high"),
+                                    "low": q.get("low"),
+                                    "close": q.get("close"),
+                                    "volume": q.get("volume"),
+                                    "change": q.get("change"),
+                                    "change_percent": q.get("change_percentage"),
+                                    "prevclose": q.get("prevclose"),
+                                    "source": "tradier",
+                                    "raw_json": json.dumps(q, default=str),
+                                },
+                            )
+                            quotes_inserted += 1
+                    except Exception as exc:
+                        quotes_failed += 1
+                        logger.exception(
+                            "quote_job: quote_insert_failed symbol={} now_et={} error={}",
+                            q.get("symbol"),
+                            now_et.isoformat(),
+                            exc,
+                        )
+
+                # Derive context snapshot fields from quotes.
+                vix = by_symbol.get("VIX", {}).get("last")
+                vix9d = by_symbol.get("VIX9D", {}).get("last")
+                spx_price = by_symbol.get("SPX", {}).get("last")
+                spy_price = by_symbol.get("SPY", {}).get("last")
+                term_structure = None
+                if vix and vix9d and vix > 0:
+                    term_structure = vix9d / vix
+
                 await session.execute(
                     text(
                         """
-                        INSERT INTO underlying_quotes (
-                          ts, symbol, last, bid, ask, open, high, low, close,
-                          volume, change, change_percent, prevclose, source, raw_json
-                        )
-                        VALUES (
-                          :ts, :symbol, :last, :bid, :ask, :open, :high, :low, :close,
-                          :volume, :change, :change_percent, :prevclose, :source, CAST(:raw_json AS jsonb)
-                        )
+                        INSERT INTO context_snapshots (ts, spx_price, spy_price, vix, vix9d, term_structure, notes_json)
+                        VALUES (:ts, :spx_price, :spy_price, :vix, :vix9d, :term_structure, CAST(:notes AS jsonb))
+                        ON CONFLICT (ts) DO UPDATE SET
+                          spx_price = EXCLUDED.spx_price,
+                          spy_price = EXCLUDED.spy_price,
+                          vix = EXCLUDED.vix,
+                          vix9d = EXCLUDED.vix9d,
+                          term_structure = EXCLUDED.term_structure,
+                          notes_json = EXCLUDED.notes_json
                         """
                     ),
                     {
-                        "ts": now_et.astimezone(ZoneInfo("UTC")),
-                        "symbol": q.get("symbol"),
-                        "last": q.get("last"),
-                        "bid": q.get("bid"),
-                        "ask": q.get("ask"),
-                        "open": q.get("open"),
-                        "high": q.get("high"),
-                        "low": q.get("low"),
-                        "close": q.get("close"),
-                        "volume": q.get("volume"),
-                        "change": q.get("change"),
-                        "change_percent": q.get("change_percentage"),
-                        "prevclose": q.get("prevclose"),
-                        "source": "tradier",
-                        "raw_json": json.dumps(q, default=str),
+                        "ts": now_et.astimezone(utc),
+                        "spx_price": spx_price,
+                        "spy_price": spy_price,
+                        "vix": vix,
+                        "vix9d": vix9d,
+                        "term_structure": term_structure,
+                        "notes": json.dumps({"source": "tradier", "symbols": quote_symbols}),
                     },
                 )
-                quotes_inserted += 1
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                logger.exception("quote_job: db_write_failed now_et={} error={}", now_et.isoformat(), exc)
+                return {
+                    "skipped": True,
+                    "reason": "db_write_failed",
+                    "now_et": now_et.isoformat(),
+                    "quotes_inserted": quotes_inserted,
+                    "quotes_failed": quotes_failed,
+                }
 
-            # Derive context snapshot fields from quotes.
-            vix = by_symbol.get("VIX", {}).get("last")
-            vix9d = by_symbol.get("VIX9D", {}).get("last")
-            spx_price = by_symbol.get("SPX", {}).get("last")
-            spy_price = by_symbol.get("SPY", {}).get("last")
-            term_structure = None
-            if vix and vix9d and vix > 0:
-                term_structure = vix9d / vix
-
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO context_snapshots (ts, spx_price, spy_price, vix, vix9d, term_structure, notes_json)
-                    VALUES (:ts, :spx_price, :spy_price, :vix, :vix9d, :term_structure, CAST(:notes AS jsonb))
-                    ON CONFLICT (ts) DO UPDATE SET
-                      spx_price = EXCLUDED.spx_price,
-                      spy_price = EXCLUDED.spy_price,
-                      vix = EXCLUDED.vix,
-                      vix9d = EXCLUDED.vix9d,
-                      term_structure = EXCLUDED.term_structure,
-                      notes_json = EXCLUDED.notes_json
-                    """
-                ),
-                {
-                    "ts": now_et.astimezone(ZoneInfo("UTC")),
-                    "spx_price": spx_price,
-                    "spy_price": spy_price,
-                    "vix": vix,
-                    "vix9d": vix9d,
-                    "term_structure": term_structure,
-                    "notes": json.dumps({"source": "tradier", "symbols": quote_symbols}),
-                },
-            )
-
-            await session.commit()
-
-        logger.info("quote_job: inserted_quotes={}", quotes_inserted)
-        return {"skipped": False, "reason": None, "now_et": now_et.isoformat(), "quotes_inserted": quotes_inserted}
+        if quotes_inserted == 0 and quotes_failed > 0:
+            return {
+                "skipped": True,
+                "reason": "all_quote_inserts_failed",
+                "now_et": now_et.isoformat(),
+                "quotes_inserted": quotes_inserted,
+                "quotes_failed": quotes_failed,
+            }
+        logger.info("quote_job: inserted_quotes={} failed_quotes={}", quotes_inserted, quotes_failed)
+        return {
+            "skipped": False,
+            "reason": None,
+            "now_et": now_et.isoformat(),
+            "quotes_inserted": quotes_inserted,
+            "quotes_failed": quotes_failed,
+        }
 
 
 def build_quote_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> QuoteJob:

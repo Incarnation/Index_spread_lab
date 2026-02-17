@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 
 from spx_backend.config import settings
 from spx_backend.database import init_db
@@ -31,16 +33,48 @@ from spx_backend.web.routers.public import (
 )
 
 
+def _scheduler_event_listener(event: Any) -> None:
+    """Log APScheduler job errors/misfires with consistent context.
+
+    Parameters
+    ----------
+    event:
+        APScheduler event object carrying job_id, exception, traceback, and
+        other runtime metadata depending on event type.
+
+    Behavior
+    --------
+    - Logs job exceptions with traceback when available.
+    - Logs missed executions as warnings so ingestion gaps are visible.
+    """
+    job_id = getattr(event, "job_id", "unknown_job")
+    exception = getattr(event, "exception", None)
+    traceback_value = getattr(event, "traceback", None)
+    if exception is not None:
+        logger.error("scheduler: job_id={} failed error={} traceback={}", job_id, exception, traceback_value)
+        return
+    logger.warning("scheduler: job_id={} missed scheduled run", job_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize DB, scheduler, and background jobs."""
+    """Initialize DB, scheduler, and background jobs.
+
+    The lifespan context wires jobs, starts APScheduler, runs one warm-up
+    ingestion cycle, then yields control to the ASGI app. On shutdown it
+    attempts a graceful scheduler stop.
+    """
     await init_db()
 
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
     scheduler = AsyncIOScheduler(timezone=settings.tz)
+    scheduler.add_listener(_scheduler_event_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
     tradier = get_tradier_client()
     clock_cache = MarketClockCache(tradier=tradier, ttl_seconds=settings.market_clock_cache_seconds)
+    max_job_instances = 1
+    misfire_grace_seconds = 300
 
     snapshot_job = build_snapshot_job(tradier=tradier, clock_cache=clock_cache)
     spy_snapshot_job = build_spy_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.spy_snapshot_enabled else None
@@ -61,6 +95,8 @@ async def lifespan(app: FastAPI):
         minutes=settings.snapshot_interval_minutes,
         id="snapshot_job",
         replace_existing=True,
+        max_instances=max_job_instances,
+        misfire_grace_time=misfire_grace_seconds,
     )
     if vix_snapshot_job is not None:
         scheduler.add_job(
@@ -69,6 +105,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.vix_snapshot_interval_minutes,
             id="snapshot_job_vix",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if spy_snapshot_job is not None:
         scheduler.add_job(
@@ -77,6 +115,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.spy_snapshot_interval_minutes,
             id="snapshot_job_spy",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     scheduler.add_job(
         quote_job.run_once,
@@ -84,6 +124,8 @@ async def lifespan(app: FastAPI):
         minutes=settings.quote_interval_minutes,
         id="quote_job",
         replace_existing=True,
+        max_instances=max_job_instances,
+        misfire_grace_time=misfire_grace_seconds,
     )
     scheduler.add_job(
         gex_job.run_once,
@@ -91,6 +133,8 @@ async def lifespan(app: FastAPI):
         minutes=settings.gex_interval_minutes,
         id="gex_job",
         replace_existing=True,
+        max_instances=max_job_instances,
+        misfire_grace_time=misfire_grace_seconds,
     )
     for hour, minute in settings.decision_entry_times_list():
         if settings.feature_builder_enabled:
@@ -101,6 +145,8 @@ async def lifespan(app: FastAPI):
                 minute=minute,
                 id=f"feature_builder_job_{hour:02d}{minute:02d}",
                 replace_existing=True,
+                max_instances=max_job_instances,
+                misfire_grace_time=misfire_grace_seconds,
             )
         scheduler.add_job(
             decision_job.run_once,
@@ -109,6 +155,8 @@ async def lifespan(app: FastAPI):
             minute=minute,
             id=f"decision_job_{hour:02d}{minute:02d}",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if settings.labeler_enabled:
         scheduler.add_job(
@@ -117,6 +165,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.labeler_interval_minutes,
             id="labeler_job",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if settings.trade_pnl_enabled:
         scheduler.add_job(
@@ -125,6 +175,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.trade_pnl_interval_minutes,
             id="trade_pnl_job",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if settings.trainer_enabled:
         scheduler.add_job(
@@ -135,6 +187,8 @@ async def lifespan(app: FastAPI):
             minute=settings.trainer_minute,
             id="trainer_job",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if settings.shadow_inference_enabled:
         scheduler.add_job(
@@ -143,6 +197,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.shadow_inference_interval_minutes,
             id="shadow_inference_job",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     if settings.promotion_gate_enabled:
         scheduler.add_job(
@@ -151,6 +207,8 @@ async def lifespan(app: FastAPI):
             minutes=settings.promotion_gate_interval_minutes,
             id="promotion_gate_job",
             replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
         )
     scheduler.start()
 
@@ -170,18 +228,23 @@ async def lifespan(app: FastAPI):
     app.state.shadow_inference_job = shadow_inference_job
     app.state.promotion_gate_job = promotion_gate_job
 
-    # Run once immediately on boot (useful for confirming wiring).
-    try:
-        await quote_job.run_once()
-        await snapshot_job.run_once()
-        if spy_snapshot_job is not None:
-            await spy_snapshot_job.run_once()
-        if vix_snapshot_job is not None:
-            await vix_snapshot_job.run_once()
-        await gex_job.run_once()
-    except Exception:
-        # Don't crash the web app if the first snapshot fails.
-        pass
+    # Run ingestion jobs once immediately on boot and log every failure explicitly.
+    warmup_jobs: list[tuple[str, Any]] = [
+        ("quote_job", quote_job.run_once),
+        ("snapshot_job", snapshot_job.run_once),
+    ]
+    if spy_snapshot_job is not None:
+        warmup_jobs.append(("snapshot_job_spy", spy_snapshot_job.run_once))
+    if vix_snapshot_job is not None:
+        warmup_jobs.append(("snapshot_job_vix", vix_snapshot_job.run_once))
+    warmup_jobs.append(("gex_job", gex_job.run_once))
+    for job_name, run_once_callable in warmup_jobs:
+        try:
+            await run_once_callable()
+            logger.info("startup_warmup: job_id={} status=ok", job_name)
+        except Exception as exc:
+            # Do not crash startup, but always emit actionable diagnostics.
+            logger.exception("startup_warmup: job_id={} status=failed error={}", job_name, exc)
 
     yield
 

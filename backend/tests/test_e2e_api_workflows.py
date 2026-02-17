@@ -255,6 +255,7 @@ class _RouterAwareSession:
             return _FakeExecResult([])
 
         if "SELECT" in sql and "quotes_count" in sql and "latest_market_clock_ts" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
             return _FakeExecResult(
                 [
                     SimpleNamespace(
@@ -272,28 +273,29 @@ class _RouterAwareSession:
                         trades_count=10,
                         open_trades_count=4,
                         closed_trades_count=6,
-                        latest_quote_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_snapshot_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_gex_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_decision_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_feature_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_candidate_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_model_version_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_training_run_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_prediction_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_trade_mark_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_trade_entry_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        latest_market_clock_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+                        latest_quote_ts=fresh_ts,
+                        latest_snapshot_ts=fresh_ts,
+                        latest_gex_ts=fresh_ts,
+                        latest_decision_ts=fresh_ts,
+                        latest_feature_ts=fresh_ts,
+                        latest_candidate_ts=fresh_ts,
+                        latest_model_version_ts=fresh_ts,
+                        latest_training_run_ts=fresh_ts,
+                        latest_prediction_ts=fresh_ts,
+                        latest_trade_mark_ts=fresh_ts,
+                        latest_trade_entry_ts=fresh_ts,
+                        latest_market_clock_ts=fresh_ts,
                     )
                 ]
             )
 
         if "FROM chain_snapshots" in sql and "ORDER BY ts DESC, snapshot_id DESC" in sql and "LIMIT 1" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
             return _FakeExecResult(
                 [
                     SimpleNamespace(
                         snapshot_id=102,
-                        ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+                        ts=fresh_ts,
                         target_dte=3,
                         expiration=date(2026, 2, 5),
                     )
@@ -301,11 +303,12 @@ class _RouterAwareSession:
             )
 
         if "FROM gex_snapshots" in sql and "ORDER BY ts DESC, snapshot_id DESC" in sql and "LIMIT 1" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
             return _FakeExecResult(
                 [
                     SimpleNamespace(
                         snapshot_id=101,
-                        ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+                        ts=fresh_ts,
                         gex_net=1200.0,
                         zero_gamma_level=6000.0,
                         method="oi_gamma_spot",
@@ -314,11 +317,12 @@ class _RouterAwareSession:
             )
 
         if "FROM trade_decisions" in sql and "ORDER BY ts DESC, decision_id DESC" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
             return _FakeExecResult(
                 [
                     SimpleNamespace(
                         decision_id=77,
-                        ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+                        ts=fresh_ts,
                         decision="TRADE",
                         reason=None,
                         score=1.23,
@@ -331,10 +335,12 @@ class _RouterAwareSession:
             )
 
         if "SELECT DISTINCT ON (symbol)" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
             return _FakeExecResult(
                 [
-                    SimpleNamespace(symbol="SPX", ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc), last=6020.0),
-                    SimpleNamespace(symbol="SPY", ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc), last=602.0),
+                    SimpleNamespace(symbol="SPX", ts=fresh_ts, last=6020.0),
+                    SimpleNamespace(symbol="SPY", ts=fresh_ts, last=602.0),
+                    SimpleNamespace(symbol="VIX", ts=fresh_ts, last=20.0),
                 ]
             )
 
@@ -494,7 +500,11 @@ def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
     payload = preflight.json()
     assert payload["counts"]["chain_snapshots"] == 50
     assert payload["latest_snapshot"]["snapshot_id"] == 102
-    assert payload["warnings"] == []
+    assert payload["freshness"]["quote_age_min"] is not None
+    assert payload["freshness"]["quotes_by_symbol"]["SPX"]["is_stale"] is False
+    assert payload["freshness"]["quotes_by_symbol"]["SPY"]["is_stale"] is False
+    assert payload["freshness"]["quotes_by_symbol"]["VIX"]["is_stale"] is False
+    assert "stale_market_clock" not in payload["warnings"]
 
     delete_missing = client.delete("/api/admin/trade-decisions/999", headers=headers)
     assert delete_missing.status_code == 404

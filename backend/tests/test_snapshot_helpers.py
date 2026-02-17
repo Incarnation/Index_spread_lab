@@ -49,6 +49,17 @@ class _CaptureSession:
         self.chain_insert_params: list[dict] = []
         self.option_insert_params: list[dict] = []
 
+    class _NestedTx:
+        """No-op async savepoint context manager for test session stubs."""
+
+        async def __aenter__(self):
+            """Enter nested transaction without side effects."""
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            """Do not suppress exceptions raised inside nested blocks."""
+            return False
+
     async def execute(self, stmt, params=None):
         """Capture SQL params and provide minimal results by query type."""
         sql = str(stmt)
@@ -66,6 +77,14 @@ class _CaptureSession:
     async def commit(self):
         """No-op commit for fake session."""
         return None
+
+    async def rollback(self):
+        """No-op rollback for fake session."""
+        return None
+
+    def begin_nested(self):
+        """Return no-op nested transaction context manager."""
+        return self._NestedTx()
 
 
 class _SessionFactory:

@@ -193,8 +193,22 @@ class SnapshotJob:
         return is_rth(now_et)
 
     async def run_once(self, *, force: bool = False) -> dict:
-        """Run one snapshot cycle and store chains."""
+        """Run one snapshot cycle and persist chain snapshots/rows.
+
+        Parameters
+        ----------
+        force:
+            When true, bypasses regular-trading-hours gating and allows relaxed
+            target-DTE fallback behavior.
+
+        Returns
+        -------
+        dict
+            Job result payload with skip reason, inserted chain metadata,
+            cumulative option-row count, and per-expiration failures.
+        """
         tz = ZoneInfo(settings.tz)
+        utc = ZoneInfo("UTC")
         now_et = datetime.now(tz=tz)
         logger.info("{}: start force={} now_et={}", self.config.job_name, force, now_et.isoformat())
 
@@ -206,17 +220,29 @@ class SnapshotJob:
         underlying = self.config.underlying
         dte_mode = self.config.dte_mode.strip().lower()
 
-        exp_resp = await self.tradier.get_option_expirations(underlying)
-        expirations = _parse_expirations(exp_resp)
+        try:
+            exp_resp = await self.tradier.get_option_expirations(underlying)
+            expirations = _parse_expirations(exp_resp)
+        except Exception as exc:
+            logger.exception("{}: expirations_fetch_failed underlying={} error={}", self.config.job_name, underlying, exc)
+            return {
+                "skipped": True,
+                "reason": "expirations_fetch_failed",
+                "now_et": now_et.isoformat(),
+                "inserted": [],
+                "chain_rows_inserted": 0,
+                "fallback_used": False,
+                "failed_items": [],
+            }
         as_of = now_et.date()
         exp_to_trading_dte = trading_dte_lookup(expirations, as_of)
 
         inserted: list[dict] = []
+        failed_items: list[dict] = []
         chain_rows_inserted = 0
         async with SessionLocal() as session:
             if not expirations:
                 logger.warning("{}: no expirations returned for {}", self.config.job_name, underlying)
-                await session.commit()
                 return {
                     "skipped": True,
                     "reason": "no_expirations",
@@ -224,9 +250,23 @@ class SnapshotJob:
                     "inserted": [],
                     "chain_rows_inserted": 0,
                     "fallback_used": False,
+                    "failed_items": [],
                 }
 
-            spot = await self._get_spot_price(session, now_et, underlying)
+            try:
+                spot = await self._get_spot_price(session, now_et, underlying)
+            except Exception as exc:
+                await session.rollback()
+                logger.exception("{}: spot_lookup_failed underlying={} error={}", self.config.job_name, underlying, exc)
+                return {
+                    "skipped": True,
+                    "reason": "spot_lookup_failed",
+                    "now_et": now_et.isoformat(),
+                    "inserted": [],
+                    "chain_rows_inserted": 0,
+                    "fallback_used": False,
+                    "failed_items": [],
+                }
             if spot is None:
                 logger.warning("{}: no spot price for {}; storing full chains", self.config.job_name, underlying)
 
@@ -256,7 +296,6 @@ class SnapshotJob:
                         )
                     else:
                         logger.warning("{}: no expirations in trading-dte range {}-{}", self.config.job_name, min_dte, max_dte)
-                        await session.commit()
                         return {
                             "skipped": True,
                             "reason": "no_expirations_in_range",
@@ -264,6 +303,7 @@ class SnapshotJob:
                             "inserted": [],
                             "chain_rows_inserted": 0,
                             "fallback_used": False,
+                            "failed_items": [],
                         }
             else:
                 dte_targets = self.config.dte_targets
@@ -300,113 +340,178 @@ class SnapshotJob:
                     selected.append((exp_to_trading_dte.get(exp, target_dte), exp))
 
             for target_dte, exp in selected:
-
-                chain = await self.tradier.get_option_chain(underlying=underlying, expiration=exp.isoformat(), greeks=True)
-                chk = _checksum(chain)
-
-                result = await session.execute(
-                    text(
-                        """
-                        INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
-                        VALUES (:ts, :underlying, :target_dte, :expiration, CAST(:payload AS jsonb), :checksum)
-                        RETURNING snapshot_id
-                        """
-                    ),
-                    {
-                        "ts": now_et.astimezone(ZoneInfo("UTC")),
-                        "underlying": underlying,
-                        "target_dte": target_dte,
-                        "expiration": exp,
-                        "payload": json.dumps(chain, default=str),
-                        "checksum": chk,
-                    },
-                )
-                snapshot_id = result.scalar_one()
-
-                # Extract per-option rows with open_interest + greeks if present.
-                options = _parse_chain_options(chain)
-                selected_strikes: set[float] | None = None
-                if spot is not None and self.config.strikes_each_side > 0:
-                    selected_strikes = _select_strikes_near_spot(
-                        options,
-                        float(spot),
-                        self.config.strikes_each_side,
-                    )
-                    if selected_strikes:
-                        logger.info(
-                            "{}: filtering to {} strikes around spot={} (exp={})",
-                            self.config.job_name,
-                            len(selected_strikes),
-                            spot,
-                            exp.isoformat(),
-                        )
-                for opt in options:
-                    symbol = opt.get("symbol")
-                    if not symbol:
-                        continue
-                    greeks = opt.get("greeks") or {}
-                    strike_val = _to_float(opt.get("strike"))
-                    if selected_strikes is not None:
-                        if strike_val is None or strike_val not in selected_strikes:
-                            continue
-                    await session.execute(
-                        text(
-                            """
-                            INSERT INTO option_chain_rows (
-                              snapshot_id, option_symbol, underlying, expiration, strike, option_right,
-                              bid, ask, last, volume, open_interest,
-                              delta, gamma, theta, vega, rho,
-                              bid_iv, mid_iv, ask_iv, greeks_updated_at,
-                              raw_json
-                            )
-                            VALUES (
-                              :snapshot_id, :option_symbol, :underlying, :expiration, :strike, :option_right,
-                              :bid, :ask, :last, :volume, :open_interest,
-                              :delta, :gamma, :theta, :vega, :rho,
-                              :bid_iv, :mid_iv, :ask_iv, :greeks_updated_at,
-                              CAST(:raw_json AS jsonb)
-                            )
-                            """
-                        ),
+                try:
+                    chain = await self.tradier.get_option_chain(underlying=underlying, expiration=exp.isoformat(), greeks=True)
+                except Exception as exc:
+                    failed_items.append(
                         {
-                            "snapshot_id": snapshot_id,
-                            "option_symbol": symbol,
-                            "underlying": underlying,
-                            "expiration": (_to_date(opt.get("expiration_date")) or exp),
-                            "strike": strike_val,
-                            "option_right": _normalize_option_right(opt),
-                            "bid": _to_float(opt.get("bid")),
-                            "ask": _to_float(opt.get("ask")),
-                            "last": _to_float(opt.get("last")),
-                            "volume": _to_int(opt.get("volume")),
-                            "open_interest": _to_int(opt.get("open_interest")),
-                            "contract_size": _to_int(opt.get("contract_size")),
-                            "delta": _to_float(greeks.get("delta")),
-                            "gamma": _to_float(greeks.get("gamma")),
-                            "theta": _to_float(greeks.get("theta")),
-                            "vega": _to_float(greeks.get("vega")),
-                            "rho": _to_float(greeks.get("rho")),
-                            "bid_iv": _to_float(greeks.get("bid_iv")),
-                            "mid_iv": _to_float(greeks.get("mid_iv")),
-                            "ask_iv": _to_float(greeks.get("ask_iv")),
-                            "greeks_updated_at": greeks.get("updated_at"),
-                            "raw_json": json.dumps(opt, default=str),
-                        },
+                            "target_dte": target_dte,
+                            "expiration": exp.isoformat(),
+                            "stage": "fetch_chain",
+                            "error": str(exc),
+                        }
                     )
-                    chain_rows_inserted += 1
-                inserted.append(
-                    {
-                        "target_dte": target_dte,
-                        "expiration": exp.isoformat(),
-                        "actual_dte_days": (exp - now_et.date()).days,
-                        "actual_trading_dte": exp_to_trading_dte.get(exp),
-                        "checksum": chk,
-                        "fallback_used": fallback_used,
-                    }
-                )
+                    logger.exception(
+                        "{}: chain_fetch_failed target_dte={} expiration={} error={}",
+                        self.config.job_name,
+                        target_dte,
+                        exp.isoformat(),
+                        exc,
+                    )
+                    continue
 
-            await session.commit()
-        logger.info("{}: inserted_chains={} chain_rows={}", self.config.job_name, len(inserted), chain_rows_inserted)
+                chk = _checksum(chain)
+                item_chain_rows_inserted = 0
+                try:
+                    # Use per-expiration savepoints so one bad chain payload or DB
+                    # write does not roll back successful snapshots from this run.
+                    async with session.begin_nested():
+                        result = await session.execute(
+                            text(
+                                """
+                                INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
+                                VALUES (:ts, :underlying, :target_dte, :expiration, CAST(:payload AS jsonb), :checksum)
+                                RETURNING snapshot_id
+                                """
+                            ),
+                            {
+                                "ts": now_et.astimezone(utc),
+                                "underlying": underlying,
+                                "target_dte": target_dte,
+                                "expiration": exp,
+                                "payload": json.dumps(chain, default=str),
+                                "checksum": chk,
+                            },
+                        )
+                        snapshot_id = result.scalar_one()
+
+                        # Extract per-option rows with open_interest + greeks if present.
+                        options = _parse_chain_options(chain)
+                        selected_strikes: set[float] | None = None
+                        if spot is not None and self.config.strikes_each_side > 0:
+                            selected_strikes = _select_strikes_near_spot(
+                                options,
+                                float(spot),
+                                self.config.strikes_each_side,
+                            )
+                            if selected_strikes:
+                                logger.info(
+                                    "{}: filtering to {} strikes around spot={} (exp={})",
+                                    self.config.job_name,
+                                    len(selected_strikes),
+                                    spot,
+                                    exp.isoformat(),
+                                )
+                        for opt in options:
+                            symbol = opt.get("symbol")
+                            if not symbol:
+                                continue
+                            greeks = opt.get("greeks") or {}
+                            strike_val = _to_float(opt.get("strike"))
+                            if selected_strikes is not None:
+                                if strike_val is None or strike_val not in selected_strikes:
+                                    continue
+                            await session.execute(
+                                text(
+                                    """
+                                    INSERT INTO option_chain_rows (
+                                      snapshot_id, option_symbol, underlying, expiration, strike, option_right,
+                                      bid, ask, last, volume, open_interest,
+                                      delta, gamma, theta, vega, rho,
+                                      bid_iv, mid_iv, ask_iv, greeks_updated_at,
+                                      raw_json
+                                    )
+                                    VALUES (
+                                      :snapshot_id, :option_symbol, :underlying, :expiration, :strike, :option_right,
+                                      :bid, :ask, :last, :volume, :open_interest,
+                                      :delta, :gamma, :theta, :vega, :rho,
+                                      :bid_iv, :mid_iv, :ask_iv, :greeks_updated_at,
+                                      CAST(:raw_json AS jsonb)
+                                    )
+                                    """
+                                ),
+                                {
+                                    "snapshot_id": snapshot_id,
+                                    "option_symbol": symbol,
+                                    "underlying": underlying,
+                                    "expiration": (_to_date(opt.get("expiration_date")) or exp),
+                                    "strike": strike_val,
+                                    "option_right": _normalize_option_right(opt),
+                                    "bid": _to_float(opt.get("bid")),
+                                    "ask": _to_float(opt.get("ask")),
+                                    "last": _to_float(opt.get("last")),
+                                    "volume": _to_int(opt.get("volume")),
+                                    "open_interest": _to_int(opt.get("open_interest")),
+                                    "contract_size": _to_int(opt.get("contract_size")),
+                                    "delta": _to_float(greeks.get("delta")),
+                                    "gamma": _to_float(greeks.get("gamma")),
+                                    "theta": _to_float(greeks.get("theta")),
+                                    "vega": _to_float(greeks.get("vega")),
+                                    "rho": _to_float(greeks.get("rho")),
+                                    "bid_iv": _to_float(greeks.get("bid_iv")),
+                                    "mid_iv": _to_float(greeks.get("mid_iv")),
+                                    "ask_iv": _to_float(greeks.get("ask_iv")),
+                                    "greeks_updated_at": greeks.get("updated_at"),
+                                    "raw_json": json.dumps(opt, default=str),
+                                },
+                            )
+                            item_chain_rows_inserted += 1
+                    chain_rows_inserted += item_chain_rows_inserted
+                    inserted.append(
+                        {
+                            "target_dte": target_dte,
+                            "expiration": exp.isoformat(),
+                            "actual_dte_days": (exp - now_et.date()).days,
+                            "actual_trading_dte": exp_to_trading_dte.get(exp),
+                            "checksum": chk,
+                            "fallback_used": fallback_used,
+                        }
+                    )
+                except Exception as exc:
+                    failed_items.append(
+                        {
+                            "target_dte": target_dte,
+                            "expiration": exp.isoformat(),
+                            "stage": "persist_chain",
+                            "error": str(exc),
+                        }
+                    )
+                    logger.exception(
+                        "{}: persist_chain_failed target_dte={} expiration={} error={}",
+                        self.config.job_name,
+                        target_dte,
+                        exp.isoformat(),
+                        exc,
+                    )
+                    continue
+
+            try:
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                logger.exception(
+                    "{}: commit_failed inserted_chains={} failed_items={} error={}",
+                    self.config.job_name,
+                    len(inserted),
+                    len(failed_items),
+                    exc,
+                )
+                return {
+                    "skipped": True,
+                    "reason": "db_commit_failed",
+                    "now_et": now_et.isoformat(),
+                    "inserted": inserted,
+                    "chain_rows_inserted": chain_rows_inserted,
+                    "fallback_used": fallback_used,
+                    "failed_items": failed_items,
+                }
+        logger.info(
+            "{}: inserted_chains={} chain_rows={} failed_items={}",
+            self.config.job_name,
+            len(inserted),
+            chain_rows_inserted,
+            len(failed_items),
+        )
         return {
             "skipped": False,
             "reason": None,
@@ -414,6 +519,7 @@ class SnapshotJob:
             "inserted": inserted,
             "chain_rows_inserted": chain_rows_inserted,
             "fallback_used": fallback_used,
+            "failed_items": failed_items,
         }
 
     async def _get_spot_price(self, session, ts: datetime, underlying: str) -> float | None:

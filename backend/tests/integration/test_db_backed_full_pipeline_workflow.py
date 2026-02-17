@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -20,7 +20,7 @@ from spx_backend.jobs.labeler_job import LabelerJob
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
-from spx_backend.jobs.snapshot_job import build_snapshot_job
+from spx_backend.jobs.snapshot_job import SnapshotJob, SnapshotJobConfig, build_snapshot_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.web.routers import admin, public
@@ -194,6 +194,63 @@ class _NoExpirationsTradier(_DeterministicTradier):
         return {"expirations": {"date": []}}
 
 
+class _QuoteTimeoutTradier(_DeterministicTradier):
+    """Tradier stub that raises timeout-style quote errors."""
+
+    async def get_quotes(self, symbols: list[str] | str) -> dict:  # noqa: ARG002
+        raise TimeoutError("forced_timeout")
+
+
+class _PartialMalformedQuotesTradier(_DeterministicTradier):
+    """Tradier stub that emits one invalid quote row and one valid row."""
+
+    async def get_quotes(self, symbols: list[str] | str) -> dict:  # noqa: ARG002
+        return {
+            "quotes": {
+                "quote": [
+                    {
+                        "symbol": "SPX",
+                        "last": 6000.0,
+                        "bid": 5999.0,
+                        "ask": 6001.0,
+                        "open": 6000.0,
+                        "high": 6002.0,
+                        "low": 5998.0,
+                        "close": 6000.0,
+                        "volume": 1000,
+                        "change": 0.0,
+                        "change_percentage": 0.0,
+                        "prevclose": 6000.0,
+                    },
+                    {
+                        # Missing symbol triggers NOT NULL violation for isolation test.
+                        "last": 20.0,
+                        "bid": 19.9,
+                        "ask": 20.1,
+                    },
+                ]
+            }
+        }
+
+
+class _PartiallyMalformedChainTradier(_DeterministicTradier):
+    """Tradier stub that returns one valid chain and one malformed chain."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._expirations: list[str] = []
+
+    async def get_option_expirations(self, symbol: str) -> dict:  # noqa: ARG002
+        as_of = datetime.now(tz=ZoneInfo(settings.tz)).date()
+        self._expirations = [(as_of + timedelta(days=2)).isoformat(), (as_of + timedelta(days=3)).isoformat()]
+        return {"expirations": {"date": self._expirations}}
+
+    async def get_option_chain(self, *, underlying: str, expiration: str, greeks: bool = True) -> dict:  # noqa: ARG002
+        if self._expirations and expiration == self._expirations[1]:
+            return {"options": {"option": "malformed_option_payload"}}
+        return await super().get_option_chain(underlying=underlying, expiration=expiration, greeks=greeks)
+
+
 def _configure_workflow_settings(monkeypatch) -> None:
     """Pin workflow settings for deterministic integration behavior."""
     monkeypatch.setattr(settings, "quote_symbols", "SPX,SPY,VIX,VIX9D")
@@ -275,6 +332,77 @@ async def workflow_client(integration_db_session, monkeypatch, admin_headers):  
         tradier=_DeterministicTradier(),
     ) as client:
         yield client
+
+
+async def _seed_two_chain_snapshots_for_gex(*, session, now_utc: datetime) -> list[int]:
+    """Seed two snapshots + option rows and one quote for GEX failure-isolation tests.
+
+    Parameters
+    ----------
+    session:
+        Async SQLAlchemy session bound to the integration test database.
+    now_utc:
+        Reference timestamp for deterministic ordering.
+
+    Returns
+    -------
+    list[int]
+        Snapshot IDs inserted in descending recency order.
+    """
+    await session.execute(
+        text(
+            """
+            INSERT INTO underlying_quotes (
+              ts, symbol, last, bid, ask, open, high, low, close, source, raw_json
+            )
+            VALUES (
+              :ts, 'SPX', 6000.0, 5999.0, 6001.0, 6000.0, 6002.0, 5998.0, 6000.0, 'tradier', '{}'::jsonb
+            )
+            """
+        ),
+        {"ts": now_utc - timedelta(minutes=1)},
+    )
+    snapshot_ids: list[int] = []
+    for idx in range(2):
+        ts_value = now_utc - timedelta(minutes=idx + 2)
+        expiration = (ts_value + timedelta(days=3)).date()
+        snapshot_row = await session.execute(
+            text(
+                """
+                INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
+                VALUES (:ts, 'SPX', 3, :expiration, '{}'::jsonb, :checksum)
+                RETURNING snapshot_id
+                """
+            ),
+            {
+                "ts": ts_value,
+                "expiration": expiration,
+                "checksum": f"gex_seed_{idx}",
+            },
+        )
+        snapshot_id = int(snapshot_row.scalar_one())
+        snapshot_ids.append(snapshot_id)
+        await session.execute(
+            text(
+                """
+                INSERT INTO option_chain_rows (
+                  snapshot_id, option_symbol, underlying, expiration, strike, option_right,
+                  bid, ask, last, volume, open_interest, contract_size, gamma, raw_json
+                )
+                VALUES
+                  (:snapshot_id, :opt_put, 'SPX', :expiration, 6000.0, 'P', 2.0, 2.2, 2.1, 10, 100, 100, 0.020, '{}'::jsonb),
+                  (:snapshot_id, :opt_call, 'SPX', :expiration, 6025.0, 'C', 1.8, 2.0, 1.9, 10, 100, 100, 0.019, '{}'::jsonb)
+                """
+            ),
+            {
+                "snapshot_id": snapshot_id,
+                "expiration": expiration,
+                "opt_put": f"SPX_P_{snapshot_id}",
+                "opt_call": f"SPX_C_{snapshot_id}",
+            },
+        )
+    await session.commit()
+    return snapshot_ids
 
 
 async def _seed_completed_training_run(*, session, version: str, metrics: dict[str, Any]) -> tuple[int, int]:
@@ -439,6 +567,185 @@ async def test_db_backed_quote_fetch_failure_returns_skip(
 
     count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM underlying_quotes"))).scalar_one()
     assert int(count) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.regression
+async def test_db_backed_quote_timeout_returns_skip(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Quote endpoint should map timeout exceptions into a clean skip payload."""
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_QuoteTimeoutTradier(),
+    ) as client:
+        run_quotes = await client.post("/api/admin/run-quotes", headers=admin_headers)
+
+    assert run_quotes.status_code == 200
+    payload = run_quotes.json()
+    assert payload["skipped"] is True
+    assert payload["reason"] == "quote_fetch_failed"
+    assert payload["quotes_inserted"] == 0
+
+    count = (await integration_db_session.execute(text("SELECT COUNT(*) FROM underlying_quotes"))).scalar_one()
+    assert int(count) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.regression
+async def test_db_backed_quote_partial_insert_isolated_per_symbol(
+    integration_db_session,
+    monkeypatch,
+    admin_headers,
+) -> None:
+    """Quote job should keep valid symbols when one malformed quote row fails."""
+    async with _build_workflow_client(
+        integration_db_session=integration_db_session,
+        monkeypatch=monkeypatch,
+        tradier=_PartialMalformedQuotesTradier(),
+    ) as client:
+        run_quotes = await client.post("/api/admin/run-quotes", headers=admin_headers)
+
+    assert run_quotes.status_code == 200
+    payload = run_quotes.json()
+    assert payload["skipped"] is False
+    assert payload["quotes_inserted"] == 1
+    assert payload["quotes_failed"] == 1
+
+    rows = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT symbol
+                FROM underlying_quotes
+                ORDER BY quote_id ASC
+                """
+            )
+        )
+    ).fetchall()
+    assert [row.symbol for row in rows] == ["SPX"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.regression
+async def test_db_backed_snapshot_malformed_chain_rolls_back_only_failed_expiration(
+    integration_db_session,
+    monkeypatch,
+) -> None:
+    """Snapshot job should commit valid expirations while rolling back malformed ones."""
+    session_factory = async_sessionmaker(
+        bind=integration_db_session.bind,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(snapshot_module, "SessionLocal", session_factory)
+    tradier = _PartiallyMalformedChainTradier()
+    config = SnapshotJobConfig(
+        job_name="snapshot_job_test",
+        underlying="SPX",
+        dte_mode="range",
+        dte_targets=[],
+        dte_min_days=0,
+        dte_max_days=10,
+        range_fallback_enabled=False,
+        range_fallback_count=2,
+        dte_tolerance_days=0,
+        strikes_each_side=0,
+        allow_outside_rth=True,
+    )
+    result = await SnapshotJob(tradier=tradier, config=config).run_once(force=True)
+
+    assert result["skipped"] is False
+    assert len(result["inserted"]) == 1
+    assert len(result["failed_items"]) == 1
+    assert result["failed_items"][0]["stage"] == "persist_chain"
+    assert result["chain_rows_inserted"] > 0
+
+    snapshots = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT expiration
+                FROM chain_snapshots
+                ORDER BY snapshot_id ASC
+                """
+            )
+        )
+    ).fetchall()
+    assert len(snapshots) == 1
+    assert snapshots[0].expiration.isoformat() == tradier._expirations[0]
+    bad_count = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM chain_snapshots
+                WHERE expiration = :bad_expiration
+                """
+            ),
+            {"bad_expiration": date.fromisoformat(tradier._expirations[1])},
+        )
+    ).scalar_one()
+    assert int(bad_count) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.regression
+async def test_db_backed_gex_partial_failure_keeps_other_snapshots(
+    integration_db_session,
+    monkeypatch,
+) -> None:
+    """GEX job should continue batch processing when one snapshot fails."""
+    session_factory = async_sessionmaker(
+        bind=integration_db_session.bind,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(gex_module, "SessionLocal", session_factory)
+    await _seed_two_chain_snapshots_for_gex(session=integration_db_session, now_utc=datetime.now(tz=ZoneInfo("UTC")))
+
+    call_state = {"count": 0}
+
+    async def _flaky_get_spot_price(session, ts, underlying):  # noqa: ANN001
+        """Raise for first snapshot then return a valid spot for remaining snapshots."""
+        call_state["count"] += 1
+        if call_state["count"] == 1:
+            raise RuntimeError("forced_spot_lookup_failure")
+        return 6000.0
+
+    class _FlakyGexJob(GexJob):
+        """GEX job override that fails one snapshot-level spot lookup."""
+
+        async def _get_spot_price(self, session, ts, underlying):  # noqa: ANN001
+            """Raise first call to force one snapshot failure path."""
+            return await _flaky_get_spot_price(session, ts, underlying)
+
+    job = _FlakyGexJob()
+    result = await job.run_once()
+
+    assert result["skipped"] is False
+    assert result["computed_snapshots"] == 1
+    assert len(result["failed_snapshots"]) == 1
+
+    gex_rows = (
+        await integration_db_session.execute(
+            text(
+                """
+                SELECT snapshot_id
+                FROM gex_snapshots
+                ORDER BY snapshot_id ASC
+                """
+            )
+        )
+    ).fetchall()
+    assert len(gex_rows) == 1
+    failed_snapshot_id = int(result["failed_snapshots"][0]["snapshot_id"])
+    assert int(gex_rows[0].snapshot_id) != failed_snapshot_id
 
 
 @pytest.mark.asyncio

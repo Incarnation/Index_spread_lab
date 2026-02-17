@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import text
@@ -21,6 +21,33 @@ from spx_backend.jobs.trainer_job import TrainerJob, build_trainer_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
 
 router = APIRouter()
+
+
+def _minutes_since(ts: datetime | None, now_utc: datetime) -> float | None:
+    """Return elapsed minutes between now_utc and ts.
+
+    Parameters
+    ----------
+    ts:
+        Optional timestamp to evaluate.
+    now_utc:
+        Current UTC timestamp used as the freshness reference.
+
+    Returns
+    -------
+    float | None
+        Rounded minute age when ts is present, otherwise None.
+    """
+    if ts is None:
+        return None
+    ts_utc = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    delta_seconds = max(0.0, (now_utc - ts_utc).total_seconds())
+    return round(delta_seconds / 60.0, 2)
+
+
+def _is_stale(age_minutes: float | None, threshold_minutes: float) -> bool:
+    """Evaluate whether a freshness age exceeds its staleness threshold."""
+    return age_minutes is not None and age_minutes > threshold_minutes
 
 
 def _require_admin(x_api_key: str | None = Header(default=None)) -> None:
@@ -143,7 +170,7 @@ async def admin_list_expirations(request: Request, symbol: str = "SPX", _: None 
 
 @router.get("/api/admin/preflight")
 async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = Depends(_require_admin)) -> dict:
-    """Return one-call pipeline health summary."""
+    """Return one-call pipeline health summary with freshness diagnostics."""
 
     def _iso(ts) -> str | None:
         """Convert nullable timestamps into ISO strings for preflight payloads."""
@@ -265,6 +292,26 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         "trade_entry_ts": _iso(summary.latest_trade_entry_ts),
         "market_clock_ts": _iso(summary.latest_market_clock_ts),
     }
+    now_utc = datetime.now(tz=timezone.utc)
+    quote_stale_threshold_min = max(float(settings.quote_interval_minutes) * 3.0, 10.0)
+    snapshot_stale_threshold_min = max(float(settings.snapshot_interval_minutes) * 3.0, 15.0)
+    gex_stale_threshold_min = max(float(settings.gex_interval_minutes) * 3.0, 15.0)
+    market_clock_stale_threshold_min = max((float(settings.market_clock_cache_seconds) / 60.0) * 3.0, 10.0)
+    quote_age_min = _minutes_since(summary.latest_quote_ts, now_utc)
+    snapshot_age_min = _minutes_since(summary.latest_snapshot_ts, now_utc)
+    gex_age_min = _minutes_since(summary.latest_gex_ts, now_utc)
+    market_clock_age_min = _minutes_since(summary.latest_market_clock_ts, now_utc)
+    quote_freshness_by_symbol: dict[str, dict[str, object]] = {}
+    latest_quotes_by_symbol = [{"symbol": row.symbol, "ts": _iso(row.ts), "last": row.last} for row in latest_quotes]
+    quote_ts_by_symbol = {row.symbol: row.ts for row in latest_quotes}
+    for symbol in ("SPX", "SPY", "VIX"):
+        symbol_ts = quote_ts_by_symbol.get(symbol)
+        symbol_age = _minutes_since(symbol_ts, now_utc)
+        quote_freshness_by_symbol[symbol] = {
+            "age_min": symbol_age,
+            "is_stale": _is_stale(symbol_age, quote_stale_threshold_min),
+            "ts": _iso(symbol_ts),
+        }
 
     warnings: list[str] = []
     if counts["chain_snapshots"] == 0:
@@ -285,11 +332,37 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
         warnings.append("no_model_predictions")
     if counts["trades"] == 0:
         warnings.append("no_trades")
+    if _is_stale(quote_age_min, quote_stale_threshold_min):
+        warnings.append("stale_quotes_overall")
+    if _is_stale(snapshot_age_min, snapshot_stale_threshold_min):
+        warnings.append("stale_snapshots")
+    if _is_stale(gex_age_min, gex_stale_threshold_min):
+        warnings.append("stale_gex")
+    if _is_stale(market_clock_age_min, market_clock_stale_threshold_min):
+        warnings.append("stale_market_clock")
+    for symbol in ("SPX", "SPY", "VIX"):
+        symbol_freshness = quote_freshness_by_symbol[symbol]
+        if symbol_freshness["ts"] is None:
+            warnings.append(f"missing_quote_{symbol.lower()}")
+            continue
+        if bool(symbol_freshness["is_stale"]):
+            warnings.append(f"stale_quote_{symbol.lower()}")
 
     return {
-        "now_utc": f"{datetime.utcnow().isoformat()}Z",
+        "now_utc": now_utc.isoformat(),
         "counts": counts,
         "latest": latest,
+        "freshness": {
+            "quote_age_min": quote_age_min,
+            "snapshot_age_min": snapshot_age_min,
+            "gex_age_min": gex_age_min,
+            "market_clock_age_min": market_clock_age_min,
+            "quote_stale_threshold_min": quote_stale_threshold_min,
+            "snapshot_stale_threshold_min": snapshot_stale_threshold_min,
+            "gex_stale_threshold_min": gex_stale_threshold_min,
+            "market_clock_stale_threshold_min": market_clock_stale_threshold_min,
+            "quotes_by_symbol": quote_freshness_by_symbol,
+        },
         "latest_snapshot": (
             None
             if latest_snapshot_row is None
@@ -326,10 +399,7 @@ async def admin_preflight(db: AsyncSession = Depends(get_db_session), _: None = 
                 "decision_source": latest_decision_row.decision_source,
             }
         ),
-        "latest_quotes_by_symbol": [
-            {"symbol": row.symbol, "ts": _iso(row.ts), "last": row.last}
-            for row in latest_quotes
-        ],
+        "latest_quotes_by_symbol": latest_quotes_by_symbol,
         "warnings": warnings,
     }
 
