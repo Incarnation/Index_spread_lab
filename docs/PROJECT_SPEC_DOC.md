@@ -1,4 +1,4 @@
-## SPX Tools — Detailed Project Specification & Design Doc
+## IndexSpreadLab — Detailed Project Specification & Design Doc
 
 This document expands `PROJECT_SPEC.md` into an implementation-level reference: architecture, data flows, database schema, API contracts, configuration, and an execution/backtest/ML roadmap.
 
@@ -106,7 +106,7 @@ This document expands `PROJECT_SPEC.md` into an implementation-level reference: 
 ## Repo layout and responsibilities
 
 ```text
-spx_tools/
+index_spread_lab/
   backend/
     requirements.txt
     spx_backend/

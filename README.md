@@ -1,6 +1,6 @@
-# SPX Tools
+# IndexSpreadLab
 
-SPX Tools is a research and paper-execution platform for SPX index options with a practical focus on short-dated credit spread workflows.
+IndexSpreadLab is a research and paper-execution platform for index options with a practical focus on short-dated credit spread workflows.
 
 The current stack is:
 - Backend: FastAPI + APScheduler + PostgreSQL
@@ -350,7 +350,7 @@ DB-backed integration tests (separate local test DB):
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
-export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test"
+export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test"
 cd backend
 python -m pytest -q -m integration
 ```

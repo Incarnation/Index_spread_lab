@@ -1,15 +1,15 @@
 services:
   postgres_test:
     image: postgres:16
-    container_name: spx-tools-pg-test
+    container_name: index-spread-lab-pg-test
     environment:
       POSTGRES_USER: spx_test
       POSTGRES_PASSWORD: spx_test_pw
-      POSTGRES_DB: spx_tools_test
+      POSTGRES_DB: index_spread_lab_test
     ports:
       - "5434:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spx_test -d spx_tools_test"]
+      test: ["CMD-SHELL", "pg_isready -U spx_test -d index_spread_lab_test"]
       interval: 5s
       timeout: 5s
       retries: 10

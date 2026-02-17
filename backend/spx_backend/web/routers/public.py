@@ -818,9 +818,9 @@ async def home(db: AsyncSession = Depends(get_db_session)) -> HTMLResponse:
     )
     html = f"""
     <html>
-      <head><title>SPX Tools (Backend)</title></head>
+      <head><title>IndexSpreadLab (Backend)</title></head>
       <body style="font-family: system-ui; max-width: 900px; margin: 40px auto;">
-        <h2>SPX Tools (Backend)</h2>
+        <h2>IndexSpreadLab (Backend)</h2>
         <p>Server time: {datetime.utcnow().isoformat()}Z</p>
         <h3>Latest chain snapshots</h3>
         <ol>{items}</ol>

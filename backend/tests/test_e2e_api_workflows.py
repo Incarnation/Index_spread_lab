@@ -456,7 +456,7 @@ def test_e2e_public_api_surface(monkeypatch) -> None:
 
     home = client.get("/")
     assert home.status_code == 200
-    assert "SPX Tools (Backend)" in home.text
+    assert "IndexSpreadLab (Backend)" in home.text
 
 
 def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:

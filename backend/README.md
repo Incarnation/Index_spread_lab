@@ -1,4 +1,4 @@
-# SPX Tools Backend
+# IndexSpreadLab Backend
 
 This backend is a FastAPI service that captures options market data, computes context/GEX, and runs a rules-first plus model-assisted paper execution pipeline.
 
@@ -552,7 +552,7 @@ docker compose -f docker-compose.test.yml up -d
 2) Set `DATABASE_URL_TEST` (example in `backend/.env.test.example`):
 
 ```bash
-export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test"
+export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test"
 ```
 
 3) Run only integration tests:

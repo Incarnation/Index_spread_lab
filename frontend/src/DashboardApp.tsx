@@ -15,7 +15,7 @@ import {
 import { useAdminRuns, useDecisionDeletion, useGexData, useSnapshotsDecisions } from "./hooks";
 
 /**
- * Render the main SPX dashboard page and wire cross-panel interactions.
+ * Render the main IndexSpreadLab dashboard page and wire cross-panel interactions.
  *
  * This container composes all major cards/panels and coordinates shared
  * concerns such as global error display, drawer state, and manual admin runs.
@@ -112,7 +112,7 @@ export function DashboardApp() {
         />
 
         <Box>
-          <Title order={2}>SPX Tools</Title>
+          <Title order={2}>IndexSpreadLab</Title>
           <Text c="dimmed" mt={4}>
             React dashboard (MVP)
           </Text>
