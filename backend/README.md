@@ -1,6 +1,6 @@
 # SPX Tools Backend
 
-This backend is a FastAPI service that captures SPX options market data, computes GEX context, and produces rules-based trade decisions for paper workflow analysis.
+This backend is a FastAPI service that captures options market data, computes context/GEX, and runs a rules-first plus model-assisted paper execution pipeline.
 
 It is built for observability and reproducibility:
 - every chain snapshot is stored raw + normalized
@@ -12,14 +12,17 @@ It is built for observability and reproducibility:
 
 ## 1) Service Responsibilities
 
-The backend performs seven continuous tasks:
+The backend performs ten continuous tasks:
 - Quote ingestion (`underlying_quotes`, `context_snapshots`)
 - Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
 - GEX computation (`gex_snapshots`, strike/expiry detail tables)
-- Decision generation (`trade_decisions`)
 - Feature generation (`feature_snapshots`, `trade_candidates`)
+- Decision generation (`trade_decisions`, rules/hybrid policy)
+- Trade mark-to-market and exits (`trades`, `trade_legs`, `trade_marks`)
 - Label resolution (`trade_candidates.label_*`, `realized_pnl`)
-- Live trade mark-to-market (`trades`, `trade_legs`, `trade_marks`)
+- Weekly training (`training_runs`, `model_versions`)
+- Shadow inference (`model_predictions`)
+- Promotion gate evaluation (model rollout status updates)
 
 And exposes APIs for:
 - dashboard data reads
@@ -34,7 +37,7 @@ Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
 3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/decision/feature-builder/labeler/trade-pnl.
+4) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/feature-builder/decision/trade-pnl/labeler/trainer/shadow-inference/promotion-gates.
 5) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
@@ -145,11 +148,14 @@ Input:
 
 Core process:
 1) For each target DTE, choose freshest eligible snapshot.
-2) Build candidate vertical spread(s) using delta and configured width.
+2) Build candidate vertical spread(s) for each enabled side (`put`/`call`) using delta and configured width.
 3) Compute candidate credit and validate viability.
 4) Apply context score adjustments.
-5) Enforce guardrails (`DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`).
-6) Insert one `trade_decisions` row with final action.
+5) Enforce guardrails (`DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`, per-side daily/open caps).
+6) Apply execution policy:
+   - default: rules-ranked selection (`decision_source='rules'`)
+   - optional hybrid: model-ranked selection after rules safety checks (`decision_source='hybrid_model'`)
+7) Insert one `trade_decisions` row with final action and create paper trade rows for TRADE decisions.
 
 Why SKIP rows are stored:
 - They provide full auditability for why no trade occurred.
@@ -173,7 +179,8 @@ Input:
 Output:
 - Resolved labels in `trade_candidates.label_json`.
 - Status updates in `label_status`.
-- Scalar outcomes in `realized_pnl` and `hit_tp50_before_sl_or_expiry`.
+- Scalar outcomes in `realized_pnl`, `hit_tp50_before_sl_or_expiry`, and `hit_tp100_at_expiry`.
+- Separate expiry counterfactual fields in label payload (`expiry_pnl`, `expiry_exit_cost`, `expiry_ts_utc`).
 
 ### 4.7 Trade PnL Job
 
@@ -185,6 +192,32 @@ Output:
 - Rolling mark-to-market updates in `trades.current_pnl` every interval.
 - Mark history in `trade_marks`.
 - Auto-close updates (`status`, `exit_time`, `realized_pnl`, `exit_reason`) when TP/SL/expiry rules are met.
+
+### 4.8 Trainer Job
+
+Input:
+- Resolved `trade_candidates` over configured lookback/test windows.
+
+Output:
+- `training_runs` lifecycle rows (RUNNING/COMPLETED/FAILED).
+- `model_versions` rows with serialized model payload and walk-forward metrics.
+
+### 4.9 Shadow Inference Job
+
+Input:
+- Most recent eligible model (`shadow`/`canary`/`active`) and recent candidates without predictions.
+
+Output:
+- `model_predictions` inserts/updates with `probability_win`, `expected_value`, and utility metadata.
+
+### 4.10 Promotion Gate Job
+
+Input:
+- Most recent completed training run for configured model name.
+
+Output:
+- Gate pass/fail evaluation persisted into run/model metrics JSON.
+- `model_versions.rollout_status` updates (`shadow`/`canary`) and optional activation behavior.
 
 ---
 
@@ -223,6 +256,14 @@ Helpers:
 - `GET /api/gex/curve?snapshot_id=...&dte_days=...`
 - `GET /api/gex/curve?snapshot_id=...&expirations_csv=YYYY-MM-DD,YYYY-MM-DD`
   - strike curve for all, one DTE, or custom expiration set
+- `GET /api/trades?status=...&limit=...`
+  - recent/open/closed paper trade rows with legs and PnL fields
+- `GET /api/label-metrics?lookback_days=...`
+  - TP50/TP100 and realized PnL summary from resolved labels
+- `GET /api/strategy-metrics?lookback_days=...`
+  - strategy quality/risk metrics (win rates, expectancy, drawdown, tail-loss proxy, margin usage, side breakdown)
+- `GET /api/model-ops`
+  - model/training/prediction operational summary
 
 Batch-scoped GEX note:
 - DTE/expiration/curve endpoints use all snapshots in the same capture batch (`same ts + underlying`), not only one row.
@@ -240,6 +281,9 @@ Routes:
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
 - `POST /api/admin/run-trade-pnl`
+- `POST /api/admin/run-trainer`
+- `POST /api/admin/run-shadow-inference`
+- `POST /api/admin/run-promotion-gates`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -293,9 +337,16 @@ High-impact settings:
   - `DECISION_ENTRY_TIMES`
   - `DECISION_DTE_TARGETS`, `DECISION_DTE_TOLERANCE_DAYS`
   - `DECISION_DELTA_TARGETS`
-  - `DECISION_SPREAD_SIDE`, `DECISION_SPREAD_WIDTH_POINTS`
+  - `DECISION_SPREAD_SIDE`, `DECISION_SPREAD_SIDES`, `DECISION_SPREAD_WIDTH_POINTS`
   - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
   - `DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`
+  - `DECISION_MAX_TRADES_PER_SIDE_PER_DAY`, `DECISION_MAX_OPEN_TRADES_PER_SIDE`
+- Hybrid execution policy:
+  - `DECISION_HYBRID_ENABLED`
+  - `DECISION_HYBRID_MODEL_NAME`
+  - `DECISION_HYBRID_MIN_PROBABILITY`
+  - `DECISION_HYBRID_MIN_EXPECTED_PNL`
+  - `DECISION_HYBRID_REQUIRE_ACTIVE_MODEL`
 - Feature Builder:
   - `FEATURE_BUILDER_ENABLED`
   - `FEATURE_BUILDER_ALLOW_OUTSIDE_RTH`
@@ -310,6 +361,29 @@ High-impact settings:
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
   - `LABEL_CONTRACT_MULTIPLIER`
+- Weekly trainer:
+  - `TRAINER_ENABLED`
+  - `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`
+  - `TRAINER_MODEL_NAME`
+  - `TRAINER_LOOKBACK_DAYS`, `TRAINER_TEST_DAYS`
+  - `TRAINER_MIN_ROWS`, `TRAINER_MIN_TRAIN_ROWS`, `TRAINER_MIN_TEST_ROWS`
+- Shadow inference:
+  - `SHADOW_INFERENCE_ENABLED`
+  - `SHADOW_INFERENCE_INTERVAL_MINUTES`
+  - `SHADOW_INFERENCE_BATCH_LIMIT`
+  - `SHADOW_INFERENCE_LOOKBACK_MINUTES`
+  - `SHADOW_INFERENCE_MODEL_NAME`
+- Promotion gates:
+  - `PROMOTION_GATE_ENABLED`
+  - `PROMOTION_GATE_INTERVAL_MINUTES`
+  - `PROMOTION_GATE_MODEL_NAME`
+  - `PROMOTION_GATE_MIN_RESOLVED`
+  - `PROMOTION_GATE_MIN_TP50_RATE`
+  - `PROMOTION_GATE_MIN_EXPECTANCY`
+  - `PROMOTION_GATE_MAX_DRAWDOWN`
+  - `PROMOTION_GATE_MIN_TAIL_LOSS_PROXY`
+  - `PROMOTION_GATE_MAX_AVG_MARGIN_USAGE`
+  - `PROMOTION_GATE_AUTO_ACTIVATE`
 - Trade PnL:
   - `TRADE_PNL_ENABLED`
   - `TRADE_PNL_INTERVAL_MINUTES`
@@ -522,6 +596,7 @@ Current coverage domains:
 - HTTP-level mocked E2E router workflows
 - DB-backed integration smoke tests (`-m integration`)
 - DB-backed regression failure pack (quote fetch fail, no expirations, no shadow model, promotion gate fail/pass)
+- DB-backed trainer/shadow run-once integration coverage
 
 ---
 
@@ -577,4 +652,4 @@ LIMIT 20;
 - Hybrid decision path is implemented, but defaults to rules-first with model ranking gated by config/promotions.
 - Order placement/fill lifecycle tables exist but workflow remains staged.
 - Frontend test coverage has not yet been added.
-- Full backtest runner orchestration is still pending.
+- Full historical replay/backtest orchestration is still pending.

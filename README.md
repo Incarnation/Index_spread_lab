@@ -14,18 +14,23 @@ This repository is designed so live capture, analytics (GEX), and decision logs 
 ## Current Product Scope
 
 What is implemented now:
-- Scheduled option-chain snapshot capture.
+- Scheduled SPX option-chain snapshot capture (0-10 DTE range profile).
+- Scheduled SPY snapshot stream (enabled by default) and optional VIX snapshot stream.
 - Scheduled quote capture (SPX, VIX, VIX9D, SPY by default).
 - Scheduled GEX computation and persistence.
-- Rules-based decision engine that writes TRADE/SKIP decisions.
+- Feature/candidate generation for both `put` and `call` credit spreads.
+- Label resolution with both live-style TP50 outcome and expiry counterfactual outcome.
+- Weekly walk-forward trainer that writes `training_runs` and `model_versions`.
+- Shadow inference writer to `model_predictions`.
+- Promotion gate evaluator for rollout safety checks.
+- Hybrid execution policy support (rules guardrails first, model ranking second) with safe default `decision_source='rules'`.
 - Admin APIs to manually trigger each pipeline stage.
-- React dashboard to inspect snapshots, GEX curves, and decisions.
-- Backend test suite for core business logic.
+- React dashboard including strategy quality/risk cards (win50, win100@expiry, expectancy, drawdown, tail loss proxy, margin usage, side breakdown).
+- Backend unit/integration/E2E suites with a predeploy gate and CI workflow.
 
-What is not implemented yet:
-- Full broker order lifecycle in production usage (schema exists, execution flow is still intentionally limited).
-- Full historical backfill pipeline and walk-forward orchestration.
-- ML training/serving loop execution (schema scaffolding exists).
+Still intentionally limited:
+- Live broker order/fill automation remains staged (schema and paper workflow are available).
+- Backtest runner orchestration and full historical backfill are still evolving.
 
 ---
 
@@ -56,12 +61,30 @@ The pipeline runs in this order:
   - `gex_by_strike`
   - `gex_by_expiry_strike`
 
-4) Decision job
-- At configured entry times, evaluates current snapshots.
-- Builds spread candidates and scores them.
-- Writes one decision record per run in `trade_decisions`:
-  - `TRADE` with chosen legs and params, or
-  - `SKIP` with reason.
+4) Feature builder + candidate generation
+- At configured entry times, builds feature snapshots and ranked candidates.
+- Generates candidates for both `put` and `call` sides.
+- Writes:
+  - `feature_snapshots`
+  - `trade_candidates` (ranked, hashed candidates)
+
+5) Decision + execution policy
+- Enforces hard risk guardrails first (day/open caps and per-side caps).
+- Selects candidate by rules score by default.
+- If hybrid is enabled and eligible model predictions exist, applies model ranking subject to safety thresholds.
+- Writes one decision row per run (`TRADE`/`SKIP`) in `trade_decisions`, then creates/updates paper trade rows.
+
+6) Labeler + trade PnL
+- Trade PnL job marks open trades continuously and closes on TP/SL/expiry policy.
+- Labeler resolves candidate outcomes from forward marks and stores:
+  - `hit_tp50_before_sl_or_expiry`
+  - `hit_tp100_at_expiry`
+  - `realized_pnl` and separate expiry counterfactual fields.
+
+7) Weekly model loop
+- Trainer runs walk-forward evaluation and writes `training_runs` + `model_versions`.
+- Shadow inference scores fresh candidates and writes `model_predictions`.
+- Promotion gates evaluate quality/risk thresholds and update rollout status.
 
 Important semantics:
 - DTE handling is trading-session based (weekends and market holidays are skipped).
@@ -94,7 +117,7 @@ Why 3DTE is 2026-02-18:
   - `spx_backend/web/routers/`: public/admin route modules.
   - `spx_backend/database/`: DB package (`connection.py`, `schema.py`, reset CLIs).
   - `spx_backend/backtest/`: local backtest engine + sample data docs.
-  - `spx_backend/jobs/`: snapshot, quote, gex, decision jobs.
+- `spx_backend/jobs/`: snapshot, quote, gex, feature-builder, decision, labeler, trade-pnl, trainer, shadow-inference, promotion-gate jobs.
   - `spx_backend/dte.py`: trading-day DTE helper logic.
   - `spx_backend/database/sql/db_schema.sql`: schema bootstrap.
   - `requirements.txt`: runtime dependencies.
@@ -142,7 +165,16 @@ Primary knobs:
   - `DECISION_DTE_TOLERANCE_DAYS`
   - `DECISION_DELTA_TARGETS`
   - `DECISION_SPREAD_WIDTH_POINTS`
+  - `DECISION_SPREAD_SIDES`
   - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
+  - `DECISION_MAX_TRADES_PER_SIDE_PER_DAY`
+  - `DECISION_MAX_OPEN_TRADES_PER_SIDE`
+- Hybrid decision policy:
+  - `DECISION_HYBRID_ENABLED`
+  - `DECISION_HYBRID_MODEL_NAME`
+  - `DECISION_HYBRID_MIN_PROBABILITY`
+  - `DECISION_HYBRID_MIN_EXPECTED_PNL`
+  - `DECISION_HYBRID_REQUIRE_ACTIVE_MODEL`
 - ML (feature + label pipeline):
   - `FEATURE_BUILDER_ENABLED`
   - `FEATURE_BUILDER_ALLOW_OUTSIDE_RTH`
@@ -153,6 +185,29 @@ Primary knobs:
   - `LABELER_BATCH_LIMIT`
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
+- Weekly trainer:
+  - `TRAINER_ENABLED`
+  - `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`
+  - `TRAINER_MODEL_NAME`
+  - `TRAINER_LOOKBACK_DAYS`, `TRAINER_TEST_DAYS`
+  - `TRAINER_MIN_ROWS`, `TRAINER_MIN_TRAIN_ROWS`, `TRAINER_MIN_TEST_ROWS`
+- Shadow inference:
+  - `SHADOW_INFERENCE_ENABLED`
+  - `SHADOW_INFERENCE_INTERVAL_MINUTES`
+  - `SHADOW_INFERENCE_BATCH_LIMIT`
+  - `SHADOW_INFERENCE_LOOKBACK_MINUTES`
+  - `SHADOW_INFERENCE_MODEL_NAME`
+- Promotion gates:
+  - `PROMOTION_GATE_ENABLED`
+  - `PROMOTION_GATE_INTERVAL_MINUTES`
+  - `PROMOTION_GATE_MODEL_NAME`
+  - `PROMOTION_GATE_MIN_RESOLVED`
+  - `PROMOTION_GATE_MIN_TP50_RATE`
+  - `PROMOTION_GATE_MIN_EXPECTANCY`
+  - `PROMOTION_GATE_MAX_DRAWDOWN`
+  - `PROMOTION_GATE_MIN_TAIL_LOSS_PROXY`
+  - `PROMOTION_GATE_MAX_AVG_MARGIN_USAGE`
+  - `PROMOTION_GATE_AUTO_ACTIVATE`
 - Live trade PnL:
   - `TRADE_PNL_ENABLED`
   - `TRADE_PNL_INTERVAL_MINUTES`
@@ -219,6 +274,10 @@ Public read endpoints:
 - `GET /api/gex/expirations?snapshot_id=...`
 - `GET /api/gex/curve?snapshot_id=...`
 - `GET /api/trade-decisions`
+- `GET /api/trades`
+- `GET /api/label-metrics`
+- `GET /api/strategy-metrics`
+- `GET /api/model-ops`
 
 Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
 - `POST /api/admin/run-snapshot`
@@ -228,6 +287,9 @@ Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
 - `POST /api/admin/run-trade-pnl`
+- `POST /api/admin/run-trainer`
+- `POST /api/admin/run-shadow-inference`
+- `POST /api/admin/run-promotion-gates`
 - `DELETE /api/admin/trade-decisions/{decision_id}`
 - `GET /api/admin/expirations?symbol=SPX`
 - `GET /api/admin/preflight`
@@ -369,6 +431,10 @@ If decisions are skipping:
 - Check `DECISION_SNAPSHOT_MAX_AGE_MINUTES`.
 - Inspect last `trade_decisions` reason.
 
+If model loop is not producing predictions yet:
+- After a fresh DB reset, `no_model_versions` and `no_model_predictions` warnings are expected initially.
+- Wait for enough resolved labels, or temporarily reduce trainer minimum-row thresholds to bootstrap first model.
+
 ---
 
 ## Common Troubleshooting
@@ -392,7 +458,7 @@ Unexpected DTE mapping:
 
 ## Next Improvements
 
-- CI now runs the backend predeploy gate (`make test-predeploy`) on push/PR; next step is splitting into faster parallel jobs.
-- Expand integration tests with temp Postgres fixtures.
-- Add frontend test suite (Vitest + React Testing Library).
-- Add explicit decision skip reason taxonomy in API/UI.
+- Split CI predeploy checks into faster parallel jobs while preserving gate quality.
+- Expand backtest orchestration and historical replay tooling.
+- Add frontend automated tests (Vitest + React Testing Library).
+- Add richer decision skip taxonomy views in dashboard.
