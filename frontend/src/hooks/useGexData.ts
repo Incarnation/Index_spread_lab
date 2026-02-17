@@ -8,6 +8,12 @@ import {
   type GexExpirationItem,
   type GexSnapshot,
 } from "../api";
+import {
+  GEX_UNDERLYING_OPTIONS,
+  GEX_ZERO_DTE_ONLY_SENTINEL,
+  getSnapshotTradingDateIso,
+  type GexUnderlying,
+} from "../constants/gex";
 
 type UseGexDataArgs = {
   onError: (message: string) => void;
@@ -16,6 +22,34 @@ type UseGexDataArgs = {
 const GEX_DTE_STORAGE_KEY = "dashboard.gex.selectedDte";
 const GEX_CUSTOM_EXP_STORAGE_KEY = "dashboard.gex.selectedCustomExpirations";
 const GEX_SNAPSHOT_STORAGE_KEY = "dashboard.gex.selectedSnapshotId";
+const GEX_UNDERLYING_STORAGE_KEY = "dashboard.gex.selectedUnderlying";
+
+/**
+ * Normalize one underlying symbol to uppercase without surrounding whitespace.
+ */
+function normalizeUnderlying(value: string | null | undefined): string {
+  return (value ?? "").trim().toUpperCase();
+}
+
+/**
+ * Return true when a snapshot row belongs to the selected underlying.
+ */
+function isMatchingUnderlying(snapshot: GexSnapshot, selectedUnderlying: GexUnderlying): boolean {
+  return normalizeUnderlying(snapshot.underlying) === selectedUnderlying;
+}
+
+/**
+ * Normalize custom expiration selection values and enforce exclusive 0DTE mode.
+ */
+function normalizeCustomExpirationSelection(values: string[]): string[] {
+  const cleaned = Array.from(
+    new Set(values.map((value) => value.trim()).filter((value) => value.length > 0)),
+  );
+  if (cleaned.includes(GEX_ZERO_DTE_ONLY_SENTINEL)) {
+    return [GEX_ZERO_DTE_ONLY_SENTINEL];
+  }
+  return cleaned;
+}
 
 /**
  * Read one localStorage string value, guarding browsers where storage is unavailable.
@@ -64,10 +98,23 @@ function writeStorageStringArray(key: string, value: string[]): void {
   }
 }
 
+/**
+ * Normalize persisted underlying values to one supported symbol.
+ */
+function readStoredGexUnderlying(): GexUnderlying {
+  const raw = normalizeUnderlying(readStorageString(GEX_UNDERLYING_STORAGE_KEY));
+  if ((GEX_UNDERLYING_OPTIONS as readonly string[]).includes(raw)) {
+    return raw as GexUnderlying;
+  }
+  return "SPX";
+}
+
 type UseGexDataResult = {
   gexSnapshots: GexSnapshot[];
   selectedGexSnapshot: GexSnapshot | null;
   setSelectedGexSnapshot: (snapshot: GexSnapshot | null) => void;
+  selectedUnderlying: GexUnderlying;
+  handleSelectedUnderlyingChange: (value: string | null) => void;
   gexDtes: number[];
   gexExpirations: GexExpirationItem[];
   selectedDte: string;
@@ -86,34 +133,64 @@ type UseGexDataResult = {
  */
 export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   const [gexSnapshots, setGexSnapshots] = React.useState<GexSnapshot[]>([]);
-  const [selectedGexSnapshot, setSelectedGexSnapshot] = React.useState<GexSnapshot | null>(null);
+  const [selectedGexSnapshotState, setSelectedGexSnapshotState] = React.useState<GexSnapshot | null>(null);
+  const [selectedUnderlying, setSelectedUnderlying] = React.useState<GexUnderlying>(() => readStoredGexUnderlying());
   const [gexDtes, setGexDtes] = React.useState<number[]>([]);
   const [gexExpirations, setGexExpirations] = React.useState<GexExpirationItem[]>([]);
   const [selectedDte, setSelectedDte] = React.useState<string>(() => readStorageString(GEX_DTE_STORAGE_KEY) ?? "all");
-  const [selectedCustomExpirations, setSelectedCustomExpirations] = React.useState<string[]>(() =>
-    readStorageStringArray(GEX_CUSTOM_EXP_STORAGE_KEY),
+  const [selectedCustomExpirationsState, setSelectedCustomExpirationsState] = React.useState<string[]>(() =>
+    normalizeCustomExpirationSelection(readStorageStringArray(GEX_CUSTOM_EXP_STORAGE_KEY)),
   );
   const [gexCurve, setGexCurve] = React.useState<GexCurvePoint[]>([]);
   const [gexLoading, setGexLoading] = React.useState<boolean>(false);
 
+  const selectedGexSnapshot = selectedGexSnapshotState;
+  const selectedCustomExpirations = selectedCustomExpirationsState;
+
   /**
-   * Load recent GEX snapshots once on mount and default-select the latest row.
+   * Enforce symbol consistency whenever the selected snapshot is set manually.
+   */
+  const setSelectedGexSnapshot = React.useCallback(
+    (snapshot: GexSnapshot | null) => {
+      if (snapshot && !isMatchingUnderlying(snapshot, selectedUnderlying)) {
+        return;
+      }
+      setSelectedGexSnapshotState(snapshot);
+    },
+    [selectedUnderlying],
+  );
+
+  /**
+   * Normalize custom expiration values before storing selection state.
+   */
+  const setSelectedCustomExpirations = React.useCallback((values: string[]) => {
+    setSelectedCustomExpirationsState(normalizeCustomExpirationSelection(values));
+  }, []);
+
+  /**
+   * Load recent GEX snapshots for the selected underlying and pick a default batch.
    */
   React.useEffect(() => {
     let cancelled = false;
     setGexLoading(true);
-    fetchGexSnapshots(20)
+    fetchGexSnapshots(20, selectedUnderlying)
       .then((rows) => {
         if (cancelled) return;
-        setGexSnapshots(rows);
-        if (rows.length > 0) {
+        const symbolRows = rows.filter((row) => isMatchingUnderlying(row, selectedUnderlying));
+        setGexSnapshots(symbolRows);
+        if (symbolRows.length > 0) {
           const persistedSnapshotIdRaw = readStorageString(GEX_SNAPSHOT_STORAGE_KEY);
           const persistedSnapshotId = persistedSnapshotIdRaw ? Number(persistedSnapshotIdRaw) : null;
           const preferredSnapshot =
             persistedSnapshotId != null && Number.isFinite(persistedSnapshotId)
-              ? rows.find((row) => row.snapshot_id === persistedSnapshotId) ?? null
+              ? symbolRows.find((row) => row.snapshot_id === persistedSnapshotId) ?? null
               : null;
-          setSelectedGexSnapshot(preferredSnapshot ?? rows[0]);
+          setSelectedGexSnapshotState(preferredSnapshot ?? symbolRows[0]);
+        } else {
+          setSelectedGexSnapshotState(null);
+          setGexDtes([]);
+          setGexExpirations([]);
+          setGexCurve([]);
         }
       })
       .catch((e: unknown) => {
@@ -125,7 +202,19 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     return () => {
       cancelled = true;
     };
-  }, [onError]);
+  }, [onError, selectedUnderlying]);
+
+  /**
+   * Guard against stale UI state by forcing selected snapshot symbol to match filter.
+   */
+  React.useEffect(() => {
+    if (!selectedGexSnapshot) return;
+    if (isMatchingUnderlying(selectedGexSnapshot, selectedUnderlying)) {
+      return;
+    }
+    const fallbackSnapshot = gexSnapshots.find((row) => isMatchingUnderlying(row, selectedUnderlying)) ?? null;
+    setSelectedGexSnapshotState(fallbackSnapshot);
+  }, [gexSnapshots, selectedGexSnapshot, selectedUnderlying]);
 
   /**
    * Load DTE and expiration options whenever selected snapshot changes.
@@ -142,8 +231,11 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
           if (prev === "all" || prev === "custom") return prev;
           return dteRows.includes(Number(prev)) ? prev : "all";
         });
-        setSelectedCustomExpirations((prev) =>
-          prev.filter((value) => expirationRows.some((row) => row.expiration === value)),
+        setSelectedCustomExpirationsState((prev) =>
+          prev.filter(
+            (value) =>
+              value === GEX_ZERO_DTE_ONLY_SENTINEL || expirationRows.some((row) => row.expiration === value),
+          ),
         );
       })
       .catch((e: unknown) => {
@@ -169,10 +261,23 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     }
 
     const dteVal = selectedDte === "all" || selectedDte === "custom" ? undefined : Number(selectedDte);
+    const hasZeroDteOnlySelection =
+      selectedDte === "custom" && selectedCustomExpirations.includes(GEX_ZERO_DTE_ONLY_SENTINEL);
+    const selectedSnapshotTradingDate = getSnapshotTradingDateIso(selectedGexSnapshot);
+    const selectedRealExpirations = selectedCustomExpirations.filter((value) => value !== GEX_ZERO_DTE_ONLY_SENTINEL);
+    if (hasZeroDteOnlySelection && !selectedSnapshotTradingDate) {
+      setGexCurve([]);
+      setGexLoading(false);
+      return;
+    }
+    const expirationsForRequest =
+      hasZeroDteOnlySelection && selectedSnapshotTradingDate
+        ? [selectedSnapshotTradingDate]
+        : selectedRealExpirations;
     fetchGexCurve(
       selectedGexSnapshot.snapshot_id,
       dteVal,
-      selectedDte === "custom" ? selectedCustomExpirations : undefined,
+      selectedDte === "custom" ? expirationsForRequest : undefined,
     )
       .then((points) => {
         if (!cancelled) setGexCurve(points);
@@ -205,13 +310,33 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     writeStorageString(GEX_SNAPSHOT_STORAGE_KEY, String(selectedGexSnapshot.snapshot_id));
   }, [selectedGexSnapshot]);
 
+  React.useEffect(() => {
+    writeStorageString(GEX_UNDERLYING_STORAGE_KEY, selectedUnderlying);
+  }, [selectedUnderlying]);
+
+  /**
+   * Update selected underlying and reset stale snapshot-specific selections.
+   */
+  const handleSelectedUnderlyingChange = React.useCallback((value: string | null) => {
+    const normalized = normalizeUnderlying(value);
+    if (!(GEX_UNDERLYING_OPTIONS as readonly string[]).includes(normalized)) {
+      return;
+    }
+    setSelectedUnderlying(normalized as GexUnderlying);
+    setSelectedGexSnapshotState(null);
+    setSelectedCustomExpirationsState([]);
+    setGexDtes([]);
+    setGexExpirations([]);
+    setGexCurve([]);
+  }, []);
+
   /**
    * Update DTE mode and clear stale custom selections when leaving custom mode.
    */
   const handleSelectedDteChange = React.useCallback((value: string) => {
     setSelectedDte(value);
     if (value !== "custom") {
-      setSelectedCustomExpirations([]);
+      setSelectedCustomExpirationsState([]);
     }
   }, []);
 
@@ -219,6 +344,8 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     gexSnapshots,
     selectedGexSnapshot,
     setSelectedGexSnapshot,
+    selectedUnderlying,
+    handleSelectedUnderlyingChange,
     gexDtes,
     gexExpirations,
     selectedDte,

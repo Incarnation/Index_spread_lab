@@ -593,22 +593,38 @@ async def get_model_ops(
 @router.get("/api/gex/snapshots")
 async def list_gex_snapshots(
     limit: int = 50,
+    underlying: str | None = None,
     current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return recent GEX snapshot aggregates."""
+    """Return recent GEX snapshot aggregates with optional symbol filtering.
+
+    Parameters
+    ----------
+    limit:
+        Maximum number of rows to return (clamped to 1..500).
+    underlying:
+        Optional underlying symbol filter (for example ``SPX``, ``SPY``, ``VIX``).
+        Matching is case-insensitive, whitespace-tolerant, and applied in SQL.
+
+    Returns
+    -------
+    dict
+        JSON payload with one ``items`` list containing snapshot metadata and
+        aggregate GEX fields used by the dashboard selector.
+    """
     limit = max(1, min(limit, 500))
-    r = await db.execute(
-        text(
-            """
-            SELECT snapshot_id, ts, underlying, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
-            FROM gex_snapshots
-            ORDER BY ts DESC
-            LIMIT :limit
-            """
-        ),
-        {"limit": limit},
-    )
+    normalized_underlying = (underlying or "").strip().upper()
+    sql = """
+        SELECT snapshot_id, ts, underlying, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
+        FROM gex_snapshots
+    """
+    params: dict[str, object] = {"limit": limit}
+    if normalized_underlying:
+        sql += " WHERE UPPER(TRIM(underlying)) = :underlying"
+        params["underlying"] = normalized_underlying
+    sql += " ORDER BY ts DESC, snapshot_id DESC LIMIT :limit"
+    r = await db.execute(text(sql), params)
     rows = r.fetchall()
     return {
         "items": [

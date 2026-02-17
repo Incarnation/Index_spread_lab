@@ -130,6 +130,8 @@ export function DashboardApp() {
     gexSnapshots,
     selectedGexSnapshot,
     setSelectedGexSnapshot,
+    selectedUnderlying,
+    handleSelectedUnderlyingChange,
     gexDtes,
     gexExpirations,
     selectedDte,
@@ -188,6 +190,8 @@ export function DashboardApp() {
           snapshots={gexSnapshots}
           selectedSnapshot={selectedGexSnapshot}
           onSelectedSnapshotChange={setSelectedGexSnapshot}
+          selectedUnderlying={selectedUnderlying}
+          onSelectedUnderlyingChange={handleSelectedUnderlyingChange}
           dtes={gexDtes}
           expirations={gexExpirations}
           selectedDte={selectedDte}

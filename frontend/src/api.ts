@@ -259,9 +259,16 @@ export type GexExpirationItem = {
 
 /**
  * Fetch recent GEX snapshot aggregates for the panel selector.
+ *
+ * When `underlying` is provided, the backend returns only that symbol's
+ * snapshots so the UI can switch between SPX/SPY/VIX cleanly.
  */
-export async function fetchGexSnapshots(limit = 20): Promise<GexSnapshot[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?limit=${encodeURIComponent(limit)}`));
+export async function fetchGexSnapshots(limit = 20, underlying?: string): Promise<GexSnapshot[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (underlying && underlying.trim()) {
+    params.set("underlying", underlying.trim().toUpperCase());
+  }
+  const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()) as { items: GexSnapshot[] };
   return data.items;

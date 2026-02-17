@@ -13,12 +13,19 @@ import {
   YAxis,
 } from "recharts";
 import { fetchGexCurve, type GexCurvePoint, type GexExpirationItem, type GexSnapshot } from "../api";
+import {
+  GEX_UNDERLYING_OPTIONS,
+  GEX_ZERO_DTE_ONLY_SENTINEL,
+  getSnapshotTradingDateIso,
+} from "../constants/gex";
 import { formatTs } from "../utils/format";
 
 type GexPanelProps = {
   snapshots: GexSnapshot[];
   selectedSnapshot: GexSnapshot | null;
   onSelectedSnapshotChange: (snapshot: GexSnapshot | null) => void;
+  selectedUnderlying: string;
+  onSelectedUnderlyingChange: (value: string | null) => void;
   dtes: number[];
   expirations: GexExpirationItem[];
   selectedDte: string;
@@ -72,6 +79,46 @@ function writeStoredGexView(value: ChartView): void {
   } catch {
     // Ignore storage write errors.
   }
+}
+
+/**
+ * Build a snapshot dropdown label that always includes the underlying symbol.
+ */
+function formatSnapshotOptionLabel(snapshot: GexSnapshot): string {
+  const underlying = snapshot.underlying?.trim() || "UNKNOWN";
+  return `${underlying} · Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`;
+}
+
+/**
+ * Normalize symbol values before applying equality checks.
+ */
+function normalizeUnderlying(value: string | null | undefined): string {
+  return (value ?? "").trim().toUpperCase();
+}
+
+/**
+ * Build the synthetic strict 0DTE option for custom expiration mode.
+ */
+function buildZeroDteOnlyOption(snapshot: GexSnapshot | null): { value: string; label: string } | null {
+  const tradingDate = getSnapshotTradingDateIso(snapshot);
+  if (!tradingDate) return null;
+  return {
+    value: GEX_ZERO_DTE_ONLY_SENTINEL,
+    label: `${tradingDate} (Today, 0DTE only)`,
+  };
+}
+
+/**
+ * Keep custom expiration selection deterministic and make 0DTE mode exclusive.
+ */
+function normalizeCustomExpirationSelection(values: string[]): string[] {
+  const cleaned = Array.from(
+    new Set(values.map((value) => value.trim()).filter((value) => value.length > 0)),
+  );
+  if (cleaned.includes(GEX_ZERO_DTE_ONLY_SENTINEL)) {
+    return [GEX_ZERO_DTE_ONLY_SENTINEL];
+  }
+  return cleaned;
 }
 
 /** Coerce nullable numeric fields from API rows into chart-safe numbers. */
@@ -153,6 +200,8 @@ export function GexPanel({
   snapshots,
   selectedSnapshot,
   onSelectedSnapshotChange,
+  selectedUnderlying,
+  onSelectedUnderlyingChange,
   dtes,
   expirations,
   selectedDte,
@@ -169,6 +218,11 @@ export function GexPanel({
   const [heatmapLoading, setHeatmapLoading] = React.useState<boolean>(false);
   const [heatmapError, setHeatmapError] = React.useState<string | null>(null);
 
+  const normalizedUnderlying = normalizeUnderlying(selectedUnderlying);
+  const filteredSnapshots = React.useMemo(
+    () => snapshots.filter((snapshot) => normalizeUnderlying(snapshot.underlying) === normalizedUnderlying),
+    [normalizedUnderlying, snapshots],
+  );
   const chartRows = React.useMemo<ChartRow[]>(
     () =>
       curve
@@ -185,11 +239,22 @@ export function GexPanel({
 
   const snapshotOptions = React.useMemo(
     () =>
-      snapshots.map((snapshot) => ({
+      filteredSnapshots.map((snapshot) => ({
         value: String(snapshot.snapshot_id),
-        label: `Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`,
+        label: formatSnapshotOptionLabel(snapshot),
       })),
-    [snapshots],
+    [filteredSnapshots],
+  );
+  const selectedSnapshotForDisplay = React.useMemo(() => {
+    if (!selectedSnapshot) return null;
+    if (normalizeUnderlying(selectedSnapshot.underlying) !== normalizedUnderlying) {
+      return null;
+    }
+    return filteredSnapshots.find((row) => row.snapshot_id === selectedSnapshot.snapshot_id) ?? null;
+  }, [filteredSnapshots, normalizedUnderlying, selectedSnapshot]);
+  const underlyingOptions = React.useMemo(
+    () => GEX_UNDERLYING_OPTIONS.map((symbol) => ({ value: symbol, label: symbol })),
+    [],
   );
 
   const dteOptions = React.useMemo(
@@ -202,22 +267,32 @@ export function GexPanel({
   );
 
   const expirationOptions = React.useMemo(
-    () =>
-      expirations.map((expiration) => ({
+    () => {
+      const realExpirationOptions = expirations.map((expiration) => ({
         value: expiration.expiration,
         label:
           expiration.dte_days == null
             ? expiration.expiration
             : `${expiration.expiration} (DTE ${expiration.dte_days})`,
-      })),
-    [expirations],
+      }));
+      const zeroDteOption = buildZeroDteOnlyOption(selectedSnapshotForDisplay);
+      return zeroDteOption ? [zeroDteOption, ...realExpirationOptions] : realExpirationOptions;
+    },
+    [expirations, selectedSnapshotForDisplay],
   );
 
   const needsCustomSelections = selectedDte === "custom" && selectedCustomExpirations.length === 0;
-  const selectedSnapshotId = selectedSnapshot?.snapshot_id ?? null;
+  const selectedSnapshotId = selectedSnapshotForDisplay?.snapshot_id ?? null;
 
   const heatmapExpirations = React.useMemo<ExpirationChoice[]>(() => {
     if (selectedDte === "custom") {
+      if (selectedCustomExpirations.includes(GEX_ZERO_DTE_ONLY_SENTINEL)) {
+        const tradingDate = getSnapshotTradingDateIso(selectedSnapshotForDisplay);
+        if (!tradingDate) return [];
+        return expirations
+          .filter((row) => row.expiration === tradingDate)
+          .map((row) => ({ expiration: row.expiration, dte_days: row.dte_days }));
+      }
       const byDate = new Map(expirations.map((row) => [row.expiration, row]));
       return selectedCustomExpirations
         .map((expiration) => byDate.get(expiration))
@@ -232,15 +307,15 @@ export function GexPanel({
     return expirations
       .filter((row) => row.dte_days === dteValue)
       .map((row) => ({ expiration: row.expiration, dte_days: row.dte_days }));
-  }, [expirations, selectedCustomExpirations, selectedDte]);
+  }, [expirations, selectedCustomExpirations, selectedDte, selectedSnapshotForDisplay]);
 
   const nearestSpotStrike = React.useMemo(
-    () => findNearestStrike(selectedSnapshot?.spot_price, curveStrikes),
-    [curveStrikes, selectedSnapshot?.spot_price],
+    () => findNearestStrike(selectedSnapshotForDisplay?.spot_price, curveStrikes),
+    [curveStrikes, selectedSnapshotForDisplay?.spot_price],
   );
   const nearestZeroGammaStrike = React.useMemo(
-    () => findNearestStrike(selectedSnapshot?.zero_gamma_level, curveStrikes),
-    [curveStrikes, selectedSnapshot?.zero_gamma_level],
+    () => findNearestStrike(selectedSnapshotForDisplay?.zero_gamma_level, curveStrikes),
+    [curveStrikes, selectedSnapshotForDisplay?.zero_gamma_level],
   );
 
   const heatmapLabelStep = React.useMemo(() => {
@@ -325,15 +400,22 @@ export function GexPanel({
         <Text fw={600}>Gamma exposure (GEX)</Text>
         <Group gap="sm">
           <Select
+            label="Underlying"
+            data={underlyingOptions}
+            value={selectedUnderlying}
+            onChange={onSelectedUnderlyingChange}
+            w={120}
+          />
+          <Select
             label="Capture batch"
             data={snapshotOptions}
-            value={selectedSnapshot ? String(selectedSnapshot.snapshot_id) : null}
+            value={selectedSnapshotForDisplay ? String(selectedSnapshotForDisplay.snapshot_id) : null}
             onChange={(value) => {
               const id = value ? Number(value) : null;
-              const snapshot = id ? snapshots.find((row) => row.snapshot_id === id) ?? null : null;
+              const snapshot = id ? filteredSnapshots.find((row) => row.snapshot_id === id) ?? null : null;
               onSelectedSnapshotChange(snapshot);
             }}
-            w={260}
+            w={320}
             placeholder="Select capture batch"
           />
           <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
@@ -355,8 +437,8 @@ export function GexPanel({
               label="Expirations"
               data={expirationOptions}
               value={selectedCustomExpirations}
-              onChange={onSelectedCustomExpirationsChange}
-              placeholder="Pick upcoming dates"
+              onChange={(values) => onSelectedCustomExpirationsChange(normalizeCustomExpirationSelection(values))}
+              placeholder="Pick expiration dates"
               searchable
               clearable
               w={300}
@@ -365,16 +447,16 @@ export function GexPanel({
         </Group>
       </Group>
 
-      {selectedSnapshot && (
+      {selectedSnapshotForDisplay && (
         <Group gap="lg" mb="sm">
           <Text size="sm" c="dimmed">
-            Spot: {selectedSnapshot.spot_price ?? "—"}
+            Spot: {selectedSnapshotForDisplay.spot_price ?? "—"}
           </Text>
           <Text size="sm" c="dimmed">
-            GEX Net: {selectedSnapshot.gex_net ?? "—"}
+            GEX Net: {selectedSnapshotForDisplay.gex_net ?? "—"}
           </Text>
           <Text size="sm" c="dimmed">
-            Zero Gamma: {selectedSnapshot.zero_gamma_level ?? "—"}
+            Zero Gamma: {selectedSnapshotForDisplay.zero_gamma_level ?? "—"}
           </Text>
         </Group>
       )}

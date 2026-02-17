@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from spx_backend.web.app import get_gex_curve, list_gex_dtes, list_gex_expirations
+from spx_backend.web.routers.public import get_gex_curve, list_gex_dtes, list_gex_expirations, list_gex_snapshots
 
 
 class _FakeExecResult:
@@ -42,6 +42,66 @@ async def test_list_gex_dtes_shapes_response() -> None:
     result = await list_gex_dtes(snapshot_id=123, db=session)
 
     assert result == {"snapshot_id": 123, "dte_days": [0, 1, 3]}
+
+
+@pytest.mark.asyncio
+async def test_list_gex_snapshots_shapes_response_without_filter() -> None:
+    """List GEX snapshots returns shaped rows and no symbol WHERE clause by default."""
+    session = _FakeSession(
+        row_batches=[
+            [
+                SimpleNamespace(
+                    snapshot_id=862,
+                    ts=datetime(2026, 2, 17, 8, 51, tzinfo=timezone.utc),
+                    underlying="SPX",
+                    spot_price=6819.4,
+                    gex_net=-2010.5,
+                    gex_calls=120.0,
+                    gex_puts=-2130.5,
+                    gex_abs=2250.5,
+                    zero_gamma_level=500.0,
+                    method="test_method",
+                )
+            ]
+        ]
+    )
+
+    result = await list_gex_snapshots(limit=10, db=session)
+
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "FROM gex_snapshots" in sql
+    assert "UPPER(TRIM(underlying)) = :underlying" not in sql
+    assert params == {"limit": 10}
+    assert result["items"][0]["underlying"] == "SPX"
+    assert result["items"][0]["snapshot_id"] == 862
+
+
+@pytest.mark.asyncio
+async def test_list_gex_snapshots_applies_underlying_filter_case_insensitive() -> None:
+    """Underlying filter is normalized to uppercase and applied in SQL."""
+    session = _FakeSession(row_batches=[[]])
+
+    await list_gex_snapshots(limit=25, underlying="spy", db=session)
+
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "UPPER(TRIM(underlying)) = :underlying" in sql
+    assert params["underlying"] == "SPY"
+    assert params["limit"] == 25
+
+
+@pytest.mark.asyncio
+async def test_list_gex_snapshots_applies_underlying_filter_with_surrounding_spaces() -> None:
+    """Underlying filter trims spaces and still binds the normalized symbol."""
+    session = _FakeSession(row_batches=[[]])
+
+    await list_gex_snapshots(limit=15, underlying="  spx  ", db=session)
+
+    assert len(session.calls) == 1
+    _, params = session.calls[0]
+    assert params["underlying"] == "SPX"
+    assert params["limit"] == 15
 
 
 @pytest.mark.asyncio

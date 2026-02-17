@@ -25,6 +25,28 @@ export function formatTs(ts: string): string {
 }
 
 /**
+ * Convert one timestamp into an ISO date string (`YYYY-MM-DD`) in a target timezone.
+ *
+ * This is used for strict expiration-day matching (for example 0DTE views) where
+ * local browser timezone should not affect filtering behavior.
+ */
+export function formatDateIsoInTimezone(ts: string, timeZone: string): string | null {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  if (!year || !month || !day) return null;
+  return `${year}-${month}-${day}`;
+}
+
+/**
  * Safely coerce JSON-like values into an object payload.
  *
  * Accepts object input directly or parses a string payload; returns null for
