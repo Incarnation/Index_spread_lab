@@ -1,6 +1,6 @@
 .PHONY: test-e2e-mocked test-e2e-db test-e2e test-e2e-up test-e2e-down test-e2e-regression test-predeploy
 
-DATABASE_URL_TEST ?= postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/spx_tools_test
+DATABASE_URL_TEST ?= postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test
 PYTHON_BIN ?= python3.11
 
 test-e2e-up:
