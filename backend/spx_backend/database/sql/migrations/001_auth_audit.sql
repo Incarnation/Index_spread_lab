@@ -1,4 +1,4 @@
--- Auth audit: add is_admin to users; drop and recreate auth_audit_log with final schema.
+-- Auth audit: add is_admin to users, drop and recreate auth_audit_log with final schema.
 -- Safe when table is empty. Run after db_schema.sql (which also creates auth_audit_log for new installs).
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
