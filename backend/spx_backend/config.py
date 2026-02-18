@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     tradier_access_token: str
     tradier_account_id: str
 
-    snapshot_interval_minutes: int = 5
+    snapshot_interval_minutes: int = 10
     snapshot_underlying: str = "SPX"
     snapshot_dte_targets: str = "3,5,7"
     snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     snapshot_dte_tolerance_days: int = 1
     snapshot_strikes_each_side: int = 75
     spy_snapshot_enabled: bool = True
-    spy_snapshot_interval_minutes: int = 5
+    spy_snapshot_interval_minutes: int = 10
     spy_snapshot_underlying: str = "SPY"
     spy_snapshot_dte_targets: str = "3,5,7"
     spy_snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     spy_snapshot_strikes_each_side: int = 75
     spy_allow_snapshot_outside_rth: bool = False
     vix_snapshot_enabled: bool = False
-    vix_snapshot_interval_minutes: int = 5
+    vix_snapshot_interval_minutes: int = 10
     vix_snapshot_underlying: str = "VIX"
     vix_snapshot_dte_targets: str = "14,21,28"
     vix_snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     vix_snapshot_strikes_each_side: int = 50
     vix_allow_snapshot_outside_rth: bool = False
     quote_symbols: str = "SPX,VIX,VIX9D,SPY"
-    quote_interval_minutes: int = 5
+    quote_interval_minutes: int = 10
     gex_enabled: bool = True
     gex_interval_minutes: int = 5
     gex_allow_outside_rth: bool = False
