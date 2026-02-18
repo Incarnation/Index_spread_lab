@@ -485,7 +485,8 @@ async def test_db_backed_full_admin_workflow_pipeline(workflow_client, admin_hea
     run_decision = await workflow_client.post("/api/admin/run-decision", headers=admin_headers)
     assert run_decision.status_code == 200
     assert run_decision.json()["skipped"] is False
-    assert run_decision.json()["decision"] == "TRADE"
+    assert run_decision.json()["decisions_created_count"] >= 1
+    assert run_decision.json()["trades_created_count"] >= 1
 
     # Second snapshot creates forward marks for labeler/trade-pnl evaluation.
     run_snapshot_2 = await workflow_client.post("/api/admin/run-snapshot", headers=admin_headers)

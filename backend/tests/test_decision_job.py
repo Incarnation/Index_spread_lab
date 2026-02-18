@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import spx_backend.jobs.decision_job as decision_module
 from spx_backend.config import settings
 from spx_backend.jobs.decision_job import DecisionJob
 
@@ -27,6 +28,34 @@ class _FakeSession:
         self.calls.append((str(stmt), params or {}))
         row = self._rows.pop(0) if self._rows else None
         return _FakeResult(row)
+
+
+class _NoopSession:
+    """Minimal async session stub for run_once orchestration tests."""
+
+    async def commit(self) -> None:
+        """No-op commit used by patched decision-job workflows."""
+        return None
+
+
+class _SessionFactory:
+    """Async context-manager factory that returns one fake session."""
+
+    def __init__(self, session: _NoopSession):
+        """Store the fake session instance yielded to job code."""
+        self._session = session
+
+    def __call__(self):
+        """Return self to mimic SessionLocal callable behavior."""
+        return self
+
+    async def __aenter__(self) -> _NoopSession:
+        """Yield fake session to the decision job."""
+        return self._session
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+        """Do not suppress exceptions raised inside the context."""
+        return False
 
 
 def _set_default_decision_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,3 +201,264 @@ async def test_side_limit_helpers_use_strategy_type_pattern(monkeypatch: pytest.
     assert first_params["strategy_type_pattern"] == "%_call"
     assert "strategy_type LIKE :strategy_type_pattern" in second_sql
     assert second_params["strategy_type_pattern"] == "%_put"
+
+
+def _selection(
+    *,
+    short_symbol: str,
+    long_symbol: str,
+    score: float,
+    target_dte: int,
+    delta_target: float,
+    spread_side: str,
+) -> dict:
+    """Build one ranked-selection payload for run_once top-N tests."""
+    candidate = {
+        "target_dte": target_dte,
+        "delta_target": delta_target,
+        "snapshot_id": 501,
+        "expiration": "2026-02-20",
+        "credit": 1.2,
+        "delta_diff": 0.01,
+        "score": score,
+        "context_score": 0.0,
+        "chosen_legs_json": {
+            "short": {"symbol": short_symbol},
+            "long": {"symbol": long_symbol},
+            "spread_side": spread_side,
+        },
+        "strategy_params_json": {"spread_side": spread_side},
+    }
+    return {
+        "chosen": candidate,
+        "candidate_ref": {"candidate_id": 99, "feature_snapshot_id": 77},
+        "decision_source": "rules",
+        "model_prediction": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_once_creates_top_n_with_dedupe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_once should dedupe repeated legs and insert up to per-run cap."""
+    _set_default_decision_settings(monkeypatch)
+    monkeypatch.setattr(settings, "decision_dte_targets", "0")
+    monkeypatch.setattr(settings, "decision_delta_targets", "0.10")
+    monkeypatch.setattr(settings, "decision_spread_sides", "put")
+    monkeypatch.setattr(settings, "decision_max_trades_per_run", 3)
+    monkeypatch.setattr(settings, "decision_max_trades_per_day", 20)
+    monkeypatch.setattr(settings, "decision_max_open_trades", 20)
+    monkeypatch.setattr(settings, "decision_max_trades_per_side_per_day", 0)
+    monkeypatch.setattr(settings, "decision_max_open_trades_per_side", 0)
+    monkeypatch.setattr(decision_module, "SessionLocal", _SessionFactory(_NoopSession()))
+
+    ranked = [
+        _selection(short_symbol="SPXW_DUP", long_symbol="SPXW_DUPL", score=5.0, target_dte=0, delta_target=0.10, spread_side="put"),
+        _selection(short_symbol="SPXW_DUP", long_symbol="SPXW_DUPL", score=4.9, target_dte=0, delta_target=0.10, spread_side="put"),
+        _selection(short_symbol="SPXW_A", long_symbol="SPXW_AL", score=4.8, target_dte=3, delta_target=0.10, spread_side="put"),
+        _selection(short_symbol="SPXW_B", long_symbol="SPXW_BL", score=4.7, target_dte=7, delta_target=0.20, spread_side="call"),
+        _selection(short_symbol="SPXW_C", long_symbol="SPXW_CL", score=4.6, target_dte=10, delta_target=0.20, spread_side="call"),
+    ]
+
+    async def fake_max_open(self, session):  # noqa: ANN001
+        """Return zero open trades for deterministic clipping checks."""
+        return 0
+
+    async def fake_trades_today(self, session, now_et):  # noqa: ANN001
+        """Return zero trades today so per-run cap controls selection."""
+        return 0
+
+    async def fake_snapshot(self, session, now_et, target_dte, force=False):  # noqa: ANN001
+        """Return one available snapshot so candidate generation continues."""
+        return {
+            "snapshot_id": 500 + int(target_dte),
+            "ts": now_et.astimezone(ZoneInfo("UTC")),
+            "expiration": date(2026, 2, 20),
+            "target_dte": int(target_dte),
+        }
+
+    async def fake_option_rows(self, session, snapshot_id, spread_side):  # noqa: ANN001
+        """Return one option row placeholder for candidate builder path."""
+        return [{"symbol": f"{spread_side}_{snapshot_id}", "strike": 5000.0, "bid": 1.0, "ask": 1.1, "delta": -0.1}]
+
+    def fake_build_candidate(
+        self,
+        *,
+        options,
+        target_dte,
+        delta_target,
+        spread_side,
+        width_points,
+        snapshot_id,
+        expiration,
+        spot,
+        context,
+    ):  # noqa: ANN001
+        """Return a placeholder candidate; final ranking is monkeypatched."""
+        return {
+            "target_dte": target_dte,
+            "delta_target": delta_target,
+            "snapshot_id": snapshot_id,
+            "expiration": expiration,
+            "score": 1.0,
+            "delta_diff": 0.01,
+            "chosen_legs_json": {"short": {"symbol": "S"}, "long": {"symbol": "L"}, "spread_side": spread_side},
+            "strategy_params_json": {"spread_side": spread_side},
+        }
+
+    async def fake_rank(self, session, now_et, candidates):  # noqa: ANN001
+        """Return deterministic ranked list including one duplicate leg pair."""
+        return ranked
+
+    async def fake_spot(self, session, ts, underlying):  # noqa: ANN001
+        """Return stable spot value for scoring payloads."""
+        return 6000.0
+
+    async def fake_context(self, session, now_et):  # noqa: ANN001
+        """Return no context so score depends on candidate payload only."""
+        return None
+
+    decision_ids: list[int] = []
+    trade_ids: list[int] = []
+
+    async def fake_insert_decision(self, **kwargs):  # noqa: ANN001
+        """Return incrementing decision IDs for created trade decisions."""
+        decision_id = 900 + len(decision_ids) + 1
+        decision_ids.append(decision_id)
+        return decision_id
+
+    async def fake_create_trade(self, **kwargs):  # noqa: ANN001
+        """Return incrementing trade IDs for created trades."""
+        trade_id = 700 + len(trade_ids) + 1
+        trade_ids.append(trade_id)
+        return trade_id
+
+    monkeypatch.setattr(DecisionJob, "_max_open_trades", fake_max_open)
+    monkeypatch.setattr(DecisionJob, "_trades_today", fake_trades_today)
+    monkeypatch.setattr(DecisionJob, "_get_latest_snapshot_for_dte", fake_snapshot)
+    monkeypatch.setattr(DecisionJob, "_get_option_rows", fake_option_rows)
+    monkeypatch.setattr(DecisionJob, "_build_candidate", fake_build_candidate)
+    monkeypatch.setattr(DecisionJob, "_rank_candidates_with_policy", fake_rank)
+    monkeypatch.setattr(DecisionJob, "_insert_decision", fake_insert_decision)
+    monkeypatch.setattr(DecisionJob, "_create_trade_from_decision", fake_create_trade)
+    monkeypatch.setattr(DecisionJob, "_get_spot_price", fake_spot)
+    monkeypatch.setattr(DecisionJob, "_get_latest_context", fake_context)
+
+    result = await DecisionJob().run_once(force=True)
+
+    assert result["skipped"] is False
+    assert result["decisions_created_count"] == 3
+    assert result["trades_created_count"] == 3
+    assert len(result["decisions_created"]) == 3
+    assert len(result["trades_created"]) == 3
+    assert result["selection_meta"]["candidates_ranked"] == 5
+    assert result["selection_meta"]["candidates_after_dedupe"] == 4
+    assert result["selection_meta"]["duplicates_removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_clips_by_day_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_once should clip selected trades when daily capacity is limited."""
+    _set_default_decision_settings(monkeypatch)
+    monkeypatch.setattr(settings, "decision_dte_targets", "0")
+    monkeypatch.setattr(settings, "decision_delta_targets", "0.10")
+    monkeypatch.setattr(settings, "decision_spread_sides", "put")
+    monkeypatch.setattr(settings, "decision_max_trades_per_run", 4)
+    monkeypatch.setattr(settings, "decision_max_trades_per_day", 3)
+    monkeypatch.setattr(settings, "decision_max_open_trades", 20)
+    monkeypatch.setattr(settings, "decision_max_trades_per_side_per_day", 0)
+    monkeypatch.setattr(settings, "decision_max_open_trades_per_side", 0)
+    monkeypatch.setattr(decision_module, "SessionLocal", _SessionFactory(_NoopSession()))
+
+    ranked = [
+        _selection(short_symbol="SPXW_A", long_symbol="SPXW_AL", score=5.0, target_dte=0, delta_target=0.10, spread_side="put"),
+        _selection(short_symbol="SPXW_B", long_symbol="SPXW_BL", score=4.9, target_dte=3, delta_target=0.10, spread_side="put"),
+        _selection(short_symbol="SPXW_C", long_symbol="SPXW_CL", score=4.8, target_dte=7, delta_target=0.20, spread_side="call"),
+    ]
+
+    async def fake_max_open(self, session):  # noqa: ANN001
+        """Return no open trades so daily cap is the only clip factor."""
+        return 0
+
+    async def fake_trades_today(self, session, now_et):  # noqa: ANN001
+        """Return two existing trades so only one slot remains today."""
+        return 2
+
+    async def fake_snapshot(self, session, now_et, target_dte, force=False):  # noqa: ANN001
+        """Return one available snapshot so candidate generation continues."""
+        return {
+            "snapshot_id": 510 + int(target_dte),
+            "ts": now_et.astimezone(ZoneInfo("UTC")),
+            "expiration": date(2026, 2, 20),
+            "target_dte": int(target_dte),
+        }
+
+    async def fake_option_rows(self, session, snapshot_id, spread_side):  # noqa: ANN001
+        """Return one option row placeholder for candidate builder path."""
+        return [{"symbol": f"{spread_side}_{snapshot_id}", "strike": 5000.0, "bid": 1.0, "ask": 1.1, "delta": -0.1}]
+
+    def fake_build_candidate(
+        self,
+        *,
+        options,
+        target_dte,
+        delta_target,
+        spread_side,
+        width_points,
+        snapshot_id,
+        expiration,
+        spot,
+        context,
+    ):  # noqa: ANN001
+        """Return a placeholder candidate; ranking is monkeypatched in this test."""
+        return {
+            "target_dte": target_dte,
+            "delta_target": delta_target,
+            "snapshot_id": snapshot_id,
+            "expiration": expiration,
+            "score": 1.0,
+            "delta_diff": 0.01,
+            "chosen_legs_json": {"short": {"symbol": "S"}, "long": {"symbol": "L"}, "spread_side": spread_side},
+            "strategy_params_json": {"spread_side": spread_side},
+        }
+
+    async def fake_rank(self, session, now_et, candidates):  # noqa: ANN001
+        """Return deterministic ranked list with enough items to hit day cap."""
+        return ranked
+
+    async def fake_spot(self, session, ts, underlying):  # noqa: ANN001
+        """Return stable spot value for candidate payloads."""
+        return 6000.0
+
+    async def fake_context(self, session, now_et):  # noqa: ANN001
+        """Return no context so ranking remains deterministic in test."""
+        return None
+
+    created_trade_ids: list[int] = []
+
+    async def fake_insert_decision(self, **kwargs):  # noqa: ANN001
+        """Return incrementing decision IDs for one expected insertion."""
+        return 1200 + len(created_trade_ids) + 1
+
+    async def fake_create_trade(self, **kwargs):  # noqa: ANN001
+        """Return incrementing trade IDs for one expected insertion."""
+        trade_id = 2200 + len(created_trade_ids) + 1
+        created_trade_ids.append(trade_id)
+        return trade_id
+
+    monkeypatch.setattr(DecisionJob, "_max_open_trades", fake_max_open)
+    monkeypatch.setattr(DecisionJob, "_trades_today", fake_trades_today)
+    monkeypatch.setattr(DecisionJob, "_get_latest_snapshot_for_dte", fake_snapshot)
+    monkeypatch.setattr(DecisionJob, "_get_option_rows", fake_option_rows)
+    monkeypatch.setattr(DecisionJob, "_build_candidate", fake_build_candidate)
+    monkeypatch.setattr(DecisionJob, "_rank_candidates_with_policy", fake_rank)
+    monkeypatch.setattr(DecisionJob, "_insert_decision", fake_insert_decision)
+    monkeypatch.setattr(DecisionJob, "_create_trade_from_decision", fake_create_trade)
+    monkeypatch.setattr(DecisionJob, "_get_spot_price", fake_spot)
+    monkeypatch.setattr(DecisionJob, "_get_latest_context", fake_context)
+
+    result = await DecisionJob().run_once(force=True)
+
+    assert result["skipped"] is False
+    assert result["trades_created_count"] == 1
+    assert result["decisions_created_count"] == 1
+    assert result["selection_meta"]["clipped_by"] == "day_cap"

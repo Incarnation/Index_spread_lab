@@ -99,6 +99,20 @@ type UseAdminRunsResult = {
 
 /** Build concise step detail text from a heterogeneous admin-run payload. */
 function getRunDetail(result: GenericAdminRunResult): string {
+  // Prefer explicit run counters when available (e.g. multi-trade decisions).
+  const resultRecord = result as Record<string, unknown>;
+  const tradesCreatedCount = resultRecord["trades_created_count"];
+  if (typeof tradesCreatedCount === "number") {
+    const selectionMeta = resultRecord["selection_meta"];
+    const clippedBy =
+      selectionMeta && typeof selectionMeta === "object" && selectionMeta !== null
+        ? (selectionMeta as Record<string, unknown>)["clipped_by"]
+        : null;
+    if (typeof clippedBy === "string" && clippedBy.trim().length > 0) {
+      return `created_trades=${tradesCreatedCount} clipped_by=${clippedBy}`;
+    }
+    return `created_trades=${tradesCreatedCount}`;
+  }
   if (typeof result.reason === "string" && result.reason.trim()) return result.reason;
   if (typeof result.status === "string" && result.status.trim()) return result.status;
   if (typeof result.error === "string" && result.error.trim()) return result.error;

@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     decision_spread_width_points: float = 25.0
     decision_contracts: int = 1
     decision_snapshot_max_age_minutes: int = 15
+    decision_max_trades_per_run: int = 4
     decision_max_trades_per_day: int = 20
     decision_max_open_trades: int = 15
     decision_max_trades_per_side_per_day: int = 0

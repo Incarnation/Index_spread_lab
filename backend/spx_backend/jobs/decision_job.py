@@ -36,30 +36,88 @@ class DecisionJob:
         allowed = settings.decision_entry_times_list()
         return (now_et.hour, now_et.minute) in allowed
 
+    def _build_run_result(
+        self,
+        *,
+        now_et: datetime,
+        skipped: bool,
+        reason: str | None,
+        decisions_created: list[dict] | None = None,
+        trades_created: list[int] | None = None,
+        selection_meta: dict | None = None,
+    ) -> dict:
+        """Build a normalized decision-run payload for UI/API consumers.
+
+        Parameters
+        ----------
+        now_et:
+            Current ET timestamp for consistent response metadata.
+        skipped:
+            Whether the run produced no trades.
+        reason:
+            Skip reason when skipped is true; otherwise optional context.
+        decisions_created:
+            Optional decision/trade summaries persisted during this run.
+        trades_created:
+            Optional list of newly created trade IDs.
+        selection_meta:
+            Optional ranking/dedupe/clipping diagnostics.
+
+        Returns
+        -------
+        dict
+            Multi-trade-first payload with counts, IDs, and diagnostics.
+        """
+        decisions = decisions_created or []
+        trades = trades_created or []
+        return {
+            "skipped": skipped,
+            "reason": reason,
+            "now_et": now_et.isoformat(),
+            "decisions_created_count": len(decisions),
+            "trades_created_count": len(trades),
+            "decisions_created": decisions,
+            "trades_created": trades,
+            "selection_meta": selection_meta,
+        }
+
     async def run_once(self, *, force: bool = False) -> dict:
-        """Run one decision cycle and write TRADE/SKIP."""
+        """Run one decision cycle and persist top-N trades.
+
+        Parameters
+        ----------
+        force:
+            When true, bypasses entry-time and regular-hours checks.
+
+        Returns
+        -------
+        dict
+            Multi-trade run payload with created decision/trade IDs, skip
+            reason (when applicable), and selection diagnostics.
+        """
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
         entry_slot = now_et.hour
         logger.info("decision_job: start force={} now_et={}", force, now_et.isoformat())
 
         if (not force) and (not self._is_entry_time(now_et)):
-            return {"skipped": True, "reason": "not_entry_time", "now_et": now_et.isoformat()}
+            return self._build_run_result(now_et=now_et, skipped=True, reason="not_entry_time")
 
         if (not force) and (not settings.decision_allow_outside_rth):
             if not await self._market_open(now_et):
-                return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat()}
+                return self._build_run_result(now_et=now_et, skipped=True, reason="market_closed")
 
         decision_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
         spread_sides = settings.decision_spread_sides_list()
         if not decision_dtes or not delta_targets:
-            return {"skipped": True, "reason": "missing_targets", "now_et": now_et.isoformat()}
+            return self._build_run_result(now_et=now_et, skipped=True, reason="missing_targets")
         if not spread_sides:
-            return {"skipped": True, "reason": "missing_spread_sides", "now_et": now_et.isoformat()}
+            return self._build_run_result(now_et=now_et, skipped=True, reason="missing_spread_sides")
 
         async with SessionLocal() as session:
-            if await self._max_open_trades(session) >= settings.decision_max_open_trades:
+            open_trades_now = await self._max_open_trades(session)
+            if open_trades_now >= settings.decision_max_open_trades:
                 await self._insert_decision(
                     session=session,
                     now_et=now_et,
@@ -70,9 +128,19 @@ class DecisionJob:
                     reason="max_open_trades",
                 )
                 await session.commit()
-                return {"skipped": True, "reason": "max_open_trades", "now_et": now_et.isoformat()}
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="max_open_trades",
+                    selection_meta={
+                        "max_trades_per_run": max(1, int(settings.decision_max_trades_per_run)),
+                        "day_remaining_before": None,
+                        "open_remaining_before": 0,
+                    },
+                )
 
-            if await self._trades_today(session, now_et) >= settings.decision_max_trades_per_day:
+            trades_today_now = await self._trades_today(session, now_et)
+            if trades_today_now >= settings.decision_max_trades_per_day:
                 await self._insert_decision(
                     session=session,
                     now_et=now_et,
@@ -83,7 +151,16 @@ class DecisionJob:
                     reason="max_trades_per_day",
                 )
                 await session.commit()
-                return {"skipped": True, "reason": "max_trades_per_day", "now_et": now_et.isoformat()}
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="max_trades_per_day",
+                    selection_meta={
+                        "max_trades_per_run": max(1, int(settings.decision_max_trades_per_run)),
+                        "day_remaining_before": 0,
+                        "open_remaining_before": max(0, settings.decision_max_open_trades - open_trades_now),
+                    },
+                )
 
             side_limits: dict[str, str] = {}
             eligible_spread_sides: list[str] = []
@@ -115,7 +192,15 @@ class DecisionJob:
                     },
                 )
                 await session.commit()
-                return {"skipped": True, "reason": "side_limits_reached", "now_et": now_et.isoformat()}
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="side_limits_reached",
+                    selection_meta={
+                        "requested_spread_sides": spread_sides,
+                        "side_limits": side_limits,
+                    },
+                )
 
             spot = await self._get_spot_price(session, now_et, settings.snapshot_underlying)
             context = await self._get_latest_context(session, now_et)
@@ -159,57 +244,256 @@ class DecisionJob:
                     },
                 )
                 await session.commit()
-                return {"skipped": True, "reason": "no_candidates", "now_et": now_et.isoformat()}
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="no_candidates",
+                    selection_meta={
+                        "candidates_total": 0,
+                        "candidates_ranked": 0,
+                        "candidates_after_dedupe": 0,
+                        "duplicates_removed": 0,
+                        "max_trades_per_run": max(1, int(settings.decision_max_trades_per_run)),
+                        "day_remaining_before": max(0, settings.decision_max_trades_per_day - trades_today_now),
+                        "open_remaining_before": max(0, settings.decision_max_open_trades - open_trades_now),
+                        "selected_count": 0,
+                        "clipped_by": "no_candidates",
+                    },
+                )
 
-            selection = await self._select_candidate_with_policy(session=session, now_et=now_et, candidates=candidates)
-            chosen = selection["chosen"]
-            candidate_ref = selection.get("candidate_ref") or {}
-            model_prediction = selection.get("model_prediction")
-            decision_source = str(selection.get("decision_source") or "rules")
-            model_score = model_prediction.get("score_raw") if isinstance(model_prediction, dict) else None
-            expected_value = model_prediction.get("expected_value") if isinstance(model_prediction, dict) else None
-            prediction_id = model_prediction.get("prediction_id") if isinstance(model_prediction, dict) else None
-            model_version_id = model_prediction.get("model_version_id") if isinstance(model_prediction, dict) else None
+            ranked = await self._rank_candidates_with_policy(session=session, now_et=now_et, candidates=candidates)
+            ranked_deduped, duplicates_removed = self._dedupe_ranked_selections(ranked)
+            if not ranked_deduped:
+                await self._insert_decision(
+                    session=session,
+                    now_et=now_et,
+                    entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP",
+                    reason="no_candidates",
+                    strategy_params_json={
+                        "spread_sides_considered": eligible_spread_sides,
+                        "side_limits": side_limits,
+                    },
+                )
+                await session.commit()
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="no_candidates",
+                    selection_meta={
+                        "candidates_total": len(candidates),
+                        "candidates_ranked": len(ranked),
+                        "candidates_after_dedupe": 0,
+                        "duplicates_removed": duplicates_removed,
+                        "max_trades_per_run": max(1, int(settings.decision_max_trades_per_run)),
+                        "day_remaining_before": max(0, settings.decision_max_trades_per_day - trades_today_now),
+                        "open_remaining_before": max(0, settings.decision_max_open_trades - open_trades_now),
+                        "selected_count": 0,
+                        "clipped_by": "all_duplicates",
+                    },
+                )
 
-            decision_id = await self._insert_decision(
-                session=session,
-                now_et=now_et,
-                entry_slot=entry_slot,
-                target_dte=chosen["target_dte"],
-                delta_target=chosen["delta_target"],
-                decision="TRADE",
-                reason=None,
-                chain_snapshot_id=chosen["snapshot_id"],
-                score=chosen["score"],
-                chosen_legs_json=chosen["chosen_legs_json"],
-                strategy_params_json=chosen["strategy_params_json"],
-                candidate_id=candidate_ref.get("candidate_id"),
-                feature_snapshot_id=candidate_ref.get("feature_snapshot_id"),
-                decision_source=decision_source,
-                model_score=(float(model_score) if model_score is not None else None),
-                expected_value=(float(expected_value) if expected_value is not None else None),
-                prediction_id=(int(prediction_id) if prediction_id is not None else None),
-                model_version_id=(int(model_version_id) if model_version_id is not None else None),
-            )
-            trade_id = await self._create_trade_from_decision(
-                session=session,
-                decision_id=decision_id,
-                now_et=now_et,
-                chosen=chosen,
-                candidate_ref=candidate_ref,
-                model_version_id=(int(model_version_id) if model_version_id is not None else None),
-            )
+            max_per_run = max(1, int(settings.decision_max_trades_per_run))
+            day_remaining_before = max(0, settings.decision_max_trades_per_day - trades_today_now)
+            open_remaining_before = max(0, settings.decision_max_open_trades - open_trades_now)
+            capacity_limit = min(max_per_run, day_remaining_before, open_remaining_before)
+
+            if capacity_limit <= 0:
+                clipped_by = "day_cap" if day_remaining_before <= 0 else "open_cap"
+                await self._insert_decision(
+                    session=session,
+                    now_et=now_et,
+                    entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP",
+                    reason="capacity_reached",
+                    strategy_params_json={
+                        "day_remaining_before": day_remaining_before,
+                        "open_remaining_before": open_remaining_before,
+                        "max_trades_per_run": max_per_run,
+                    },
+                )
+                await session.commit()
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="capacity_reached",
+                    selection_meta={
+                        "candidates_total": len(candidates),
+                        "candidates_ranked": len(ranked),
+                        "candidates_after_dedupe": len(ranked_deduped),
+                        "duplicates_removed": duplicates_removed,
+                        "max_trades_per_run": max_per_run,
+                        "day_remaining_before": day_remaining_before,
+                        "open_remaining_before": open_remaining_before,
+                        "selected_count": 0,
+                        "clipped_by": clipped_by,
+                    },
+                )
+
+            selected: list[dict[str, Any]] = []
+            selected_by_side: dict[str, int] = {}
+            open_by_side: dict[str, int] = {}
+            trades_today_by_side: dict[str, int] = {}
+            skipped_by_side_limits: dict[str, str] = {}
+
+            # Walk ranked candidates in order and keep selecting until the
+            # clipped capacity limit is reached.
+            for selection in ranked_deduped:
+                if len(selected) >= capacity_limit:
+                    break
+                chosen = selection["chosen"]
+                legs = chosen.get("chosen_legs_json") or {}
+                spread_side = str(legs.get("spread_side") or "").lower()
+                if spread_side not in {"put", "call"}:
+                    spread_side = settings.decision_spread_side.lower()
+
+                if settings.decision_max_open_trades_per_side > 0:
+                    if spread_side not in open_by_side:
+                        open_by_side[spread_side] = await self._max_open_trades_by_side(session, spread_side)
+                    side_open_after = open_by_side[spread_side] + selected_by_side.get(spread_side, 0)
+                    if side_open_after >= settings.decision_max_open_trades_per_side:
+                        skipped_by_side_limits[spread_side] = "max_open_trades_per_side"
+                        continue
+
+                if settings.decision_max_trades_per_side_per_day > 0:
+                    if spread_side not in trades_today_by_side:
+                        trades_today_by_side[spread_side] = await self._trades_today_by_side(session, now_et, spread_side)
+                    side_day_after = trades_today_by_side[spread_side] + selected_by_side.get(spread_side, 0)
+                    if side_day_after >= settings.decision_max_trades_per_side_per_day:
+                        skipped_by_side_limits[spread_side] = "max_trades_per_side_per_day"
+                        continue
+
+                selected.append(selection)
+                selected_by_side[spread_side] = selected_by_side.get(spread_side, 0) + 1
+
+            if not selected:
+                await self._insert_decision(
+                    session=session,
+                    now_et=now_et,
+                    entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP",
+                    reason="side_limits_reached",
+                    strategy_params_json={
+                        "requested_spread_sides": spread_sides,
+                        "side_limits": side_limits | skipped_by_side_limits,
+                    },
+                )
+                await session.commit()
+                return self._build_run_result(
+                    now_et=now_et,
+                    skipped=True,
+                    reason="side_limits_reached",
+                    selection_meta={
+                        "candidates_total": len(candidates),
+                        "candidates_ranked": len(ranked),
+                        "candidates_after_dedupe": len(ranked_deduped),
+                        "duplicates_removed": duplicates_removed,
+                        "max_trades_per_run": max_per_run,
+                        "day_remaining_before": day_remaining_before,
+                        "open_remaining_before": open_remaining_before,
+                        "selected_count": 0,
+                        "clipped_by": "side_cap",
+                    },
+                )
+
+            decisions_created: list[dict] = []
+            trades_created: list[int] = []
+            for selection in selected:
+                chosen = selection["chosen"]
+                candidate_ref = selection.get("candidate_ref") or {}
+                model_prediction = selection.get("model_prediction")
+                decision_source = str(selection.get("decision_source") or "rules")
+                model_score = model_prediction.get("score_raw") if isinstance(model_prediction, dict) else None
+                expected_value = model_prediction.get("expected_value") if isinstance(model_prediction, dict) else None
+                prediction_id = model_prediction.get("prediction_id") if isinstance(model_prediction, dict) else None
+                model_version_id = model_prediction.get("model_version_id") if isinstance(model_prediction, dict) else None
+
+                decision_id = await self._insert_decision(
+                    session=session,
+                    now_et=now_et,
+                    entry_slot=entry_slot,
+                    target_dte=chosen["target_dte"],
+                    delta_target=chosen["delta_target"],
+                    decision="TRADE",
+                    reason=None,
+                    chain_snapshot_id=chosen["snapshot_id"],
+                    score=chosen["score"],
+                    chosen_legs_json=chosen["chosen_legs_json"],
+                    strategy_params_json=chosen["strategy_params_json"],
+                    candidate_id=candidate_ref.get("candidate_id"),
+                    feature_snapshot_id=candidate_ref.get("feature_snapshot_id"),
+                    decision_source=decision_source,
+                    model_score=(float(model_score) if model_score is not None else None),
+                    expected_value=(float(expected_value) if expected_value is not None else None),
+                    prediction_id=(int(prediction_id) if prediction_id is not None else None),
+                    model_version_id=(int(model_version_id) if model_version_id is not None else None),
+                )
+                trade_id = await self._create_trade_from_decision(
+                    session=session,
+                    decision_id=decision_id,
+                    now_et=now_et,
+                    chosen=chosen,
+                    candidate_ref=candidate_ref,
+                    model_version_id=(int(model_version_id) if model_version_id is not None else None),
+                )
+                spread_side = str((chosen.get("chosen_legs_json") or {}).get("spread_side") or "").lower()
+                decisions_created.append(
+                    {
+                        "decision_id": int(decision_id),
+                        "trade_id": int(trade_id),
+                        "target_dte": int(chosen["target_dte"]),
+                        "delta_target": float(chosen["delta_target"]),
+                        "spread_side": spread_side if spread_side in {"put", "call"} else settings.decision_spread_side.lower(),
+                        "score": float(chosen["score"]) if chosen.get("score") is not None else None,
+                        "decision_source": decision_source,
+                    }
+                )
+                trades_created.append(int(trade_id))
             await session.commit()
 
-        logger.info("decision_job: decision=TRADE target_dte={} delta_target={}", chosen["target_dte"], chosen["delta_target"])
-        return {
-            "skipped": False,
-            "decision": "TRADE",
-            "now_et": now_et.isoformat(),
-            "decision_id": decision_id,
-            "trade_id": trade_id,
-            "chosen": chosen,
+        clipped_by = None
+        if len(selected) < max_per_run:
+            if len(selected) == open_remaining_before:
+                clipped_by = "open_cap"
+            elif len(selected) == day_remaining_before:
+                clipped_by = "day_cap"
+            elif len(selected) < capacity_limit:
+                clipped_by = "side_cap"
+            else:
+                clipped_by = "insufficient_candidates"
+
+        selection_meta = {
+            "candidates_total": len(candidates),
+            "candidates_ranked": len(ranked),
+            "candidates_after_dedupe": len(ranked_deduped),
+            "duplicates_removed": duplicates_removed,
+            "max_trades_per_run": max_per_run,
+            "day_remaining_before": day_remaining_before,
+            "open_remaining_before": open_remaining_before,
+            "selected_count": len(selected),
+            "clipped_by": clipped_by,
         }
+        logger.info(
+            "decision_job: created_trades={} ranked={} deduped={} clipped_by={}",
+            len(trades_created),
+            len(ranked),
+            len(ranked_deduped),
+            clipped_by,
+        )
+        return self._build_run_result(
+            now_et=now_et,
+            skipped=False,
+            reason=None,
+            decisions_created=decisions_created,
+            trades_created=trades_created,
+            selection_meta=selection_meta,
+        )
 
     async def _get_latest_snapshot_for_dte(
         self,
@@ -489,27 +773,65 @@ class DecisionJob:
             "rank_in_snapshot": (int(row.rank_in_snapshot) if row.rank_in_snapshot is not None else None),
         }
 
-    async def _select_candidate_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> dict[str, Any]:
-        """Select final candidate with rules-first, model-second hybrid policy."""
+    def _candidate_dedupe_key(self, candidate: dict) -> tuple[str, str, str, str]:
+        """Return a stable identity key used to dedupe repeated spread legs.
+
+        The key captures spread side, expiration, short symbol, and long symbol
+        so one exact leg pair is only executed once per run.
+        """
+        chosen_legs = candidate.get("chosen_legs_json") or {}
+        short_symbol = str(((chosen_legs.get("short") or {}).get("symbol")) or "")
+        long_symbol = str(((chosen_legs.get("long") or {}).get("symbol")) or "")
+        spread_side = str(chosen_legs.get("spread_side") or "")
+        expiration = str(candidate.get("expiration") or chosen_legs.get("expiration") or "")
+        return (spread_side, expiration, short_symbol, long_symbol)
+
+    def _dedupe_ranked_selections(self, ranked: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        """Drop duplicate leg-pair selections while preserving ranking order."""
+        seen: set[tuple[str, str, str, str]] = set()
+        deduped: list[dict[str, Any]] = []
+        duplicates_removed = 0
+        for selection in ranked:
+            key = self._candidate_dedupe_key(selection["chosen"])
+            if key in seen:
+                duplicates_removed += 1
+                continue
+            seen.add(key)
+            deduped.append(selection)
+        return deduped, duplicates_removed
+
+    async def _rank_candidates_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> list[dict[str, Any]]:
+        """Rank candidates using rules first, then hybrid-model overrides.
+
+        Behavior
+        --------
+        - Rules ranking: score desc, delta_diff asc.
+        - Hybrid ranking (when enabled): model score desc, then rules score.
+        - Fallback: append non-model-qualified rules candidates after hybrid
+          picks so runs can still fill top-N when model predictions are sparse.
+        """
         candidates_sorted = sorted(candidates, key=lambda c: (-c["score"], c["delta_diff"]))
-        chosen_rules = candidates_sorted[0]
-        rules_ref = await self._find_candidate_reference(session, now_et, chosen_rules)
-        selection = {
-            "chosen": chosen_rules,
-            "candidate_ref": rules_ref,
-            "decision_source": "rules",
-            "model_prediction": None,
-        }
+        rules_ranked: list[dict[str, Any]] = []
+        for candidate in candidates_sorted:
+            candidate_ref = await self._find_candidate_reference(session, now_et, candidate)
+            rules_ranked.append(
+                {
+                    "chosen": candidate,
+                    "candidate_ref": candidate_ref,
+                    "decision_source": "rules",
+                    "model_prediction": None,
+                }
+            )
         if not settings.decision_hybrid_enabled:
-            return selection
+            return rules_ranked
 
         model_version = await self._get_hybrid_model_version(session)
         if model_version is None:
-            return selection
+            return rules_ranked
 
-        ranked_by_model: list[tuple[float, float, dict, dict, dict]] = []
-        for candidate in candidates_sorted:
-            candidate_ref = await self._find_candidate_reference(session, now_et, candidate)
+        ranked_by_model: list[tuple[float, float, dict[str, Any]]] = []
+        for rules_entry in rules_ranked:
+            candidate_ref = rules_entry.get("candidate_ref") or {}
             candidate_id = candidate_ref.get("candidate_id")
             if candidate_id is None:
                 continue
@@ -529,24 +851,57 @@ class DecisionJob:
                 continue
             if float(ev) < settings.decision_hybrid_min_expected_pnl:
                 continue
-            ranked_by_model.append((float(pred["score_raw"]), float(candidate["score"]), candidate, candidate_ref, pred))
+            ranked_by_model.append(
+                (
+                    float(pred["score_raw"]),
+                    float(rules_entry["chosen"]["score"]),
+                    {
+                        **rules_entry,
+                        "decision_source": "hybrid_model",
+                        "model_prediction": {
+                            **pred,
+                            "model_version_id": int(model_version["model_version_id"]),
+                            "model_name": model_version["model_name"],
+                            "model_version": model_version["version"],
+                        },
+                    },
+                )
+            )
 
         if not ranked_by_model:
-            return selection
+            return rules_ranked
 
         ranked_by_model.sort(key=lambda item: (-item[0], -item[1]))
-        _, _, chosen_model, chosen_ref, chosen_pred = ranked_by_model[0]
-        return {
-            "chosen": chosen_model,
-            "candidate_ref": chosen_ref,
-            "decision_source": "hybrid_model",
-            "model_prediction": {
-                **chosen_pred,
-                "model_version_id": int(model_version["model_version_id"]),
-                "model_name": model_version["model_name"],
-                "model_version": model_version["version"],
-            },
-        }
+        hybrid_ranked = [item[2] for item in ranked_by_model]
+
+        # Keep hybrid-qualified picks first, then append remaining rules-ranked
+        # candidates so top-N can still fill when hybrid coverage is incomplete.
+        hybrid_keys = {self._candidate_dedupe_key(entry["chosen"]) for entry in hybrid_ranked}
+        for rules_entry in rules_ranked:
+            key = self._candidate_dedupe_key(rules_entry["chosen"])
+            if key in hybrid_keys:
+                continue
+            hybrid_ranked.append(rules_entry)
+        return hybrid_ranked
+
+    async def _select_candidate_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> dict[str, Any]:
+        """Select a single best candidate (compatibility helper for tests).
+
+        The production run path uses `_rank_candidates_with_policy` for top-N
+        execution. This helper preserves legacy behavior by returning the first
+        ranked candidate.
+        """
+        ranked = await self._rank_candidates_with_policy(session=session, now_et=now_et, candidates=candidates)
+        if not ranked:
+            chosen_rules = sorted(candidates, key=lambda c: (-c["score"], c["delta_diff"]))[0]
+            rules_ref = await self._find_candidate_reference(session, now_et, chosen_rules)
+            return {
+                "chosen": chosen_rules,
+                "candidate_ref": rules_ref,
+                "decision_source": "rules",
+                "model_prediction": None,
+            }
+        return ranked[0]
 
     async def _insert_decision(
         self,

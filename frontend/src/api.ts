@@ -115,8 +115,29 @@ export type RunDecisionResult = {
   skipped: boolean;
   reason?: string | null;
   now_et: string;
-  decision?: string;
-  chosen?: Record<string, unknown>;
+  decisions_created_count: number;
+  trades_created_count: number;
+  decisions_created: Array<{
+    decision_id: number;
+    trade_id: number;
+    target_dte: number;
+    delta_target: number;
+    spread_side: "put" | "call";
+    score: number | null;
+    decision_source: string;
+  }>;
+  trades_created: number[];
+  selection_meta?: {
+    candidates_total?: number;
+    candidates_ranked?: number;
+    candidates_after_dedupe?: number;
+    duplicates_removed?: number;
+    max_trades_per_run?: number;
+    day_remaining_before?: number | null;
+    open_remaining_before?: number | null;
+    selected_count?: number;
+    clipped_by?: string | null;
+  } | null;
 };
 
 /**
