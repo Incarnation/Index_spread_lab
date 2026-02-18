@@ -1,11 +1,9 @@
--- Auth audit: add is_admin to users, drop and recreate auth_audit_log with final schema.
--- Safe when table is empty. Run after db_schema.sql (which also creates auth_audit_log for new installs).
+-- Auth audit migration: ensure users.is_admin and auth_audit_log schema exist.
+-- Non-destructive by design so startup init_db() does not wipe audit history.
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
 
-DROP TABLE IF EXISTS auth_audit_log;
-
-CREATE TABLE auth_audit_log (
+CREATE TABLE IF NOT EXISTS auth_audit_log (
   id BIGSERIAL PRIMARY KEY,
   event_type TEXT NOT NULL,
   user_id BIGINT NULL REFERENCES users(id) ON DELETE SET NULL,
