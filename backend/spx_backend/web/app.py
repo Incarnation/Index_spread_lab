@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
     spy_snapshot_job = build_spy_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.spy_snapshot_enabled else None
     vix_snapshot_job = build_vix_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.vix_snapshot_enabled else None
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
-    gex_job = GexJob()
+    gex_job = GexJob(clock_cache=clock_cache)
     decision_job = DecisionJob(clock_cache=clock_cache)
     feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
     labeler_job = LabelerJob()

@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     quote_interval_minutes: int = 5
     gex_enabled: bool = True
     gex_interval_minutes: int = 5
+    gex_allow_outside_rth: bool = False
     gex_store_by_expiry: bool = True
     gex_spot_max_age_seconds: int = 600
     gex_contract_multiplier: int = 100

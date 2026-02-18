@@ -9,13 +9,28 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
+from spx_backend.market_clock import MarketClockCache, is_rth
 
 
 @dataclass(frozen=True)
 class GexJob:
     """Compute and persist GEX aggregates for new snapshots."""
-    async def run_once(self) -> dict:
+    clock_cache: MarketClockCache | None = None
+
+    async def _market_open(self, now_et: datetime) -> bool:
+        """Check if market is open using cache or RTH fallback."""
+        if self.clock_cache:
+            return await self.clock_cache.is_open(now_et)
+        return is_rth(now_et)
+
+    async def run_once(self, *, force: bool = False) -> dict:
         """Compute GEX for snapshots that are missing results.
+
+        Parameters
+        ----------
+        force:
+            When true, bypasses regular-trading-hours gating and computes GEX
+            regardless of market status.
 
         Returns
         -------
@@ -29,6 +44,17 @@ class GexJob:
 
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
+        if (not force) and (not settings.gex_allow_outside_rth):
+            if not await self._market_open(now_et):
+                logger.info("gex_job: market closed; skipping (now_et={})", now_et.isoformat())
+                return {
+                    "skipped": True,
+                    "reason": "market_closed",
+                    "computed_snapshots": 0,
+                    "skipped_snapshots": 0,
+                    "failed_snapshots": [],
+                    "now_et": now_et.isoformat(),
+                }
         computed = 0
         skipped_snapshots = 0
         failed_snapshots: list[dict] = []
@@ -66,7 +92,7 @@ class GexJob:
                         spot = await self._get_spot_price(session, ts, underlying)
                         if spot is None:
                             skipped_snapshots += 1
-                            logger.warning("gex_job: no spot price for snapshot_id={}", snapshot_id)
+                            logger.info("gex_job: no spot price for snapshot_id={}; skipping snapshot", snapshot_id)
                             continue
 
                         opt_rows = await session.execute(
@@ -82,7 +108,7 @@ class GexJob:
                         opts = opt_rows.fetchall()
                         if not opts:
                             skipped_snapshots += 1
-                            logger.warning("gex_job: no option rows for snapshot_id={}", snapshot_id)
+                            logger.info("gex_job: no option rows for snapshot_id={}; skipping snapshot", snapshot_id)
                             continue
 
                         # Filter by DTE window and select top-N strikes near spot.
@@ -100,8 +126,8 @@ class GexJob:
 
                         if not filtered:
                             skipped_snapshots += 1
-                            logger.warning(
-                                "gex_job: no options within dte_limit={} for snapshot_id={}",
+                            logger.info(
+                                "gex_job: no options within dte_limit={} for snapshot_id={}; skipping snapshot",
                                 settings.gex_max_dte_days,
                                 snapshot_id,
                             )

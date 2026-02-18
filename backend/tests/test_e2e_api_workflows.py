@@ -26,6 +26,19 @@ class _FakeExecResult:
     def fetchone(self) -> SimpleNamespace | None:
         return self._rows[0] if self._rows else None
 
+    def scalar_one(self) -> Any:
+        """Return one scalar-like value from the first stored row."""
+        if not self._rows:
+            raise AssertionError("Expected one scalar row but no rows were stored")
+        first = self._rows[0]
+        if isinstance(first, (int, float, str, bool)):
+            return first
+        if hasattr(first, "value"):
+            return getattr(first, "value")
+        if hasattr(first, "count"):
+            return getattr(first, "count")
+        raise AssertionError(f"Unable to read scalar from fake row type: {type(first)!r}")
+
 
 class _RouterAwareSession:
     """Route-aware fake DB session serving deterministic endpoint fixtures."""
@@ -54,8 +67,29 @@ class _RouterAwareSession:
                 )
             if "id" in sql and "username" in sql and "WHERE id" in sql:
                 return _FakeExecResult(
-                    [SimpleNamespace(id=1, username="testuser")]
+                    [SimpleNamespace(id=1, username="testuser", is_admin=True)]
                 )
+
+        if "SELECT COUNT(*) FROM auth_audit_log" in sql:
+            return _FakeExecResult([1])
+
+        if "FROM auth_audit_log" in sql and "ORDER BY occurred_at DESC" in sql:
+            return _FakeExecResult(
+                [
+                    SimpleNamespace(
+                        id=901,
+                        event_type="login_success",
+                        user_id=1,
+                        username="testuser",
+                        occurred_at=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
+                        ip_address="73.83.187.53/32",
+                        user_agent="unit-test-agent",
+                        country="United States",
+                        geo_json={"country": "United States", "regionName": "Washington"},
+                        details=None,
+                    )
+                ]
+            )
 
         if "FROM chain_snapshots" in sql and "checksum" in sql and "LIMIT :limit" in sql:
             return _FakeExecResult(
@@ -522,6 +556,7 @@ def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
         resp = client.post(path, headers=headers)
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+    assert client.app.state.gex_job.calls == [{"force": True}]
 
     expirations = client.get("/api/admin/expirations?symbol=SPY", headers=headers)
     assert expirations.status_code == 200
@@ -546,3 +581,17 @@ def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
     assert delete_ok.status_code == 200
     assert delete_ok.json() == {"deleted": True, "decision_id": 1}
     assert fake_session.commits >= 1
+
+
+def test_e2e_admin_auth_audit_normalizes_ip(monkeypatch) -> None:
+    """Admin auth-audit endpoint should strip /32 suffix from INET host addresses."""
+    client, _ = _build_test_client(monkeypatch)
+    headers = _e2e_auth_headers(client)
+
+    resp = client.get("/api/admin/auth-audit?limit=1", headers=headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total"] == 1
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["ip_address"] == "73.83.187.53"

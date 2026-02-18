@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
-from spx_backend.web.routers.auth import UserOut, get_current_user, require_admin
+from spx_backend.web.routers.auth import UserOut, _normalize_ip, get_current_user, require_admin
 from spx_backend.database import get_db_session
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
@@ -81,7 +81,7 @@ async def admin_run_gex(
 ) -> dict:
     """Force a GEX run immediately."""
     job: GexJob = getattr(request.app.state, "gex_job", GexJob())
-    result = await job.run_once()
+    result = await job.run_once(force=True)
     return result
 
 
@@ -245,7 +245,7 @@ async def admin_auth_audit(
             "user_id": row.user_id,
             "username": row.username,
             "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
-            "ip_address": str(row.ip_address) if row.ip_address else None,
+            "ip_address": _normalize_ip(str(row.ip_address)) if row.ip_address else None,
             "user_agent": row.user_agent,
             "country": row.country,
             "geo_json": getattr(row, "geo_json", None),
