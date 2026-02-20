@@ -73,6 +73,14 @@ async def _fake_init_db() -> None:
     return None
 
 
+def _job_by_id(scheduler: _FakeScheduler, job_id: str) -> dict:
+    """Return one captured scheduler job by id for focused assertions."""
+    for job in scheduler.jobs:
+        if job["id"] == job_id:
+            return job
+    raise AssertionError(f"missing job id: {job_id}")
+
+
 @pytest.mark.asyncio
 async def test_lifespan_wires_vix_snapshot_job_when_enabled(monkeypatch) -> None:
     """Verify optional VIX snapshot scheduler job is added and exposed on app.state."""
@@ -112,10 +120,20 @@ async def test_lifespan_wires_vix_snapshot_job_when_enabled(monkeypatch) -> None
     async with app_module.lifespan(app_module.app):
         scheduler = app_module.app.state.scheduler
         job_ids = {job["id"] for job in scheduler.jobs}
+        assert "quote_job" in job_ids
+        assert "quote_job_close" in job_ids
+        assert "gex_job" in job_ids
+        assert "gex_job_close" in job_ids
         assert "snapshot_job" in job_ids
+        assert "snapshot_job_close" in job_ids
         assert "snapshot_job_vix" in job_ids
+        assert "snapshot_job_vix_close" in job_ids
         assert app_module.app.state.vix_snapshot_job is vix_snapshot_job
         assert vix_snapshot_job.run_calls == 1
+        assert _job_by_id(scheduler, "quote_job_close")["kwargs"]["kwargs"] == {"force": True}
+        assert _job_by_id(scheduler, "gex_job_close")["kwargs"]["kwargs"] == {"force": True}
+        assert _job_by_id(scheduler, "snapshot_job_close")["kwargs"]["kwargs"] == {"force": True}
+        assert _job_by_id(scheduler, "snapshot_job_vix_close")["kwargs"]["kwargs"] == {"force": True}
         assert scheduler.listeners
         for job in scheduler.jobs:
             assert job["kwargs"]["max_instances"] == 1
@@ -161,6 +179,7 @@ async def test_lifespan_skips_vix_snapshot_job_when_disabled(monkeypatch) -> Non
         scheduler = app_module.app.state.scheduler
         job_ids = {job["id"] for job in scheduler.jobs}
         assert "snapshot_job_vix" not in job_ids
+        assert "snapshot_job_vix_close" not in job_ids
         assert app_module.app.state.vix_snapshot_job is None
 
 
@@ -204,8 +223,10 @@ async def test_lifespan_wires_cboe_gex_job_when_enabled(monkeypatch) -> None:
         scheduler = app_module.app.state.scheduler
         job_ids = {job["id"] for job in scheduler.jobs}
         assert "cboe_gex_job" in job_ids
+        assert "cboe_gex_job_close" in job_ids
         assert app_module.app.state.cboe_gex_job is cboe_gex_job
         assert cboe_gex_job.run_calls == 1
+        assert _job_by_id(scheduler, "cboe_gex_job_close")["kwargs"]["kwargs"] == {"force": True}
 
 
 @pytest.mark.asyncio
@@ -247,9 +268,13 @@ async def test_lifespan_wires_spy_snapshot_job_when_enabled(monkeypatch) -> None
         scheduler = app_module.app.state.scheduler
         job_ids = {job["id"] for job in scheduler.jobs}
         assert "snapshot_job" in job_ids
+        assert "snapshot_job_close" in job_ids
         assert "snapshot_job_spy" in job_ids
+        assert "snapshot_job_spy_close" in job_ids
         assert app_module.app.state.spy_snapshot_job is spy_snapshot_job
         assert spy_snapshot_job.run_calls == 1
+        assert _job_by_id(scheduler, "snapshot_job_close")["kwargs"]["kwargs"] == {"force": True}
+        assert _job_by_id(scheduler, "snapshot_job_spy_close")["kwargs"]["kwargs"] == {"force": True}
 
 
 @pytest.mark.asyncio
@@ -291,6 +316,7 @@ async def test_lifespan_skips_spy_snapshot_job_when_disabled(monkeypatch) -> Non
         scheduler = app_module.app.state.scheduler
         job_ids = {job["id"] for job in scheduler.jobs}
         assert "snapshot_job_spy" not in job_ids
+        assert "snapshot_job_spy_close" not in job_ids
         assert app_module.app.state.spy_snapshot_job is None
 
 
