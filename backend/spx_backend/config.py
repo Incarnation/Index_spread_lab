@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     tradier_base_url: str = "https://sandbox.tradier.com/v1"
     tradier_access_token: str
     tradier_account_id: str
+    mzdata_base_url: str = "https://mztrading-data.deno.dev"
 
     snapshot_interval_minutes: int = 10
     snapshot_underlying: str = "SPX"
@@ -66,6 +67,10 @@ class Settings(BaseSettings):
     gex_snapshot_batch_limit: int = 20
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
+    cboe_gex_enabled: bool = False
+    cboe_gex_underlying: str = "SPX"
+    cboe_gex_interval_minutes: int = 15
+    cboe_gex_allow_outside_rth: bool = False
 
     decision_entry_times: str = "10:00,11:00,12:00"
     decision_dte_targets: str = "0,3,5,7,10"
@@ -87,8 +92,8 @@ class Settings(BaseSettings):
     # ML feature/candidate generation (step 1)
     feature_builder_enabled: bool = True
     feature_builder_allow_outside_rth: bool = False
-    feature_schema_version: str = "fs_v1"
-    candidate_schema_version: str = "cand_v1"
+    feature_schema_version: str = "fs_v2"
+    candidate_schema_version: str = "cand_v2"
 
     # ML label resolver (step 2)
     labeler_enabled: bool = True

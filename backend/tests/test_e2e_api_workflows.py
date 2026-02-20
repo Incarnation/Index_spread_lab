@@ -141,6 +141,7 @@ class _RouterAwareSession:
                         snapshot_id=101,
                         ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
                         underlying="SPX",
+                        source="TRADIER",
                         spot_price=6020.0,
                         gex_net=1200.0,
                         gex_calls=1600.0,
@@ -361,6 +362,7 @@ class _RouterAwareSession:
                     SimpleNamespace(
                         snapshot_id=101,
                         ts=fresh_ts,
+                        source="TRADIER",
                         gex_net=1200.0,
                         zero_gamma_level=6000.0,
                         method="oi_gamma_spot",

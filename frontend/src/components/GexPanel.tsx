@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import { fetchGexCurve, type GexCurvePoint, type GexExpirationItem, type GexSnapshot } from "../api";
 import {
+  GEX_SOURCE_OPTIONS,
   GEX_UNDERLYING_OPTIONS,
   GEX_ZERO_DTE_ONLY_SENTINEL,
   getSnapshotTradingDateIso,
@@ -26,6 +27,8 @@ type GexPanelProps = {
   onSelectedSnapshotChange: (snapshot: GexSnapshot | null) => void;
   selectedUnderlying: string;
   onSelectedUnderlyingChange: (value: string | null) => void;
+  selectedSource: string;
+  onSelectedSourceChange: (value: string | null) => void;
   dtes: number[];
   expirations: GexExpirationItem[];
   selectedDte: string;
@@ -115,13 +118,21 @@ function writeStoredGexStrikeCount(value: GexStrikeCountOption): void {
  */
 function formatSnapshotOptionLabel(snapshot: GexSnapshot): string {
   const underlying = snapshot.underlying?.trim() || "UNKNOWN";
-  return `${underlying} · Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`;
+  const source = snapshot.source?.trim() || "UNKNOWN";
+  return `${underlying} [${source}] · Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`;
 }
 
 /**
  * Normalize symbol values before applying equality checks.
  */
 function normalizeUnderlying(value: string | null | undefined): string {
+  return (value ?? "").trim().toUpperCase();
+}
+
+/**
+ * Normalize source values before applying equality checks.
+ */
+function normalizeSource(value: string | null | undefined): string {
   return (value ?? "").trim().toUpperCase();
 }
 
@@ -250,6 +261,8 @@ export function GexPanel({
   onSelectedSnapshotChange,
   selectedUnderlying,
   onSelectedUnderlyingChange,
+  selectedSource,
+  onSelectedSourceChange,
   dtes,
   expirations,
   selectedDte,
@@ -270,9 +283,15 @@ export function GexPanel({
   const [heatmapError, setHeatmapError] = React.useState<string | null>(null);
 
   const normalizedUnderlying = normalizeUnderlying(selectedUnderlying);
+  const normalizedSource = selectedSource === "all" ? "all" : normalizeSource(selectedSource);
   const filteredSnapshots = React.useMemo(
-    () => snapshots.filter((snapshot) => normalizeUnderlying(snapshot.underlying) === normalizedUnderlying),
-    [normalizedUnderlying, snapshots],
+    () =>
+      snapshots.filter((snapshot) => {
+        if (normalizeUnderlying(snapshot.underlying) !== normalizedUnderlying) return false;
+        if (normalizedSource === "all") return true;
+        return normalizeSource(snapshot.source) === normalizedSource;
+      }),
+    [normalizedSource, normalizedUnderlying, snapshots],
   );
   const strikeSelectionTarget = React.useMemo(() => {
     if (!selectedSnapshot) return null;
@@ -314,10 +333,21 @@ export function GexPanel({
     if (normalizeUnderlying(selectedSnapshot.underlying) !== normalizedUnderlying) {
       return null;
     }
+    if (normalizedSource !== "all" && normalizeSource(selectedSnapshot.source) !== normalizedSource) {
+      return null;
+    }
     return filteredSnapshots.find((row) => row.snapshot_id === selectedSnapshot.snapshot_id) ?? null;
-  }, [filteredSnapshots, normalizedUnderlying, selectedSnapshot]);
+  }, [filteredSnapshots, normalizedSource, normalizedUnderlying, selectedSnapshot]);
   const underlyingOptions = React.useMemo(
     () => GEX_UNDERLYING_OPTIONS.map((symbol) => ({ value: symbol, label: symbol })),
+    [],
+  );
+  const sourceOptions = React.useMemo(
+    () =>
+      GEX_SOURCE_OPTIONS.map((source) => ({
+        value: source,
+        label: source === "all" ? "All Sources" : source,
+      })),
     [],
   );
 
@@ -482,6 +512,13 @@ export function GexPanel({
             value={selectedUnderlying}
             onChange={onSelectedUnderlyingChange}
             w={120}
+          />
+          <Select
+            label="Source"
+            data={sourceOptions}
+            value={selectedSource}
+            onChange={onSelectedSourceChange}
+            w={140}
           />
           <Select
             label="Capture batch"

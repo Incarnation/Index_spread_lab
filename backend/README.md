@@ -266,7 +266,7 @@ Helpers:
   - model/training/prediction operational summary
 
 Batch-scoped GEX note:
-- DTE/expiration/curve endpoints use all snapshots in the same capture batch (`same ts + underlying`), not only one row.
+- DTE/expiration/curve endpoints use all snapshots in the same capture batch (`same ts + underlying + source`), not only one row.
 
 ### Admin Endpoints
 
@@ -277,6 +277,7 @@ Routes:
 - `POST /api/admin/run-snapshot`
 - `POST /api/admin/run-quotes`
 - `POST /api/admin/run-gex`
+- `POST /api/admin/run-cboe-gex`
 - `POST /api/admin/run-decision`
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
@@ -398,6 +399,12 @@ High-impact settings:
   - `GEX_STRIKE_LIMIT` (default `150`)
   - `GEX_MAX_DTE_DAYS` (default `10`)
   - `GEX_SPOT_MAX_AGE_SECONDS`
+- CBOE precomputed GEX (parallel stream):
+  - `MZDATA_BASE_URL`
+  - `CBOE_GEX_ENABLED`
+  - `CBOE_GEX_UNDERLYING` (default `SPX`)
+  - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
+  - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
 - Ops/Safety:
   - `ALLOW_QUOTES_OUTSIDE_RTH`
   - `MARKET_CLOCK_CACHE_SECONDS`

@@ -9,9 +9,11 @@ import {
   type GexSnapshot,
 } from "../api";
 import {
+  GEX_SOURCE_OPTIONS,
   GEX_UNDERLYING_OPTIONS,
   GEX_ZERO_DTE_ONLY_SENTINEL,
   getSnapshotTradingDateIso,
+  type GexSource,
   type GexUnderlying,
 } from "../constants/gex";
 
@@ -23,6 +25,7 @@ const GEX_DTE_STORAGE_KEY = "dashboard.gex.selectedDte";
 const GEX_CUSTOM_EXP_STORAGE_KEY = "dashboard.gex.selectedCustomExpirations";
 const GEX_SNAPSHOT_STORAGE_KEY = "dashboard.gex.selectedSnapshotId";
 const GEX_UNDERLYING_STORAGE_KEY = "dashboard.gex.selectedUnderlying";
+const GEX_SOURCE_STORAGE_KEY = "dashboard.gex.selectedSource";
 
 /**
  * Normalize one underlying symbol to uppercase without surrounding whitespace.
@@ -36,6 +39,14 @@ function normalizeUnderlying(value: string | null | undefined): string {
  */
 function isMatchingUnderlying(snapshot: GexSnapshot, selectedUnderlying: GexUnderlying): boolean {
   return normalizeUnderlying(snapshot.underlying) === selectedUnderlying;
+}
+
+/**
+ * Return true when a snapshot row belongs to the selected source filter.
+ */
+function isMatchingSource(snapshot: GexSnapshot, selectedSource: GexSource): boolean {
+  if (selectedSource === "all") return true;
+  return (snapshot.source ?? "").trim().toUpperCase() === selectedSource;
 }
 
 /**
@@ -109,12 +120,25 @@ function readStoredGexUnderlying(): GexUnderlying {
   return "SPX";
 }
 
+/**
+ * Normalize persisted source values to one supported source filter option.
+ */
+function readStoredGexSource(): GexSource {
+  const raw = (readStorageString(GEX_SOURCE_STORAGE_KEY) ?? "").trim();
+  if ((GEX_SOURCE_OPTIONS as readonly string[]).includes(raw)) {
+    return raw as GexSource;
+  }
+  return "all";
+}
+
 type UseGexDataResult = {
   gexSnapshots: GexSnapshot[];
   selectedGexSnapshot: GexSnapshot | null;
   setSelectedGexSnapshot: (snapshot: GexSnapshot | null) => void;
   selectedUnderlying: GexUnderlying;
   handleSelectedUnderlyingChange: (value: string | null) => void;
+  selectedSource: GexSource;
+  handleSelectedSourceChange: (value: string | null) => void;
   gexDtes: number[];
   gexExpirations: GexExpirationItem[];
   selectedDte: string;
@@ -135,6 +159,7 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   const [gexSnapshots, setGexSnapshots] = React.useState<GexSnapshot[]>([]);
   const [selectedGexSnapshotState, setSelectedGexSnapshotState] = React.useState<GexSnapshot | null>(null);
   const [selectedUnderlying, setSelectedUnderlying] = React.useState<GexUnderlying>(() => readStoredGexUnderlying());
+  const [selectedSource, setSelectedSource] = React.useState<GexSource>(() => readStoredGexSource());
   const [gexDtes, setGexDtes] = React.useState<number[]>([]);
   const [gexExpirations, setGexExpirations] = React.useState<GexExpirationItem[]>([]);
   const [selectedDte, setSelectedDte] = React.useState<string>(() => readStorageString(GEX_DTE_STORAGE_KEY) ?? "all");
@@ -152,12 +177,12 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
    */
   const setSelectedGexSnapshot = React.useCallback(
     (snapshot: GexSnapshot | null) => {
-      if (snapshot && !isMatchingUnderlying(snapshot, selectedUnderlying)) {
+      if (snapshot && (!isMatchingUnderlying(snapshot, selectedUnderlying) || !isMatchingSource(snapshot, selectedSource))) {
         return;
       }
       setSelectedGexSnapshotState(snapshot);
     },
-    [selectedUnderlying],
+    [selectedSource, selectedUnderlying],
   );
 
   /**
@@ -173,10 +198,12 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   React.useEffect(() => {
     let cancelled = false;
     setGexLoading(true);
-    fetchGexSnapshots(20, selectedUnderlying)
+    fetchGexSnapshots(20, selectedUnderlying, selectedSource === "all" ? undefined : selectedSource)
       .then((rows) => {
         if (cancelled) return;
-        const symbolRows = rows.filter((row) => isMatchingUnderlying(row, selectedUnderlying));
+        const symbolRows = rows.filter(
+          (row) => isMatchingUnderlying(row, selectedUnderlying) && isMatchingSource(row, selectedSource),
+        );
         setGexSnapshots(symbolRows);
         if (symbolRows.length > 0) {
           const persistedSnapshotIdRaw = readStorageString(GEX_SNAPSHOT_STORAGE_KEY);
@@ -202,19 +229,20 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     return () => {
       cancelled = true;
     };
-  }, [onError, selectedUnderlying]);
+  }, [onError, selectedSource, selectedUnderlying]);
 
   /**
    * Guard against stale UI state by forcing selected snapshot symbol to match filter.
    */
   React.useEffect(() => {
     if (!selectedGexSnapshot) return;
-    if (isMatchingUnderlying(selectedGexSnapshot, selectedUnderlying)) {
+    if (isMatchingUnderlying(selectedGexSnapshot, selectedUnderlying) && isMatchingSource(selectedGexSnapshot, selectedSource)) {
       return;
     }
-    const fallbackSnapshot = gexSnapshots.find((row) => isMatchingUnderlying(row, selectedUnderlying)) ?? null;
+    const fallbackSnapshot =
+      gexSnapshots.find((row) => isMatchingUnderlying(row, selectedUnderlying) && isMatchingSource(row, selectedSource)) ?? null;
     setSelectedGexSnapshotState(fallbackSnapshot);
-  }, [gexSnapshots, selectedGexSnapshot, selectedUnderlying]);
+  }, [gexSnapshots, selectedGexSnapshot, selectedSource, selectedUnderlying]);
 
   /**
    * Load DTE and expiration options whenever selected snapshot changes.
@@ -314,6 +342,10 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     writeStorageString(GEX_UNDERLYING_STORAGE_KEY, selectedUnderlying);
   }, [selectedUnderlying]);
 
+  React.useEffect(() => {
+    writeStorageString(GEX_SOURCE_STORAGE_KEY, selectedSource);
+  }, [selectedSource]);
+
   /**
    * Update selected underlying and reset stale snapshot-specific selections.
    */
@@ -323,6 +355,22 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
       return;
     }
     setSelectedUnderlying(normalized as GexUnderlying);
+    setSelectedGexSnapshotState(null);
+    setSelectedCustomExpirationsState([]);
+    setGexDtes([]);
+    setGexExpirations([]);
+    setGexCurve([]);
+  }, []);
+
+  /**
+   * Update selected source filter and reset stale snapshot-specific selections.
+   */
+  const handleSelectedSourceChange = React.useCallback((value: string | null) => {
+    const raw = (value ?? "").trim();
+    if (!(GEX_SOURCE_OPTIONS as readonly string[]).includes(raw)) {
+      return;
+    }
+    setSelectedSource(raw as GexSource);
     setSelectedGexSnapshotState(null);
     setSelectedCustomExpirationsState([]);
     setGexDtes([]);
@@ -346,6 +394,8 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
     setSelectedGexSnapshot,
     selectedUnderlying,
     handleSelectedUnderlyingChange,
+    selectedSource,
+    handleSelectedSourceChange,
     gexDtes,
     gexExpirations,
     selectedDte,

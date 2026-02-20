@@ -88,7 +88,7 @@ The pipeline runs in this order:
 
 Important semantics:
 - DTE handling is trading-session based (weekends and market holidays are skipped).
-- GEX API data for UI is batch-scoped (same timestamp + underlying), not only one snapshot row.
+- GEX API data for UI is batch-scoped (same timestamp + underlying + source), not only one snapshot row.
 
 ---
 
@@ -221,6 +221,12 @@ Primary knobs:
   - `GEX_MAX_DTE_DAYS`
   - `GEX_STRIKE_LIMIT`
   - `GEX_SNAPSHOT_BATCH_LIMIT` (recommended >= number of expirations captured per cycle; default `20`)
+- CBOE precomputed GEX (parallel stream):
+  - `MZDATA_BASE_URL`
+  - `CBOE_GEX_ENABLED`
+  - `CBOE_GEX_UNDERLYING` (default `SPX`)
+  - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
+  - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
 - Ops:
   - `ADMIN_API_KEY`
   - `CORS_ORIGINS`
@@ -283,6 +289,7 @@ Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
 - `POST /api/admin/run-snapshot`
 - `POST /api/admin/run-quotes`
 - `POST /api/admin/run-gex`
+- `POST /api/admin/run-cboe-gex`
 - `POST /api/admin/run-decision`
 - `POST /api/admin/run-feature-builder`
 - `POST /api/admin/run-labeler`
@@ -419,11 +426,12 @@ Recommended manual sequence for diagnostics:
 1) `POST /api/admin/run-quotes`
 2) `POST /api/admin/run-snapshot`
 3) `POST /api/admin/run-gex`
-4) `POST /api/admin/run-feature-builder`
-5) `POST /api/admin/run-labeler`
-6) `POST /api/admin/run-decision`
-7) `POST /api/admin/run-trade-pnl`
-8) `GET /api/admin/preflight`
+4) `POST /api/admin/run-cboe-gex` (if CBOE stream enabled)
+5) `POST /api/admin/run-feature-builder`
+6) `POST /api/admin/run-labeler`
+7) `POST /api/admin/run-decision`
+8) `POST /api/admin/run-trade-pnl`
+9) `GET /api/admin/preflight`
 
 If decisions are skipping:
 - Check `preflight.latest.snapshot_ts` freshness.

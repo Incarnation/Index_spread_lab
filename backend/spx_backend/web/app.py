@@ -10,6 +10,7 @@ from loguru import logger
 from spx_backend.config import settings
 from spx_backend.database import init_db
 from spx_backend.ingestion.tradier_client import get_tradier_client
+from spx_backend.jobs.cboe_gex_job import build_cboe_gex_job
 from spx_backend.jobs.decision_job import DecisionJob
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob
 from spx_backend.jobs.gex_job import GexJob
@@ -81,6 +82,7 @@ async def lifespan(app: FastAPI):
     vix_snapshot_job = build_vix_snapshot_job(tradier=tradier, clock_cache=clock_cache) if settings.vix_snapshot_enabled else None
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob(clock_cache=clock_cache)
+    cboe_gex_job = build_cboe_gex_job(clock_cache=clock_cache) if settings.cboe_gex_enabled else None
     decision_job = DecisionJob(clock_cache=clock_cache)
     feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
     labeler_job = LabelerJob()
@@ -136,6 +138,16 @@ async def lifespan(app: FastAPI):
         max_instances=max_job_instances,
         misfire_grace_time=misfire_grace_seconds,
     )
+    if cboe_gex_job is not None:
+        scheduler.add_job(
+            cboe_gex_job.run_once,
+            "interval",
+            minutes=settings.cboe_gex_interval_minutes,
+            id="cboe_gex_job",
+            replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
+        )
     for hour, minute in settings.decision_entry_times_list():
         if settings.feature_builder_enabled:
             scheduler.add_job(
@@ -220,6 +232,7 @@ async def lifespan(app: FastAPI):
     app.state.vix_snapshot_job = vix_snapshot_job
     app.state.quote_job = quote_job
     app.state.gex_job = gex_job
+    app.state.cboe_gex_job = cboe_gex_job
     app.state.decision_job = decision_job
     app.state.feature_builder_job = feature_builder_job
     app.state.labeler_job = labeler_job
@@ -239,6 +252,8 @@ async def lifespan(app: FastAPI):
         if vix_snapshot_job is not None:
             warmup_jobs.append(("snapshot_job_vix", vix_snapshot_job.run_once))
         warmup_jobs.append(("gex_job", gex_job.run_once))
+        if cboe_gex_job is not None:
+            warmup_jobs.append(("cboe_gex_job", cboe_gex_job.run_once))
         for job_name, run_once_callable in warmup_jobs:
             try:
                 await run_once_callable()

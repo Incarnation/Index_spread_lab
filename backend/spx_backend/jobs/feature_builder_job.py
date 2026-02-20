@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
 import statistics
@@ -124,6 +124,165 @@ class FeatureBuilderJob:
         """Return True if current ET hour/minute is configured for entries."""
         return (now_et.hour, now_et.minute) in settings.decision_entry_times_list()
 
+    async def _nearest_cboe_batch_ts(
+        self,
+        *,
+        session,
+        target_ts: datetime,
+        underlying: str,
+    ) -> datetime | None:
+        """Return nearest CBOE GEX batch timestamp for the given underlying.
+
+        Parameters
+        ----------
+        session:
+            Open SQLAlchemy async session.
+        target_ts:
+            Timestamp we want to align with (typically the Tradier snapshot ts).
+        underlying:
+            Underlying symbol (for example ``SPX``).
+
+        Returns
+        -------
+        datetime | None
+            UTC timestamp of the nearest CBOE batch when available.
+        """
+        target_utc = target_ts if target_ts.tzinfo is not None else target_ts.replace(tzinfo=ZoneInfo("UTC"))
+        row = await session.execute(
+            text(
+                """
+                SELECT ts
+                FROM gex_snapshots
+                WHERE underlying = :underlying
+                  AND source = 'CBOE'
+                ORDER BY ABS(EXTRACT(EPOCH FROM (ts - :target_ts))) ASC, snapshot_id DESC
+                LIMIT 1
+                """
+            ),
+            {"underlying": underlying, "target_ts": target_utc.astimezone(ZoneInfo("UTC"))},
+        )
+        result = row.fetchone()
+        if result is None:
+            return None
+        return result.ts
+
+    async def _build_cboe_expiration_context(
+        self,
+        *,
+        session,
+        target_ts: datetime,
+        underlying: str,
+        expiration: date,
+        spot: float | None,
+    ) -> dict | None:
+        """Build CBOE-derived expiry context for one candidate expiration.
+
+        Parameters
+        ----------
+        session:
+            Open SQLAlchemy async session.
+        target_ts:
+            Timestamp used to find the nearest CBOE batch.
+        underlying:
+            Underlying symbol (for example ``SPX``).
+        expiration:
+            Candidate expiration date.
+        spot:
+            Current spot used for wall-distance normalization.
+
+        Returns
+        -------
+        dict | None
+            Expiration-level CBOE context with wall levels and distance ratios.
+        """
+        batch_ts = await self._nearest_cboe_batch_ts(session=session, target_ts=target_ts, underlying=underlying)
+        if batch_ts is None:
+            return None
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT gbes.strike, gbes.gex_net, gbes.gex_calls, gbes.gex_puts
+                    FROM gex_by_expiry_strike gbes
+                    JOIN gex_snapshots gs ON gs.snapshot_id = gbes.snapshot_id
+                    WHERE gs.ts = :batch_ts
+                      AND gs.underlying = :underlying
+                      AND gs.source = 'CBOE'
+                      AND gbes.expiration = :expiration
+                    ORDER BY gbes.strike ASC
+                    """
+                ),
+                {
+                    "batch_ts": batch_ts,
+                    "underlying": underlying,
+                    "expiration": expiration,
+                },
+            )
+        ).fetchall()
+        if not rows:
+            return None
+
+        expiry_gex_net = 0.0
+        expiry_gex_calls = 0.0
+        expiry_gex_puts = 0.0
+        gamma_wall_strike: float | None = None
+        gamma_wall_abs = -1.0
+        call_wall_strike: float | None = None
+        call_wall_value = float("-inf")
+        put_wall_strike: float | None = None
+        put_wall_value = float("inf")
+        for row in rows:
+            strike = _to_float(row.strike)
+            gex_net = _to_float(row.gex_net) or 0.0
+            gex_calls = _to_float(row.gex_calls) or 0.0
+            gex_puts = _to_float(row.gex_puts) or 0.0
+            expiry_gex_net += gex_net
+            expiry_gex_calls += gex_calls
+            expiry_gex_puts += gex_puts
+            if strike is None:
+                continue
+            if abs(gex_net) > gamma_wall_abs:
+                gamma_wall_abs = abs(gex_net)
+                gamma_wall_strike = strike
+            if gex_calls > call_wall_value:
+                call_wall_value = gex_calls
+                call_wall_strike = strike
+            if gex_puts < put_wall_value:
+                put_wall_value = gex_puts
+                put_wall_strike = strike
+
+        distance_ratio_denominator = float(spot) if spot is not None and float(spot) > 0 else None
+        gamma_wall_distance_ratio = (
+            None
+            if distance_ratio_denominator is None or gamma_wall_strike is None
+            else abs(float(spot) - gamma_wall_strike) / distance_ratio_denominator
+        )
+        call_wall_distance_ratio = (
+            None
+            if distance_ratio_denominator is None or call_wall_strike is None
+            else abs(float(spot) - call_wall_strike) / distance_ratio_denominator
+        )
+        put_wall_distance_ratio = (
+            None
+            if distance_ratio_denominator is None or put_wall_strike is None
+            else abs(float(spot) - put_wall_strike) / distance_ratio_denominator
+        )
+
+        return {
+            "source": "CBOE",
+            "batch_ts_utc": batch_ts.astimezone(ZoneInfo("UTC")).isoformat(),
+            "expiration": expiration.isoformat(),
+            "expiry_gex_net": expiry_gex_net,
+            "expiry_gex_calls": expiry_gex_calls,
+            "expiry_gex_puts": expiry_gex_puts,
+            "gamma_wall_strike": gamma_wall_strike,
+            "call_wall_strike": call_wall_strike,
+            "put_wall_strike": put_wall_strike,
+            "gamma_wall_distance_ratio": gamma_wall_distance_ratio,
+            "call_wall_distance_ratio": call_wall_distance_ratio,
+            "put_wall_distance_ratio": put_wall_distance_ratio,
+        }
+
     def _build_feature_payload(
         self,
         *,
@@ -133,6 +292,7 @@ class FeatureBuilderJob:
         spot: float | None,
         context: dict | None,
         spread_side: str,
+        cboe_context: dict | None,
     ) -> dict:
         """Build compact, reproducible market-state feature payload."""
         spreads = [float(o["ask"]) - float(o["bid"]) for o in options]
@@ -179,6 +339,7 @@ class FeatureBuilderJob:
                 "gex_net": None if context is None else context.get("gex_net"),
                 "zero_gamma_level": None if context is None else context.get("zero_gamma_level"),
             },
+            "cboe_context": cboe_context,
             "chain_quality": {
                 "rows_total": len(options),
                 "strike_min": min(strikes) if strikes else None,
@@ -200,7 +361,7 @@ class FeatureBuilderJob:
             },
         }
 
-    def _build_candidate_json(self, candidate: dict) -> dict:
+    def _build_candidate_json(self, candidate: dict, *, cboe_context: dict | None) -> dict:
         """Normalize candidate payload to a stable JSON document."""
         chosen = candidate["chosen_legs_json"]
         short_leg = chosen.get("short") or {}
@@ -239,6 +400,7 @@ class FeatureBuilderJob:
             "legs": {"short": short_leg, "long": long_leg},
             "context": context,
             "context_flags": chosen.get("context_flags"),
+            "cboe_context": cboe_context,
         }
 
     async def run_once(self, *, force: bool = False) -> dict:
@@ -270,6 +432,7 @@ class FeatureBuilderJob:
         features_inserted = 0
         candidates_inserted = 0
         built: list[dict] = []
+        cboe_context_cache: dict[tuple[int, str], dict | None] = {}
 
         async with SessionLocal() as session:
             spot = await helper._get_spot_price(session, now_et, settings.snapshot_underlying)
@@ -285,6 +448,23 @@ class FeatureBuilderJob:
                     if not options:
                         continue
 
+                    cache_key = (int(snapshot["snapshot_id"]), str(snapshot["expiration"]))
+                    if cache_key not in cboe_context_cache:
+                        # Cache by snapshot/expiration to avoid re-querying the same
+                        # CBOE batch context for put/call loops in one run.
+                        expiration_value = snapshot["expiration"]
+                        if isinstance(expiration_value, date):
+                            cboe_context_cache[cache_key] = await self._build_cboe_expiration_context(
+                                session=session,
+                                target_ts=snapshot["ts"],
+                                underlying=settings.snapshot_underlying,
+                                expiration=expiration_value,
+                                spot=spot,
+                            )
+                        else:
+                            cboe_context_cache[cache_key] = None
+                    cboe_context = cboe_context_cache[cache_key]
+
                     feature_payload = self._build_feature_payload(
                         now_et=now_et,
                         snapshot=snapshot,
@@ -292,6 +472,7 @@ class FeatureBuilderJob:
                         spot=spot,
                         context=context,
                         spread_side=spread_side,
+                        cboe_context=cboe_context,
                     )
                     feature_hash = stable_json_hash(feature_payload)
                     feature_insert = await session.execute(
@@ -350,7 +531,7 @@ class FeatureBuilderJob:
                     # Ranking is persisted to support model-vs-rules comparison later.
                     candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
                     for rank, candidate in enumerate(candidates, start=1):
-                        candidate_json = self._build_candidate_json(candidate)
+                        candidate_json = self._build_candidate_json(candidate, cboe_context=cboe_context)
                         candidate_hash = build_candidate_hash(candidate_json)
                         entry_credit = float(candidate["credit"])
                         width_points = float(candidate_json["width_points"])

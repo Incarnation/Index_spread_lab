@@ -69,6 +69,7 @@ class GexJob:
                         FROM chain_snapshots cs
                         LEFT JOIN gex_snapshots gs ON gs.snapshot_id = cs.snapshot_id
                         WHERE gs.snapshot_id IS NULL
+                          AND cs.source = 'TRADIER'
                         ORDER BY cs.snapshot_id DESC
                         LIMIT :limit
                         """
@@ -191,10 +192,10 @@ class GexJob:
                             text(
                                 """
                                 INSERT INTO gex_snapshots (
-                                  snapshot_id, ts, underlying, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
+                                  snapshot_id, ts, underlying, source, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
                                 )
                                 VALUES (
-                                  :snapshot_id, :ts, :underlying, :spot_price, :gex_net, :gex_calls, :gex_puts, :gex_abs, :zero_gamma, :method
+                                  :snapshot_id, :ts, :underlying, :source, :spot_price, :gex_net, :gex_calls, :gex_puts, :gex_abs, :zero_gamma, :method
                                 )
                                 ON CONFLICT (snapshot_id) DO NOTHING
                                 """
@@ -203,6 +204,7 @@ class GexJob:
                                 "snapshot_id": snapshot_id,
                                 "ts": ts,
                                 "underlying": underlying,
+                                "source": "TRADIER",
                                 "spot_price": spot,
                                 "gex_net": gex_net,
                                 "gex_calls": gex_calls,

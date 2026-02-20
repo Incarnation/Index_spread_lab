@@ -3,6 +3,8 @@ import { formatDateIsoInTimezone } from "../utils/format";
 
 export const GEX_UNDERLYING_OPTIONS = ["SPX", "SPY", "VIX"] as const;
 export type GexUnderlying = (typeof GEX_UNDERLYING_OPTIONS)[number];
+export const GEX_SOURCE_OPTIONS = ["all", "TRADIER", "CBOE"] as const;
+export type GexSource = (typeof GEX_SOURCE_OPTIONS)[number];
 
 export const GEX_TRADING_TIMEZONE = "America/New_York";
 export const GEX_ZERO_DTE_ONLY_SENTINEL = "__ZERO_DTE_ONLY__";

@@ -16,6 +16,8 @@ FULL_BUCKET_DIMENSIONS: tuple[str, ...] = (
     "vix_regime",
     "term_structure_regime",
     "spy_spx_ratio_regime",
+    "cboe_regime",
+    "cboe_wall_proximity",
     "vix_delta_interaction_bucket",
     "dte_credit_interaction_bucket",
 )
@@ -36,6 +38,8 @@ RELAXED_MARKET_BUCKET_DIMENSIONS: tuple[str, ...] = (
     "credit_bucket",
     "context_regime",
     "vix_regime",
+    "cboe_regime",
+    "cboe_wall_proximity",
     "vix_delta_interaction_bucket",
     "dte_credit_interaction_bucket",
 )
@@ -44,6 +48,7 @@ CORE_BUCKET_DIMENSIONS: tuple[str, ...] = (
     "target_dte",
     "delta_bucket",
     "credit_bucket",
+    "cboe_regime",
     "vix_delta_interaction_bucket",
     "dte_credit_interaction_bucket",
 )
@@ -150,6 +155,28 @@ def _classify_spy_spx_ratio_regime(spy_spx_ratio: float | None) -> str:
     if spy_spx_ratio <= 0.101:
         return "parity"
     return "premium"
+
+
+def _classify_cboe_regime(expiry_gex_net: float | None) -> str:
+    """Classify CBOE expiry net-gamma into support/headwind/neutral."""
+    if expiry_gex_net is None:
+        return "unknown"
+    if expiry_gex_net > 0:
+        return "support"
+    if expiry_gex_net < 0:
+        return "headwind"
+    return "neutral"
+
+
+def _classify_cboe_wall_proximity(distance_ratio: float | None) -> str:
+    """Bucket CBOE wall-distance ratio for robust sparse-data grouping."""
+    if distance_ratio is None:
+        return "unknown"
+    if distance_ratio <= 0.003:
+        return "near"
+    if distance_ratio <= 0.01:
+        return "mid"
+    return "far"
 
 
 def compute_max_drawdown(pnls: list[float]) -> float:
@@ -298,6 +325,22 @@ def extract_candidate_features(
         spy_spx_ratio_regime = raw_spy_ratio_regime.strip().lower()
     else:
         spy_spx_ratio_regime = _classify_spy_spx_ratio_regime(spy_spx_ratio)
+    cboe_payload = candidate_json.get("cboe_context")
+    cboe_context = cboe_payload if isinstance(cboe_payload, dict) else {}
+    expiry_gex_net = _as_float(candidate_json.get("expiry_gex_net"))
+    if expiry_gex_net is None:
+        expiry_gex_net = _as_float(cboe_context.get("expiry_gex_net")) if isinstance(cboe_context, dict) else None
+    gamma_wall_distance_ratio = _as_float(candidate_json.get("gamma_wall_distance_ratio"))
+    if gamma_wall_distance_ratio is None:
+        gamma_wall_distance_ratio = (
+            _as_float(cboe_context.get("gamma_wall_distance_ratio")) if isinstance(cboe_context, dict) else None
+        )
+    if gamma_wall_distance_ratio is None:
+        gamma_wall_distance_ratio = _as_float(cboe_context.get("call_wall_distance_ratio")) if isinstance(cboe_context, dict) else None
+    if gamma_wall_distance_ratio is None:
+        gamma_wall_distance_ratio = _as_float(cboe_context.get("put_wall_distance_ratio")) if isinstance(cboe_context, dict) else None
+    cboe_regime = _classify_cboe_regime(expiry_gex_net)
+    cboe_wall_proximity = _classify_cboe_wall_proximity(gamma_wall_distance_ratio)
 
     contracts = _as_int(candidate_json.get("contracts")) or 1
     margin_usage = compute_margin_usage_dollars(
@@ -323,6 +366,8 @@ def extract_candidate_features(
         "vix_regime": vix_regime,
         "term_structure_regime": term_structure_regime,
         "spy_spx_ratio_regime": spy_spx_ratio_regime,
+        "cboe_regime": cboe_regime,
+        "cboe_wall_proximity": cboe_wall_proximity,
         "contracts": contracts,
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,

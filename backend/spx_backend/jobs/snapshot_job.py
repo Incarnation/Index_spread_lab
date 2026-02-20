@@ -389,14 +389,15 @@ class SnapshotJob:
                         result = await session.execute(
                             text(
                                 """
-                                INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
-                                VALUES (:ts, :underlying, :target_dte, :expiration, CAST(:payload AS jsonb), :checksum)
+                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload AS jsonb), :checksum)
                                 RETURNING snapshot_id
                                 """
                             ),
                             {
                                 "ts": now_et.astimezone(utc),
                                 "underlying": underlying,
+                                "source": "TRADIER",
                                 "target_dte": target_dte,
                                 "expiration": exp,
                                 "payload": json.dumps(chain, default=str),

@@ -127,11 +127,13 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert features["vix_regime"] == "high"
     assert features["term_structure_regime"] == "backwardation"
     assert features["spy_spx_ratio_regime"] == "parity"
+    assert features["cboe_regime"] == "unknown"
+    assert features["cboe_wall_proximity"] == "unknown"
     assert features["vix_delta_interaction_bucket"] == "high:0.20"
     assert features["dte_credit_interaction_bucket"] == "5:0.10"
     assert features["margin_usage"] == 850.0
     bucket_key = build_bucket_key(features)
-    assert "support|high|backwardation|parity" in bucket_key
+    assert "support|high|backwardation|parity|unknown|unknown" in bucket_key
     assert bucket_key.endswith("high:0.20|5:0.10")
     assert build_legacy_bucket_key(features).endswith("support|high|backwardation|parity")
     levels = build_bucket_key_levels(features)
@@ -148,6 +150,27 @@ def test_extract_candidate_features_and_quality_summary() -> None:
     assert summary["tp100_at_expiry"] == 1
     assert isinstance(summary["expectancy"], float)
     assert isinstance(summary["max_drawdown"], float)
+
+
+def test_extract_candidate_features_reads_cboe_context_buckets() -> None:
+    """CBOE context should map into deterministic regime/proximity buckets."""
+    features = extract_candidate_features(
+        candidate_json={
+            "spread_side": "call",
+            "target_dte": 3,
+            "delta_target": 0.15,
+            "entry_credit": 1.0,
+            "width_points": 5.0,
+            "contracts": 1,
+            "context_flags": [],
+            "context": {"vix": 18.0, "term_structure": 1.0, "spy_price": 600.0, "spx_price": 6000.0},
+            "cboe_context": {"expiry_gex_net": 1250.0, "gamma_wall_distance_ratio": 0.002},
+        },
+        max_loss_points=4.0,
+        contract_multiplier=100,
+    )
+    assert features["cboe_regime"] == "support"
+    assert features["cboe_wall_proximity"] == "near"
 
 
 def test_predict_with_bucket_model_uses_relaxed_hierarchy_before_global() -> None:

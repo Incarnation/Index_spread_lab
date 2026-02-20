@@ -594,6 +594,7 @@ async def get_model_ops(
 async def list_gex_snapshots(
     limit: int = 50,
     underlying: str | None = None,
+    source: str | None = None,
     current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
@@ -606,6 +607,9 @@ async def list_gex_snapshots(
     underlying:
         Optional underlying symbol filter (for example ``SPX``, ``SPY``, ``VIX``).
         Matching is case-insensitive, whitespace-tolerant, and applied in SQL.
+    source:
+        Optional source filter (for example ``TRADIER`` or ``CBOE``). When
+        omitted, snapshots from all available sources are returned.
 
     Returns
     -------
@@ -615,14 +619,21 @@ async def list_gex_snapshots(
     """
     limit = max(1, min(limit, 500))
     normalized_underlying = (underlying or "").strip().upper()
+    normalized_source = (source or "").strip().upper()
     sql = """
-        SELECT snapshot_id, ts, underlying, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
+        SELECT snapshot_id, ts, underlying, source, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
         FROM gex_snapshots
     """
     params: dict[str, object] = {"limit": limit}
+    where_clauses: list[str] = []
     if normalized_underlying:
-        sql += " WHERE UPPER(TRIM(underlying)) = :underlying"
+        where_clauses.append("UPPER(TRIM(underlying)) = :underlying")
         params["underlying"] = normalized_underlying
+    if normalized_source:
+        where_clauses.append("UPPER(TRIM(source)) = :source")
+        params["source"] = normalized_source
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
     sql += " ORDER BY ts DESC, snapshot_id DESC LIMIT :limit"
     r = await db.execute(text(sql), params)
     rows = r.fetchall()
@@ -632,6 +643,7 @@ async def list_gex_snapshots(
                 "snapshot_id": row.snapshot_id,
                 "ts": row.ts.isoformat(),
                 "underlying": row.underlying,
+                "source": row.source,
                 "spot_price": row.spot_price,
                 "gex_net": row.gex_net,
                 "gex_calls": row.gex_calls,
@@ -651,19 +663,19 @@ async def list_gex_dtes(
     current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return available DTEs for a GEX snapshot batch (same ts + underlying)."""
+    """Return available DTEs for a GEX snapshot batch (same ts + underlying + source)."""
     r = await db.execute(
         text(
             """
             WITH anchor AS (
-              SELECT ts, underlying
+              SELECT ts, underlying, source
               FROM gex_snapshots
               WHERE snapshot_id = :snapshot_id
             ),
             batch AS (
               SELECT gs.snapshot_id
               FROM gex_snapshots gs
-              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying AND gs.source = a.source
             )
             SELECT DISTINCT gbes.dte_days
             FROM gex_by_expiry_strike gbes
@@ -684,19 +696,19 @@ async def list_gex_expirations(
     current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return available expirations for a GEX snapshot batch (same ts + underlying)."""
+    """Return available expirations for a GEX snapshot batch (same ts + underlying + source)."""
     r = await db.execute(
         text(
             """
             WITH anchor AS (
-              SELECT ts, underlying
+              SELECT ts, underlying, source
               FROM gex_snapshots
               WHERE snapshot_id = :snapshot_id
             ),
             batch AS (
               SELECT gs.snapshot_id
               FROM gex_snapshots gs
-              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying AND gs.source = a.source
             )
             SELECT DISTINCT gbes.expiration, gbes.dte_days
             FROM gex_by_expiry_strike gbes
@@ -745,14 +757,14 @@ async def get_gex_curve(
         stmt = text(
             """
             WITH anchor AS (
-              SELECT ts, underlying
+              SELECT ts, underlying, source
               FROM gex_snapshots
               WHERE snapshot_id = :snapshot_id
             ),
             batch AS (
               SELECT gs.snapshot_id
               FROM gex_snapshots gs
-              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+              JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying AND gs.source = a.source
             )
             SELECT gbes.strike,
                    SUM(gbes.gex_net) AS gex_net,
@@ -774,14 +786,14 @@ async def get_gex_curve(
             text(
                 """
                 WITH anchor AS (
-                  SELECT ts, underlying
+                  SELECT ts, underlying, source
                   FROM gex_snapshots
                   WHERE snapshot_id = :snapshot_id
                 ),
                 batch AS (
                   SELECT gs.snapshot_id
                   FROM gex_snapshots gs
-                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying AND gs.source = a.source
                 )
                 SELECT gbes.strike,
                        SUM(gbes.gex_net) AS gex_net,
@@ -800,14 +812,14 @@ async def get_gex_curve(
             text(
                 """
                 WITH anchor AS (
-                  SELECT ts, underlying
+                  SELECT ts, underlying, source
                   FROM gex_snapshots
                   WHERE snapshot_id = :snapshot_id
                 ),
                 batch AS (
                   SELECT gs.snapshot_id
                   FROM gex_snapshots gs
-                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying
+                  JOIN anchor a ON gs.ts = a.ts AND gs.underlying = a.underlying AND gs.source = a.source
                 )
                 SELECT gbes.strike,
                        SUM(gbes.gex_net) AS gex_net,

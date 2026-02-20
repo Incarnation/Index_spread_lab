@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
   snapshot_id BIGSERIAL PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL,
   underlying TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'TRADIER',
   target_dte INTEGER NOT NULL,
   expiration DATE NOT NULL,
   payload_json JSONB NOT NULL,
@@ -51,6 +52,8 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_ts ON chain_snapshots (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_exp ON chain_snapshots (expiration, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_underlying_ts ON chain_snapshots (underlying, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_chain_snapshots_source_ts ON chain_snapshots (source, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_chain_snapshots_underlying_source_ts ON chain_snapshots (underlying, source, ts DESC);
 
 CREATE TABLE IF NOT EXISTS option_chain_rows (
   snapshot_id BIGINT NOT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -89,6 +92,7 @@ CREATE TABLE IF NOT EXISTS gex_snapshots (
   snapshot_id BIGINT PRIMARY KEY REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
   ts TIMESTAMPTZ NOT NULL,
   underlying TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'TRADIER',
   spot_price DOUBLE PRECISION NULL,
   gex_net DOUBLE PRECISION NULL,
   gex_calls DOUBLE PRECISION NULL,
@@ -97,6 +101,9 @@ CREATE TABLE IF NOT EXISTS gex_snapshots (
   zero_gamma_level DOUBLE PRECISION NULL,
   method TEXT NOT NULL DEFAULT 'oi_gamma_spot'
 );
+
+CREATE INDEX IF NOT EXISTS idx_gex_snapshots_source_ts ON gex_snapshots (source, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_gex_snapshots_underlying_source_ts ON gex_snapshots (underlying, source, ts DESC);
 
 CREATE TABLE IF NOT EXISTS gex_by_strike (
   snapshot_id BIGINT NOT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,

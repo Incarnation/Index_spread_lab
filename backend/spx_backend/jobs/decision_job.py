@@ -516,6 +516,7 @@ class DecisionJob:
                 SELECT snapshot_id, ts, expiration, target_dte
                 FROM chain_snapshots
                 WHERE underlying = :underlying
+                  AND source = 'TRADIER'
                   AND ts <= :now_ts
                   {freshness_sql}
                   AND target_dte BETWEEN :min_dte AND :max_dte
@@ -542,6 +543,7 @@ class DecisionJob:
                     SELECT snapshot_id, ts, expiration, target_dte
                     FROM chain_snapshots
                     WHERE underlying = :underlying
+                      AND source = 'TRADIER'
                       AND ts <= :now_ts
                       {freshness_sql}
                     ORDER BY ABS(target_dte - :target_dte) ASC, ts DESC, snapshot_id DESC

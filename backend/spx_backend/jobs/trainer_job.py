@@ -657,6 +657,8 @@ class TrainerJob:
                         "vix_regime",
                         "term_structure_regime",
                         "spy_spx_ratio_regime",
+                        "cboe_regime",
+                        "cboe_wall_proximity",
                         "vix_delta_interaction_bucket",
                         "dte_credit_interaction_bucket",
                     ],

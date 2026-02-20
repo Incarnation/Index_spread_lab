@@ -257,6 +257,7 @@ export type GexSnapshot = {
   snapshot_id: number;
   ts: string;
   underlying: string;
+  source: string;
   spot_price: number | null;
   gex_net: number | null;
   gex_calls: number | null;
@@ -284,10 +285,13 @@ export type GexExpirationItem = {
  * When `underlying` is provided, the backend returns only that symbol's
  * snapshots so the UI can switch between SPX/SPY/VIX cleanly.
  */
-export async function fetchGexSnapshots(limit = 20, underlying?: string): Promise<GexSnapshot[]> {
+export async function fetchGexSnapshots(limit = 20, underlying?: string, source?: string): Promise<GexSnapshot[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (underlying && underlying.trim()) {
     params.set("underlying", underlying.trim().toUpperCase());
+  }
+  if (source && source.trim()) {
+    params.set("source", source.trim().toUpperCase());
   }
   const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);

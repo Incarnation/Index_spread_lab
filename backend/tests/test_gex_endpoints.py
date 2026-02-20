@@ -54,6 +54,7 @@ async def test_list_gex_snapshots_shapes_response_without_filter() -> None:
                     snapshot_id=862,
                     ts=datetime(2026, 2, 17, 8, 51, tzinfo=timezone.utc),
                     underlying="SPX",
+                    source="TRADIER",
                     spot_price=6819.4,
                     gex_net=-2010.5,
                     gex_calls=120.0,
@@ -74,6 +75,7 @@ async def test_list_gex_snapshots_shapes_response_without_filter() -> None:
     assert "UPPER(TRIM(underlying)) = :underlying" not in sql
     assert params == {"limit": 10}
     assert result["items"][0]["underlying"] == "SPX"
+    assert result["items"][0]["source"] == "TRADIER"
     assert result["items"][0]["snapshot_id"] == 862
 
 
@@ -89,6 +91,20 @@ async def test_list_gex_snapshots_applies_underlying_filter_case_insensitive() -
     assert "UPPER(TRIM(underlying)) = :underlying" in sql
     assert params["underlying"] == "SPY"
     assert params["limit"] == 25
+
+
+@pytest.mark.asyncio
+async def test_list_gex_snapshots_applies_source_filter_case_insensitive() -> None:
+    """Source filter is normalized to uppercase and applied in SQL."""
+    session = _FakeSession(row_batches=[[]])
+
+    await list_gex_snapshots(limit=12, source="cboe", db=session)
+
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "UPPER(TRIM(source)) = :source" in sql
+    assert params["source"] == "CBOE"
+    assert params["limit"] == 12
 
 
 @pytest.mark.asyncio
@@ -155,6 +171,7 @@ async def test_get_gex_curve_custom_dates_uses_expiration_filter_query() -> None
     assert len(session.calls) == 1
     sql, params = session.calls[0]
     assert "WITH anchor AS" in sql
+    assert "gs.source = a.source" in sql
     assert "expiration IN (" in sql
     assert params["snapshot_id"] == 2
     assert params["expirations"] == [date(2026, 2, 17), date(2026, 2, 18)]
@@ -175,6 +192,7 @@ async def test_get_gex_curve_all_mode_falls_back_to_gex_by_strike_when_needed() 
     assert len(session.calls) == 2
     first_sql, _ = session.calls[0]
     second_sql, _ = session.calls[1]
+    assert "gs.source = a.source" in first_sql
     assert "FROM gex_by_expiry_strike" in first_sql
     assert "FROM gex_by_strike" in second_sql
     assert result["points"] == [{"strike": 6800.0, "gex_net": 5.0, "gex_calls": 8.0, "gex_puts": -3.0}]

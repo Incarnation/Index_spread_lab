@@ -10,6 +10,7 @@ from spx_backend.config import settings
 from spx_backend.web.routers.auth import UserOut, _normalize_ip, get_current_user, require_admin
 from spx_backend.database import get_db_session
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
+from spx_backend.jobs.cboe_gex_job import CboeGexJob, build_cboe_gex_job
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
 from spx_backend.jobs.gex_job import GexJob
@@ -81,6 +82,17 @@ async def admin_run_gex(
 ) -> dict:
     """Force a GEX run immediately."""
     job: GexJob = getattr(request.app.state, "gex_job", GexJob())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-cboe-gex")
+async def admin_run_cboe_gex(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
+    """Force a CBOE-mode precomputed GEX run immediately."""
+    job: CboeGexJob = getattr(request.app.state, "cboe_gex_job", build_cboe_gex_job())
     result = await job.run_once(force=True)
     return result
 
