@@ -57,6 +57,9 @@ type HeatmapRow = {
 };
 
 const GEX_VIEW_STORAGE_KEY = "dashboard.gex.chartView";
+const GEX_STRIKE_COUNT_STORAGE_KEY = "dashboard.gex.strikeCount";
+const GEX_STRIKE_COUNT_OPTIONS = ["50", "100", "150", "all"] as const;
+type GexStrikeCountOption = (typeof GEX_STRIKE_COUNT_OPTIONS)[number];
 
 /**
  * Load the persisted GEX chart view, defaulting to composed mode.
@@ -76,6 +79,32 @@ function readStoredGexView(): ChartView {
 function writeStoredGexView(value: ChartView): void {
   try {
     window.localStorage.setItem(GEX_VIEW_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage write errors.
+  }
+}
+
+/**
+ * Load the persisted strike-window size for GEX charts.
+ */
+function readStoredGexStrikeCount(): GexStrikeCountOption {
+  try {
+    const raw = window.localStorage.getItem(GEX_STRIKE_COUNT_STORAGE_KEY);
+    if (raw && GEX_STRIKE_COUNT_OPTIONS.includes(raw as GexStrikeCountOption)) {
+      return raw as GexStrikeCountOption;
+    }
+    return "all";
+  } catch {
+    return "all";
+  }
+}
+
+/**
+ * Save the selected strike-window size for GEX charts.
+ */
+function writeStoredGexStrikeCount(value: GexStrikeCountOption): void {
+  try {
+    window.localStorage.setItem(GEX_STRIKE_COUNT_STORAGE_KEY, value);
   } catch {
     // Ignore storage write errors.
   }
@@ -140,6 +169,25 @@ function findNearestStrike(target: number | null | undefined, strikes: number[])
     }
   }
   return nearest;
+}
+
+/**
+ * Keep only the nearest N strikes to a reference level (spot by default).
+ */
+function selectNearestStrikes(allStrikes: number[], target: number | null | undefined, limit: number): number[] {
+  if (limit <= 0 || allStrikes.length <= limit) {
+    return [...allStrikes].sort((a, b) => a - b);
+  }
+  const fallbackTarget = allStrikes.length > 0 ? allStrikes[Math.floor(allStrikes.length / 2)] : 0;
+  const reference = typeof target === "number" ? target : fallbackTarget;
+  return [...allStrikes]
+    .sort((a, b) => {
+      const distanceDiff = Math.abs(a - reference) - Math.abs(b - reference);
+      if (distanceDiff !== 0) return distanceDiff;
+      return a - b;
+    })
+    .slice(0, limit)
+    .sort((a, b) => a - b);
 }
 
 /** Compact large GEX values for axis ticks and tooltips. */
@@ -212,6 +260,9 @@ export function GexPanel({
   curve,
 }: GexPanelProps) {
   const [chartView, setChartView] = React.useState<ChartView>(() => readStoredGexView());
+  const [selectedStrikeCount, setSelectedStrikeCount] = React.useState<GexStrikeCountOption>(() =>
+    readStoredGexStrikeCount()
+  );
   const [heatmapRows, setHeatmapRows] = React.useState<HeatmapRow[]>([]);
   const [heatmapStrikes, setHeatmapStrikes] = React.useState<number[]>([]);
   const [heatmapMaxAbs, setHeatmapMaxAbs] = React.useState<number>(0);
@@ -223,7 +274,13 @@ export function GexPanel({
     () => snapshots.filter((snapshot) => normalizeUnderlying(snapshot.underlying) === normalizedUnderlying),
     [normalizedUnderlying, snapshots],
   );
-  const chartRows = React.useMemo<ChartRow[]>(
+  const strikeSelectionTarget = React.useMemo(() => {
+    if (!selectedSnapshot) return null;
+    if (normalizeUnderlying(selectedSnapshot.underlying) !== normalizedUnderlying) return null;
+    return typeof selectedSnapshot.spot_price === "number" ? selectedSnapshot.spot_price : null;
+  }, [normalizedUnderlying, selectedSnapshot]);
+  const strikeLimit = selectedStrikeCount === "all" ? null : Number(selectedStrikeCount);
+  const allChartRows = React.useMemo<ChartRow[]>(
     () =>
       curve
         .map((point) => ({
@@ -235,6 +292,13 @@ export function GexPanel({
         .sort((a, b) => a.strike - b.strike),
     [curve],
   );
+  const chartRows = React.useMemo<ChartRow[]>(() => {
+    if (strikeLimit == null || allChartRows.length <= strikeLimit) {
+      return allChartRows;
+    }
+    const selectedStrikes = new Set(selectNearestStrikes(allChartRows.map((row) => row.strike), strikeSelectionTarget, strikeLimit));
+    return allChartRows.filter((row) => selectedStrikes.has(row.strike));
+  }, [allChartRows, strikeLimit, strikeSelectionTarget]);
   const curveStrikes = React.useMemo(() => chartRows.map((row) => row.strike), [chartRows]);
 
   const snapshotOptions = React.useMemo(
@@ -317,11 +381,17 @@ export function GexPanel({
     () => findNearestStrike(selectedSnapshotForDisplay?.zero_gamma_level, curveStrikes),
     [curveStrikes, selectedSnapshotForDisplay?.zero_gamma_level],
   );
+  const visibleHeatmapStrikes = React.useMemo(() => {
+    if (strikeLimit == null || heatmapStrikes.length <= strikeLimit) {
+      return heatmapStrikes;
+    }
+    return selectNearestStrikes(heatmapStrikes, strikeSelectionTarget, strikeLimit);
+  }, [heatmapStrikes, strikeLimit, strikeSelectionTarget]);
 
   const heatmapLabelStep = React.useMemo(() => {
-    if (heatmapStrikes.length <= 12) return 1;
-    return Math.ceil(heatmapStrikes.length / 12);
-  }, [heatmapStrikes.length]);
+    if (visibleHeatmapStrikes.length <= 12) return 1;
+    return Math.ceil(visibleHeatmapStrikes.length / 12);
+  }, [visibleHeatmapStrikes.length]);
 
   /**
    * Persist selected chart view between reloads for analyst convenience.
@@ -329,6 +399,13 @@ export function GexPanel({
   React.useEffect(() => {
     writeStoredGexView(chartView);
   }, [chartView]);
+
+  /**
+   * Persist selected strike-window size between reloads.
+   */
+  React.useEffect(() => {
+    writeStoredGexStrikeCount(selectedStrikeCount);
+  }, [selectedStrikeCount]);
 
   /**
    * Load per-expiration curves for heatmap mode and normalize them into a
@@ -419,6 +496,24 @@ export function GexPanel({
             placeholder="Select capture batch"
           />
           <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
+          <Select
+            label="Strikes"
+            data={[
+              { value: "50", label: "50" },
+              { value: "100", label: "100" },
+              { value: "150", label: "150" },
+              { value: "all", label: "All" },
+            ]}
+            value={selectedStrikeCount}
+            onChange={(value) => {
+              if (!value || !GEX_STRIKE_COUNT_OPTIONS.includes(value as GexStrikeCountOption)) {
+                setSelectedStrikeCount("all");
+                return;
+              }
+              setSelectedStrikeCount(value as GexStrikeCountOption);
+            }}
+            w={120}
+          />
           <div>
             <Text size="xs" c="dimmed" mb={4}>
               View
@@ -523,7 +618,7 @@ export function GexPanel({
         <Text c="dimmed">No heatmap data available for this selection.</Text>
       )}
 
-      {chartView === "heatmap" && !heatmapLoading && !heatmapError && heatmapRows.length > 0 && heatmapStrikes.length > 0 && (
+      {chartView === "heatmap" && !heatmapLoading && !heatmapError && heatmapRows.length > 0 && visibleHeatmapStrikes.length > 0 && (
         <div style={{ width: "100%" }}>
           <Group gap={8} mb="xs" align="center">
             <Text size="xs" c="dimmed">
@@ -556,13 +651,13 @@ export function GexPanel({
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: `160px repeat(${heatmapStrikes.length}, 12px)`,
+                gridTemplateColumns: `160px repeat(${visibleHeatmapStrikes.length}, 12px)`,
                 gap: 2,
-                minWidth: 160 + heatmapStrikes.length * 14,
+                minWidth: 160 + visibleHeatmapStrikes.length * 14,
               }}
             >
               <div />
-              {heatmapStrikes.map((strike, index) => (
+              {visibleHeatmapStrikes.map((strike, index) => (
                 <div
                   key={`strike-${strike}`}
                   style={{ fontSize: 10, lineHeight: "12px", color: "#868e96", textAlign: "center", minHeight: 12 }}
@@ -576,7 +671,7 @@ export function GexPanel({
                   <Text size="xs" style={{ alignSelf: "center" }}>
                     {row.dte_days == null ? row.expiration : `${row.expiration} (DTE ${row.dte_days})`}
                   </Text>
-                  {heatmapStrikes.map((strike) => {
+                  {visibleHeatmapStrikes.map((strike) => {
                     const value = row.byStrike.get(strike);
                     return (
                       <div
