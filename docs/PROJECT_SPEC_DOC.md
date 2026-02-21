@@ -220,9 +220,6 @@ Backend configuration is loaded via `pydantic-settings` from `.env` (repo root) 
 - **`ALLOW_QUOTES_OUTSIDE_RTH`**
   - Default: `false`
   - Controls quote-only scheduler gating.
-- **`ADMIN_API_KEY`**
-  - Default: unset
-  - If set, admin endpoints require `X-API-Key` header.
 - **`MARKET_CLOCK_CACHE_SECONDS`**
   - Default: `300`
   - Cache TTL for Tradier market clock responses.
@@ -368,7 +365,7 @@ Normalized multi-leg trades (supports verticals, condors, butterflies).
     - `items[]`: `{ snapshot_id, ts, underlying, target_dte, expiration, checksum }`
 
 ### Admin
-Admin endpoints are optionally protected by `ADMIN_API_KEY` via `X-API-Key` header.
+Admin endpoints require a valid authenticated user token.
 
 - `POST /api/admin/run-snapshot`
   - Forces a snapshot run immediately.

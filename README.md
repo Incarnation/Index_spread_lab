@@ -181,10 +181,10 @@ Primary knobs:
   - `FEATURE_SCHEMA_VERSION`
   - `CANDIDATE_SCHEMA_VERSION`
   - `LABELER_ENABLED`
-  - `LABELER_INTERVAL_MINUTES`
   - `LABELER_BATCH_LIMIT`
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
+  - Schedule: daily after close (Mon-Fri) at 16:15 ET
 - Weekly trainer:
   - `TRAINER_ENABLED`
   - `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`
@@ -193,13 +193,12 @@ Primary knobs:
   - `TRAINER_MIN_ROWS`, `TRAINER_MIN_TRAIN_ROWS`, `TRAINER_MIN_TEST_ROWS`
 - Shadow inference:
   - `SHADOW_INFERENCE_ENABLED`
-  - `SHADOW_INFERENCE_INTERVAL_MINUTES`
   - `SHADOW_INFERENCE_BATCH_LIMIT`
   - `SHADOW_INFERENCE_LOOKBACK_MINUTES`
   - `SHADOW_INFERENCE_MODEL_NAME`
+  - Schedule: daily after close (Mon-Fri) at 16:20 ET
 - Promotion gates:
   - `PROMOTION_GATE_ENABLED`
-  - `PROMOTION_GATE_INTERVAL_MINUTES`
   - `PROMOTION_GATE_MODEL_NAME`
   - `PROMOTION_GATE_MIN_RESOLVED`
   - `PROMOTION_GATE_MIN_TP50_RATE`
@@ -208,6 +207,7 @@ Primary knobs:
   - `PROMOTION_GATE_MIN_TAIL_LOSS_PROXY`
   - `PROMOTION_GATE_MAX_AVG_MARGIN_USAGE`
   - `PROMOTION_GATE_AUTO_ACTIVATE`
+  - Schedule: weekly after trainer (trainer cron + 60 minutes)
 - Live trade PnL:
   - `TRADE_PNL_ENABLED`
   - `TRADE_PNL_INTERVAL_MINUTES`
@@ -231,7 +231,6 @@ Primary knobs:
   - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
   - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
 - Ops:
-  - `ADMIN_API_KEY`
   - `CORS_ORIGINS`
   - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
   - `ALLOW_QUOTES_OUTSIDE_RTH`
@@ -288,7 +287,7 @@ Public read endpoints:
 - `GET /api/strategy-metrics`
 - `GET /api/model-ops`
 
-Admin endpoints (`X-API-Key` required if `ADMIN_API_KEY` is configured):
+Admin endpoints (authenticated user required):
 - `POST /api/admin/run-snapshot`
 - `POST /api/admin/run-quotes`
 - `POST /api/admin/run-gex`
@@ -411,11 +410,9 @@ Backend service:
 Checklist:
 1) Provision Railway Postgres.
 2) Set backend env vars from `.env.example`.
-3) Set `APP_ENV=production`.
-4) Set `ADMIN_API_KEY`.
-5) Set `CORS_ORIGINS` to your frontend domain.
-6) Keep secrets only in Railway variables.
-7) Run `make test-predeploy` before shipping changes.
+3) Set `CORS_ORIGINS` to your frontend domain.
+4) Keep secrets only in Railway variables.
+5) Run `make test-predeploy` before shipping changes.
 
 Frontend service:
 - Deploy `frontend/` as static Vite app.

@@ -270,8 +270,7 @@ Batch-scoped GEX note:
 
 ### Admin Endpoints
 
-If `ADMIN_API_KEY` is set, include header:
-- `X-API-Key: <key>`
+All admin endpoints require a valid authenticated user token.
 
 Routes:
 - `POST /api/admin/run-snapshot`
@@ -355,13 +354,13 @@ High-impact settings:
   - `CANDIDATE_SCHEMA_VERSION`
 - Labeler:
   - `LABELER_ENABLED`
-  - `LABELER_INTERVAL_MINUTES`
   - `LABELER_BATCH_LIMIT`
   - `LABELER_MIN_AGE_MINUTES`
   - `LABELER_MAX_WAIT_HOURS`
   - `LABELER_TAKE_PROFIT_PCT`
   - `LABEL_SCHEMA_VERSION`
   - `LABEL_CONTRACT_MULTIPLIER`
+  - Schedule: daily after close (Mon-Fri) at 16:15 ET
 - Weekly trainer:
   - `TRAINER_ENABLED`
   - `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`
@@ -370,13 +369,12 @@ High-impact settings:
   - `TRAINER_MIN_ROWS`, `TRAINER_MIN_TRAIN_ROWS`, `TRAINER_MIN_TEST_ROWS`
 - Shadow inference:
   - `SHADOW_INFERENCE_ENABLED`
-  - `SHADOW_INFERENCE_INTERVAL_MINUTES`
   - `SHADOW_INFERENCE_BATCH_LIMIT`
   - `SHADOW_INFERENCE_LOOKBACK_MINUTES`
   - `SHADOW_INFERENCE_MODEL_NAME`
+  - Schedule: daily after close (Mon-Fri) at 16:20 ET
 - Promotion gates:
   - `PROMOTION_GATE_ENABLED`
-  - `PROMOTION_GATE_INTERVAL_MINUTES`
   - `PROMOTION_GATE_MODEL_NAME`
   - `PROMOTION_GATE_MIN_RESOLVED`
   - `PROMOTION_GATE_MIN_TP50_RATE`
@@ -385,6 +383,7 @@ High-impact settings:
   - `PROMOTION_GATE_MIN_TAIL_LOSS_PROXY`
   - `PROMOTION_GATE_MAX_AVG_MARGIN_USAGE`
   - `PROMOTION_GATE_AUTO_ACTIVATE`
+  - Schedule: weekly after trainer (trainer cron + 60 minutes)
 - Trade PnL:
   - `TRADE_PNL_ENABLED`
   - `TRADE_PNL_INTERVAL_MINUTES`
@@ -411,7 +410,6 @@ High-impact settings:
 - Ops/Safety:
   - `ALLOW_QUOTES_OUTSIDE_RTH`
   - `MARKET_CLOCK_CACHE_SECONDS`
-  - `ADMIN_API_KEY`
   - `CORS_ORIGINS`
   - `TZ`
 
@@ -613,9 +611,7 @@ Current coverage domains:
 ## 11) Railway Deployment Notes
 
 Required:
-- `APP_ENV=production`
 - valid `DATABASE_URL`
-- `ADMIN_API_KEY` enabled
 - `CORS_ORIGINS` includes deployed frontend
 
 Tradier mode:

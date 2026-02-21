@@ -10,7 +10,6 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from spx_backend.config import settings
 from spx_backend.web.routers import admin, auth, public
 
 
@@ -70,9 +69,8 @@ async def integration_db_session(database_url_test: str) -> AsyncSession:
 
 
 @pytest.fixture
-def admin_headers(monkeypatch) -> dict[str, str]:
-    """Enable admin API key auth in test app and return valid header."""
-    monkeypatch.setattr(settings, "admin_api_key", "test-key")
+def admin_headers() -> dict[str, str]:
+    """Return optional admin header used by integration request helpers."""
     return {"X-API-Key": "test-key"}
 
 

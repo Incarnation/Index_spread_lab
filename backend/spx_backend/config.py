@@ -7,7 +7,6 @@ class Settings(BaseSettings):
     # When running locally, we typically run from repo root or from backend/.
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 
-    app_env: str = "local"
     log_level: str = "INFO"
     """If True, skip running quote/snapshot/gex jobs once on startup (server becomes ready immediately). Scheduler still runs jobs on their intervals."""
     skip_startup_warmup: bool = False
@@ -97,7 +96,6 @@ class Settings(BaseSettings):
 
     # ML label resolver (step 2)
     labeler_enabled: bool = True
-    labeler_interval_minutes: int = 15
     labeler_batch_limit: int = 200
     labeler_min_age_minutes: int = 5
     labeler_max_wait_hours: int = 336
@@ -133,14 +131,12 @@ class Settings(BaseSettings):
 
     # Shadow inference (step 4)
     shadow_inference_enabled: bool = True
-    shadow_inference_interval_minutes: int = 15
     shadow_inference_batch_limit: int = 500
     shadow_inference_lookback_minutes: int = 1440
     shadow_inference_model_name: str = "cand_bucket_v1"
 
     # Promotion gate evaluator (step 5)
     promotion_gate_enabled: bool = True
-    promotion_gate_interval_minutes: int = 60
     promotion_gate_model_name: str = "cand_bucket_v1"
     promotion_gate_min_resolved: int = 100
     promotion_gate_min_tp50_rate: float = 0.50
@@ -177,7 +173,6 @@ class Settings(BaseSettings):
     # Testing/ops controls
     allow_snapshot_outside_rth: bool = False
     allow_quotes_outside_rth: bool = False
-    admin_api_key: str | None = None
     market_clock_cache_seconds: int = 300
 
     # Auth: JWT and user registration (multiple users, in-house auth).
