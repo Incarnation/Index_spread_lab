@@ -20,6 +20,7 @@ import {
 
 type UseSnapshotsDecisionsArgs = {
   adminKey: string;
+  performanceAnalyticsLookbackDays: number;
   onError: (message: string) => void;
 };
 
@@ -51,8 +52,13 @@ type UseSnapshotsDecisionsResult = {
  * This hook centralizes fetch orchestration for snapshots, decisions, trades,
  * label metrics, strategy metrics, model-ops metrics, and admin preflight
  * freshness diagnostics so the page renders from a single source of truth.
+ * Performance analytics lookback is caller-controlled to support 1/7/30-day views.
  */
-export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisionsArgs): UseSnapshotsDecisionsResult {
+export function useSnapshotsDecisions({
+  adminKey,
+  performanceAnalyticsLookbackDays,
+  onError,
+}: UseSnapshotsDecisionsArgs): UseSnapshotsDecisionsResult {
   const [items, setItems] = React.useState<ChainSnapshot[]>([]);
   const [decisions, setDecisions] = React.useState<TradeDecision[]>([]);
   const [trades, setTrades] = React.useState<TradeRow[]>([]);
@@ -115,8 +121,8 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
       fetchLabelMetrics(90),
       fetchModelOps(),
       fetchStrategyMetrics(90),
-      fetchPerformanceAnalytics(90, "combined"),
-      fetchPerformanceAnalytics(90, "realized"),
+      fetchPerformanceAnalytics(performanceAnalyticsLookbackDays, "combined"),
+      fetchPerformanceAnalytics(performanceAnalyticsLookbackDays, "realized"),
       preflightPromise,
     ])
       .then(([snapshotRows, decisionRows, tradeRows, metrics, ops, strategy, combinedAnalytics, realizedAnalytics]) => {
@@ -139,7 +145,7 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
         setStrategyMetricsLoading(false);
         setPerformanceAnalyticsLoading(false);
       });
-  }, [adminKey, onError]);
+  }, [adminKey, onError, performanceAnalyticsLookbackDays]);
 
   React.useEffect(() => {
     refresh();

@@ -92,6 +92,7 @@ function maskSecret(value: string): string {
 export function DashboardApp() {
   const { user, logout } = useAuth();
   const [error, setError] = React.useState<string | null>(null);
+  const [performanceAnalyticsLookbackDays, setPerformanceAnalyticsLookbackDays] = React.useState<number>(30);
   const adminKey = React.useMemo(() => readFrontendAdminKey(), []);
   const [drawerOpen, setDrawerOpen] = React.useState<boolean>(false);
   const [drawerDecision, setDrawerDecision] = React.useState<{
@@ -129,7 +130,11 @@ export function DashboardApp() {
     preflightLoading,
     preflightAuthRequired,
     refresh,
-  } = useSnapshotsDecisions({ adminKey, onError: handleError });
+  } = useSnapshotsDecisions({
+    adminKey,
+    performanceAnalyticsLookbackDays,
+    onError: handleError,
+  });
 
   const {
     gexSnapshots,
@@ -234,6 +239,8 @@ export function DashboardApp() {
           realized={performanceAnalyticsRealized}
           loading={performanceAnalyticsLoading}
           error={error}
+          lookbackDays={performanceAnalyticsLookbackDays}
+          onLookbackDaysChange={setPerformanceAnalyticsLookbackDays}
         />
 
         <TradesLivePnlPanel trades={trades} loading={tradesLoading} error={error} />

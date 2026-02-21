@@ -16,6 +16,8 @@ type PerformanceAnalyticsPanelProps = {
   realized: PerformanceAnalyticsResponse | null;
   loading: boolean;
   error: string | null;
+  lookbackDays: number;
+  onLookbackDaysChange: (days: number) => void;
 };
 
 /** Format ratio values (0..1) as percentages for badge/table display. */
@@ -37,6 +39,13 @@ function tooltipFormatter(value: number | string | undefined, name: string | und
   if (name === "cumulative_pnl") return [formatMoney(numericValue), "Cumulative PnL"];
   if (name === "daily_pnl") return [formatMoney(numericValue), "Daily PnL"];
   return [String(value), name ?? ""];
+}
+
+/** Convert segmented-control lookback value into a supported day window. */
+function parseLookbackValue(value: string): number {
+  const parsed = Number(value);
+  if (parsed === 1 || parsed === 7 || parsed === 30) return parsed;
+  return 30;
 }
 
 /** Render one compact breakdown table for a specific analytics dimension. */
@@ -95,7 +104,14 @@ function BreakdownTable({
  * This panel renders KPI badges, an equity-curve chart, and grouped breakdown
  * tables backed by the aggregate-first `/api/performance-analytics` payload.
  */
-export function PerformanceAnalyticsPanel({ combined, realized, loading, error }: PerformanceAnalyticsPanelProps) {
+export function PerformanceAnalyticsPanel({
+  combined,
+  realized,
+  loading,
+  error,
+  lookbackDays,
+  onLookbackDaysChange,
+}: PerformanceAnalyticsPanelProps) {
   const [mode, setMode] = React.useState<PerformanceAnalyticsMode>("combined");
   const active = mode === "combined" ? combined : realized;
   const summary = active?.summary ?? null;
@@ -105,6 +121,15 @@ export function PerformanceAnalyticsPanel({ combined, realized, loading, error }
       <Group justify="space-between" align="center" mb="sm">
         <Text fw={600}>PnL analytics (aggregate-first)</Text>
         <Group gap="xs">
+          <SegmentedControl
+            value={String(lookbackDays)}
+            onChange={(nextValue) => onLookbackDaysChange(parseLookbackValue(nextValue))}
+            data={[
+              { value: "1", label: "1D" },
+              { value: "7", label: "7D" },
+              { value: "30", label: "30D" },
+            ]}
+          />
           <SegmentedControl
             value={mode}
             onChange={(nextMode) => setMode((nextMode as PerformanceAnalyticsMode) || "combined")}
@@ -122,7 +147,7 @@ export function PerformanceAnalyticsPanel({ combined, realized, loading, error }
             </Group>
           ) : (
             <Text c="dimmed" size="sm">
-              Last {active?.lookback_days ?? 0} days
+              Last {active?.lookback_days ?? lookbackDays} days
             </Text>
           )}
         </Group>
