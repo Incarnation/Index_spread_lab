@@ -15,6 +15,7 @@ from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
+from spx_backend.jobs.performance_analytics_job import PerformanceAnalyticsJob, build_performance_analytics_job
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob, build_promotion_gate_job
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob, build_shadow_inference_job
@@ -137,6 +138,18 @@ async def admin_run_trade_pnl(
 ) -> dict:
     """Force trade mark-to-market run immediately."""
     job: TradePnlJob = getattr(request.app.state, "trade_pnl_job", build_trade_pnl_job())
+    result = await job.run_once(force=True)
+    return result
+
+
+@router.post("/api/admin/run-performance-analytics")
+async def admin_run_performance_analytics(
+    request: Request,
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
+    """Force performance-analytics aggregate refresh immediately."""
+    state_job = getattr(request.app.state, "performance_analytics_job", None)
+    job: PerformanceAnalyticsJob = state_job if state_job is not None else build_performance_analytics_job()
     result = await job.run_once(force=True)
     return result
 

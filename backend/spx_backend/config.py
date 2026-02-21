@@ -168,6 +168,10 @@ class Settings(BaseSettings):
     trade_pnl_stop_loss_pct: float = 1.00
     trade_pnl_contract_multiplier: int = 100
 
+    # Aggregate PnL analytics refresher
+    performance_analytics_enabled: bool = False
+    performance_analytics_interval_minutes: int = 10
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls

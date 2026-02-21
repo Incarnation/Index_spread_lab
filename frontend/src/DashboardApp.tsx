@@ -7,6 +7,7 @@ import {
   GexPanel,
   LabelMetricsPanel,
   ModelOpsPanel,
+  PerformanceAnalyticsPanel,
   PipelineStatusBar,
   StrategyQualityPanel,
   TradeDecisionDetailsDrawer,
@@ -115,12 +116,15 @@ export function DashboardApp() {
     labelMetrics,
     modelOps,
     strategyMetrics,
+    performanceAnalyticsCombined,
+    performanceAnalyticsRealized,
     loading,
     decisionsLoading,
     tradesLoading,
     labelMetricsLoading,
     modelOpsLoading,
     strategyMetricsLoading,
+    performanceAnalyticsLoading,
     preflight,
     preflightLoading,
     preflightAuthRequired,
@@ -225,6 +229,12 @@ export function DashboardApp() {
         <LabelMetricsPanel metrics={labelMetrics} loading={labelMetricsLoading} error={error} />
         <ModelOpsPanel ops={modelOps} loading={modelOpsLoading} error={error} />
         <StrategyQualityPanel metrics={strategyMetrics} loading={strategyMetricsLoading} error={error} />
+        <PerformanceAnalyticsPanel
+          combined={performanceAnalyticsCombined}
+          realized={performanceAnalyticsRealized}
+          loading={performanceAnalyticsLoading}
+          error={error}
+        />
 
         <TradesLivePnlPanel trades={trades} loading={tradesLoading} error={error} />
 

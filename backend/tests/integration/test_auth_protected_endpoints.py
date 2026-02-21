@@ -73,6 +73,15 @@ async def test_protected_endpoint_returns_401_without_token(integration_client_w
 
 
 @pytest.mark.asyncio
+async def test_performance_analytics_endpoint_returns_401_without_token(
+    integration_client_with_auth: AsyncClient,
+) -> None:
+    """GET /api/performance-analytics without Authorization returns 401."""
+    r = await integration_client_with_auth.get("/api/performance-analytics")
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_health_remains_public(integration_client_with_auth: AsyncClient) -> None:
     """GET /health does not require auth."""
     r = await integration_client_with_auth.get("/health")

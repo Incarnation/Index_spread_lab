@@ -278,6 +278,54 @@ async def test_lifespan_wires_spy_snapshot_job_when_enabled(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_lifespan_wires_performance_analytics_job_when_enabled(monkeypatch) -> None:
+    """Verify analytics refresh job is scheduled and exposed on app.state."""
+    import apscheduler.schedulers.asyncio as aps_asyncio
+
+    spx_snapshot_job = _FakeJob()
+    performance_analytics_job = _FakeJob()
+
+    monkeypatch.setattr(aps_asyncio, "AsyncIOScheduler", _FakeScheduler)
+    monkeypatch.setattr(app_module, "init_db", _fake_init_db)
+    monkeypatch.setattr(app_module, "get_tradier_client", lambda: object())
+    monkeypatch.setattr(app_module, "MarketClockCache", _FakeClockCache)
+    monkeypatch.setattr(app_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
+    monkeypatch.setattr(app_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
+    monkeypatch.setattr(app_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
+    monkeypatch.setattr(app_module, "build_performance_analytics_job", lambda **kwargs: performance_analytics_job)
+    monkeypatch.setattr(app_module, "QuoteJob", _FakeJob)
+    monkeypatch.setattr(app_module, "GexJob", _FakeJob)
+    monkeypatch.setattr(app_module, "DecisionJob", _FakeJob)
+    monkeypatch.setattr(app_module, "FeatureBuilderJob", _FakeJob)
+    monkeypatch.setattr(app_module, "LabelerJob", _FakeJob)
+    monkeypatch.setattr(app_module, "TradePnlJob", _FakeJob)
+    monkeypatch.setattr(app_module, "TrainerJob", _FakeJob)
+    monkeypatch.setattr(app_module, "ShadowInferenceJob", _FakeJob)
+    monkeypatch.setattr(app_module, "PromotionGateJob", _FakeJob)
+
+    monkeypatch.setattr(settings, "performance_analytics_enabled", True)
+    monkeypatch.setattr(settings, "performance_analytics_interval_minutes", 15)
+    monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
+    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
+    monkeypatch.setattr(settings, "cboe_gex_enabled", False)
+    monkeypatch.setattr(settings, "skip_startup_warmup", False)
+    monkeypatch.setattr(settings, "labeler_enabled", False)
+    monkeypatch.setattr(settings, "trade_pnl_enabled", False)
+    monkeypatch.setattr(settings, "trainer_enabled", False)
+    monkeypatch.setattr(settings, "shadow_inference_enabled", False)
+    monkeypatch.setattr(settings, "promotion_gate_enabled", False)
+
+    async with app_module.lifespan(app_module.app):
+        scheduler = app_module.app.state.scheduler
+        job_ids = {job["id"] for job in scheduler.jobs}
+        assert "performance_analytics_job" in job_ids
+        assert "performance_analytics_job_close" in job_ids
+        assert app_module.app.state.performance_analytics_job is performance_analytics_job
+        assert performance_analytics_job.run_calls == 1
+        assert _job_by_id(scheduler, "performance_analytics_job_close")["kwargs"]["kwargs"] == {"force": True}
+
+
+@pytest.mark.asyncio
 async def test_lifespan_skips_spy_snapshot_job_when_disabled(monkeypatch) -> None:
     """Verify no SPY scheduler job/state is created when feature is disabled."""
     import apscheduler.schedulers.asyncio as aps_asyncio

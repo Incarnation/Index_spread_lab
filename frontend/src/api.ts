@@ -495,6 +495,90 @@ export async function fetchStrategyMetrics(lookbackDays = 90): Promise<StrategyM
   return (await r.json()) as StrategyMetricsResponse;
 }
 
+export type PerformanceAnalyticsMode = "realized" | "combined";
+
+export type PerformanceAnalyticsSummary = {
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+  net_pnl: number;
+  realized_net_pnl: number;
+  unrealized_net_pnl: number;
+  combined_net_pnl: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  avg_pnl: number | null;
+  expectancy: number | null;
+  profit_factor: number | null;
+  max_drawdown: number | null;
+};
+
+export type PerformanceAnalyticsCurvePoint = {
+  date: string;
+  daily_pnl: number;
+  cumulative_pnl: number;
+  drawdown: number;
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+};
+
+export type PerformanceAnalyticsBreakdownRow = {
+  bucket: string;
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+  net_pnl: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  avg_pnl: number | null;
+  expectancy: number | null;
+  profit_factor: number | null;
+};
+
+export type PerformanceAnalyticsBreakdowns = {
+  side: PerformanceAnalyticsBreakdownRow[];
+  dte_bucket: PerformanceAnalyticsBreakdownRow[];
+  delta_bucket: PerformanceAnalyticsBreakdownRow[];
+  weekday: PerformanceAnalyticsBreakdownRow[];
+  hour: PerformanceAnalyticsBreakdownRow[];
+  source: PerformanceAnalyticsBreakdownRow[];
+};
+
+export type PerformanceAnalyticsResponse = {
+  lookback_days: number;
+  mode: PerformanceAnalyticsMode;
+  window_start_utc: string | null;
+  as_of_utc: string | null;
+  snapshot: {
+    analytics_snapshot_id: number;
+    source_trade_count: number;
+    source_closed_count: number;
+    source_open_count: number;
+  } | null;
+  summary: PerformanceAnalyticsSummary | null;
+  equity_curve: PerformanceAnalyticsCurvePoint[];
+  breakdowns: PerformanceAnalyticsBreakdowns;
+};
+
+/**
+ * Fetch aggregate trade-performance analytics for the selected mode/lookback.
+ */
+export async function fetchPerformanceAnalytics(
+  lookbackDays = 90,
+  mode: PerformanceAnalyticsMode = "combined"
+): Promise<PerformanceAnalyticsResponse> {
+  const params = new URLSearchParams({
+    lookback_days: String(lookbackDays),
+    mode,
+  });
+  const r = await fetchWithAuth(apiUrl(`/api/performance-analytics?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as PerformanceAnalyticsResponse;
+}
+
 export type ModelOpsGate = {
   passed: boolean;
   checks: Record<string, { value: number; threshold: number; pass: boolean }>;

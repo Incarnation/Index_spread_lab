@@ -5,6 +5,7 @@ export { ChainSnapshotsPanel } from "./ChainSnapshotsPanel";
 export { GexPanel } from "./GexPanel";
 export { LabelMetricsPanel } from "./LabelMetricsPanel";
 export { ModelOpsPanel } from "./ModelOpsPanel";
+export { PerformanceAnalyticsPanel } from "./PerformanceAnalyticsPanel";
 export { PipelineRunStepperCard } from "./PipelineRunStepperCard";
 export { PipelineStatusBar } from "./PipelineStatusBar";
 export { ProtectedRoute } from "./ProtectedRoute";

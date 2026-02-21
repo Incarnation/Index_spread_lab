@@ -4,6 +4,7 @@ import {
   fetchChainSnapshots,
   fetchLabelMetrics,
   fetchModelOps,
+  fetchPerformanceAnalytics,
   fetchStrategyMetrics,
   fetchTradeDecisions,
   fetchTrades,
@@ -11,6 +12,7 @@ import {
   type ChainSnapshot,
   type LabelMetricsResponse,
   type ModelOpsResponse,
+  type PerformanceAnalyticsResponse,
   type StrategyMetricsResponse,
   type TradeDecision,
   type TradeRow,
@@ -28,6 +30,8 @@ type UseSnapshotsDecisionsResult = {
   labelMetrics: LabelMetricsResponse | null;
   modelOps: ModelOpsResponse | null;
   strategyMetrics: StrategyMetricsResponse | null;
+  performanceAnalyticsCombined: PerformanceAnalyticsResponse | null;
+  performanceAnalyticsRealized: PerformanceAnalyticsResponse | null;
   preflight: AdminPreflightResponse | null;
   loading: boolean;
   decisionsLoading: boolean;
@@ -35,6 +39,7 @@ type UseSnapshotsDecisionsResult = {
   labelMetricsLoading: boolean;
   modelOpsLoading: boolean;
   strategyMetricsLoading: boolean;
+  performanceAnalyticsLoading: boolean;
   preflightLoading: boolean;
   preflightAuthRequired: boolean;
   refresh: () => void;
@@ -54,6 +59,8 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
   const [labelMetrics, setLabelMetrics] = React.useState<LabelMetricsResponse | null>(null);
   const [modelOps, setModelOps] = React.useState<ModelOpsResponse | null>(null);
   const [strategyMetrics, setStrategyMetrics] = React.useState<StrategyMetricsResponse | null>(null);
+  const [performanceAnalyticsCombined, setPerformanceAnalyticsCombined] = React.useState<PerformanceAnalyticsResponse | null>(null);
+  const [performanceAnalyticsRealized, setPerformanceAnalyticsRealized] = React.useState<PerformanceAnalyticsResponse | null>(null);
   const [preflight, setPreflight] = React.useState<AdminPreflightResponse | null>(null);
   const [loading, setLoading] = React.useState<boolean>(true);
   const [decisionsLoading, setDecisionsLoading] = React.useState<boolean>(true);
@@ -61,6 +68,7 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
   const [labelMetricsLoading, setLabelMetricsLoading] = React.useState<boolean>(true);
   const [modelOpsLoading, setModelOpsLoading] = React.useState<boolean>(true);
   const [strategyMetricsLoading, setStrategyMetricsLoading] = React.useState<boolean>(true);
+  const [performanceAnalyticsLoading, setPerformanceAnalyticsLoading] = React.useState<boolean>(true);
   const [preflightLoading, setPreflightLoading] = React.useState<boolean>(true);
   const [preflightAuthRequired, setPreflightAuthRequired] = React.useState<boolean>(false);
 
@@ -77,6 +85,7 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
     setLabelMetricsLoading(true);
     setModelOpsLoading(true);
     setStrategyMetricsLoading(true);
+    setPerformanceAnalyticsLoading(true);
     setPreflightLoading(true);
 
     const trimmedAdminKey = adminKey.trim();
@@ -106,15 +115,19 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
       fetchLabelMetrics(90),
       fetchModelOps(),
       fetchStrategyMetrics(90),
+      fetchPerformanceAnalytics(90, "combined"),
+      fetchPerformanceAnalytics(90, "realized"),
       preflightPromise,
     ])
-      .then(([snapshotRows, decisionRows, tradeRows, metrics, ops, strategy]) => {
+      .then(([snapshotRows, decisionRows, tradeRows, metrics, ops, strategy, combinedAnalytics, realizedAnalytics]) => {
         setItems(snapshotRows);
         setDecisions(decisionRows);
         setTrades(tradeRows);
         setLabelMetrics(metrics);
         setModelOps(ops);
         setStrategyMetrics(strategy);
+        setPerformanceAnalyticsCombined(combinedAnalytics);
+        setPerformanceAnalyticsRealized(realizedAnalytics);
       })
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
       .finally(() => {
@@ -124,6 +137,7 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
         setLabelMetricsLoading(false);
         setModelOpsLoading(false);
         setStrategyMetricsLoading(false);
+        setPerformanceAnalyticsLoading(false);
       });
   }, [adminKey, onError]);
 
@@ -138,6 +152,8 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
     labelMetrics,
     modelOps,
     strategyMetrics,
+    performanceAnalyticsCombined,
+    performanceAnalyticsRealized,
     preflight,
     loading,
     decisionsLoading,
@@ -145,6 +161,7 @@ export function useSnapshotsDecisions({ adminKey, onError }: UseSnapshotsDecisio
     labelMetricsLoading,
     modelOpsLoading,
     strategyMetricsLoading,
+    performanceAnalyticsLoading,
     preflightLoading,
     preflightAuthRequired,
     refresh,

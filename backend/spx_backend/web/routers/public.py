@@ -11,10 +11,79 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
 from spx_backend.database import get_db_session
-from spx_backend.jobs.modeling import compute_margin_usage_dollars, summarize_strategy_quality
+from spx_backend.jobs.modeling import compute_margin_usage_dollars, compute_max_drawdown, summarize_strategy_quality
 from spx_backend.web.routers.auth import UserOut, get_current_user
 
 router = APIRouter()
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    """Compute a ratio with None for zero/negative denominators."""
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _profit_factor(win_pnl_sum: float, loss_pnl_sum: float) -> float | None:
+    """Compute profit factor from aggregated win/loss PnL sums."""
+    loss_abs = abs(loss_pnl_sum)
+    if loss_abs <= 0:
+        return None
+    return win_pnl_sum / loss_abs
+
+
+def _summarize_mode_rows(rows: list[Any]) -> dict[str, float | int | None]:
+    """Summarize one mode's equity rows into headline KPI values.
+
+    Parameters
+    ----------
+    rows:
+        Equity rows for a single mode and lookback window.
+
+    Returns
+    -------
+    dict[str, float | int | None]
+        Trade counts and core PnL quality metrics derived from aggregated rows.
+    """
+    if not rows:
+        return {
+            "trade_count": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "net_pnl": 0.0,
+            "win_pnl_sum": 0.0,
+            "loss_pnl_sum": 0.0,
+            "win_rate": None,
+            "avg_win": None,
+            "avg_loss": None,
+            "avg_pnl": None,
+            "profit_factor": None,
+            "expectancy": None,
+            "max_drawdown": None,
+        }
+    trade_count = int(sum(int(row.trade_count or 0) for row in rows))
+    win_count = int(sum(int(row.win_count or 0) for row in rows))
+    loss_count = int(sum(int(row.loss_count or 0) for row in rows))
+    net_pnl = float(sum(float(row.pnl_sum or 0.0) for row in rows))
+    win_pnl_sum = float(sum(float(row.win_pnl_sum or 0.0) for row in rows))
+    loss_pnl_sum = float(sum(float(row.loss_pnl_sum or 0.0) for row in rows))
+    daily_pnls = [float(row.pnl_sum or 0.0) for row in rows]
+    avg_pnl = _safe_ratio(net_pnl, float(trade_count))
+    return {
+        "trade_count": trade_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "net_pnl": net_pnl,
+        "win_pnl_sum": win_pnl_sum,
+        "loss_pnl_sum": loss_pnl_sum,
+        "win_rate": _safe_ratio(float(win_count), float(trade_count)),
+        "avg_win": _safe_ratio(win_pnl_sum, float(win_count)),
+        "avg_loss": _safe_ratio(loss_pnl_sum, float(loss_count)),
+        "avg_pnl": avg_pnl,
+        "profit_factor": _profit_factor(win_pnl_sum, loss_pnl_sum),
+        "expectancy": avg_pnl,
+        "max_drawdown": (float(compute_max_drawdown(daily_pnls)) if daily_pnls else None),
+    }
 
 
 @router.get("/health")
@@ -406,6 +475,211 @@ async def get_strategy_metrics(
         "window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
         "summary": summary,
         "by_side": by_side,
+    }
+
+
+@router.get("/api/performance-analytics")
+async def get_performance_analytics(
+    lookback_days: int = 90,
+    mode: str = "combined",
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return aggregate dashboard analytics for realized/combined PnL modes."""
+    if lookback_days <= 0 or lookback_days > 3650:
+        raise HTTPException(status_code=400, detail="invalid_lookback_days")
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in {"realized", "combined"}:
+        raise HTTPException(status_code=400, detail="invalid_mode")
+
+    latest_snapshot = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  analytics_snapshot_id,
+                  as_of_ts,
+                  source_trade_count,
+                  source_closed_count,
+                  source_open_count
+                FROM trade_performance_snapshots
+                ORDER BY as_of_ts DESC, analytics_snapshot_id DESC
+                LIMIT 1
+                """
+            )
+        )
+    ).fetchone()
+    if latest_snapshot is None:
+        return {
+            "lookback_days": lookback_days,
+            "mode": normalized_mode,
+            "window_start_utc": None,
+            "as_of_utc": None,
+            "snapshot": None,
+            "summary": None,
+            "equity_curve": [],
+            "breakdowns": {
+                "side": [],
+                "dte_bucket": [],
+                "delta_bucket": [],
+                "weekday": [],
+                "hour": [],
+                "source": [],
+            },
+        }
+
+    window_start_date = (datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=lookback_days)).date()
+    mode_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  mode,
+                  bucket_date,
+                  trade_count,
+                  win_count,
+                  loss_count,
+                  pnl_sum,
+                  win_pnl_sum,
+                  loss_pnl_sum
+                FROM trade_performance_equity_curve
+                WHERE analytics_snapshot_id = :analytics_snapshot_id
+                  AND mode IN ('realized', 'combined')
+                  AND bucket_date >= :window_start_date
+                ORDER BY mode ASC, bucket_date ASC
+                """
+            ),
+            {
+                "analytics_snapshot_id": latest_snapshot.analytics_snapshot_id,
+                "window_start_date": window_start_date,
+            },
+        )
+    ).fetchall()
+
+    by_mode: dict[str, list[Any]] = {"realized": [], "combined": []}
+    for row in mode_rows:
+        row_mode = str(row.mode).lower()
+        if row_mode in by_mode:
+            by_mode[row_mode].append(row)
+
+    realized_summary = _summarize_mode_rows(by_mode["realized"])
+    combined_summary = _summarize_mode_rows(by_mode["combined"])
+    selected_summary = realized_summary if normalized_mode == "realized" else combined_summary
+
+    selected_curve_rows = by_mode[normalized_mode]
+    equity_curve: list[dict[str, Any]] = []
+    cumulative = 0.0
+    peak = 0.0
+    for row in selected_curve_rows:
+        daily_pnl = float(row.pnl_sum or 0.0)
+        cumulative += daily_pnl
+        peak = max(peak, cumulative)
+        equity_curve.append(
+            {
+                "date": row.bucket_date.isoformat(),
+                "daily_pnl": daily_pnl,
+                "cumulative_pnl": cumulative,
+                "drawdown": peak - cumulative,
+                "trade_count": int(row.trade_count or 0),
+                "win_count": int(row.win_count or 0),
+                "loss_count": int(row.loss_count or 0),
+            }
+        )
+
+    breakdown_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                  dimension_type,
+                  dimension_value,
+                  SUM(trade_count)::bigint AS trade_count,
+                  SUM(win_count)::bigint AS win_count,
+                  SUM(loss_count)::bigint AS loss_count,
+                  SUM(pnl_sum) AS pnl_sum,
+                  SUM(win_pnl_sum) AS win_pnl_sum,
+                  SUM(loss_pnl_sum) AS loss_pnl_sum
+                FROM trade_performance_breakdowns
+                WHERE analytics_snapshot_id = :analytics_snapshot_id
+                  AND mode = :mode
+                  AND bucket_date >= :window_start_date
+                GROUP BY dimension_type, dimension_value
+                ORDER BY dimension_type ASC, pnl_sum DESC, dimension_value ASC
+                """
+            ),
+            {
+                "analytics_snapshot_id": latest_snapshot.analytics_snapshot_id,
+                "mode": normalized_mode,
+                "window_start_date": window_start_date,
+            },
+        )
+    ).fetchall()
+
+    breakdowns: dict[str, list[dict[str, Any]]] = {
+        "side": [],
+        "dte_bucket": [],
+        "delta_bucket": [],
+        "weekday": [],
+        "hour": [],
+        "source": [],
+    }
+    for row in breakdown_rows:
+        dimension_type = str(row.dimension_type)
+        if dimension_type not in breakdowns:
+            continue
+        trade_count = int(row.trade_count or 0)
+        win_count = int(row.win_count or 0)
+        loss_count = int(row.loss_count or 0)
+        pnl_sum = float(row.pnl_sum or 0.0)
+        win_pnl_sum = float(row.win_pnl_sum or 0.0)
+        loss_pnl_sum = float(row.loss_pnl_sum or 0.0)
+        avg_pnl = _safe_ratio(pnl_sum, float(trade_count))
+        breakdowns[dimension_type].append(
+            {
+                "bucket": row.dimension_value,
+                "trade_count": trade_count,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "net_pnl": pnl_sum,
+                "win_rate": _safe_ratio(float(win_count), float(trade_count)),
+                "avg_win": _safe_ratio(win_pnl_sum, float(win_count)),
+                "avg_loss": _safe_ratio(loss_pnl_sum, float(loss_count)),
+                "avg_pnl": avg_pnl,
+                "expectancy": avg_pnl,
+                "profit_factor": _profit_factor(win_pnl_sum, loss_pnl_sum),
+            }
+        )
+
+    window_start_utc = datetime.combine(window_start_date, datetime.min.time(), tzinfo=ZoneInfo("UTC"))
+    return {
+        "lookback_days": lookback_days,
+        "mode": normalized_mode,
+        "window_start_utc": window_start_utc.isoformat().replace("+00:00", "Z"),
+        "as_of_utc": latest_snapshot.as_of_ts.isoformat().replace("+00:00", "Z"),
+        "snapshot": {
+            "analytics_snapshot_id": int(latest_snapshot.analytics_snapshot_id),
+            "source_trade_count": int(latest_snapshot.source_trade_count or 0),
+            "source_closed_count": int(latest_snapshot.source_closed_count or 0),
+            "source_open_count": int(latest_snapshot.source_open_count or 0),
+        },
+        "summary": {
+            "trade_count": int(selected_summary["trade_count"] or 0),
+            "win_count": int(selected_summary["win_count"] or 0),
+            "loss_count": int(selected_summary["loss_count"] or 0),
+            "net_pnl": float(selected_summary["net_pnl"] or 0.0),
+            "realized_net_pnl": float(realized_summary["net_pnl"] or 0.0),
+            "unrealized_net_pnl": float((combined_summary["net_pnl"] or 0.0) - (realized_summary["net_pnl"] or 0.0)),
+            "combined_net_pnl": float(combined_summary["net_pnl"] or 0.0),
+            "win_rate": selected_summary["win_rate"],
+            "avg_win": selected_summary["avg_win"],
+            "avg_loss": selected_summary["avg_loss"],
+            "avg_pnl": selected_summary["avg_pnl"],
+            "expectancy": selected_summary["expectancy"],
+            "profit_factor": selected_summary["profit_factor"],
+            "max_drawdown": selected_summary["max_drawdown"],
+        },
+        "equity_curve": equity_curve,
+        "breakdowns": breakdowns,
     }
 
 

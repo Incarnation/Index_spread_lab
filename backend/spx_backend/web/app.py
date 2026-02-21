@@ -16,6 +16,7 @@ from spx_backend.jobs.decision_job import DecisionJob
 from spx_backend.jobs.feature_builder_job import FeatureBuilderJob
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob
+from spx_backend.jobs.performance_analytics_job import build_performance_analytics_job
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
@@ -25,6 +26,7 @@ from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
 from spx_backend.web.routers import admin, auth, public
 from spx_backend.web.routers.public import (
+    get_performance_analytics,
     get_gex_curve,
     get_label_metrics,
     get_model_ops,
@@ -213,6 +215,7 @@ async def lifespan(app: FastAPI):
     trainer_job = TrainerJob()
     shadow_inference_job = ShadowInferenceJob()
     promotion_gate_job = PromotionGateJob()
+    performance_analytics_job = build_performance_analytics_job() if settings.performance_analytics_enabled else None
 
     _schedule_rth_window_job(
         scheduler,
@@ -313,6 +316,16 @@ async def lifespan(app: FastAPI):
             max_instances=max_job_instances,
             misfire_grace_time=misfire_grace_seconds,
         )
+    if performance_analytics_job is not None:
+        _schedule_rth_window_job(
+            scheduler,
+            job=performance_analytics_job,
+            job_id="performance_analytics_job",
+            interval_minutes=settings.performance_analytics_interval_minutes,
+            timezone=settings.tz,
+            max_job_instances=max_job_instances,
+            misfire_grace_seconds=misfire_grace_seconds,
+        )
     if settings.trainer_enabled:
         scheduler.add_job(
             trainer_job.run_once,
@@ -363,6 +376,7 @@ async def lifespan(app: FastAPI):
     app.state.trainer_job = trainer_job
     app.state.shadow_inference_job = shadow_inference_job
     app.state.promotion_gate_job = promotion_gate_job
+    app.state.performance_analytics_job = performance_analytics_job
 
     # Run ingestion jobs once immediately on boot (unless skip_startup_warmup). Log every failure explicitly.
     if not settings.skip_startup_warmup:
@@ -377,6 +391,8 @@ async def lifespan(app: FastAPI):
         warmup_jobs.append(("gex_job", gex_job.run_once))
         if cboe_gex_job is not None:
             warmup_jobs.append(("cboe_gex_job", cboe_gex_job.run_once))
+        if performance_analytics_job is not None:
+            warmup_jobs.append(("performance_analytics_job", performance_analytics_job.run_once))
         for job_name, run_once_callable in warmup_jobs:
             try:
                 await run_once_callable()
@@ -416,6 +432,7 @@ __all__ = [
     # Re-exported endpoint symbols for tests/backward compatibility.
     "list_trades",
     "get_label_metrics",
+    "get_performance_analytics",
     "get_model_ops",
     "get_strategy_metrics",
     "list_gex_dtes",
