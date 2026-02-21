@@ -44,7 +44,7 @@ function tooltipFormatter(value: number | string | undefined, name: string | und
 /** Convert segmented-control lookback value into a supported day window. */
 function parseLookbackValue(value: string): number {
   const parsed = Number(value);
-  if (parsed === 1 || parsed === 7 || parsed === 30) return parsed;
+  if (parsed === 1 || parsed === 7 || parsed === 30 || parsed === 90) return parsed;
   return 30;
 }
 
@@ -128,6 +128,7 @@ export function PerformanceAnalyticsPanel({
               { value: "1", label: "1D" },
               { value: "7", label: "7D" },
               { value: "30", label: "30D" },
+              { value: "90", label: "90D" },
             ]}
           />
           <SegmentedControl
