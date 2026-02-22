@@ -20,7 +20,7 @@ import {
   GEX_ZERO_DTE_ONLY_SENTINEL,
   getSnapshotTradingDateIso,
 } from "../constants/gex";
-import { formatDateIsoInTimezone, formatDateTimeInTimezone, formatTimeSlotInTimezone } from "../utils/format";
+import { formatDateTimeInTimezone } from "../utils/format";
 
 type GexPanelProps = {
   snapshots: GexSnapshot[];
@@ -62,7 +62,6 @@ type HeatmapRow = {
 
 const GEX_VIEW_STORAGE_KEY = "dashboard.gex.chartView";
 const GEX_STRIKE_COUNT_STORAGE_KEY = "dashboard.gex.strikeCount";
-const GEX_CAPTURE_SLOT_MINUTES = 15;
 const GEX_STRIKE_COUNT_OPTIONS = ["50", "100", "150", "all"] as const;
 type GexStrikeCountOption = (typeof GEX_STRIKE_COUNT_OPTIONS)[number];
 
@@ -116,17 +115,14 @@ function writeStoredGexStrikeCount(value: GexStrikeCountOption): void {
 }
 
 /**
- * Build one capture-batch label with slot-first ET formatting.
+ * Build one compact capture-batch label as exact ET timestamp only.
+ *
+ * We intentionally keep this short so users can scan runs quickly while source
+ * and underlying are already controlled by dedicated selectors in the same row.
  */
 function formatSnapshotOptionLabel(snapshot: GexSnapshot): string {
-  const underlying = snapshot.underlying?.trim() || "UNKNOWN";
-  const source = snapshot.source?.trim() || "UNKNOWN";
-  const dateEt = formatDateIsoInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE);
   const exactEt = formatDateTimeInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE);
-  const slotEt = formatTimeSlotInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE, GEX_CAPTURE_SLOT_MINUTES);
-  const slotLabel = slotEt && dateEt ? `${dateEt} ${slotEt} ET` : "Unknown ET slot";
-  const captureLabel = exactEt ? `captured ${exactEt} ET` : `captured ${snapshot.ts}`;
-  return `${slotLabel} · ${underlying} [${source}] · ${captureLabel} · Batch #${snapshot.snapshot_id}`;
+  return exactEt ? `${exactEt} ET` : snapshot.ts;
 }
 
 /**
@@ -361,7 +357,7 @@ export function GexPanel({
   const dteOptions = React.useMemo(
     () => [
       { value: "all", label: "All" },
-      { value: "custom", label: "Custom (pick dates)" },
+      { value: "custom", label: "Custom" },
       ...dtes.map((dte) => ({ value: String(dte), label: `${dte}` })),
     ],
     [dtes],
@@ -536,7 +532,7 @@ export function GexPanel({
               const snapshot = id ? filteredSnapshots.find((row) => row.snapshot_id === id) ?? null : null;
               onSelectedSnapshotChange(snapshot);
             }}
-            w={430}
+            w={280}
             placeholder="Select capture batch"
           />
           <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
