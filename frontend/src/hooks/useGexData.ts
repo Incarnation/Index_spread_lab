@@ -26,6 +26,7 @@ const GEX_CUSTOM_EXP_STORAGE_KEY = "dashboard.gex.selectedCustomExpirations";
 const GEX_SNAPSHOT_STORAGE_KEY = "dashboard.gex.selectedSnapshotId";
 const GEX_UNDERLYING_STORAGE_KEY = "dashboard.gex.selectedUnderlying";
 const GEX_SOURCE_STORAGE_KEY = "dashboard.gex.selectedSource";
+const GEX_SNAPSHOT_FETCH_LIMIT = 500;
 
 /**
  * Normalize one underlying symbol to uppercase without surrounding whitespace.
@@ -47,6 +48,34 @@ function isMatchingUnderlying(snapshot: GexSnapshot, selectedUnderlying: GexUnde
 function isMatchingSource(snapshot: GexSnapshot, selectedSource: GexSource): boolean {
   if (selectedSource === "all") return true;
   return (snapshot.source ?? "").trim().toUpperCase() === selectedSource;
+}
+
+/**
+ * Build a stable capture-batch key from symbol/source/timestamp dimensions.
+ */
+function buildBatchKey(snapshot: GexSnapshot): string {
+  return `${normalizeUnderlying(snapshot.underlying)}|${(snapshot.source ?? "").trim().toUpperCase()}|${snapshot.ts}`;
+}
+
+/**
+ * Reduce per-expiration snapshot rows into one representative row per batch.
+ *
+ * The API returns one `gex_snapshots` row per expiration snapshot_id. For
+ * dropdown usability, we surface only one option per unique capture timestamp
+ * (`underlying + source + ts`). Because the upstream query is already sorted by
+ * newest `snapshot_id` first within each timestamp, keeping first seen rows is
+ * deterministic and preserves recency ordering.
+ */
+function dedupeByBatch(rows: GexSnapshot[]): GexSnapshot[] {
+  const seen = new Set<string>();
+  const deduped: GexSnapshot[] = [];
+  for (const row of rows) {
+    const key = buildBatchKey(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(row);
+  }
+  return deduped;
 }
 
 /**
@@ -198,21 +227,22 @@ export function useGexData({ onError }: UseGexDataArgs): UseGexDataResult {
   React.useEffect(() => {
     let cancelled = false;
     setGexLoading(true);
-    fetchGexSnapshots(20, selectedUnderlying, selectedSource === "all" ? undefined : selectedSource)
+    fetchGexSnapshots(GEX_SNAPSHOT_FETCH_LIMIT, selectedUnderlying, selectedSource === "all" ? undefined : selectedSource)
       .then((rows) => {
         if (cancelled) return;
         const symbolRows = rows.filter(
           (row) => isMatchingUnderlying(row, selectedUnderlying) && isMatchingSource(row, selectedSource),
         );
-        setGexSnapshots(symbolRows);
-        if (symbolRows.length > 0) {
+        const batchRows = dedupeByBatch(symbolRows);
+        setGexSnapshots(batchRows);
+        if (batchRows.length > 0) {
           const persistedSnapshotIdRaw = readStorageString(GEX_SNAPSHOT_STORAGE_KEY);
           const persistedSnapshotId = persistedSnapshotIdRaw ? Number(persistedSnapshotIdRaw) : null;
           const preferredSnapshot =
             persistedSnapshotId != null && Number.isFinite(persistedSnapshotId)
-              ? symbolRows.find((row) => row.snapshot_id === persistedSnapshotId) ?? null
+              ? batchRows.find((row) => row.snapshot_id === persistedSnapshotId) ?? null
               : null;
-          setSelectedGexSnapshotState(preferredSnapshot ?? symbolRows[0]);
+          setSelectedGexSnapshotState(preferredSnapshot ?? batchRows[0]);
         } else {
           setSelectedGexSnapshotState(null);
           setGexDtes([]);

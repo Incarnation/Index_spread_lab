@@ -15,11 +15,12 @@ import {
 import { fetchGexCurve, type GexCurvePoint, type GexExpirationItem, type GexSnapshot } from "../api";
 import {
   GEX_SOURCE_OPTIONS,
+  GEX_TRADING_TIMEZONE,
   GEX_UNDERLYING_OPTIONS,
   GEX_ZERO_DTE_ONLY_SENTINEL,
   getSnapshotTradingDateIso,
 } from "../constants/gex";
-import { formatTs } from "../utils/format";
+import { formatDateIsoInTimezone, formatDateTimeInTimezone, formatTimeSlotInTimezone } from "../utils/format";
 
 type GexPanelProps = {
   snapshots: GexSnapshot[];
@@ -61,6 +62,7 @@ type HeatmapRow = {
 
 const GEX_VIEW_STORAGE_KEY = "dashboard.gex.chartView";
 const GEX_STRIKE_COUNT_STORAGE_KEY = "dashboard.gex.strikeCount";
+const GEX_CAPTURE_SLOT_MINUTES = 15;
 const GEX_STRIKE_COUNT_OPTIONS = ["50", "100", "150", "all"] as const;
 type GexStrikeCountOption = (typeof GEX_STRIKE_COUNT_OPTIONS)[number];
 
@@ -114,12 +116,17 @@ function writeStoredGexStrikeCount(value: GexStrikeCountOption): void {
 }
 
 /**
- * Build a snapshot dropdown label that always includes the underlying symbol.
+ * Build one capture-batch label with slot-first ET formatting.
  */
 function formatSnapshotOptionLabel(snapshot: GexSnapshot): string {
   const underlying = snapshot.underlying?.trim() || "UNKNOWN";
   const source = snapshot.source?.trim() || "UNKNOWN";
-  return `${underlying} [${source}] · Batch #${snapshot.snapshot_id} · ${formatTs(snapshot.ts)}`;
+  const dateEt = formatDateIsoInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE);
+  const exactEt = formatDateTimeInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE);
+  const slotEt = formatTimeSlotInTimezone(snapshot.ts, GEX_TRADING_TIMEZONE, GEX_CAPTURE_SLOT_MINUTES);
+  const slotLabel = slotEt && dateEt ? `${dateEt} ${slotEt} ET` : "Unknown ET slot";
+  const captureLabel = exactEt ? `captured ${exactEt} ET` : `captured ${snapshot.ts}`;
+  return `${slotLabel} · ${underlying} [${source}] · ${captureLabel} · Batch #${snapshot.snapshot_id}`;
 }
 
 /**
@@ -529,7 +536,7 @@ export function GexPanel({
               const snapshot = id ? filteredSnapshots.find((row) => row.snapshot_id === id) ?? null : null;
               onSelectedSnapshotChange(snapshot);
             }}
-            w={320}
+            w={430}
             placeholder="Select capture batch"
           />
           <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
