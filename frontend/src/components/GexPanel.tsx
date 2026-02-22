@@ -535,7 +535,7 @@ export function GexPanel({
             w={280}
             placeholder="Select capture batch"
           />
-          <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={220} />
+          <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={120} />
           <Select
             label="Strikes"
             data={[
