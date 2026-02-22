@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -134,6 +134,33 @@ class _FakeMzDataClient:
         }
 
 
+class _FakeMzDataClientWithWideDte:
+    """MZData stub that returns expirations spanning beyond 10 trading slots."""
+
+    async def get_live_option_exposure(self, symbol: str) -> dict:
+        """Return one payload that includes trading-slot DTE values 0..12."""
+        as_of = date(2026, 2, 16)
+        data: list[dict] = []
+        for offset in range(13):
+            expiration = as_of + timedelta(days=offset)
+            strike = 6000 + offset
+            data.append(
+                {
+                    "expiration": expiration.isoformat(),
+                    "dte": 999,
+                    "strikes": [str(strike)],
+                    "netGamma": [10.0 + float(offset)],
+                    "call": {"absGamma": [5.0], "openInterest": [100]},
+                    "put": {"absGamma": [1.0], "openInterest": [40]},
+                }
+            )
+        return {
+            "spotPrice": 6015.0,
+            "timestamp": "2026-02-16T15:00:00Z",
+            "data": data,
+        }
+
+
 @pytest.mark.asyncio
 async def test_cboe_gex_job_skips_when_market_closed(monkeypatch) -> None:
     """CBOE job should short-circuit when market is closed and force is false."""
@@ -148,11 +175,12 @@ async def test_cboe_gex_job_skips_when_market_closed(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_cboe_gex_job_persists_source_tagged_rows(monkeypatch) -> None:
-    """CBOE job should write source-tagged chain and GEX rows."""
+    """CBOE job should persist source tags and trading-slot DTE fields."""
     capture_session = _RecordingSession()
     monkeypatch.setattr(settings, "cboe_gex_enabled", True)
     monkeypatch.setattr(settings, "cboe_gex_allow_outside_rth", False)
     monkeypatch.setattr(settings, "cboe_gex_underlying", "SPX")
+    monkeypatch.setattr(settings, "gex_max_dte_days", 10)
     monkeypatch.setattr(cboe_module, "SessionLocal", _SessionFactory(capture_session))
 
     result = await CboeGexJob(mzdata=_FakeMzDataClient()).run_once(force=True)
@@ -162,5 +190,32 @@ async def test_cboe_gex_job_persists_source_tagged_rows(monkeypatch) -> None:
     assert result["gex_snapshots_upserted"] == 1
     assert result["gex_by_strike_upserted"] == 2
     assert result["gex_by_expiry_strike_upserted"] == 2
+    assert result["skipped_items"] == 0
+    assert result["skipped_items_by_reason"] == {}
     assert capture_session.chain_snapshot_inserts[0]["source"] == "CBOE"
+    assert capture_session.chain_snapshot_inserts[0]["target_dte"] == 1
     assert capture_session.gex_snapshot_upserts[0]["source"] == "CBOE"
+    assert all(row["dte_days"] == 1 for row in capture_session.gex_by_expiry_strike_upserts)
+
+
+@pytest.mark.asyncio
+async def test_cboe_gex_job_skips_items_outside_max_trading_slot_dte(monkeypatch) -> None:
+    """CBOE job should skip expirations beyond configured trading-slot DTE cap."""
+    capture_session = _RecordingSession()
+    monkeypatch.setattr(settings, "cboe_gex_enabled", True)
+    monkeypatch.setattr(settings, "cboe_gex_allow_outside_rth", False)
+    monkeypatch.setattr(settings, "cboe_gex_underlying", "SPX")
+    monkeypatch.setattr(settings, "gex_max_dte_days", 10)
+    monkeypatch.setattr(cboe_module, "SessionLocal", _SessionFactory(capture_session))
+
+    result = await CboeGexJob(mzdata=_FakeMzDataClientWithWideDte()).run_once(force=True)
+
+    assert result["skipped"] is False
+    assert result["inserted_snapshots"] == 11
+    assert result["gex_snapshots_upserted"] == 11
+    assert result["gex_by_strike_upserted"] == 11
+    assert result["gex_by_expiry_strike_upserted"] == 11
+    assert result["skipped_items"] == 2
+    assert result["skipped_items_by_reason"] == {"dte_out_of_range": 2}
+    assert len(capture_session.chain_snapshot_inserts) == 11
+    assert all(0 <= row["target_dte"] <= 10 for row in capture_session.chain_snapshot_inserts)

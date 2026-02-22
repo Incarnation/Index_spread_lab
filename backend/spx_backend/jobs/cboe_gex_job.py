@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
+from spx_backend.dte import trading_dte_lookup
 from spx_backend.ingestion.mzdata_client import MzDataClient, get_mzdata_client
 from spx_backend.market_clock import MarketClockCache, is_rth
 
@@ -160,11 +161,52 @@ class CboeGexJob:
             return await self.clock_cache.is_open(now_et)
         return is_rth(now_et)
 
-    def _resolve_target_dte(self, *, item: CboeExposureItem, batch_ts_utc: datetime) -> int:
-        """Resolve chain snapshot target DTE using payload DTE or date fallback."""
-        if item.dte_days is not None:
-            return max(int(item.dte_days), 0)
-        return max((item.expiration - batch_ts_utc.date()).days, 0)
+    def _build_trading_slot_dte_lookup(
+        self,
+        *,
+        exposure_items: list[CboeExposureItem],
+        as_of_trading_date: date,
+    ) -> dict[date, int]:
+        """Build one expiration->trading-slot DTE map for a CBOE batch.
+
+        Parameters
+        ----------
+        exposure_items:
+            One normalized MZData payload expressed as per-expiration rows.
+        as_of_trading_date:
+            Trading date derived from batch timestamp in market timezone.
+
+        Returns
+        -------
+        dict[date, int]
+            Mapping from expiration date to trading-slot DTE where 0DTE is
+            same-day expiration and subsequent expirations increment by one.
+        """
+        expirations = sorted({item.expiration for item in exposure_items})
+        return trading_dte_lookup(expirations, as_of_trading_date)
+
+    def _resolve_target_dte(
+        self,
+        *,
+        item: CboeExposureItem,
+        trading_slot_dte_by_expiration: dict[date, int],
+    ) -> int | None:
+        """Resolve one CBOE expiration into Tradier-style trading-slot DTE.
+
+        Parameters
+        ----------
+        item:
+            One normalized CBOE expiration payload.
+        trading_slot_dte_by_expiration:
+            Batch-level expiration->trading-slot mapping.
+
+        Returns
+        -------
+        int | None
+            Trading-slot DTE for the expiration, or ``None`` when the
+            expiration is not eligible in the current trading-date window.
+        """
+        return trading_slot_dte_by_expiration.get(item.expiration)
 
     async def _get_existing_snapshot_id(
         self,
@@ -222,7 +264,12 @@ class CboeGexJob:
         return None
 
     async def run_once(self, *, force: bool = False) -> dict[str, Any]:
-        """Fetch MZData exposure payload and persist source-scoped CBOE rows."""
+        """Fetch MZData exposure payload and persist source-scoped CBOE rows.
+
+        The CBOE pipeline intentionally aligns DTE labeling to Tradier trading
+        slot semantics and only stores expirations within the configured
+        ``0..gex_max_dte_days`` window.
+        """
         if not settings.cboe_gex_enabled:
             return {"skipped": True, "reason": "cboe_gex_disabled"}
 
@@ -248,17 +295,48 @@ class CboeGexJob:
         exposure_items = _normalize_exposure_items(payload)
         if not exposure_items:
             return {"skipped": True, "reason": "no_exposure_items", "now_et": now_et.isoformat()}
+        as_of_trading_date = batch_ts_utc.astimezone(ZoneInfo(settings.tz)).date()
+        trading_slot_dte_by_expiration = self._build_trading_slot_dte_lookup(
+            exposure_items=exposure_items,
+            as_of_trading_date=as_of_trading_date,
+        )
+        max_allowed_dte = max(int(settings.gex_max_dte_days), 0)
 
         inserted_snapshots = 0
         reused_snapshots = 0
         gex_snapshots_upserted = 0
         strike_rows_upserted = 0
         expiry_strike_rows_upserted = 0
+        skipped_items_by_reason: dict[str, int] = {}
         failed_items: list[dict[str, Any]] = []
 
         async with SessionLocal() as session:
             for item in exposure_items:
                 try:
+                    # Build CBOE DTE labels with the same trading-slot indexing
+                    # used by Tradier snapshots so cross-source filters match.
+                    target_dte = self._resolve_target_dte(
+                        item=item,
+                        trading_slot_dte_by_expiration=trading_slot_dte_by_expiration,
+                    )
+                    if target_dte is None:
+                        skipped_items_by_reason["missing_trading_slot_dte"] = (
+                            skipped_items_by_reason.get("missing_trading_slot_dte", 0) + 1
+                        )
+                        logger.info(
+                            "cboe_gex_job: skipping expiration={} reason=missing_trading_slot_dte",
+                            item.expiration.isoformat(),
+                        )
+                        continue
+                    if target_dte < 0 or target_dte > max_allowed_dte:
+                        skipped_items_by_reason["dte_out_of_range"] = skipped_items_by_reason.get("dte_out_of_range", 0) + 1
+                        logger.info(
+                            "cboe_gex_job: skipping expiration={} reason=dte_out_of_range target_dte={} max_allowed_dte={}",
+                            item.expiration.isoformat(),
+                            target_dte,
+                            max_allowed_dte,
+                        )
+                        continue
                     async with session.begin_nested():
                         snapshot_payload = {
                             "source": "CBOE",
@@ -287,7 +365,7 @@ class CboeGexJob:
                                     "ts": batch_ts_utc,
                                     "underlying": underlying,
                                     "source": "CBOE",
-                                    "target_dte": self._resolve_target_dte(item=item, batch_ts_utc=batch_ts_utc),
+                                    "target_dte": target_dte,
                                     "expiration": item.expiration,
                                     "payload_json": json.dumps(snapshot_payload, default=str),
                                     "checksum": checksum,
@@ -423,7 +501,7 @@ class CboeGexJob:
                                 {
                                     "snapshot_id": snapshot_id,
                                     "expiration": item.expiration,
-                                    "dte_days": self._resolve_target_dte(item=item, batch_ts_utc=batch_ts_utc),
+                                    "dte_days": target_dte,
                                     "strike": strike,
                                     "gex_net": strike_data["gex_net"],
                                     "gex_calls": strike_data["gex_calls"],
@@ -446,12 +524,14 @@ class CboeGexJob:
             await session.commit()
 
         logger.info(
-            "cboe_gex_job: inserted_snapshots={} reused_snapshots={} gex_snapshots={} strikes={} expiry_strikes={} failed_items={}",
+            "cboe_gex_job: inserted_snapshots={} reused_snapshots={} gex_snapshots={} strikes={} expiry_strikes={} skipped_items={} skipped_items_by_reason={} failed_items={}",
             inserted_snapshots,
             reused_snapshots,
             gex_snapshots_upserted,
             strike_rows_upserted,
             expiry_strike_rows_upserted,
+            sum(skipped_items_by_reason.values()),
+            skipped_items_by_reason,
             len(failed_items),
         )
         return {
@@ -465,6 +545,8 @@ class CboeGexJob:
             "gex_snapshots_upserted": gex_snapshots_upserted,
             "gex_by_strike_upserted": strike_rows_upserted,
             "gex_by_expiry_strike_upserted": expiry_strike_rows_upserted,
+            "skipped_items": sum(skipped_items_by_reason.values()),
+            "skipped_items_by_reason": skipped_items_by_reason,
             "failed_items": failed_items,
         }
 
