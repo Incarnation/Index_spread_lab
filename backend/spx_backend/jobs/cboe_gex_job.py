@@ -263,38 +263,51 @@ class CboeGexJob:
             prev_strike = strike
         return None
 
-    async def run_once(self, *, force: bool = False) -> dict[str, Any]:
-        """Fetch MZData exposure payload and persist source-scoped CBOE rows.
+    def _empty_underlying_result(self, *, now_et: datetime, underlying: str) -> dict[str, Any]:
+        """Build a default per-underlying result payload with zeroed counters."""
+        return {
+            "underlying": underlying,
+            "skipped": False,
+            "reason": None,
+            "now_et": now_et.isoformat(),
+            "batch_ts_utc": None,
+            "inserted_snapshots": 0,
+            "reused_snapshots": 0,
+            "gex_snapshots_upserted": 0,
+            "gex_by_strike_upserted": 0,
+            "gex_by_expiry_strike_upserted": 0,
+            "skipped_items": 0,
+            "skipped_items_by_reason": {},
+            "failed_items": [],
+        }
 
-        The CBOE pipeline intentionally aligns DTE labeling to Tradier trading
-        slot semantics and only stores expirations within the configured
-        ``0..gex_max_dte_days`` window.
-        """
-        if not settings.cboe_gex_enabled:
-            return {"skipped": True, "reason": "cboe_gex_disabled"}
-
-        tz = ZoneInfo(settings.tz)
-        now_et = datetime.now(tz=tz)
-        if (not force) and (not settings.cboe_gex_allow_outside_rth):
-            if not await self._market_open(now_et):
-                logger.info("cboe_gex_job: market closed; skipping (now_et={})", now_et.isoformat())
-                return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat()}
-
-        underlying = settings.cboe_gex_underlying.strip().upper()
-        if not underlying:
-            return {"skipped": True, "reason": "missing_underlying", "now_et": now_et.isoformat()}
-
+    async def _run_once_for_underlying(
+        self,
+        *,
+        session: Any,
+        underlying: str,
+        now_et: datetime,
+    ) -> dict[str, Any]:
+        """Fetch and persist one underlying's CBOE exposure payload."""
+        result = self._empty_underlying_result(now_et=now_et, underlying=underlying)
         try:
             payload = await self.mzdata.get_live_option_exposure(underlying)
         except Exception as exc:
             logger.exception("cboe_gex_job: exposure_fetch_failed underlying={} error={}", underlying, exc)
-            return {"skipped": True, "reason": "exposure_fetch_failed", "now_et": now_et.isoformat()}
+            result["skipped"] = True
+            result["reason"] = "exposure_fetch_failed"
+            result["failed_items"] = [{"underlying": underlying, "reason": "exposure_fetch_failed", "error": str(exc)}]
+            return result
 
         spot_price = _to_float(payload.get("spotPrice"))
         batch_ts_utc = _parse_payload_timestamp(payload.get("timestamp"), fallback=now_et.astimezone(ZoneInfo("UTC")))
+        result["batch_ts_utc"] = batch_ts_utc.isoformat()
         exposure_items = _normalize_exposure_items(payload)
         if not exposure_items:
-            return {"skipped": True, "reason": "no_exposure_items", "now_et": now_et.isoformat()}
+            result["skipped"] = True
+            result["reason"] = "no_exposure_items"
+            return result
+
         as_of_trading_date = batch_ts_utc.astimezone(ZoneInfo(settings.tz)).date()
         trading_slot_dte_by_expiration = self._build_trading_slot_dte_lookup(
             exposure_items=exposure_items,
@@ -310,236 +323,291 @@ class CboeGexJob:
         skipped_items_by_reason: dict[str, int] = {}
         failed_items: list[dict[str, Any]] = []
 
-        async with SessionLocal() as session:
-            for item in exposure_items:
-                try:
-                    # Build CBOE DTE labels with the same trading-slot indexing
-                    # used by Tradier snapshots so cross-source filters match.
-                    target_dte = self._resolve_target_dte(
-                        item=item,
-                        trading_slot_dte_by_expiration=trading_slot_dte_by_expiration,
+        for item in exposure_items:
+            try:
+                # Build CBOE DTE labels with the same trading-slot indexing used
+                # by Tradier snapshots so cross-source filters remain aligned.
+                target_dte = self._resolve_target_dte(
+                    item=item,
+                    trading_slot_dte_by_expiration=trading_slot_dte_by_expiration,
+                )
+                if target_dte is None:
+                    skipped_items_by_reason["missing_trading_slot_dte"] = (
+                        skipped_items_by_reason.get("missing_trading_slot_dte", 0) + 1
                     )
-                    if target_dte is None:
-                        skipped_items_by_reason["missing_trading_slot_dte"] = (
-                            skipped_items_by_reason.get("missing_trading_slot_dte", 0) + 1
+                    logger.info(
+                        "cboe_gex_job: skipping underlying={} expiration={} reason=missing_trading_slot_dte",
+                        underlying,
+                        item.expiration.isoformat(),
+                    )
+                    continue
+                if target_dte < 0 or target_dte > max_allowed_dte:
+                    skipped_items_by_reason["dte_out_of_range"] = skipped_items_by_reason.get("dte_out_of_range", 0) + 1
+                    logger.info(
+                        "cboe_gex_job: skipping underlying={} expiration={} reason=dte_out_of_range target_dte={} max_allowed_dte={}",
+                        underlying,
+                        item.expiration.isoformat(),
+                        target_dte,
+                        max_allowed_dte,
+                    )
+                    continue
+                async with session.begin_nested():
+                    snapshot_payload = {
+                        "source": "CBOE",
+                        "underlying": underlying,
+                        "timestamp": batch_ts_utc.isoformat(),
+                        "spotPrice": spot_price,
+                        "item": item.raw_item,
+                    }
+                    checksum = _checksum_payload(snapshot_payload)
+                    snapshot_id = await self._get_existing_snapshot_id(
+                        session=session,
+                        batch_ts_utc=batch_ts_utc,
+                        underlying=underlying,
+                        expiration=item.expiration,
+                    )
+                    if snapshot_id is None:
+                        insert_result = await session.execute(
+                            text(
+                                """
+                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload_json AS jsonb), :checksum)
+                                RETURNING snapshot_id
+                                """
+                            ),
+                            {
+                                "ts": batch_ts_utc,
+                                "underlying": underlying,
+                                "source": "CBOE",
+                                "target_dte": target_dte,
+                                "expiration": item.expiration,
+                                "payload_json": json.dumps(snapshot_payload, default=str),
+                                "checksum": checksum,
+                            },
                         )
-                        logger.info(
-                            "cboe_gex_job: skipping expiration={} reason=missing_trading_slot_dte",
-                            item.expiration.isoformat(),
-                        )
-                        continue
-                    if target_dte < 0 or target_dte > max_allowed_dte:
-                        skipped_items_by_reason["dte_out_of_range"] = skipped_items_by_reason.get("dte_out_of_range", 0) + 1
-                        logger.info(
-                            "cboe_gex_job: skipping expiration={} reason=dte_out_of_range target_dte={} max_allowed_dte={}",
-                            item.expiration.isoformat(),
-                            target_dte,
-                            max_allowed_dte,
-                        )
-                        continue
-                    async with session.begin_nested():
-                        snapshot_payload = {
-                            "source": "CBOE",
-                            "underlying": underlying,
-                            "timestamp": batch_ts_utc.isoformat(),
-                            "spotPrice": spot_price,
-                            "item": item.raw_item,
-                        }
-                        checksum = _checksum_payload(snapshot_payload)
-                        snapshot_id = await self._get_existing_snapshot_id(
-                            session=session,
-                            batch_ts_utc=batch_ts_utc,
-                            underlying=underlying,
-                            expiration=item.expiration,
-                        )
-                        if snapshot_id is None:
-                            result = await session.execute(
-                                text(
-                                    """
-                                    INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                                    VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload_json AS jsonb), :checksum)
-                                    RETURNING snapshot_id
-                                    """
-                                ),
-                                {
-                                    "ts": batch_ts_utc,
-                                    "underlying": underlying,
-                                    "source": "CBOE",
-                                    "target_dte": target_dte,
-                                    "expiration": item.expiration,
-                                    "payload_json": json.dumps(snapshot_payload, default=str),
-                                    "checksum": checksum,
-                                },
-                            )
-                            snapshot_id = int(result.scalar_one())
-                            inserted_snapshots += 1
-                        else:
-                            reused_snapshots += 1
+                        snapshot_id = int(insert_result.scalar_one())
+                        inserted_snapshots += 1
+                    else:
+                        reused_snapshots += 1
 
-                        per_strike: dict[float, dict[str, float]] = {}
-                        gex_calls_total = 0.0
-                        gex_puts_total = 0.0
-                        gex_abs_total = 0.0
+                    per_strike: dict[float, dict[str, float]] = {}
+                    gex_calls_total = 0.0
+                    gex_puts_total = 0.0
+                    gex_abs_total = 0.0
 
-                        # Keep MZData net gamma as canonical and sign puts negative
-                        # so charting behavior stays consistent with existing UI.
-                        for index, strike_value in enumerate(item.strikes):
-                            if strike_value is None:
-                                continue
-                            strike = float(strike_value)
-                            call_gamma = _series_float(item.call_abs_gamma, index, default=0.0)
-                            put_gamma = -abs(_series_float(item.put_abs_gamma, index, default=0.0))
-                            net_gamma = _series_float(item.net_gamma, index, default=call_gamma + put_gamma)
-                            call_oi = _series_int(item.call_open_interest, index, default=0)
-                            put_oi = _series_int(item.put_open_interest, index, default=0)
-                            oi_total = max(call_oi + put_oi, 0)
-
-                            bucket = per_strike.setdefault(strike, {"gex_calls": 0.0, "gex_puts": 0.0, "gex_net": 0.0, "oi_total": 0.0})
-                            bucket["gex_calls"] += call_gamma
-                            bucket["gex_puts"] += put_gamma
-                            bucket["gex_net"] += net_gamma
-                            bucket["oi_total"] += float(oi_total)
-                            gex_calls_total += call_gamma
-                            gex_puts_total += put_gamma
-                            gex_abs_total += abs(call_gamma) + abs(put_gamma)
-
-                        if not per_strike:
-                            failed_items.append(
-                                {
-                                    "expiration": item.expiration.isoformat(),
-                                    "reason": "no_valid_strikes",
-                                }
-                            )
+                    # Keep MZData net gamma as canonical and sign puts negative so
+                    # charting behavior stays consistent with existing UI logic.
+                    for index, strike_value in enumerate(item.strikes):
+                        if strike_value is None:
                             continue
+                        strike = float(strike_value)
+                        call_gamma = _series_float(item.call_abs_gamma, index, default=0.0)
+                        put_gamma = -abs(_series_float(item.put_abs_gamma, index, default=0.0))
+                        net_gamma = _series_float(item.net_gamma, index, default=call_gamma + put_gamma)
+                        call_oi = _series_int(item.call_open_interest, index, default=0)
+                        put_oi = _series_int(item.put_open_interest, index, default=0)
+                        oi_total = max(call_oi + put_oi, 0)
 
-                        method = "cboe_mz_precomputed"
-                        zero_gamma_level = self._zero_gamma_level(per_strike)
-                        gex_net_total = sum(strike_data["gex_net"] for strike_data in per_strike.values())
+                        bucket = per_strike.setdefault(
+                            strike,
+                            {"gex_calls": 0.0, "gex_puts": 0.0, "gex_net": 0.0, "oi_total": 0.0},
+                        )
+                        bucket["gex_calls"] += call_gamma
+                        bucket["gex_puts"] += put_gamma
+                        bucket["gex_net"] += net_gamma
+                        bucket["oi_total"] += float(oi_total)
+                        gex_calls_total += call_gamma
+                        gex_puts_total += put_gamma
+                        gex_abs_total += abs(call_gamma) + abs(put_gamma)
 
+                    if not per_strike:
+                        failed_items.append(
+                            {
+                                "underlying": underlying,
+                                "expiration": item.expiration.isoformat(),
+                                "reason": "no_valid_strikes",
+                            }
+                        )
+                        continue
+
+                    method = "cboe_mz_precomputed"
+                    zero_gamma_level = self._zero_gamma_level(per_strike)
+                    gex_net_total = sum(strike_data["gex_net"] for strike_data in per_strike.values())
+
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO gex_snapshots (
+                              snapshot_id, ts, underlying, source, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
+                            )
+                            VALUES (
+                              :snapshot_id, :ts, :underlying, :source, :spot_price, :gex_net, :gex_calls, :gex_puts, :gex_abs, :zero_gamma_level, :method
+                            )
+                            ON CONFLICT (snapshot_id) DO UPDATE SET
+                              ts = EXCLUDED.ts,
+                              underlying = EXCLUDED.underlying,
+                              source = EXCLUDED.source,
+                              spot_price = EXCLUDED.spot_price,
+                              gex_net = EXCLUDED.gex_net,
+                              gex_calls = EXCLUDED.gex_calls,
+                              gex_puts = EXCLUDED.gex_puts,
+                              gex_abs = EXCLUDED.gex_abs,
+                              zero_gamma_level = EXCLUDED.zero_gamma_level,
+                              method = EXCLUDED.method
+                            """
+                        ),
+                        {
+                            "snapshot_id": snapshot_id,
+                            "ts": batch_ts_utc,
+                            "underlying": underlying,
+                            "source": "CBOE",
+                            "spot_price": spot_price,
+                            "gex_net": gex_net_total,
+                            "gex_calls": gex_calls_total,
+                            "gex_puts": gex_puts_total,
+                            "gex_abs": gex_abs_total,
+                            "zero_gamma_level": zero_gamma_level,
+                            "method": method,
+                        },
+                    )
+                    gex_snapshots_upserted += 1
+
+                    for strike, strike_data in per_strike.items():
                         await session.execute(
                             text(
                                 """
-                                INSERT INTO gex_snapshots (
-                                  snapshot_id, ts, underlying, source, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
-                                )
-                                VALUES (
-                                  :snapshot_id, :ts, :underlying, :source, :spot_price, :gex_net, :gex_calls, :gex_puts, :gex_abs, :zero_gamma_level, :method
-                                )
-                                ON CONFLICT (snapshot_id) DO UPDATE SET
-                                  ts = EXCLUDED.ts,
-                                  underlying = EXCLUDED.underlying,
-                                  source = EXCLUDED.source,
-                                  spot_price = EXCLUDED.spot_price,
+                                INSERT INTO gex_by_strike (snapshot_id, strike, gex_net, gex_calls, gex_puts, oi_total, method)
+                                VALUES (:snapshot_id, :strike, :gex_net, :gex_calls, :gex_puts, :oi_total, :method)
+                                ON CONFLICT (snapshot_id, strike) DO UPDATE SET
                                   gex_net = EXCLUDED.gex_net,
                                   gex_calls = EXCLUDED.gex_calls,
                                   gex_puts = EXCLUDED.gex_puts,
-                                  gex_abs = EXCLUDED.gex_abs,
-                                  zero_gamma_level = EXCLUDED.zero_gamma_level,
+                                  oi_total = EXCLUDED.oi_total,
                                   method = EXCLUDED.method
                                 """
                             ),
                             {
                                 "snapshot_id": snapshot_id,
-                                "ts": batch_ts_utc,
-                                "underlying": underlying,
-                                "source": "CBOE",
-                                "spot_price": spot_price,
-                                "gex_net": gex_net_total,
-                                "gex_calls": gex_calls_total,
-                                "gex_puts": gex_puts_total,
-                                "gex_abs": gex_abs_total,
-                                "zero_gamma_level": zero_gamma_level,
+                                "strike": strike,
+                                "gex_net": strike_data["gex_net"],
+                                "gex_calls": strike_data["gex_calls"],
+                                "gex_puts": strike_data["gex_puts"],
+                                "oi_total": int(strike_data["oi_total"]),
                                 "method": method,
                             },
                         )
-                        gex_snapshots_upserted += 1
+                        strike_rows_upserted += 1
 
-                        for strike, strike_data in per_strike.items():
-                            await session.execute(
-                                text(
-                                    """
-                                    INSERT INTO gex_by_strike (snapshot_id, strike, gex_net, gex_calls, gex_puts, oi_total, method)
-                                    VALUES (:snapshot_id, :strike, :gex_net, :gex_calls, :gex_puts, :oi_total, :method)
-                                    ON CONFLICT (snapshot_id, strike) DO UPDATE SET
-                                      gex_net = EXCLUDED.gex_net,
-                                      gex_calls = EXCLUDED.gex_calls,
-                                      gex_puts = EXCLUDED.gex_puts,
-                                      oi_total = EXCLUDED.oi_total,
-                                      method = EXCLUDED.method
-                                    """
-                                ),
-                                {
-                                    "snapshot_id": snapshot_id,
-                                    "strike": strike,
-                                    "gex_net": strike_data["gex_net"],
-                                    "gex_calls": strike_data["gex_calls"],
-                                    "gex_puts": strike_data["gex_puts"],
-                                    "oi_total": int(strike_data["oi_total"]),
-                                    "method": method,
-                                },
-                            )
-                            strike_rows_upserted += 1
+                        await session.execute(
+                            text(
+                                """
+                                INSERT INTO gex_by_expiry_strike (
+                                  snapshot_id, expiration, dte_days, strike, gex_net, gex_calls, gex_puts, oi_total, method
+                                )
+                                VALUES (
+                                  :snapshot_id, :expiration, :dte_days, :strike, :gex_net, :gex_calls, :gex_puts, :oi_total, :method
+                                )
+                                ON CONFLICT (snapshot_id, expiration, strike) DO UPDATE SET
+                                  dte_days = EXCLUDED.dte_days,
+                                  gex_net = EXCLUDED.gex_net,
+                                  gex_calls = EXCLUDED.gex_calls,
+                                  gex_puts = EXCLUDED.gex_puts,
+                                  oi_total = EXCLUDED.oi_total,
+                                  method = EXCLUDED.method
+                                """
+                            ),
+                            {
+                                "snapshot_id": snapshot_id,
+                                "expiration": item.expiration,
+                                "dte_days": target_dte,
+                                "strike": strike,
+                                "gex_net": strike_data["gex_net"],
+                                "gex_calls": strike_data["gex_calls"],
+                                "gex_puts": strike_data["gex_puts"],
+                                "oi_total": int(strike_data["oi_total"]),
+                                "method": method,
+                            },
+                        )
+                        expiry_strike_rows_upserted += 1
+            except Exception as exc:
+                failed_items.append(
+                    {
+                        "underlying": underlying,
+                        "expiration": item.expiration.isoformat(),
+                        "error": str(exc),
+                    }
+                )
+                logger.exception(
+                    "cboe_gex_job: process_item_failed underlying={} expiration={} error={}",
+                    underlying,
+                    item.expiration.isoformat(),
+                    exc,
+                )
+                continue
 
-                            await session.execute(
-                                text(
-                                    """
-                                    INSERT INTO gex_by_expiry_strike (
-                                      snapshot_id, expiration, dte_days, strike, gex_net, gex_calls, gex_puts, oi_total, method
-                                    )
-                                    VALUES (
-                                      :snapshot_id, :expiration, :dte_days, :strike, :gex_net, :gex_calls, :gex_puts, :oi_total, :method
-                                    )
-                                    ON CONFLICT (snapshot_id, expiration, strike) DO UPDATE SET
-                                      dte_days = EXCLUDED.dte_days,
-                                      gex_net = EXCLUDED.gex_net,
-                                      gex_calls = EXCLUDED.gex_calls,
-                                      gex_puts = EXCLUDED.gex_puts,
-                                      oi_total = EXCLUDED.oi_total,
-                                      method = EXCLUDED.method
-                                    """
-                                ),
-                                {
-                                    "snapshot_id": snapshot_id,
-                                    "expiration": item.expiration,
-                                    "dte_days": target_dte,
-                                    "strike": strike,
-                                    "gex_net": strike_data["gex_net"],
-                                    "gex_calls": strike_data["gex_calls"],
-                                    "gex_puts": strike_data["gex_puts"],
-                                    "oi_total": int(strike_data["oi_total"]),
-                                    "method": method,
-                                },
-                            )
-                            expiry_strike_rows_upserted += 1
-                except Exception as exc:
-                    failed_items.append({"expiration": item.expiration.isoformat(), "error": str(exc)})
-                    logger.exception(
-                        "cboe_gex_job: process_item_failed underlying={} expiration={} error={}",
-                        underlying,
-                        item.expiration.isoformat(),
-                        exc,
-                    )
-                    continue
-
-            await session.commit()
-
-        logger.info(
-            "cboe_gex_job: inserted_snapshots={} reused_snapshots={} gex_snapshots={} strikes={} expiry_strikes={} skipped_items={} skipped_items_by_reason={} failed_items={}",
-            inserted_snapshots,
-            reused_snapshots,
-            gex_snapshots_upserted,
-            strike_rows_upserted,
-            expiry_strike_rows_upserted,
-            sum(skipped_items_by_reason.values()),
-            skipped_items_by_reason,
-            len(failed_items),
+        result.update(
+            {
+                "inserted_snapshots": inserted_snapshots,
+                "reused_snapshots": reused_snapshots,
+                "gex_snapshots_upserted": gex_snapshots_upserted,
+                "gex_by_strike_upserted": strike_rows_upserted,
+                "gex_by_expiry_strike_upserted": expiry_strike_rows_upserted,
+                "skipped_items": sum(skipped_items_by_reason.values()),
+                "skipped_items_by_reason": skipped_items_by_reason,
+                "failed_items": failed_items,
+            }
         )
+        return result
+
+    def _aggregate_underlying_results(
+        self,
+        *,
+        now_et: datetime,
+        requested_underlyings: list[str],
+        underlying_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Aggregate per-underlying counters into a single run response."""
+        inserted_snapshots = sum(int(item.get("inserted_snapshots", 0) or 0) for item in underlying_results)
+        reused_snapshots = sum(int(item.get("reused_snapshots", 0) or 0) for item in underlying_results)
+        gex_snapshots_upserted = sum(int(item.get("gex_snapshots_upserted", 0) or 0) for item in underlying_results)
+        strike_rows_upserted = sum(int(item.get("gex_by_strike_upserted", 0) or 0) for item in underlying_results)
+        expiry_strike_rows_upserted = sum(
+            int(item.get("gex_by_expiry_strike_upserted", 0) or 0) for item in underlying_results
+        )
+        failed_items: list[dict[str, Any]] = []
+        skipped_items_by_reason: dict[str, int] = {}
+        for item in underlying_results:
+            for reason, count in dict(item.get("skipped_items_by_reason", {})).items():
+                skipped_items_by_reason[reason] = skipped_items_by_reason.get(reason, 0) + int(count)
+            failed_items.extend(list(item.get("failed_items", [])))
+
+        processed_underlyings = [
+            str(item.get("underlying", "")).upper() for item in underlying_results if not bool(item.get("skipped"))
+        ]
+        skipped_underlyings = [
+            {"underlying": str(item.get("underlying", "")).upper(), "reason": item.get("reason")}
+            for item in underlying_results
+            if bool(item.get("skipped"))
+        ]
+        all_skipped = len(processed_underlyings) == 0
+        if all_skipped and len(underlying_results) == 1:
+            run_reason = underlying_results[0].get("reason")
+        elif all_skipped:
+            run_reason = "all_underlyings_skipped"
+        else:
+            run_reason = None
+        first_result = underlying_results[0] if len(underlying_results) == 1 else None
         return {
-            "skipped": False,
-            "reason": None,
+            "skipped": all_skipped,
+            "reason": run_reason,
             "now_et": now_et.isoformat(),
-            "underlying": underlying,
-            "batch_ts_utc": batch_ts_utc.isoformat(),
+            # Keep single-symbol keys for backwards compatibility where possible.
+            "underlying": first_result.get("underlying") if first_result else None,
+            "batch_ts_utc": first_result.get("batch_ts_utc") if first_result else None,
+            "underlyings": requested_underlyings,
+            "processed_underlyings": processed_underlyings,
+            "skipped_underlyings": skipped_underlyings,
+            "underlying_results": underlying_results,
             "inserted_snapshots": inserted_snapshots,
             "reused_snapshots": reused_snapshots,
             "gex_snapshots_upserted": gex_snapshots_upserted,
@@ -549,6 +617,56 @@ class CboeGexJob:
             "skipped_items_by_reason": skipped_items_by_reason,
             "failed_items": failed_items,
         }
+
+    async def run_once(self, *, force: bool = False) -> dict[str, Any]:
+        """Fetch MZData exposure payloads and persist CBOE rows by symbol.
+
+        The CBOE pipeline intentionally aligns DTE labeling to Tradier trading
+        slot semantics and only stores expirations within the configured
+        ``0..gex_max_dte_days`` window for every configured underlying.
+        """
+        if not settings.cboe_gex_enabled:
+            return {"skipped": True, "reason": "cboe_gex_disabled"}
+
+        tz = ZoneInfo(settings.tz)
+        now_et = datetime.now(tz=tz)
+        if (not force) and (not settings.cboe_gex_allow_outside_rth):
+            if not await self._market_open(now_et):
+                logger.info("cboe_gex_job: market closed; skipping (now_et={})", now_et.isoformat())
+                return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat()}
+
+        underlyings = settings.cboe_gex_underlyings_list()
+        if not underlyings:
+            return {"skipped": True, "reason": "missing_underlyings", "now_et": now_et.isoformat()}
+
+        underlying_results: list[dict[str, Any]] = []
+        async with SessionLocal() as session:
+            for underlying in underlyings:
+                underlying_results.append(
+                    await self._run_once_for_underlying(session=session, underlying=underlying, now_et=now_et)
+                )
+            await session.commit()
+
+        aggregated_result = self._aggregate_underlying_results(
+            now_et=now_et,
+            requested_underlyings=underlyings,
+            underlying_results=underlying_results,
+        )
+        logger.info(
+            "cboe_gex_job: underlyings={} processed_underlyings={} skipped_underlyings={} inserted_snapshots={} reused_snapshots={} gex_snapshots={} strikes={} expiry_strikes={} skipped_items={} skipped_items_by_reason={} failed_items={}",
+            aggregated_result["underlyings"],
+            aggregated_result["processed_underlyings"],
+            aggregated_result["skipped_underlyings"],
+            aggregated_result["inserted_snapshots"],
+            aggregated_result["reused_snapshots"],
+            aggregated_result["gex_snapshots_upserted"],
+            aggregated_result["gex_by_strike_upserted"],
+            aggregated_result["gex_by_expiry_strike_upserted"],
+            aggregated_result["skipped_items"],
+            aggregated_result["skipped_items_by_reason"],
+            len(aggregated_result["failed_items"]),
+        )
+        return aggregated_result
 
 
 def build_cboe_gex_job(

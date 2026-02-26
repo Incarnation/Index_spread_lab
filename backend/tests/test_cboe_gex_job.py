@@ -117,21 +117,42 @@ class _FakeMzDataClient:
     """Minimal MZData stub returning one valid exposure payload."""
 
     async def get_live_option_exposure(self, symbol: str) -> dict:
-        """Return one precomputed CBOE exposure payload for tests."""
+        """Return one precomputed CBOE exposure payload for the requested symbol."""
+        normalized_symbol = symbol.strip().upper()
+        strike_base_by_symbol = {"SPX": 6000.0, "SPY": 500.0, "VIX": 15.0}
+        spot_by_symbol = {"SPX": 6015.0, "SPY": 506.5, "VIX": 17.2}
+        strike_base = strike_base_by_symbol.get(normalized_symbol, 100.0)
+        spot_price = spot_by_symbol.get(normalized_symbol, 100.0)
         return {
-            "spotPrice": 6015.0,
+            "spotPrice": spot_price,
             "timestamp": "2026-02-16T15:00:00Z",
             "data": [
                 {
                     "expiration": "2026-02-20",
                     "dte": 4,
-                    "strikes": ["6000", "6010"],
+                    "strikes": [str(strike_base), str(strike_base + 10.0)],
                     "netGamma": [10.0, -5.0],
                     "call": {"absGamma": [12.0, 3.0], "openInterest": [100, 50]},
                     "put": {"absGamma": [2.0, 8.0], "openInterest": [80, 120]},
                 }
             ],
         }
+
+
+class _FakeMzDataClientWithSelectiveFailure:
+    """MZData stub that fails selected symbols while serving others."""
+
+    def __init__(self, failing_symbols: set[str]) -> None:
+        """Store normalized symbol set that should raise fetch failures."""
+        self._failing_symbols = {symbol.strip().upper() for symbol in failing_symbols}
+        self._fallback = _FakeMzDataClient()
+
+    async def get_live_option_exposure(self, symbol: str) -> dict:
+        """Raise for configured symbols and return normal payload otherwise."""
+        normalized_symbol = symbol.strip().upper()
+        if normalized_symbol in self._failing_symbols:
+            raise RuntimeError(f"forced_fetch_failure:{normalized_symbol}")
+        return await self._fallback.get_live_option_exposure(normalized_symbol)
 
 
 class _FakeMzDataClientWithWideDte:
@@ -175,10 +196,11 @@ async def test_cboe_gex_job_skips_when_market_closed(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_cboe_gex_job_persists_source_tagged_rows(monkeypatch) -> None:
-    """CBOE job should persist source tags and trading-slot DTE fields."""
+    """CBOE job should ingest all configured symbols and persist source tags."""
     capture_session = _RecordingSession()
     monkeypatch.setattr(settings, "cboe_gex_enabled", True)
     monkeypatch.setattr(settings, "cboe_gex_allow_outside_rth", False)
+    monkeypatch.setattr(settings, "cboe_gex_underlyings", "SPX,SPY,VIX")
     monkeypatch.setattr(settings, "cboe_gex_underlying", "SPX")
     monkeypatch.setattr(settings, "gex_max_dte_days", 10)
     monkeypatch.setattr(cboe_module, "SessionLocal", _SessionFactory(capture_session))
@@ -186,15 +208,20 @@ async def test_cboe_gex_job_persists_source_tagged_rows(monkeypatch) -> None:
     result = await CboeGexJob(mzdata=_FakeMzDataClient()).run_once(force=True)
 
     assert result["skipped"] is False
-    assert result["inserted_snapshots"] == 1
-    assert result["gex_snapshots_upserted"] == 1
-    assert result["gex_by_strike_upserted"] == 2
-    assert result["gex_by_expiry_strike_upserted"] == 2
+    assert result["underlyings"] == ["SPX", "SPY", "VIX"]
+    assert set(result["processed_underlyings"]) == {"SPX", "SPY", "VIX"}
+    assert result["skipped_underlyings"] == []
+    assert len(result["underlying_results"]) == 3
+    assert result["inserted_snapshots"] == 3
+    assert result["gex_snapshots_upserted"] == 3
+    assert result["gex_by_strike_upserted"] == 6
+    assert result["gex_by_expiry_strike_upserted"] == 6
     assert result["skipped_items"] == 0
     assert result["skipped_items_by_reason"] == {}
-    assert capture_session.chain_snapshot_inserts[0]["source"] == "CBOE"
-    assert capture_session.chain_snapshot_inserts[0]["target_dte"] == 1
-    assert capture_session.gex_snapshot_upserts[0]["source"] == "CBOE"
+    assert {row["underlying"] for row in capture_session.chain_snapshot_inserts} == {"SPX", "SPY", "VIX"}
+    assert all(row["source"] == "CBOE" for row in capture_session.chain_snapshot_inserts)
+    assert all(row["target_dte"] == 1 for row in capture_session.chain_snapshot_inserts)
+    assert all(row["source"] == "CBOE" for row in capture_session.gex_snapshot_upserts)
     assert all(row["dte_days"] == 1 for row in capture_session.gex_by_expiry_strike_upserts)
 
 
@@ -204,6 +231,7 @@ async def test_cboe_gex_job_skips_items_outside_max_trading_slot_dte(monkeypatch
     capture_session = _RecordingSession()
     monkeypatch.setattr(settings, "cboe_gex_enabled", True)
     monkeypatch.setattr(settings, "cboe_gex_allow_outside_rth", False)
+    monkeypatch.setattr(settings, "cboe_gex_underlyings", "SPX")
     monkeypatch.setattr(settings, "cboe_gex_underlying", "SPX")
     monkeypatch.setattr(settings, "gex_max_dte_days", 10)
     monkeypatch.setattr(cboe_module, "SessionLocal", _SessionFactory(capture_session))
@@ -219,3 +247,28 @@ async def test_cboe_gex_job_skips_items_outside_max_trading_slot_dte(monkeypatch
     assert result["skipped_items_by_reason"] == {"dte_out_of_range": 2}
     assert len(capture_session.chain_snapshot_inserts) == 11
     assert all(0 <= row["target_dte"] <= 10 for row in capture_session.chain_snapshot_inserts)
+
+
+@pytest.mark.asyncio
+async def test_cboe_gex_job_continues_when_one_symbol_fetch_fails(monkeypatch) -> None:
+    """CBOE job should continue processing remaining symbols after one fetch failure."""
+    capture_session = _RecordingSession()
+    monkeypatch.setattr(settings, "cboe_gex_enabled", True)
+    monkeypatch.setattr(settings, "cboe_gex_allow_outside_rth", False)
+    monkeypatch.setattr(settings, "cboe_gex_underlyings", "SPX,SPY,VIX")
+    monkeypatch.setattr(settings, "cboe_gex_underlying", "SPX")
+    monkeypatch.setattr(settings, "gex_max_dte_days", 10)
+    monkeypatch.setattr(cboe_module, "SessionLocal", _SessionFactory(capture_session))
+
+    result = await CboeGexJob(mzdata=_FakeMzDataClientWithSelectiveFailure({"SPY"})).run_once(force=True)
+
+    assert result["skipped"] is False
+    assert result["underlyings"] == ["SPX", "SPY", "VIX"]
+    assert set(result["processed_underlyings"]) == {"SPX", "VIX"}
+    assert result["inserted_snapshots"] == 2
+    assert result["gex_snapshots_upserted"] == 2
+    assert result["gex_by_strike_upserted"] == 4
+    assert result["gex_by_expiry_strike_upserted"] == 4
+    assert {item["underlying"] for item in result["skipped_underlyings"]} == {"SPY"}
+    assert {row["underlying"] for row in capture_session.chain_snapshot_inserts} == {"SPX", "VIX"}
+    assert any("forced_fetch_failure:SPY" in str(item.get("error", "")) for item in result["failed_items"])

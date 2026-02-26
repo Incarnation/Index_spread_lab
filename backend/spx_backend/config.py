@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -67,11 +69,12 @@ class Settings(BaseSettings):
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
     cboe_gex_enabled: bool = False
+    cboe_gex_underlyings: str = ""
     cboe_gex_underlying: str = "SPX"
     cboe_gex_interval_minutes: int = 15
     cboe_gex_allow_outside_rth: bool = False
 
-    decision_entry_times: str = "10:00,11:00,12:00"
+    decision_entry_times: str = "10:02,11:02,12:02"
     decision_dte_targets: str = "0,3,5,7,10"
     decision_dte_tolerance_days: int = 1
     decision_delta_targets: str = "0.10,0.20"
@@ -79,7 +82,7 @@ class Settings(BaseSettings):
     decision_spread_sides: str = ""
     decision_spread_width_points: float = 25.0
     decision_contracts: int = 1
-    decision_snapshot_max_age_minutes: int = 15
+    decision_snapshot_max_age_minutes: int = 20
     decision_max_trades_per_run: int = 4
     decision_max_trades_per_day: int = 20
     decision_max_open_trades: int = 15
@@ -210,6 +213,33 @@ class Settings(BaseSettings):
         """Parse quote symbol list from comma-separated env configuration."""
         parts = [p.strip() for p in self.quote_symbols.split(",") if p.strip()]
         return parts
+
+    def cboe_gex_underlyings_list(self) -> list[str]:
+        """Parse CBOE underlyings with normalization, validation, and dedupe.
+
+        Behavior
+        --------
+        - Uses ``CBOE_GEX_UNDERLYINGS`` when configured.
+        - Falls back to legacy ``CBOE_GEX_UNDERLYING`` for backward compatibility.
+        - Normalizes symbols to uppercase, drops malformed symbols, and preserves
+          first-seen ordering while removing duplicates.
+        """
+        primary_value = self.cboe_gex_underlyings.strip()
+        source_value = primary_value if primary_value else self.cboe_gex_underlying
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for raw_part in source_value.split(","):
+            symbol = raw_part.strip().upper()
+            if not symbol:
+                continue
+            # Keep symbols exchange-like (letters first, optional numeric suffix).
+            if re.fullmatch(r"[A-Z][A-Z0-9]{0,9}", symbol) is None:
+                continue
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append(symbol)
+        return symbols
 
     def cors_origins_list(self) -> list[str]:
         """Parse CORS origins into a normalized list for FastAPI middleware."""

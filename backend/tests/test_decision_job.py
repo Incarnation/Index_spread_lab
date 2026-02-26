@@ -59,6 +59,7 @@ class _SessionFactory:
 
 
 def _set_default_decision_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch common decision settings defaults used across unit tests."""
     monkeypatch.setattr(settings, "snapshot_underlying", "SPX")
     monkeypatch.setattr(settings, "decision_contracts", 1)
     monkeypatch.setattr(settings, "decision_snapshot_max_age_minutes", 15)
@@ -128,6 +129,22 @@ def test_context_score_supports_put_spreads() -> None:
     assert score > 0
     assert "gex_support" in flags
     assert "spot_above_zero_gamma" in flags
+
+
+def test_cboe_gex_underlyings_list_prefers_plural_env_and_dedupes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plural CBOE underlyings should override legacy single-symbol config."""
+    monkeypatch.setattr(settings, "cboe_gex_underlyings", "spx, spy ,VIX,SPX,@@bad@@")
+    monkeypatch.setattr(settings, "cboe_gex_underlying", "RUT")
+
+    assert settings.cboe_gex_underlyings_list() == ["SPX", "SPY", "VIX"]
+
+
+def test_cboe_gex_underlyings_list_falls_back_to_legacy_single_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy single-symbol CBOE config should still work when plural is empty."""
+    monkeypatch.setattr(settings, "cboe_gex_underlyings", "")
+    monkeypatch.setattr(settings, "cboe_gex_underlying", "spx")
+
+    assert settings.cboe_gex_underlyings_list() == ["SPX"]
 
 
 @pytest.mark.asyncio
