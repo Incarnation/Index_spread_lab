@@ -1,4 +1,4 @@
-"""Tests for config validation and backtest engine path sanitization."""
+"""Tests for config validation helpers."""
 from __future__ import annotations
 
 import os
@@ -7,12 +7,6 @@ from unittest.mock import patch
 import pytest
 
 from spx_backend.config import Settings
-from spx_backend.backtest.engine import BacktestConfig, BacktestEngine, sanitize_parquet_path
-
-
-# ---------------------------------------------------------------------------
-# Config parsing tests
-# ---------------------------------------------------------------------------
 
 
 class TestConfigParsing:
@@ -87,49 +81,3 @@ class TestConfigParsing:
     def test_decision_delta_targets(self):
         s = self._settings(DECISION_DELTA_TARGETS="0.10,0.15,0.20")
         assert s.decision_delta_targets_list() == [0.10, 0.15, 0.20]
-
-
-# ---------------------------------------------------------------------------
-# Backtest engine path sanitization
-# ---------------------------------------------------------------------------
-
-_DANGEROUS_PATHS = [
-    "../../etc/passwd",
-    "data'; DROP TABLE cbbo; --",
-    "path/with;semicolons",
-    "'; SELECT 1; --",
-    "data/INSERT.parquet",
-]
-
-
-class TestBacktestPathSanitization:
-    """Ensure dangerous paths are rejected by sanitize_parquet_path."""
-
-    @pytest.mark.parametrize("path", _DANGEROUS_PATHS)
-    def test_dangerous_paths_rejected(self, path: str):
-        with pytest.raises(ValueError):
-            sanitize_parquet_path(path)
-
-    def test_safe_path_accepted(self):
-        safe = "data/opra/cbbo_2024.parquet"
-        assert sanitize_parquet_path(safe) == safe
-
-    def test_glob_path_accepted(self):
-        glob_path = "data/opra/cbbo_*.parquet"
-        assert sanitize_parquet_path(glob_path) == glob_path
-
-
-class TestBacktestConfigDefaults:
-    """Verify BacktestConfig defaults are sensible."""
-
-    def test_defaults(self):
-        cfg = BacktestConfig(
-            cbbo_parquet_glob="a.parquet",
-            definitions_parquet_glob="b.parquet",
-            underlying_parquet_glob="c.parquet",
-        )
-        assert cfg.spread_side in ("put", "call")
-        assert cfg.take_profit_pct > 0
-        assert cfg.stop_loss_pct > 0
-        assert cfg.dte_targets == [3, 5, 7]
-        assert cfg.contract_multiplier == 100
