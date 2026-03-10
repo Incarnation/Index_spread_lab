@@ -3,6 +3,12 @@ import * as authStorage from "./auth";
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
 
 /**
+ * Custom event dispatched on 401 responses so AuthContext can handle
+ * navigation via React Router instead of a full-page reload.
+ */
+export const UNAUTHORIZED_EVENT = "app:unauthorized";
+
+/**
  * Build an API URL relative to the configured frontend base URL.
  *
  * This keeps local/dev and deployed environments aligned without changing
@@ -21,14 +27,29 @@ function authHeaders(): HeadersInit {
 }
 
 /**
- * Fetch with auth header and 401 handling: on 401 clears token and redirects to /login.
+ * Parse JSON from a response with a descriptive error on failure.
+ * Wraps r.json() so a non-JSON body (HTML error page, empty body)
+ * produces a clear message instead of a cryptic SyntaxError.
+ */
+async function safeJson<T>(r: Response): Promise<T> {
+  try {
+    return (await r.json()) as T;
+  } catch {
+    throw new Error(`Expected JSON response but got ${r.status} ${r.statusText}`);
+  }
+}
+
+/**
+ * Fetch with auth header and 401 handling.
+ * On 401: clears token and dispatches an event so AuthContext navigates
+ * to /login via React Router (no full-page reload).
  */
 async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Response> {
   const headers = { ...authHeaders(), ...(init.headers as Record<string, string>) };
   const r = await fetch(url, { ...init, headers });
   if (r.status === 401) {
     authStorage.clearToken();
-    window.location.href = "/login";
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
     throw new Error("Unauthorized");
   }
   return r;
@@ -64,7 +85,7 @@ export type ChainSnapshot = {
 export async function fetchChainSnapshots(limit = 50): Promise<ChainSnapshot[]> {
   const r = await fetchWithAuth(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { items: ChainSnapshot[] };
+  const data = await safeJson<{ items: ChainSnapshot[] }>(r);
   return data.items;
 }
 
@@ -89,7 +110,7 @@ export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as RunSnapshotResult;
+  return safeJson<RunSnapshotResult>(r);
 }
 
 export type RunQuotesResult = {
@@ -108,7 +129,7 @@ export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as RunQuotesResult;
+  return safeJson<RunQuotesResult>(r);
 }
 
 export type RunDecisionResult = {
@@ -149,7 +170,7 @@ export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as RunDecisionResult;
+  return safeJson<RunDecisionResult>(r);
 }
 
 export type RunTradePnlResult = {
@@ -170,7 +191,7 @@ export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as RunTradePnlResult;
+  return safeJson<RunTradePnlResult>(r);
 }
 
 export type GenericAdminRunResult = {
@@ -190,7 +211,7 @@ export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult>
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 /**
@@ -202,7 +223,7 @@ export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdmi
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 /**
@@ -214,7 +235,7 @@ export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunRes
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 /**
@@ -226,7 +247,7 @@ export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunRes
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 /**
@@ -238,7 +259,7 @@ export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdm
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 /**
@@ -250,7 +271,7 @@ export async function runPromotionGatesNow(apiKey?: string): Promise<GenericAdmi
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as GenericAdminRunResult;
+  return safeJson<GenericAdminRunResult>(r);
 }
 
 export type GexSnapshot = {
@@ -295,7 +316,7 @@ export async function fetchGexSnapshots(limit = 20, underlying?: string, source?
   }
   const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { items: GexSnapshot[] };
+  const data = await safeJson<{ items: GexSnapshot[] }>(r);
   return data.items;
 }
 
@@ -305,7 +326,7 @@ export async function fetchGexSnapshots(limit = 20, underlying?: string, source?
 export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
   const r = await fetchWithAuth(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { dte_days: number[] };
+  const data = await safeJson<{ dte_days: number[] }>(r);
   return data.dte_days;
 }
 
@@ -315,7 +336,7 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
 export async function fetchGexExpirations(snapshotId: number): Promise<GexExpirationItem[]> {
   const r = await fetchWithAuth(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { items: GexExpirationItem[] };
+  const data = await safeJson<{ items: GexExpirationItem[] }>(r);
   return data.items;
 }
 
@@ -333,7 +354,7 @@ export async function fetchGexCurve(snapshotId: number, dteDays?: number, expira
   if (expirations && expirations.length > 0) params.set("expirations_csv", expirations.join(","));
   const r = await fetchWithAuth(apiUrl(`/api/gex/curve?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { points: GexCurvePoint[] };
+  const data = await safeJson<{ points: GexCurvePoint[] }>(r);
   return data.points;
 }
 
@@ -359,7 +380,7 @@ export type TradeDecision = {
 export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
   const r = await fetchWithAuth(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { items: TradeDecision[] };
+  const data = await safeJson<{ items: TradeDecision[] }>(r);
   return data.items;
 }
 
@@ -413,7 +434,7 @@ export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROL
   if (status) params.set("status", status);
   const r = await fetchWithAuth(apiUrl(`/api/trades?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = (await r.json()) as { items: TradeRow[] };
+  const data = await safeJson<{ items: TradeRow[] }>(r);
   return data.items;
 }
 
@@ -449,7 +470,7 @@ export type LabelMetricsResponse = {
 export async function fetchLabelMetrics(lookbackDays = 90): Promise<LabelMetricsResponse> {
   const r = await fetchWithAuth(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as LabelMetricsResponse;
+  return safeJson<LabelMetricsResponse>(r);
 }
 
 export type StrategyMetricsSummary = {
@@ -492,7 +513,7 @@ export type StrategyMetricsResponse = {
 export async function fetchStrategyMetrics(lookbackDays = 90): Promise<StrategyMetricsResponse> {
   const r = await fetchWithAuth(apiUrl(`/api/strategy-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as StrategyMetricsResponse;
+  return safeJson<StrategyMetricsResponse>(r);
 }
 
 export type PerformanceAnalyticsMode = "realized" | "combined";
@@ -576,7 +597,7 @@ export async function fetchPerformanceAnalytics(
   });
   const r = await fetchWithAuth(apiUrl(`/api/performance-analytics?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as PerformanceAnalyticsResponse;
+  return safeJson<PerformanceAnalyticsResponse>(r);
 }
 
 export type ModelOpsGate = {
@@ -638,7 +659,7 @@ export async function fetchModelOps(modelName?: string): Promise<ModelOpsRespons
   const query = params.toString();
   const r = await fetchWithAuth(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as ModelOpsResponse;
+  return safeJson<ModelOpsResponse>(r);
 }
 
 export type AdminPreflightCounts = {
@@ -726,7 +747,7 @@ export async function fetchAdminPreflight(apiKey?: string): Promise<AdminPreflig
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as AdminPreflightResponse;
+  return safeJson<AdminPreflightResponse>(r);
 }
 
 /**
@@ -738,7 +759,7 @@ export async function deleteTradeDecision(decisionId: number, apiKey?: string): 
     headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as { deleted: boolean; decision_id: number };
+  return safeJson<{ deleted: boolean; decision_id: number }>(r);
 }
 
 /** Single auth audit log entry (admin-only). */
@@ -777,6 +798,6 @@ export async function fetchAuthAudit(
   if (userId != null) params.set("user_id", String(userId));
   const r = await fetchWithAuth(apiUrl(`/api/admin/auth-audit?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()) as AuthAuditResponse;
+  return safeJson<AuthAuditResponse>(r);
 }
 

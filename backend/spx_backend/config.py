@@ -178,6 +178,18 @@ class Settings(BaseSettings):
     allow_quotes_outside_rth: bool = False
     market_clock_cache_seconds: int = 300
 
+    # Staleness alerting
+    staleness_alert_enabled: bool = False
+    staleness_alert_interval_minutes: int = 30
+    staleness_quotes_max_minutes: int = 120
+    staleness_snapshots_max_minutes: int = 120
+    staleness_gex_max_minutes: int = 120
+    staleness_decisions_max_minutes: int = 480
+    staleness_cooldown_minutes: int = 360
+    sendgrid_api_key: str = ""
+    email_alert_recipient: str = ""
+    email_alert_sender: str = "alerts@indexspreadlab.app"
+
     # Auth: JWT and user registration (multiple users, in-house auth).
     jwt_secret: str = ""  # set JWT_SECRET in env for auth; auth endpoints error if empty
     jwt_algorithm: str = "HS256"

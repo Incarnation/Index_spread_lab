@@ -32,6 +32,11 @@ export function useDecisionDeletion({
 }: UseDecisionDeletionArgs): UseDecisionDeletionResult {
   const [deletingDecisionId, setDeletingDecisionId] = React.useState<number | null>(null);
   const [successMessage, setSuccessMessage] = React.useState<string | null>(null);
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(() => {
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, []);
 
   /**
    * Delete a decision after confirmation and refresh table state.
@@ -49,8 +54,10 @@ export function useDecisionDeletion({
           onDeleteActiveDrawerDecision();
         }
         setSuccessMessage(`Decision #${decisionId} deleted.`);
-        window.setTimeout(() => {
+        if (timerRef.current) clearTimeout(timerRef.current);
+        timerRef.current = window.setTimeout(() => {
           setSuccessMessage((prev) => (prev === `Decision #${decisionId} deleted.` ? null : prev));
+          timerRef.current = null;
         }, 3000);
         onRefresh();
       } catch (e: unknown) {

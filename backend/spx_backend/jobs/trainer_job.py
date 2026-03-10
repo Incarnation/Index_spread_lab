@@ -605,35 +605,112 @@ class TrainerJob:
                     train_rows = [r for r in all_rows if r["ts"] < windows["test_start"]]
                     test_rows = [r for r in all_rows if r["ts"] >= windows["test_start"]]
                     if len(train_rows) < settings.trainer_min_train_rows or len(test_rows) < settings.trainer_min_test_rows:
-                        await self._mark_training_run_skipped(
-                            session=session,
-                            training_run_id=run_id,
-                            finished_at=now_utc,
-                            rows_train=len(train_rows),
-                            rows_test=len(test_rows),
-                            metrics_json={
-                                "rows_total": len(all_rows),
+                        # Walk-forward split failed -- fall back to sparse CV
+                        # when enabled and enough total rows exist.
+                        if can_run_sparse_cv:
+                            logger.info(
+                                "trainer_job: walk-forward split insufficient "
+                                "(train={}, test={}), falling back to sparse CV",
+                                len(train_rows), len(test_rows),
+                            )
+                            evaluation_mode = "sparse_time_series_cv"
+                            cv_folds = build_time_series_cv_folds(
+                                rows_count=rows_total,
+                                fold_count=settings.trainer_sparse_cv_folds,
+                                min_train_rows=settings.trainer_sparse_cv_min_train_rows,
+                                min_test_rows=settings.trainer_sparse_cv_min_test_rows,
+                            )
+                            if not cv_folds:
+                                await self._mark_training_run_skipped(
+                                    session=session,
+                                    training_run_id=run_id,
+                                    finished_at=now_utc,
+                                    rows_train=len(train_rows),
+                                    rows_test=len(test_rows),
+                                    metrics_json={
+                                        "rows_total": rows_total,
+                                        "rows_train": len(train_rows),
+                                        "rows_test": len(test_rows),
+                                        "sparse_cv_folds_requested": settings.trainer_sparse_cv_folds,
+                                        "skipped_reason": "insufficient_split_rows_and_cv_folds",
+                                    },
+                                    notes="insufficient_split_rows_and_cv_folds",
+                                )
+                                await session.commit()
+                                return {
+                                    "skipped": True,
+                                    "reason": "insufficient_split_rows_and_cv_folds",
+                                    "training_run_id": run_id,
+                                    "rows_train": len(train_rows),
+                                    "rows_test": len(test_rows),
+                                }
+
+                            fold_metrics_fb: list[dict[str, Any]] = []
+                            for fold in cv_folds:
+                                fold_train_rows = all_rows[: int(fold["train_end_idx"])]
+                                fold_test_rows = all_rows[int(fold["test_start_idx"]) : int(fold["test_end_idx"])]
+                                fold_model_payload = train_bucket_model(
+                                    rows=fold_train_rows,
+                                    min_bucket_size=settings.trainer_min_bucket_size,
+                                    prior_strength=settings.trainer_prior_strength,
+                                    adaptive_prior_enabled=settings.trainer_adaptive_prior_enabled,
+                                    adaptive_prior_reference_rows=settings.trainer_adaptive_prior_reference_rows,
+                                    adaptive_prior_min=settings.trainer_adaptive_prior_min,
+                                    adaptive_prior_max=settings.trainer_adaptive_prior_max,
+                                    utility_prob_weight=settings.trainer_utility_prob_weight,
+                                    utility_tail_penalty=settings.trainer_utility_tail_penalty,
+                                    utility_margin_penalty=settings.trainer_utility_margin_penalty,
+                                )
+                                fold_eval = self._evaluate_model(model_payload=fold_model_payload, rows=fold_test_rows)
+                                fold_eval["fold_index"] = int(fold["fold_index"])
+                                fold_eval["rows_train"] = int(fold["rows_train"])
+                                fold_eval["rows_test"] = int(fold["rows_test"])
+                                fold_metrics_fb.append(fold_eval)
+
+                            eval_metrics = self._aggregate_cv_metrics(fold_metrics=fold_metrics_fb)
+                            train_rows_for_model = list(all_rows)
+                            rows_train_for_run = len(train_rows_for_model)
+                            rows_test_for_run = int(eval_metrics.get("rows_test") or 0)
+                            walkforward_fold_value = len(cv_folds)
+                            train_start = train_rows_for_model[0]["ts"] if train_rows_for_model else None
+                            train_end = train_rows_for_model[-1]["ts"] if train_rows_for_model else None
+                            first_test_idx = int(cv_folds[0]["test_start_idx"])
+                            last_test_end_idx = int(cv_folds[-1]["test_end_idx"])
+                            if 0 <= first_test_idx < len(all_rows):
+                                test_start = all_rows[first_test_idx]["ts"]
+                            if last_test_end_idx > 0 and last_test_end_idx - 1 < len(all_rows):
+                                test_end = all_rows[last_test_end_idx - 1]["ts"]
+                        else:
+                            await self._mark_training_run_skipped(
+                                session=session,
+                                training_run_id=run_id,
+                                finished_at=now_utc,
+                                rows_train=len(train_rows),
+                                rows_test=len(test_rows),
+                                metrics_json={
+                                    "rows_total": len(all_rows),
+                                    "rows_train": len(train_rows),
+                                    "rows_test": len(test_rows),
+                                    "skipped_reason": "insufficient_split_rows",
+                                },
+                                notes="insufficient_split_rows",
+                            )
+                            await session.commit()
+                            return {
+                                "skipped": True,
+                                "reason": "insufficient_split_rows",
+                                "training_run_id": run_id,
                                 "rows_train": len(train_rows),
                                 "rows_test": len(test_rows),
-                                "skipped_reason": "insufficient_split_rows",
-                            },
-                            notes="insufficient_split_rows",
-                        )
-                        await session.commit()
-                        return {
-                            "skipped": True,
-                            "reason": "insufficient_split_rows",
-                            "training_run_id": run_id,
-                            "rows_train": len(train_rows),
-                            "rows_test": len(test_rows),
-                        }
-                    train_rows_for_model = list(train_rows)
-                    rows_train_for_run = len(train_rows_for_model)
-                    rows_test_for_run = len(test_rows)
-                    train_start = train_rows[0]["ts"] if train_rows else None
-                    train_end = train_rows[-1]["ts"] if train_rows else None
-                    test_start = test_rows[0]["ts"] if test_rows else None
-                    test_end = test_rows[-1]["ts"] if test_rows else None
+                            }
+                    else:
+                        train_rows_for_model = list(train_rows)
+                        rows_train_for_run = len(train_rows_for_model)
+                        rows_test_for_run = len(test_rows)
+                        train_start = train_rows[0]["ts"] if train_rows else None
+                        train_end = train_rows[-1]["ts"] if train_rows else None
+                        test_start = test_rows[0]["ts"] if test_rows else None
+                        test_end = test_rows[-1]["ts"] if test_rows else None
 
                 model_payload = train_bucket_model(
                     rows=train_rows_for_model,

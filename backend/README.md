@@ -3,16 +3,17 @@
 This backend is a FastAPI service that captures options market data, computes context/GEX, and runs a rules-first plus model-assisted paper execution pipeline.
 
 It is built for observability and reproducibility:
-- every chain snapshot is stored raw + normalized
+- every chain snapshot is stored with metadata and checksum (raw payload cleared to save storage)
 - market clock states are audited
 - decision runs are persisted (TRADE and SKIP) with reasons
 - preflight endpoint provides one-call pipeline health
+- staleness monitoring with email alerting during RTH
 
 ---
 
 ## 1) Service Responsibilities
 
-The backend performs ten continuous tasks:
+The backend performs twelve continuous tasks:
 - Quote ingestion (`underlying_quotes`, `context_snapshots`)
 - Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
 - GEX computation (`gex_snapshots`, strike/expiry detail tables)
@@ -20,9 +21,11 @@ The backend performs ten continuous tasks:
 - Decision generation (`trade_decisions`, rules/hybrid policy)
 - Trade mark-to-market and exits (`trades`, `trade_legs`, `trade_marks`)
 - Label resolution (`trade_candidates.label_*`, `realized_pnl`)
-- Weekly training (`training_runs`, `model_versions`)
+- Weekly training with sparse CV fallback (`training_runs`, `model_versions`)
 - Shadow inference (`model_predictions`)
 - Promotion gate evaluation (model rollout status updates)
+- Performance analytics aggregation (win rates, expectancy, drawdown, margin usage)
+- Staleness monitoring with SendGrid email alerting (RTH-only, cooldown-gated)
 
 And exposes APIs for:
 - dashboard data reads
@@ -36,9 +39,10 @@ And exposes APIs for:
 Startup flow:
 1) Load settings from env (`spx_backend/config.py`).
 2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
-3) Build Tradier client + market clock cache.
-4) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/feature-builder/decision/trade-pnl/labeler/trainer/shadow-inference/promotion-gates.
-5) Optionally run immediate first cycles to warm data.
+3) Run SQL migrations from `spx_backend/database/sql/migrations/` (idempotent, runs every startup).
+4) Build Tradier client + market clock cache.
+5) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/feature-builder/decision/trade-pnl/labeler/trainer/shadow-inference/promotion-gates/staleness-monitor/performance-analytics.
+6) Optionally run immediate first cycles to warm data.
 
 Shutdown flow:
 - Scheduler stops with FastAPI lifespan shutdown.
@@ -69,14 +73,23 @@ Entrypoint:
   - Computes GEX summary and curves.
 - `spx_backend/jobs/decision_job.py`
   - Builds/scoring candidate spreads and writes TRADE/SKIP rows.
+- `spx_backend/jobs/staleness_monitor_job.py`
+  - RTH-gated pipeline freshness checker with SendGrid alerting and cooldown.
+- `spx_backend/jobs/performance_analytics_job.py`
+  - Aggregate trade win rates, expectancy, drawdown, and margin usage.
 - `spx_backend/market_clock.py`
-  - Tradier clock cache with DB audit rows and fallback behavior.
+  - Tradier clock cache with DB audit rows and RTH fallback behavior.
 - `spx_backend/backtest/`
   - Local backtest engine code (`engine.py`, `run_backtest.py`) and `data/samples/`.
+  - Parquet path sanitization to prevent SQL injection via f-string view creation.
 - `spx_backend/dte.py`
   - Trading-session DTE lookup and expiration chooser helpers.
 - `spx_backend/database/sql/db_schema.sql`
   - Complete schema bootstrap for ingestion, decision, ML scaffolding.
+- `spx_backend/database/sql/migrations/`
+  - Idempotent SQL migrations run on every startup (index cleanup, payload_json clearing).
+- `scripts/data_retention.py`
+  - CLI to export old chain/GEX data to gzipped CSV and purge from the database.
 
 ---
 
@@ -111,7 +124,7 @@ Selection:
 - Strikes are trimmed around spot (`SNAPSHOT_STRIKES_EACH_SIDE`).
 
 Output:
-- `chain_snapshots` raw payload with checksum.
+- `chain_snapshots` metadata with checksum (raw `payload_json` cleared to `{}` to save storage).
 - `option_chain_rows` normalized rows (bid/ask/greeks/open interest/etc).
 
 Dual-stream behavior:
@@ -218,6 +231,25 @@ Input:
 Output:
 - Gate pass/fail evaluation persisted into run/model metrics JSON.
 - `model_versions.rollout_status` updates (`shadow`/`canary`) and optional activation behavior.
+
+### 4.11 Performance Analytics Job
+
+Input:
+- Closed trades and their realized PnL, side, margin usage.
+
+Output:
+- Aggregate metrics: win rates (TP50, TP100), expectancy, max drawdown, tail loss proxy, average margin usage, per-side breakdown.
+
+### 4.12 Staleness Monitor Job
+
+Input:
+- Latest timestamps from `underlying_quotes`, `chain_snapshots`, `gex_snapshots`, `trade_decisions`.
+
+Behavior:
+- Runs only during RTH (skips evenings, weekends, exchange holidays via `MarketClockCache`).
+- Compares data age against configurable thresholds per source.
+- Sends email alert via SendGrid when any source exceeds its threshold.
+- Cooldown period (default 6 hours) prevents duplicate alerts.
 
 ---
 
@@ -408,6 +440,13 @@ High-impact settings:
   - `CBOE_GEX_UNDERLYING` (legacy fallback during migration)
   - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
   - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
+- Staleness alerting:
+  - `STALENESS_ALERT_ENABLED` (default `false`)
+  - `STALENESS_ALERT_INTERVAL_MINUTES` (default `30`)
+  - `STALENESS_QUOTES_MAX_MINUTES`, `STALENESS_SNAPSHOTS_MAX_MINUTES`, `STALENESS_GEX_MAX_MINUTES` (default `120`)
+  - `STALENESS_DECISIONS_MAX_MINUTES` (default `480`)
+  - `STALENESS_COOLDOWN_MINUTES` (default `360`)
+  - `SENDGRID_API_KEY`, `EMAIL_ALERT_RECIPIENT`, `EMAIL_ALERT_SENDER`
 - Ops/Safety:
   - `ALLOW_QUOTES_OUTSIDE_RTH`
   - `MARKET_CLOCK_CACHE_SECONDS`
@@ -602,6 +641,13 @@ Current coverage domains:
 - Decision candidate/scoring/freshness logic
 - GEX zero-gamma helper
 - GEX API output behavior (including custom expiration filter and fallback)
+- Trade PnL: mark-to-market, TP/SL/expiry close, bulk leg loading, expired trade handling
+- Staleness monitor: freshness detection, cooldown, SendGrid alerting, RTH guard
+- Market clock: `is_rth` boundary cases, `MarketClockCache` with mock Tradier and fallback
+- Quote job: market gate, symbol parsing, fetch failure, successful insertion
+- Trainer: walk-forward windows, sparse CV folds, walk-forward-to-sparse-CV fallback
+- Config parsing: list fields, dedup, bad symbols, delta targets
+- Backtest engine: parquet path sanitization (traversal, semicolons, SQL keywords)
 - HTTP-level mocked E2E router workflows
 - DB-backed integration smoke tests (`-m integration`)
 - DB-backed regression failure pack (quote fetch fail, no expirations, no shadow model, promotion gate fail/pass)
@@ -654,9 +700,25 @@ LIMIT 20;
 
 ---
 
-## 13) Known Limitations
+## 13) Data Retention
+
+A CLI script is provided for manual data lifecycle management:
+
+```bash
+python backend/scripts/data_retention.py --days 90 --export-dir ./exports
+python backend/scripts/data_retention.py --days 90 --export-dir ./exports --dry-run
+```
+
+The script exports old `chain_snapshots` and cascade-dependent rows (`option_chain_rows`, `gex_by_strike`, `gex_by_expiry_strike`, `gex_snapshots`, `trade_marks`) to gzipped CSV files, then purges them from the database.
+
+Requirements: `psycopg2-binary`, `pandas`.
+
+---
+
+## 14) Known Limitations
 
 - Hybrid decision path is implemented, but defaults to rules-first with model ranking gated by config/promotions.
 - Order placement/fill lifecycle tables exist but workflow remains staged.
 - Frontend test coverage has not yet been added.
 - Full historical replay/backtest orchestration is still pending.
+- Data retention is manual (CLI script); scheduled purge automation is a future improvement.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 import statistics
@@ -7,6 +8,38 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
+
+
+def sanitize_parquet_path(path: str) -> str:
+    """Validate a Parquet file path before interpolating it into SQL.
+
+    Rejects directory traversal (``..``), embedded semicolons (statement
+    separators), and SQL keywords that could exploit the f-string view
+    creation used by the backtest engine.
+
+    Parameters
+    ----------
+    path:
+        User-provided file/glob path.
+
+    Returns
+    -------
+    str
+        The original path if it passes all checks.
+
+    Raises
+    ------
+    ValueError
+        If the path contains dangerous patterns.
+    """
+    if ".." in path:
+        raise ValueError(f"Path traversal detected: {path}")
+    if ";" in path:
+        raise ValueError(f"Semicolon in path rejected: {path}")
+    sql_kw = re.compile(r"\b(DROP|DELETE|INSERT|UPDATE|SELECT|CREATE|ALTER)\b", re.IGNORECASE)
+    if sql_kw.search(path):
+        raise ValueError(f"SQL keyword in path rejected: {path}")
+    return path
 
 
 @dataclass
@@ -114,11 +147,14 @@ class BacktestEngine:
         self.conn = duckdb.connect()
 
     def _load_views(self) -> None:
-        """Load Parquet datasets into DuckDB views."""
+        """Load Parquet datasets into DuckDB views after validating paths."""
         cfg = self.config
-        self.conn.execute(f"CREATE OR REPLACE VIEW cbbo AS SELECT * FROM read_parquet('{cfg.cbbo_parquet_glob}')")
-        self.conn.execute(f"CREATE OR REPLACE VIEW defs AS SELECT * FROM read_parquet('{cfg.definitions_parquet_glob}')")
-        self.conn.execute(f"CREATE OR REPLACE VIEW underlying AS SELECT * FROM read_parquet('{cfg.underlying_parquet_glob}')")
+        cbbo = sanitize_parquet_path(cfg.cbbo_parquet_glob)
+        defs = sanitize_parquet_path(cfg.definitions_parquet_glob)
+        undl = sanitize_parquet_path(cfg.underlying_parquet_glob)
+        self.conn.execute(f"CREATE OR REPLACE VIEW cbbo AS SELECT * FROM read_parquet('{cbbo}')")
+        self.conn.execute(f"CREATE OR REPLACE VIEW defs AS SELECT * FROM read_parquet('{defs}')")
+        self.conn.execute(f"CREATE OR REPLACE VIEW underlying AS SELECT * FROM read_parquet('{undl}')")
 
     def _get_expirations(self) -> list[date]:
         """Get distinct expirations from the definitions file."""

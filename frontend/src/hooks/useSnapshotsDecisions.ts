@@ -78,6 +78,8 @@ export function useSnapshotsDecisions({
   const [preflightLoading, setPreflightLoading] = React.useState<boolean>(true);
   const [preflightAuthRequired, setPreflightAuthRequired] = React.useState<boolean>(false);
 
+  const abortRef = React.useRef<AbortController | null>(null);
+
   /**
    * Refresh all dashboard data sources in one coordinated request cycle.
    *
@@ -85,6 +87,10 @@ export function useSnapshotsDecisions({
    * predictable loading states while the parallel API calls resolve.
    */
   const refresh = React.useCallback(() => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
     setLoading(true);
     setDecisionsLoading(true);
     setTradesLoading(true);
@@ -97,10 +103,12 @@ export function useSnapshotsDecisions({
     const trimmedAdminKey = adminKey.trim();
     const preflightPromise = fetchAdminPreflight(trimmedAdminKey ? trimmedAdminKey : undefined)
       .then((payload) => {
+        if (ac.signal.aborted) return;
         setPreflight(payload);
         setPreflightAuthRequired(false);
       })
       .catch((error: unknown) => {
+        if (ac.signal.aborted) return;
         const message = error instanceof Error ? error.message : String(error);
         setPreflight(null);
         if (message.includes("HTTP 401")) {
@@ -111,7 +119,7 @@ export function useSnapshotsDecisions({
         onError(message);
       })
       .finally(() => {
-        setPreflightLoading(false);
+        if (!ac.signal.aborted) setPreflightLoading(false);
       });
 
     Promise.all([
@@ -126,6 +134,7 @@ export function useSnapshotsDecisions({
       preflightPromise,
     ])
       .then(([snapshotRows, decisionRows, tradeRows, metrics, ops, strategy, combinedAnalytics, realizedAnalytics]) => {
+        if (ac.signal.aborted) return;
         setItems(snapshotRows);
         setDecisions(decisionRows);
         setTrades(tradeRows);
@@ -135,8 +144,11 @@ export function useSnapshotsDecisions({
         setPerformanceAnalyticsCombined(combinedAnalytics);
         setPerformanceAnalyticsRealized(realizedAnalytics);
       })
-      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        if (!ac.signal.aborted) onError(e instanceof Error ? e.message : String(e));
+      })
       .finally(() => {
+        if (ac.signal.aborted) return;
         setLoading(false);
         setDecisionsLoading(false);
         setTradesLoading(false);
@@ -149,6 +161,7 @@ export function useSnapshotsDecisions({
 
   React.useEffect(() => {
     refresh();
+    return () => abortRef.current?.abort();
   }, [refresh]);
 
   return {

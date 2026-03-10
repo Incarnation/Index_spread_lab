@@ -511,6 +511,7 @@ export function GexPanel({
         <Group gap="sm">
           <Select
             label="Underlying"
+            aria-label="Select underlying symbol"
             data={underlyingOptions}
             value={selectedUnderlying}
             onChange={onSelectedUnderlyingChange}
@@ -518,6 +519,7 @@ export function GexPanel({
           />
           <Select
             label="Source"
+            aria-label="Select data source"
             data={sourceOptions}
             value={selectedSource}
             onChange={onSelectedSourceChange}
@@ -535,7 +537,7 @@ export function GexPanel({
             w={280}
             placeholder="Select capture batch"
           />
-          <Select label="DTE" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={120} />
+          <Select label="DTE" aria-label="Select DTE filter" data={dteOptions} value={selectedDte} onChange={(value) => onSelectedDteChange(value || "all")} w={120} />
           <Select
             label="Strikes"
             data={[

@@ -16,6 +16,7 @@ orjson>=3.9
 tenacity>=8.2
 apscheduler>=3.10
 loguru>=0.7
+sendgrid>=6.10
 pyjwt>=2.8
 passlib[bcrypt]>=1.7
 # Pin bcrypt: 4.1+ removed __about__, breaking passlib; 72-byte limit is bcrypt spec.

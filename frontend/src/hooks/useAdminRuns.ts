@@ -145,6 +145,13 @@ export function useAdminRuns({ adminKey, onRefresh, onError, onClearError }: Use
   const [toasts, setToasts] = React.useState<AdminActionToast[]>([]);
   const nextAuditIdRef = React.useRef<number>(1);
   const nextToastIdRef = React.useRef<number>(1);
+  const toastTimersRef = React.useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  // Clear all pending toast timers on unmount
+  React.useEffect(() => {
+    const timers = toastTimersRef.current;
+    return () => { timers.forEach(clearTimeout); timers.clear(); };
+  }, []);
 
   const normalizedAdminKey = React.useMemo(() => {
     const value = adminKey.trim();
@@ -166,9 +173,11 @@ export function useAdminRuns({ adminKey, onRefresh, onError, onClearError }: Use
       const id = nextToastIdRef.current;
       nextToastIdRef.current += 1;
       setToasts((prev) => [...prev, { id, title, message, color }].slice(-5));
-      window.setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        toastTimersRef.current.delete(timer);
         dismissToast(id);
       }, 7000);
+      toastTimersRef.current.add(timer);
     },
     [dismissToast],
   );

@@ -411,7 +411,7 @@ class SnapshotJob:
                             text(
                                 """
                                 INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload AS jsonb), :checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, '{}'::jsonb, :checksum)
                                 RETURNING snapshot_id
                                 """
                             ),
@@ -421,7 +421,6 @@ class SnapshotJob:
                                 "source": "TRADIER",
                                 "target_dte": target_dte,
                                 "expiration": exp,
-                                "payload": json.dumps(chain, default=str),
                                 "checksum": chk,
                             },
                         )

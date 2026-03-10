@@ -24,6 +24,9 @@ frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
 
+# Cursor (may contain secrets like MCP tokens)
+.cursor/
+
 # Data / DB artifacts (keep large data out of git)
 *.duckdb
 *.db

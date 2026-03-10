@@ -20,6 +20,7 @@ from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.labeler_job import LabelerJob
 from spx_backend.jobs.performance_analytics_job import build_performance_analytics_job
 from spx_backend.jobs.promotion_gate_job import PromotionGateJob
+from spx_backend.jobs.staleness_monitor_job import build_staleness_monitor_job
 from spx_backend.jobs.quote_job import QuoteJob
 from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
 from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job, build_vix_snapshot_job
@@ -446,8 +447,9 @@ async def lifespan(app: FastAPI):
             misfire_grace_time=misfire_grace_seconds,
         )
     if settings.trade_pnl_enabled:
+        trade_pnl_runner = _build_serialized_run_once_runner(trade_pnl_job)
         scheduler.add_job(
-            trade_pnl_job.run_once,
+            trade_pnl_runner,
             "interval",
             minutes=settings.trade_pnl_interval_minutes,
             id="trade_pnl_job",
@@ -468,8 +470,9 @@ async def lifespan(app: FastAPI):
             misfire_grace_seconds=misfire_grace_seconds,
         )
     if settings.trainer_enabled:
+        trainer_runner = _build_serialized_run_once_runner(trainer_job)
         scheduler.add_job(
-            trainer_job.run_once,
+            trainer_runner,
             "cron",
             day_of_week=settings.trainer_weekday,
             hour=settings.trainer_hour,
@@ -505,8 +508,9 @@ async def lifespan(app: FastAPI):
             trainer_minute=settings.trainer_minute,
             offset_minutes=60,
         )
+        promotion_gate_runner = _build_serialized_run_once_runner(promotion_gate_job)
         scheduler.add_job(
-            promotion_gate_job.run_once,
+            promotion_gate_runner,
             "cron",
             day_of_week=settings.trainer_weekday,
             hour=promotion_gate_hour,
@@ -516,6 +520,19 @@ async def lifespan(app: FastAPI):
             max_instances=max_job_instances,
             misfire_grace_time=misfire_grace_seconds,
         )
+    staleness_monitor_job = build_staleness_monitor_job(clock_cache=clock_cache) if settings.staleness_alert_enabled else None
+    if staleness_monitor_job is not None:
+        staleness_runner = _build_serialized_run_once_runner(staleness_monitor_job)
+        scheduler.add_job(
+            staleness_runner,
+            "interval",
+            minutes=settings.staleness_alert_interval_minutes,
+            id="staleness_monitor_job",
+            replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
+        )
+
     scheduler.start()
 
     app.state.scheduler = scheduler
@@ -535,6 +552,7 @@ async def lifespan(app: FastAPI):
     app.state.shadow_inference_job = shadow_inference_job
     app.state.promotion_gate_job = promotion_gate_job
     app.state.performance_analytics_job = performance_analytics_job
+    app.state.staleness_monitor_job = staleness_monitor_job
 
     # Run ingestion jobs once immediately on boot (unless skip_startup_warmup). Log every failure explicitly.
     if not settings.skip_startup_warmup:

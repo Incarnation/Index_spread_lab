@@ -371,7 +371,7 @@ class CboeGexJob:
                             text(
                                 """
                                 INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload_json AS jsonb), :checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, '{}'::jsonb, :checksum)
                                 RETURNING snapshot_id
                                 """
                             ),
@@ -381,7 +381,6 @@ class CboeGexJob:
                                 "source": "CBOE",
                                 "target_dte": target_dte,
                                 "expiration": item.expiration,
-                                "payload_json": json.dumps(snapshot_payload, default=str),
                                 "checksum": checksum,
                             },
                         )

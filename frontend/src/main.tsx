@@ -8,34 +8,36 @@ import { DashboardApp } from "./DashboardApp";
 import { AuthAuditPage } from "./pages/AuthAuditPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProtectedRoute } from "./components/ProtectedRoute";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
-// Mount the React dashboard; login required for all routes except /login.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <MantineProvider defaultColorScheme="light">
-      <BrowserRouter>
-        <AuthProvider>
-          <Routes>
-            <Route path="/login" element={<LoginPage />} />
-            <Route
-              path="/admin/auth-audit"
-              element={
-                <ProtectedRoute>
-                  <AuthAuditPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/*"
-              element={
-                <ProtectedRoute>
-                  <DashboardApp />
-                </ProtectedRoute>
-              }
-            />
-          </Routes>
-        </AuthProvider>
-      </BrowserRouter>
+      <ErrorBoundary>
+        <BrowserRouter>
+          <AuthProvider>
+            <Routes>
+              <Route path="/login" element={<LoginPage />} />
+              <Route
+                path="/admin/auth-audit"
+                element={
+                  <ProtectedRoute>
+                    <AuthAuditPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/*"
+                element={
+                  <ProtectedRoute>
+                    <DashboardApp />
+                  </ProtectedRoute>
+                }
+              />
+            </Routes>
+          </AuthProvider>
+        </BrowserRouter>
+      </ErrorBoundary>
     </MantineProvider>
   </React.StrictMode>
 );

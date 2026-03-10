@@ -17,15 +17,18 @@ What is implemented now:
 - Scheduled SPX option-chain snapshot capture (0-10 DTE range profile).
 - Scheduled SPY snapshot stream (enabled by default) and optional VIX snapshot stream.
 - Scheduled quote capture (SPX, VIX, VIX9D, SPY by default).
-- Scheduled GEX computation and persistence.
+- Scheduled GEX computation and persistence (Tradier-computed and CBOE precomputed streams).
 - Feature/candidate generation for both `put` and `call` credit spreads.
 - Label resolution with both live-style TP50 outcome and expiry counterfactual outcome.
-- Weekly walk-forward trainer that writes `training_runs` and `model_versions`.
+- Weekly walk-forward trainer (with sparse CV fallback) that writes `training_runs` and `model_versions`.
 - Shadow inference writer to `model_predictions`.
 - Promotion gate evaluator for rollout safety checks.
 - Hybrid execution policy support (rules guardrails first, model ranking second) with safe default `decision_source='rules'`.
+- Pipeline staleness monitoring with SendGrid email alerting (RTH-only, cooldown-gated).
+- Performance analytics aggregation (win rates, expectancy, drawdown, tail loss, margin usage).
 - Admin APIs to manually trigger each pipeline stage.
-- React dashboard including strategy quality/risk cards (win50, win100@expiry, expectancy, drawdown, tail loss proxy, margin usage, side breakdown).
+- React dashboard with ErrorBoundary, strategy quality/risk cards, GEX panels, and live trade PnL.
+- Data retention CLI for exporting and purging old chain/GEX data.
 - Backend unit/integration/E2E suites with a predeploy gate and CI workflow.
 
 Still intentionally limited:
@@ -47,7 +50,7 @@ The pipeline runs in this order:
 - Gets SPX expirations from Tradier (including all roots for weeklies/dailies).
 - Selects expirations by DTE policy (`range` or `targets`).
 - Pulls option chains and writes:
-  - `chain_snapshots` (raw payload + checksum)
+  - `chain_snapshots` (metadata + checksum; raw payload cleared to save storage)
   - `option_chain_rows` (normalized per-option rows)
 - Dedicated SPY snapshot stream (enabled by default) runs in parallel and stores `underlying='SPY'` rows for future SPY model fitting.
 - Optional VIX snapshot stream can run in parallel and writes the same tables with `underlying='VIX'` for model fitting features.
@@ -83,8 +86,19 @@ The pipeline runs in this order:
 
 7) Weekly model loop
 - Trainer runs walk-forward evaluation and writes `training_runs` + `model_versions`.
+- Falls back to sparse cross-validation when walk-forward split has insufficient rows.
 - Shadow inference scores fresh candidates and writes `model_predictions`.
 - Promotion gates evaluate quality/risk thresholds and update rollout status.
+
+8) Staleness monitor
+- Periodically checks latest timestamps in `underlying_quotes`, `chain_snapshots`, `gex_snapshots`, `trade_decisions`.
+- Runs only during RTH (skips evenings, weekends, exchange holidays).
+- Sends email alert via SendGrid when any source exceeds its configured staleness threshold.
+- Cooldown period prevents duplicate alerts.
+
+9) Performance analytics
+- Aggregates win rates, expectancy, drawdown, tail loss proxy, and margin usage.
+- Refreshes on a configurable interval during RTH.
 
 Important semantics:
 - DTE handling is trading-session based (weekends and market holidays are skipped).
@@ -116,18 +130,22 @@ Why 3DTE is 2026-02-18:
   - `spx_backend/web/app.py`: FastAPI app + scheduler wiring.
   - `spx_backend/web/routers/`: public/admin route modules.
   - `spx_backend/database/`: DB package (`connection.py`, `schema.py`, reset CLIs).
-  - `spx_backend/backtest/`: local backtest engine + sample data docs.
-- `spx_backend/jobs/`: snapshot, quote, gex, feature-builder, decision, labeler, trade-pnl, trainer, shadow-inference, promotion-gate jobs.
+  - `spx_backend/database/sql/migrations/`: idempotent SQL migrations (run automatically on startup).
+  - `spx_backend/backtest/`: local backtest engine with path-sanitization + sample data docs.
+  - `spx_backend/jobs/`: snapshot, quote, gex, feature-builder, decision, labeler, trade-pnl, trainer, shadow-inference, promotion-gate, staleness-monitor, performance-analytics jobs.
+  - `spx_backend/market_clock.py`: Tradier clock cache with DB audit and RTH fallback.
   - `spx_backend/dte.py`: trading-day DTE helper logic.
-  - `spx_backend/database/sql/db_schema.sql`: schema bootstrap.
+  - `scripts/data_retention.py`: CLI to export and purge old chain/GEX data.
   - `requirements.txt`: runtime dependencies.
   - `requirements-dev.txt`: test dependencies.
   - `tests/`: backend automated tests.
 - `frontend/`
   - `src/DashboardApp.tsx`: top-level container.
-  - `src/components/`: UI panels and widgets.
+  - `src/components/`: UI panels, widgets, and `ErrorBoundary`.
   - `src/hooks/`: data and action hooks.
-  - `src/api.ts`: typed API client.
+  - `src/api.ts`: typed API client with `safeJson` response parsing.
+  - `src/contexts/AuthContext.tsx`: JWT auth state with 401 event handling.
+- `.dockerignore`: slimmed Docker build context (excludes frontend, docs, data files).
 
 ---
 
@@ -231,10 +249,18 @@ Primary knobs:
   - `CBOE_GEX_UNDERLYING` (legacy fallback during migration)
   - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
   - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
+- Staleness alerting:
+  - `STALENESS_ALERT_ENABLED` (default `false`)
+  - `STALENESS_ALERT_INTERVAL_MINUTES` (default `30`)
+  - `STALENESS_QUOTES_MAX_MINUTES`, `STALENESS_SNAPSHOTS_MAX_MINUTES`, `STALENESS_GEX_MAX_MINUTES` (default `120`)
+  - `STALENESS_DECISIONS_MAX_MINUTES` (default `480`)
+  - `STALENESS_COOLDOWN_MINUTES` (default `360`)
+  - `SENDGRID_API_KEY`, `EMAIL_ALERT_RECIPIENT`, `EMAIL_ALERT_SENDER`
 - Ops:
   - `CORS_ORIGINS`
   - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
   - `ALLOW_QUOTES_OUTSIDE_RTH`
+  - `MARKET_CLOCK_CACHE_SECONDS`
 
 Production recommendation:
 - Do not include quotes in Railway variable values (use raw values, e.g. `false`, not `"false"`).
@@ -309,7 +335,7 @@ Admin endpoints (authenticated user required):
 ## Database Model Overview
 
 Core ingestion:
-- `chain_snapshots`: one row per captured chain payload.
+- `chain_snapshots`: one row per captured chain (metadata + checksum; raw payload cleared to save storage).
 - `option_chain_rows`: normalized options from each snapshot.
 - `underlying_quotes`: raw quote history.
 - `context_snapshots`: derived market context per timestamp.
@@ -395,6 +421,13 @@ Current test coverage includes:
 - GEX endpoint output modes (all / DTE / custom expirations).
 - Snapshot strike window helper.
 - Tradier expirations request parameter correctness.
+- Trade PnL: mark-to-market, TP/SL/expiry close, bulk leg loading, expired trade handling.
+- Staleness monitor: freshness detection, cooldown, SendGrid alerting, RTH guard.
+- Market clock: `is_rth` boundary cases, `MarketClockCache` with mock Tradier and fallback.
+- Quote job: market gate, symbol parsing, fetch failure, successful insertion.
+- Trainer: walk-forward windows, sparse CV folds, walk-forward-to-sparse-CV fallback.
+- Config parsing: list fields, dedup, bad symbols, delta targets.
+- Backtest engine: parquet path sanitization (traversal, semicolons, SQL keywords).
 - HTTP-level mocked E2E API workflows.
 - DB-backed integration smoke tests behind `-m integration`.
 - DB-backed regression failure-pack (quote fetch fail, no-expiration snapshot, no-shadow-model, promotion gate fail/pass branches).
@@ -404,9 +437,10 @@ Current test coverage includes:
 ## Deployment (Railway)
 
 Backend service:
-- Uses root `Dockerfile`.
+- Uses root `Dockerfile` with `.dockerignore` for a lean build context.
 - Reads `PORT` automatically.
 - Requires valid `DATABASE_URL` and Tradier credentials.
+- SQL migrations run automatically on startup (idempotent).
 
 Checklist:
 1) Provision Railway Postgres.
@@ -471,3 +505,5 @@ Unexpected DTE mapping:
 - Expand backtest orchestration and historical replay tooling.
 - Add frontend automated tests (Vitest + React Testing Library).
 - Add richer decision skip taxonomy views in dashboard.
+- Live broker order/fill automation beyond paper trading.
+- Periodic data retention automation (scheduled purge of old chain/GEX data).

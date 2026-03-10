@@ -98,8 +98,142 @@ class TradePnlJob:
             return None
         return short_leg, long_leg
 
+    async def _bulk_trade_legs(self, session, trade_ids: list[int]) -> dict[int, tuple[dict, dict]]:
+        """Load legs for multiple trades in a single query.
+
+        Parameters
+        ----------
+        session:
+            Async database session.
+        trade_ids:
+            Trade IDs to load legs for.
+
+        Returns
+        -------
+        dict[int, tuple[dict, dict]]
+            Mapping from trade_id to (short_leg, long_leg).  Trades with
+            missing or incomplete legs are omitted from the result.
+        """
+        if not trade_ids:
+            return {}
+        rows = await session.execute(
+            text(
+                """
+                SELECT trade_id, leg_index, option_symbol, side, qty, entry_price
+                FROM trade_legs
+                WHERE trade_id = ANY(:trade_ids)
+                ORDER BY trade_id, leg_index ASC
+                """
+            ),
+            {"trade_ids": trade_ids},
+        )
+        legs_by_trade: dict[int, dict[str, dict | None]] = {}
+        for row in rows.fetchall():
+            tid = row.trade_id
+            side = (row.side or "").upper()
+            leg = {
+                "leg_index": row.leg_index,
+                "option_symbol": row.option_symbol,
+                "side": side,
+                "qty": row.qty,
+                "entry_price": row.entry_price,
+            }
+            slot = legs_by_trade.setdefault(tid, {"short": None, "long": None})
+            if side in {"STO", "SHORT"} and slot["short"] is None:
+                slot["short"] = leg
+            elif side in {"BTO", "LONG"} and slot["long"] is None:
+                slot["long"] = leg
+
+        result: dict[int, tuple[dict, dict]] = {}
+        for tid, slot in legs_by_trade.items():
+            if slot["short"] is not None and slot["long"] is not None:
+                result[tid] = (slot["short"], slot["long"])
+        return result
+
+    async def _close_trade(
+        self,
+        *,
+        session,
+        trade_id: int,
+        exit_time: datetime,
+        pnl: float,
+        exit_cost: float,
+        exit_reason: str,
+        short_leg: dict | None = None,
+        long_leg: dict | None = None,
+        short_exit_price: float | None = None,
+        long_exit_price: float | None = None,
+    ) -> None:
+        """Persist a trade closure: update status, set realized PnL, record leg exit prices.
+
+        Parameters
+        ----------
+        session:
+            Async database session.
+        trade_id:
+            ID of the trade to close.
+        exit_time:
+            Timestamp of the exit event.
+        pnl:
+            Realized PnL in dollars.
+        exit_cost:
+            Per-unit exit cost of the spread.
+        exit_reason:
+            Machine-readable close reason (TAKE_PROFIT_50, STOP_LOSS, EXPIRED).
+        short_leg / long_leg:
+            Leg dicts; when provided the corresponding exit_price is written.
+        short_exit_price / long_exit_price:
+            Mid prices for the exit mark on each leg.
+        """
+        await session.execute(
+            text(
+                """
+                UPDATE trades
+                SET status = 'CLOSED',
+                    exit_time = :exit_time,
+                    current_pnl = :current_pnl,
+                    realized_pnl = :realized_pnl,
+                    current_exit_cost = :current_exit_cost,
+                    exit_reason = :exit_reason
+                WHERE trade_id = :trade_id
+                """
+            ),
+            {
+                "trade_id": trade_id,
+                "exit_time": exit_time,
+                "current_pnl": pnl,
+                "realized_pnl": pnl,
+                "current_exit_cost": exit_cost,
+                "exit_reason": exit_reason,
+            },
+        )
+        if short_leg is not None and short_exit_price is not None:
+            await session.execute(
+                text(
+                    "UPDATE trade_legs SET exit_price = :exit_price "
+                    "WHERE trade_id = :trade_id AND option_symbol = :option_symbol"
+                ),
+                {"trade_id": trade_id, "option_symbol": short_leg["option_symbol"], "exit_price": short_exit_price},
+            )
+        if long_leg is not None and long_exit_price is not None:
+            await session.execute(
+                text(
+                    "UPDATE trade_legs SET exit_price = :exit_price "
+                    "WHERE trade_id = :trade_id AND option_symbol = :option_symbol"
+                ),
+                {"trade_id": trade_id, "option_symbol": long_leg["option_symbol"], "exit_price": long_exit_price},
+            )
+
     async def run_once(self, *, force: bool = False) -> dict:
-        """Run one live mark-to-market cycle for all open trades."""
+        """Run one live mark-to-market cycle for all open trades.
+
+        Handles three close triggers in priority order:
+        1. **Expiration** -- checked against current wall-clock time so trades
+           past their expiration date are closed even when no fresh mark exists.
+        2. **Take-profit** / **Stop-loss** -- evaluated against the latest
+           spread mark from chain snapshot data.
+        3. Otherwise the trade mark is updated with the current unrealized PnL.
+        """
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
         now_utc = now_et.astimezone(ZoneInfo("UTC"))
@@ -114,6 +248,7 @@ class TradePnlJob:
 
         updated = 0
         closed = 0
+        expired_closed = 0
         marks_written = 0
         skipped_no_legs = 0
         skipped_no_mark = 0
@@ -124,16 +259,79 @@ class TradePnlJob:
                 text(
                     """
                     SELECT trade_id, entry_credit, contracts, contract_multiplier, expiration,
-                           take_profit_target, stop_loss_target, max_profit
+                           take_profit_target, stop_loss_target, max_profit, max_loss
                     FROM trades
                     WHERE status = 'OPEN'
                     ORDER BY entry_time ASC
                     """
                 )
             )
+            trades_list = open_rows.fetchall()
 
-            for trade in open_rows.fetchall():
-                legs = await self._trade_legs(session, trade.trade_id)
+            # Batch-load all legs in one query to avoid N+1
+            trade_ids = [t.trade_id for t in trades_list]
+            all_legs = await self._bulk_trade_legs(session, trade_ids)
+
+            for trade in trades_list:
+                entry_credit = float(trade.entry_credit or 0.0)
+                contracts = int(trade.contracts or settings.decision_contracts or 1)
+                contract_multiplier = int(trade.contract_multiplier or settings.trade_pnl_contract_multiplier)
+
+                # --- Expiration gate: use wall-clock date, not mark date ---
+                if trade.expiration is not None and now_et.date() > trade.expiration:
+                    legs = all_legs.get(trade.trade_id)
+                    pnl: float
+                    exit_cost: float
+                    short_leg_ref: dict | None = None
+                    long_leg_ref: dict | None = None
+                    short_exit: float | None = None
+                    long_exit: float | None = None
+
+                    # Best-effort: use last available mark (ignore staleness)
+                    if legs is not None:
+                        short_leg_ref, long_leg_ref = legs
+                        mark = await self._latest_spread_mark(
+                            session=session,
+                            short_symbol=short_leg_ref["option_symbol"],
+                            long_symbol=long_leg_ref["option_symbol"],
+                            now_utc=now_utc,
+                        )
+                        short_mid = _mid(mark["short_bid"], mark["short_ask"]) if mark else None
+                        long_mid = _mid(mark["long_bid"], mark["long_ask"]) if mark else None
+                        if short_mid is not None and long_mid is not None:
+                            exit_cost = short_mid - long_mid
+                            pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
+                            short_exit = short_mid
+                            long_exit = long_mid
+                        else:
+                            pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                            exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
+                    else:
+                        pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                        exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
+
+                    await self._close_trade(
+                        session=session,
+                        trade_id=trade.trade_id,
+                        exit_time=now_utc,
+                        pnl=pnl,
+                        exit_cost=exit_cost,
+                        exit_reason="EXPIRED",
+                        short_leg=short_leg_ref,
+                        long_leg=long_leg_ref,
+                        short_exit_price=short_exit,
+                        long_exit_price=long_exit,
+                    )
+                    expired_closed += 1
+                    closed += 1
+                    logger.info(
+                        "trade_pnl_job: trade_id={} closed=EXPIRED expiration={} pnl={:.2f}",
+                        trade.trade_id, trade.expiration, pnl,
+                    )
+                    continue
+
+                # --- Normal mark-to-market flow ---
+                legs = all_legs.get(trade.trade_id)
                 if legs is None:
                     skipped_no_legs += 1
                     continue
@@ -161,9 +359,6 @@ class TradePnlJob:
                     skipped_no_mark += 1
                     continue
 
-                entry_credit = float(trade.entry_credit or 0.0)
-                contracts = int(trade.contracts or settings.decision_contracts or 1)
-                contract_multiplier = int(trade.contract_multiplier or settings.trade_pnl_contract_multiplier)
                 exit_cost = short_mid - long_mid
                 pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
 
@@ -179,8 +374,6 @@ class TradePnlJob:
                     close_reason = "TAKE_PROFIT_50"
                 elif stop_loss_target is not None and pnl <= -abs(float(stop_loss_target)):
                     close_reason = "STOP_LOSS"
-                elif trade.expiration is not None and mark_ts.date() > trade.expiration:
-                    close_reason = "EXPIRED"
 
                 await session.execute(
                     text(
@@ -235,70 +428,27 @@ class TradePnlJob:
                 marks_written += 1
 
                 if close_reason:
-                    await session.execute(
-                        text(
-                            """
-                            UPDATE trades
-                            SET status = 'CLOSED',
-                                exit_time = :exit_time,
-                                current_pnl = :current_pnl,
-                                realized_pnl = :realized_pnl,
-                                current_exit_cost = :current_exit_cost,
-                                exit_reason = :exit_reason
-                            WHERE trade_id = :trade_id
-                            """
-                        ),
-                        {
-                            "trade_id": trade.trade_id,
-                            "exit_time": mark_ts,
-                            "current_pnl": pnl,
-                            "realized_pnl": pnl,
-                            "current_exit_cost": exit_cost,
-                            "exit_reason": close_reason,
-                        },
-                    )
-                    await session.execute(
-                        text(
-                            """
-                            UPDATE trade_legs
-                            SET exit_price = :exit_price
-                            WHERE trade_id = :trade_id
-                              AND option_symbol = :option_symbol
-                            """
-                        ),
-                        {
-                            "trade_id": trade.trade_id,
-                            "option_symbol": short_leg["option_symbol"],
-                            "exit_price": short_mid,
-                        },
-                    )
-                    await session.execute(
-                        text(
-                            """
-                            UPDATE trade_legs
-                            SET exit_price = :exit_price
-                            WHERE trade_id = :trade_id
-                              AND option_symbol = :option_symbol
-                            """
-                        ),
-                        {
-                            "trade_id": trade.trade_id,
-                            "option_symbol": long_leg["option_symbol"],
-                            "exit_price": long_mid,
-                        },
+                    await self._close_trade(
+                        session=session,
+                        trade_id=trade.trade_id,
+                        exit_time=mark_ts,
+                        pnl=pnl,
+                        exit_cost=exit_cost,
+                        exit_reason=close_reason,
+                        short_leg=short_leg,
+                        long_leg=long_leg,
+                        short_exit_price=short_mid,
+                        long_exit_price=long_mid,
                     )
                     closed += 1
 
             await session.commit()
 
         logger.info(
-            "trade_pnl_job: updated={} closed={} marks_written={} skipped_no_legs={} skipped_no_mark={} skipped_stale={}",
-            updated,
-            closed,
-            marks_written,
-            skipped_no_legs,
-            skipped_no_mark,
-            skipped_stale,
+            "trade_pnl_job: updated={} closed={} expired_closed={} marks_written={} "
+            "skipped_no_legs={} skipped_no_mark={} skipped_stale={}",
+            updated, closed, expired_closed, marks_written,
+            skipped_no_legs, skipped_no_mark, skipped_stale,
         )
         return {
             "skipped": False,
@@ -306,6 +456,7 @@ class TradePnlJob:
             "now_et": now_et.isoformat(),
             "updated": updated,
             "closed": closed,
+            "expired_closed": expired_closed,
             "marks_written": marks_written,
             "skipped_no_legs": skipped_no_legs,
             "skipped_no_mark": skipped_no_mark,

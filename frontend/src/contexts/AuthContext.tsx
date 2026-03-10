@@ -6,7 +6,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as authStorage from "../auth";
-import { API_BASE } from "../api";
+import { API_BASE, UNAUTHORIZED_EVENT } from "../api";
 
 export type AuthUser = { id: number; username: string; is_admin: boolean };
 
@@ -58,7 +58,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [navigate]);
 
   /** Validate token and load user; on 401 clear token. */
-  const validateToken = useCallback(async () => {
+  const validateToken = useCallback(async (signal?: AbortSignal) => {
     const t = authStorage.getToken();
     if (!t) {
       setLoading(false);
@@ -67,27 +67,46 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const r = await fetch(apiUrl("/api/auth/me"), {
         headers: { Authorization: `Bearer ${t}` },
+        signal,
       });
+      if (signal?.aborted) return;
       if (r.status === 401) {
         authStorage.clearToken();
         setTokenState(null);
         setUser(null);
       } else if (r.ok) {
         const data = (await r.json()) as AuthUser;
-        setUser(data);
-        setTokenState(t);
+        if (!signal?.aborted) {
+          setUser(data);
+          setTokenState(t);
+        }
       }
     } catch {
-      setTokenState(null);
-      setUser(null);
+      if (!signal?.aborted) {
+        setTokenState(null);
+        setUser(null);
+      }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    validateToken();
+    const ac = new AbortController();
+    validateToken(ac.signal);
+    return () => ac.abort();
   }, [validateToken]);
+
+  // Listen for 401 events from fetchWithAuth so we navigate via React Router.
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setTokenState(null);
+      setUser(null);
+      navigate("/login", { replace: true });
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+  }, [navigate]);
 
   const login = useCallback(
     async (username: string, password: string) => {

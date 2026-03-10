@@ -169,3 +169,47 @@ async def test_run_once_marks_insufficient_rows_as_skipped(monkeypatch) -> None:
     assert capture_session.update_sql
     assert "status = 'SKIPPED'" in capture_session.update_sql[0]
     assert capture_session.update_params[0]["notes"] == "insufficient_rows"
+
+
+@pytest.mark.asyncio
+async def test_walkforward_fallback_to_sparse_cv_when_train_empty(monkeypatch) -> None:
+    """When walk-forward has 0 train rows but sparse CV is enabled, fall back
+    to sparse CV instead of skipping the entire training run.
+
+    Scenario: all data falls within the test window (e.g. lookback_days=365
+    but only 30 days of data). Walk-forward split produces 0 train + N test
+    rows.  With sparse_cv_enabled=True the trainer should attempt sparse CV.
+    If sparse CV also cannot form folds (too few rows), it should skip with
+    a combined reason rather than the old walk-forward skip.
+    """
+    capture_session = _CaptureTrainerSession()
+    monkeypatch.setattr(trainer_module, "SessionLocal", _SessionFactory(capture_session))
+    monkeypatch.setattr(settings, "trainer_enabled", True)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_enabled", True)
+    monkeypatch.setattr(settings, "trainer_min_rows", 5)
+    monkeypatch.setattr(settings, "trainer_min_train_rows", 10)
+    monkeypatch.setattr(settings, "trainer_min_test_rows", 5)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_folds", 3)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_min_train_rows", 50)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_min_test_rows", 20)
+
+    now_utc = datetime(2026, 3, 10, 15, 0, 0, tzinfo=ZoneInfo("UTC"))
+
+    # All rows have timestamps AFTER the test_start boundary, so
+    # walk-forward split produces 0 train rows.
+    async def _fake_load(self, *, session, window_start):  # noqa: ANN001, ARG001
+        """Return rows that all fall inside the test window."""
+        base = datetime(2026, 3, 5, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+        return [
+            {"ts": base, "resolved_pnl": 50.0, "entry_credit": 1.0, "max_loss": 100.0}
+            for _ in range(20)
+        ]
+
+    monkeypatch.setattr(TrainerJob, "_load_resolved_candidates", _fake_load)
+
+    result = await TrainerJob().run_once(force=True)
+
+    # With only 20 rows and sparse CV needing 50+ train rows per fold,
+    # both walk-forward and sparse CV fail -> combined skip reason.
+    assert result["skipped"] is True
+    assert "insufficient" in result["reason"]

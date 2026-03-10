@@ -196,8 +196,8 @@ export function TradesLivePnlPanel({ trades, loading, error }: TradesLivePnlPane
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Trade</Table.Th>
-              <Table.Th>
-                <UnstyledButton onClick={() => handleSortChange("entry_time")}>
+              <Table.Th aria-sort={sortField === "entry_time" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <UnstyledButton onClick={() => handleSortChange("entry_time")} aria-label="Sort by entry time">
                   {sortHeaderLabel("entry_time", sortField, sortDirection, "Entry Time")}
                 </UnstyledButton>
               </Table.Th>
@@ -207,13 +207,13 @@ export function TradesLivePnlPanel({ trades, loading, error }: TradesLivePnlPane
               <Table.Th>Legs</Table.Th>
               <Table.Th style={{ textAlign: "right" }}>Entry Credit</Table.Th>
               <Table.Th style={{ textAlign: "right" }}>Current Exit</Table.Th>
-              <Table.Th style={{ textAlign: "right" }}>
-                <UnstyledButton onClick={() => handleSortChange("current_pnl")}>
+              <Table.Th style={{ textAlign: "right" }} aria-sort={sortField === "current_pnl" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <UnstyledButton onClick={() => handleSortChange("current_pnl")} aria-label="Sort by current PnL">
                   {sortHeaderLabel("current_pnl", sortField, sortDirection, "Current PnL")}
                 </UnstyledButton>
               </Table.Th>
-              <Table.Th style={{ textAlign: "right" }}>
-                <UnstyledButton onClick={() => handleSortChange("realized_pnl")}>
+              <Table.Th style={{ textAlign: "right" }} aria-sort={sortField === "realized_pnl" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <UnstyledButton onClick={() => handleSortChange("realized_pnl")} aria-label="Sort by realized PnL">
                   {sortHeaderLabel("realized_pnl", sortField, sortDirection, "Realized PnL")}
                 </UnstyledButton>
               </Table.Th>
