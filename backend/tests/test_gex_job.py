@@ -24,8 +24,13 @@ class _FakeExecResult:
 class _NoPendingSession:
     """Fake async DB session that reports no pending snapshots."""
 
+    def __init__(self) -> None:
+        """Initialize SQL capture fields for candidate-query assertions."""
+        self.last_sql: str | None = None
+
     async def execute(self, stmt, params=None):  # noqa: ANN001 - SQLAlchemy text object in production
         """Return an empty candidate set for pending snapshot lookup."""
+        self.last_sql = str(stmt)
         return _FakeExecResult(rows=[])
 
     async def commit(self) -> None:
@@ -131,8 +136,11 @@ async def test_run_once_force_bypasses_market_gate(monkeypatch) -> None:
     """Forced GEX run should bypass market clock gating and query pending snapshots."""
     monkeypatch.setattr(settings, "gex_enabled", True)
     monkeypatch.setattr(settings, "gex_allow_outside_rth", False)
-    monkeypatch.setattr(gex_module, "SessionLocal", _SessionFactory(_NoPendingSession()))
+    session = _NoPendingSession()
+    monkeypatch.setattr(gex_module, "SessionLocal", _SessionFactory(session))
 
     result = await GexJob(clock_cache=_ClockCacheShouldNotBeCalled()).run_once(force=True)
 
     assert result == {"skipped": True, "reason": "no_pending_snapshots"}
+    assert session.last_sql is not None
+    assert "FROM option_chain_rows ocr" in session.last_sql

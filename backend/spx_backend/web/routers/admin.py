@@ -56,9 +56,9 @@ def _is_stale(age_minutes: float | None, threshold_minutes: float) -> bool:
 @router.post("/api/admin/run-snapshot")
 async def admin_run_snapshot(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force a snapshot run immediately."""
+    """Admin-only. Force a snapshot run immediately."""
     # Force run once even outside RTH (useful for testing).
     job: SnapshotJob = getattr(request.app.state, "snapshot_job", build_snapshot_job())
     result = await job.run_once(force=True)
@@ -68,9 +68,9 @@ async def admin_run_snapshot(
 @router.post("/api/admin/run-quotes")
 async def admin_run_quotes(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force a quote run immediately."""
+    """Admin-only. Force a quote run immediately."""
     job: QuoteJob = getattr(request.app.state, "quote_job", build_quote_job())
     result = await job.run_once(force=True)
     return result
@@ -79,9 +79,9 @@ async def admin_run_quotes(
 @router.post("/api/admin/run-gex")
 async def admin_run_gex(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force a GEX run immediately."""
+    """Admin-only. Force a GEX run immediately."""
     job: GexJob = getattr(request.app.state, "gex_job", GexJob())
     result = await job.run_once(force=True)
     return result
@@ -90,9 +90,9 @@ async def admin_run_gex(
 @router.post("/api/admin/run-cboe-gex")
 async def admin_run_cboe_gex(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force a CBOE-mode precomputed GEX run immediately."""
+    """Admin-only. Force a CBOE-mode precomputed GEX run immediately."""
     job: CboeGexJob = getattr(request.app.state, "cboe_gex_job", build_cboe_gex_job())
     result = await job.run_once(force=True)
     return result
@@ -101,9 +101,9 @@ async def admin_run_cboe_gex(
 @router.post("/api/admin/run-decision")
 async def admin_run_decision(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force a decision run immediately."""
+    """Admin-only. Force a decision run immediately."""
     job: DecisionJob = getattr(request.app.state, "decision_job", build_decision_job())
     result = await job.run_once(force=True)
     return result
@@ -112,9 +112,9 @@ async def admin_run_decision(
 @router.post("/api/admin/run-feature-builder")
 async def admin_run_feature_builder(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force feature builder run immediately."""
+    """Admin-only. Force feature builder run immediately."""
     job: FeatureBuilderJob = getattr(request.app.state, "feature_builder_job", build_feature_builder_job())
     result = await job.run_once(force=True)
     return result
@@ -123,9 +123,9 @@ async def admin_run_feature_builder(
 @router.post("/api/admin/run-labeler")
 async def admin_run_labeler(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force labeler run immediately."""
+    """Admin-only. Force labeler run immediately."""
     job: LabelerJob = getattr(request.app.state, "labeler_job", build_labeler_job())
     result = await job.run_once(force=True)
     return result
@@ -134,9 +134,9 @@ async def admin_run_labeler(
 @router.post("/api/admin/run-trade-pnl")
 async def admin_run_trade_pnl(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force trade mark-to-market run immediately."""
+    """Admin-only. Force trade mark-to-market run immediately."""
     job: TradePnlJob = getattr(request.app.state, "trade_pnl_job", build_trade_pnl_job())
     result = await job.run_once(force=True)
     return result
@@ -145,9 +145,9 @@ async def admin_run_trade_pnl(
 @router.post("/api/admin/run-performance-analytics")
 async def admin_run_performance_analytics(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force performance-analytics aggregate refresh immediately."""
+    """Admin-only. Force performance-analytics aggregate refresh immediately."""
     state_job = getattr(request.app.state, "performance_analytics_job", None)
     job: PerformanceAnalyticsJob = state_job if state_job is not None else build_performance_analytics_job()
     result = await job.run_once(force=True)
@@ -157,9 +157,9 @@ async def admin_run_performance_analytics(
 @router.post("/api/admin/run-trainer")
 async def admin_run_trainer(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force weekly trainer run immediately."""
+    """Admin-only. Force weekly trainer run immediately."""
     job: TrainerJob = getattr(request.app.state, "trainer_job", build_trainer_job())
     result = await job.run_once(force=True)
     return result
@@ -168,9 +168,9 @@ async def admin_run_trainer(
 @router.post("/api/admin/run-shadow-inference")
 async def admin_run_shadow_inference(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force shadow inference run immediately."""
+    """Admin-only. Force shadow inference run immediately."""
     job: ShadowInferenceJob = getattr(request.app.state, "shadow_inference_job", build_shadow_inference_job())
     result = await job.run_once(force=True)
     return result
@@ -179,9 +179,9 @@ async def admin_run_shadow_inference(
 @router.post("/api/admin/run-promotion-gates")
 async def admin_run_promotion_gates(
     request: Request,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
 ) -> dict:
-    """Force promotion gate evaluation immediately."""
+    """Admin-only. Force promotion gate evaluation immediately."""
     job: PromotionGateJob = getattr(request.app.state, "promotion_gate_job", build_promotion_gate_job())
     result = await job.run_once(force=True)
     return result
@@ -190,10 +190,10 @@ async def admin_run_promotion_gates(
 @router.delete("/api/admin/trade-decisions/{decision_id}")
 async def admin_delete_trade_decision(
     decision_id: int,
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Delete one trade decision row by ID."""
+    """Admin-only. Delete one trade decision row by ID."""
     r = await db.execute(
         text(
             """

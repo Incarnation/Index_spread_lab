@@ -603,13 +603,14 @@ export type ModelOpsModelVersion = {
 
 export type ModelOpsTrainingRun = {
   training_run_id: number;
-  model_version_id: number;
+  model_version_id: number | null;
   status: string;
   started_at_utc: string | null;
   finished_at_utc: string | null;
   rows_train: number;
   rows_test: number;
   notes: string | null;
+  skip_reason: string | null;
   gate: ModelOpsGate | null;
 };
 

@@ -3,6 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
+import spx_backend.jobs.trainer_job as trainer_module
+from spx_backend.config import settings
 from spx_backend.jobs.trainer_job import TrainerJob, build_time_series_cv_folds, build_walkforward_windows
 
 
@@ -81,3 +85,87 @@ def test_aggregate_cv_metrics_returns_mean_and_std_payload() -> None:
     assert result["tp50_test"] == 8
     assert result["tp50_rate_test"] is not None
     assert "tp50_rate_test" in result["cv_metric_std"]
+
+
+class _FakeExecResult:
+    """Minimal SQLAlchemy-like result wrapper for trainer job tests."""
+
+    def __init__(self, *, scalar_result=None):
+        """Store scalar values returned by insert-returning statements."""
+        self._scalar_result = scalar_result
+
+    def scalar_one(self):
+        """Return one scalar value for insert-returning SQL branches."""
+        return self._scalar_result
+
+
+class _CaptureTrainerSession:
+    """Fake async DB session that records trainer inserts and skip updates."""
+
+    def __init__(self) -> None:
+        """Initialize SQL capture containers for assertions."""
+        self.update_sql: list[str] = []
+        self.update_params: list[dict] = []
+
+    async def execute(self, stmt, params=None):  # noqa: ANN001 - SQLAlchemy text object in production
+        """Capture insert/update statements used by the trainer skip path."""
+        sql = str(stmt)
+        if "INSERT INTO training_runs" in sql:
+            return _FakeExecResult(scalar_result=321)
+        if "UPDATE training_runs" in sql:
+            self.update_sql.append(sql)
+            self.update_params.append(dict(params or {}))
+            return _FakeExecResult()
+        raise AssertionError(f"Unexpected SQL in trainer test: {sql}")
+
+    async def commit(self) -> None:
+        """No-op commit hook for fake session compatibility."""
+        return None
+
+    async def rollback(self) -> None:
+        """No-op rollback hook for fake session compatibility."""
+        return None
+
+
+class _SessionFactory:
+    """Async context-manager factory that returns one fake trainer session."""
+
+    def __init__(self, session: _CaptureTrainerSession):
+        """Store the fake session returned during the async context."""
+        self._session = session
+
+    def __call__(self):
+        """Return self to mimic the production SessionLocal callable."""
+        return self
+
+    async def __aenter__(self) -> _CaptureTrainerSession:
+        """Yield the fake trainer session to the job code."""
+        return self._session
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+        """Do not suppress exceptions raised inside the async block."""
+        return False
+
+
+@pytest.mark.asyncio
+async def test_run_once_marks_insufficient_rows_as_skipped(monkeypatch) -> None:
+    """Trainer should persist SKIPPED when row volume is below training minimums."""
+    capture_session = _CaptureTrainerSession()
+    monkeypatch.setattr(trainer_module, "SessionLocal", _SessionFactory(capture_session))
+    monkeypatch.setattr(settings, "trainer_enabled", True)
+    monkeypatch.setattr(settings, "trainer_sparse_cv_enabled", False)
+    monkeypatch.setattr(settings, "trainer_min_rows", 5)
+
+    async def _fake_load_resolved_candidates(self, *, session, window_start):  # noqa: ANN001, ARG001
+        """Return too few rows so the trainer takes the explicit skip path."""
+        return [{"ts": datetime(2026, 2, 14, 15, 0, 0, tzinfo=ZoneInfo("UTC"))}] * 2
+
+    monkeypatch.setattr(TrainerJob, "_load_resolved_candidates", _fake_load_resolved_candidates)
+
+    result = await TrainerJob().run_once(force=True)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "insufficient_rows"
+    assert capture_session.update_sql
+    assert "status = 'SKIPPED'" in capture_session.update_sql[0]
+    assert capture_session.update_params[0]["notes"] == "insufficient_rows"

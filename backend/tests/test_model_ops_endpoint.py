@@ -102,6 +102,7 @@ async def test_get_model_ops_shapes_response() -> None:
     assert result["latest_model_version"]["model_version_id"] == 11
     assert result["latest_model_version"]["metrics"]["tp50_rate_test"] == 0.58
     assert result["latest_training_run"]["training_run_id"] == 21
+    assert result["latest_training_run"]["skip_reason"] is None
     assert result["latest_training_run"]["gate"]["passed"] is True
     assert result["active_model_version"]["is_active"] is True
     assert result["warnings"] == []
@@ -109,6 +110,7 @@ async def test_get_model_ops_shapes_response() -> None:
     # Regression guard: fully qualify created_at to avoid Postgres ambiguity in joined subquery.
     assert "MAX(mp.created_at)" in session.calls[0][0]
     assert "MAX(created_at)" not in session.calls[0][0]
+    assert "config_json->>'model_name'" in session.calls[2][0]
 
 
 @pytest.mark.asyncio
@@ -139,3 +141,54 @@ async def test_get_model_ops_returns_warnings_when_no_data() -> None:
     assert "no_model_versions" in result["warnings"]
     assert "no_training_runs" in result["warnings"]
     assert "no_model_predictions" in result["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_get_model_ops_surfaces_latest_skipped_training_attempt() -> None:
+    """Skipped training attempts should remain visible even without a model_version_id."""
+    session = _FakeSession(
+        row_batches=[
+            [
+                SimpleNamespace(
+                    model_versions_count=1,
+                    training_runs_count=1,
+                    model_predictions_count=0,
+                    model_predictions_24h_count=0,
+                    latest_prediction_ts=None,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    model_version_id=11,
+                    version="wf_20260215150000",
+                    rollout_status="shadow",
+                    is_active=False,
+                    created_at=datetime(2026, 2, 15, 15, 1, 0, tzinfo=timezone.utc),
+                    promoted_at=None,
+                    metrics_json={},
+                )
+            ],
+            [
+                SimpleNamespace(
+                    training_run_id=34,
+                    model_version_id=None,
+                    status="SKIPPED",
+                    started_at=datetime(2026, 2, 16, 14, 0, 0, tzinfo=timezone.utc),
+                    finished_at=datetime(2026, 2, 16, 14, 1, 0, tzinfo=timezone.utc),
+                    rows_train=0,
+                    rows_test=12,
+                    notes="insufficient_rows",
+                    metrics_json={"skipped_reason": "insufficient_rows"},
+                )
+            ],
+            [],
+        ]
+    )
+
+    result = await get_model_ops(model_name="cand_bucket_v1", db=session)
+
+    assert result["latest_training_run"]["training_run_id"] == 34
+    assert result["latest_training_run"]["model_version_id"] is None
+    assert result["latest_training_run"]["status"] == "SKIPPED"
+    assert result["latest_training_run"]["skip_reason"] == "insufficient_rows"
+    assert "latest_training_skipped" in result["warnings"]

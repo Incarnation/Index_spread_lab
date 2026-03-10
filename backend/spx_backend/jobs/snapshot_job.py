@@ -380,6 +380,27 @@ class SnapshotJob:
                     )
                     continue
 
+                options = _parse_chain_options(chain)
+                if not options:
+                    # Empty provider payloads are not useful snapshots and would
+                    # otherwise consume downstream GEX batch capacity.
+                    failed_items.append(
+                        {
+                            "target_dte": target_dte,
+                            "expiration": exp.isoformat(),
+                            "stage": "empty_chain",
+                            "error": "no_option_rows",
+                        }
+                    )
+                    logger.warning(
+                        "{}: empty_chain_payload target_dte={} expiration={} underlying={}; skipping snapshot insert",
+                        self.config.job_name,
+                        target_dte,
+                        exp.isoformat(),
+                        underlying,
+                    )
+                    continue
+
                 chk = _checksum(chain)
                 item_chain_rows_inserted = 0
                 try:
@@ -407,7 +428,6 @@ class SnapshotJob:
                         snapshot_id = result.scalar_one()
 
                         # Extract per-option rows with open_interest + greeks if present.
-                        options = _parse_chain_options(chain)
                         selected_strikes: set[float] | None = None
                         if spot is not None and self.config.strikes_each_side > 0:
                             selected_strikes = _select_strikes_near_spot(

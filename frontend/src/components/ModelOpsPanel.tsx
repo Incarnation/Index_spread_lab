@@ -28,6 +28,13 @@ function fmtMoney(value: number | null | undefined): string {
   return `${sign}$${value.toFixed(2)}`;
 }
 
+/** Format the latest training attempt with an explicit skip or failure reason when present. */
+function fmtTrainingAttempt(run: ModelOpsResponse["latest_training_run"]): string {
+  if (!run) return "—";
+  const detail = run.skip_reason ?? run.notes;
+  return `#${run.training_run_id} (${run.status}${detail ? `: ${detail}` : ""})`;
+}
+
 /**
  * Render training/promotion/prediction health indicators for model operations.
  *
@@ -90,12 +97,8 @@ export function ModelOpsPanel({ ops, loading, error }: ModelOpsPanelProps) {
             <Table.Td>{ops?.latest_model_version?.rollout_status ?? "—"}</Table.Td>
           </Table.Tr>
           <Table.Tr>
-            <Table.Td>Latest training run</Table.Td>
-            <Table.Td>
-              {ops?.latest_training_run
-                ? `#${ops.latest_training_run.training_run_id} (${ops.latest_training_run.status})`
-                : "—"}
-            </Table.Td>
+            <Table.Td>Latest training attempt</Table.Td>
+            <Table.Td>{fmtTrainingAttempt(ops?.latest_training_run ?? null)}</Table.Td>
           </Table.Tr>
           <Table.Tr>
             <Table.Td>Latest prediction timestamp</Table.Td>

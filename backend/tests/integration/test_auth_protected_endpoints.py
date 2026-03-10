@@ -226,6 +226,38 @@ async def test_auth_audit_returns_403_for_non_admin(integration_client_with_auth
 
 
 @pytest.mark.asyncio
+async def test_admin_run_snapshot_returns_403_for_non_admin(integration_client_with_auth: AsyncClient) -> None:
+    """POST /api/admin/run-snapshot should reject non-admin users."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "otheruser", "password": "otherpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.post(
+        "/api/admin/run-snapshot",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_preflight_returns_200_for_non_admin(integration_client_with_auth: AsyncClient) -> None:
+    """GET /api/admin/preflight should stay available to authenticated non-admin users."""
+    login_r = await integration_client_with_auth.post(
+        "/api/auth/login",
+        json={"username": "otheruser", "password": "otherpass123"},
+    )
+    assert login_r.status_code == 200
+    token = login_r.json()["access_token"]
+    r = await integration_client_with_auth.get(
+        "/api/admin/preflight",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_auth_audit_returns_200_for_admin(integration_client_with_auth: AsyncClient) -> None:
     """GET /api/admin/auth-audit as admin returns 200 with total and events list."""
     login_r = await integration_client_with_auth.post(

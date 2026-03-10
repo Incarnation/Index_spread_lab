@@ -154,6 +154,14 @@ class _FakeTradier:
         }
 
 
+class _EmptyChainTradier(_FakeTradier):
+    """Tradier stub that returns an empty chain payload for one expiration."""
+
+    async def get_option_chain(self, *, underlying: str, expiration: str, greeks: bool) -> dict:  # noqa: ARG002
+        """Return an empty payload so the job can exercise skip-on-empty logic."""
+        return {"options": None}
+
+
 @pytest.mark.parametrize(
     ("underlying", "job_name", "targets"),
     [
@@ -194,3 +202,40 @@ async def test_snapshot_job_uses_configured_underlying_for_chain_and_rows(
     assert result["skipped"] is False
     assert capture_session.chain_insert_params[0]["underlying"] == underlying
     assert capture_session.option_insert_params[0]["underlying"] == underlying
+
+
+@pytest.mark.asyncio
+async def test_snapshot_job_skips_empty_chain_payloads(monkeypatch) -> None:
+    """Empty Tradier chains should not produce snapshot or option-row inserts."""
+    capture_session = _CaptureSession()
+    monkeypatch.setattr(snapshot_module, "SessionLocal", _SessionFactory(capture_session))
+
+    job = SnapshotJob(
+        tradier=_EmptyChainTradier(),
+        config=SnapshotJobConfig(
+            job_name="snapshot_job_empty_chain_test",
+            underlying="VIX",
+            dte_mode="targets",
+            dte_targets=[14],
+            dte_min_days=0,
+            dte_max_days=365,
+            range_fallback_enabled=False,
+            range_fallback_count=1,
+            dte_tolerance_days=2,
+            strikes_each_side=0,
+            allow_outside_rth=True,
+        ),
+    )
+
+    result = await job.run_once(force=True)
+
+    assert result["skipped"] is False
+    assert result["inserted"] == []
+    assert result["chain_rows_inserted"] == 0
+    assert capture_session.chain_insert_params == []
+    assert capture_session.option_insert_params == []
+    assert len(result["failed_items"]) == 1
+    assert result["failed_items"][0]["stage"] == "empty_chain"
+    assert result["failed_items"][0]["error"] == "no_option_rows"
+    assert result["failed_items"][0]["expiration"]
+    assert int(result["failed_items"][0]["target_dte"]) >= 0

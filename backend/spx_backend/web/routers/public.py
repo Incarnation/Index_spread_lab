@@ -689,7 +689,7 @@ async def get_model_ops(
     current_user: UserOut = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Return latest model/training/gate status for dashboard monitoring."""
+    """Return latest model version, training attempt, and prediction activity."""
     selected_model_name = model_name.strip() if isinstance(model_name, str) and model_name.strip() else settings.trainer_model_name
 
     counts_row = (
@@ -698,9 +698,11 @@ async def get_model_ops(
                 """
                 SELECT
                   (SELECT COUNT(*) FROM model_versions WHERE model_name = :model_name) AS model_versions_count,
-                  (SELECT COUNT(*) FROM training_runs tr
-                    JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
-                    WHERE mv.model_name = :model_name) AS training_runs_count,
+                  (SELECT COUNT(*)
+                    FROM training_runs tr
+                    LEFT JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
+                    WHERE COALESCE(NULLIF(tr.config_json->>'model_name', ''), mv.model_name) = :model_name
+                  ) AS training_runs_count,
                   (SELECT COUNT(*) FROM model_predictions mp
                     JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
                     WHERE mv.model_name = :model_name) AS model_predictions_count,
@@ -753,9 +755,9 @@ async def get_model_ops(
                   tr.notes,
                   tr.metrics_json
                 FROM training_runs tr
-                JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
-                WHERE mv.model_name = :model_name
-                ORDER BY tr.finished_at DESC NULLS LAST, tr.training_run_id DESC
+                LEFT JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
+                WHERE COALESCE(NULLIF(tr.config_json->>'model_name', ''), mv.model_name) = :model_name
+                ORDER BY COALESCE(tr.finished_at, tr.started_at) DESC NULLS LAST, tr.training_run_id DESC
                 LIMIT 1
                 """
             ),
@@ -802,6 +804,7 @@ async def get_model_ops(
         latest_training_row.metrics_json if (latest_training_row is not None and isinstance(latest_training_row.metrics_json, dict)) else {}
     )
     gate = training_metrics.get("gate") if isinstance(training_metrics.get("gate"), dict) else None
+    skip_reason = training_metrics.get("skipped_reason") if isinstance(training_metrics.get("skipped_reason"), str) else None
     warnings: list[str] = []
     if counts_row is not None:
         if int(counts_row.model_versions_count or 0) == 0:
@@ -810,6 +813,12 @@ async def get_model_ops(
             warnings.append("no_training_runs")
         if int(counts_row.model_predictions_count or 0) == 0:
             warnings.append("no_model_predictions")
+    if latest_training_row is not None:
+        latest_training_status = str(latest_training_row.status or "").upper()
+        if latest_training_status == "SKIPPED":
+            warnings.append("latest_training_skipped")
+        elif latest_training_status == "FAILED":
+            warnings.append("latest_training_failed")
 
     return {
         "model_name": selected_model_name,
@@ -850,13 +859,18 @@ async def get_model_ops(
             if latest_training_row is None
             else {
                 "training_run_id": int(latest_training_row.training_run_id),
-                "model_version_id": int(latest_training_row.model_version_id),
+                "model_version_id": (
+                    int(latest_training_row.model_version_id)
+                    if latest_training_row.model_version_id is not None
+                    else None
+                ),
                 "status": str(latest_training_row.status),
                 "started_at_utc": _iso(latest_training_row.started_at),
                 "finished_at_utc": _iso(latest_training_row.finished_at),
                 "rows_train": int(latest_training_row.rows_train or 0),
                 "rows_test": int(latest_training_row.rows_test or 0),
                 "notes": latest_training_row.notes,
+                "skip_reason": skip_reason,
                 "gate": gate,
             }
         ),

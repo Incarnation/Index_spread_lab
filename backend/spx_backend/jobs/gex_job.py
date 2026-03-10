@@ -70,6 +70,11 @@ class GexJob:
                         LEFT JOIN gex_snapshots gs ON gs.snapshot_id = cs.snapshot_id
                         WHERE gs.snapshot_id IS NULL
                           AND cs.source = 'TRADIER'
+                          AND EXISTS (
+                            SELECT 1
+                            FROM option_chain_rows ocr
+                            WHERE ocr.snapshot_id = cs.snapshot_id
+                          )
                         ORDER BY cs.snapshot_id DESC
                         LIMIT :limit
                         """

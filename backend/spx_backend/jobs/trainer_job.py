@@ -153,6 +153,59 @@ class TrainerJob:
         )
         return int(result.scalar_one())
 
+    async def _mark_training_run_skipped(
+        self,
+        *,
+        session,
+        training_run_id: int,
+        finished_at: datetime,
+        notes: str,
+        metrics_json: dict[str, Any],
+        rows_train: int | None = None,
+        rows_test: int | None = None,
+    ) -> None:
+        """Persist a skipped training attempt with honest status metadata.
+
+        Parameters
+        ----------
+        session:
+            Async database session used for the update statement.
+        training_run_id:
+            Primary key of the in-flight training run row.
+        finished_at:
+            UTC timestamp marking when the skip decision was finalized.
+        notes:
+            Short machine-readable reason stored alongside the run.
+        metrics_json:
+            JSON payload explaining why the attempt skipped.
+        rows_train:
+            Optional training-row count to store when known.
+        rows_test:
+            Optional test-row or total-row count to store when known.
+        """
+        await session.execute(
+            text(
+                """
+                UPDATE training_runs
+                SET status = 'SKIPPED',
+                    finished_at = :finished_at,
+                    rows_train = COALESCE(:rows_train, rows_train),
+                    rows_test = COALESCE(:rows_test, rows_test),
+                    metrics_json = CAST(:metrics_json AS jsonb),
+                    notes = :notes
+                WHERE training_run_id = :training_run_id
+                """
+            ),
+            {
+                "training_run_id": training_run_id,
+                "finished_at": finished_at,
+                "rows_train": rows_train,
+                "rows_test": rows_test,
+                "metrics_json": _to_json(metrics_json),
+                "notes": notes,
+            },
+        )
+
     async def _load_resolved_candidates(self, *, session, window_start: datetime) -> list[dict[str, Any]]:
         """Load resolved labeled candidates for training/evaluation."""
         rows = (
@@ -451,31 +504,17 @@ class TrainerJob:
                 can_run_sparse_cv = settings.trainer_sparse_cv_enabled and rows_total >= sparse_cv_min_rows
                 if (not can_run_walk_forward) and (not can_run_sparse_cv):
                     rows_required = min(trainer_min_rows, sparse_cv_min_rows) if settings.trainer_sparse_cv_enabled else trainer_min_rows
-                    await session.execute(
-                        text(
-                            """
-                            UPDATE training_runs
-                            SET status = 'COMPLETED',
-                                finished_at = :finished_at,
-                                rows_test = :rows_test,
-                                metrics_json = CAST(:metrics_json AS jsonb),
-                                notes = :notes
-                            WHERE training_run_id = :training_run_id
-                            """
-                        ),
-                        {
-                            "training_run_id": run_id,
-                            "finished_at": now_utc,
-                            "rows_test": rows_total,
-                            "metrics_json": _to_json(
-                                {
-                                    "rows_total": rows_total,
-                                    "rows_required": rows_required,
-                                    "skipped_reason": "insufficient_rows",
-                                }
-                            ),
-                            "notes": "insufficient_rows",
+                    await self._mark_training_run_skipped(
+                        session=session,
+                        training_run_id=run_id,
+                        finished_at=now_utc,
+                        rows_test=rows_total,
+                        metrics_json={
+                            "rows_total": rows_total,
+                            "rows_required": rows_required,
+                            "skipped_reason": "insufficient_rows",
                         },
+                        notes="insufficient_rows",
                     )
                     await session.commit()
                     return {
@@ -507,31 +546,17 @@ class TrainerJob:
                         min_test_rows=settings.trainer_sparse_cv_min_test_rows,
                     )
                     if not cv_folds:
-                        await session.execute(
-                            text(
-                                """
-                                UPDATE training_runs
-                                SET status = 'COMPLETED',
-                                    finished_at = :finished_at,
-                                    rows_test = :rows_test,
-                                    metrics_json = CAST(:metrics_json AS jsonb),
-                                    notes = :notes
-                                WHERE training_run_id = :training_run_id
-                                """
-                            ),
-                            {
-                                "training_run_id": run_id,
-                                "finished_at": now_utc,
-                                "rows_test": rows_total,
-                                "metrics_json": _to_json(
-                                    {
-                                        "rows_total": rows_total,
-                                        "sparse_cv_folds_requested": settings.trainer_sparse_cv_folds,
-                                        "skipped_reason": "insufficient_cv_folds",
-                                    }
-                                ),
-                                "notes": "insufficient_cv_folds",
+                        await self._mark_training_run_skipped(
+                            session=session,
+                            training_run_id=run_id,
+                            finished_at=now_utc,
+                            rows_test=rows_total,
+                            metrics_json={
+                                "rows_total": rows_total,
+                                "sparse_cv_folds_requested": settings.trainer_sparse_cv_folds,
+                                "skipped_reason": "insufficient_cv_folds",
                             },
+                            notes="insufficient_cv_folds",
                         )
                         await session.commit()
                         return {
@@ -580,34 +605,19 @@ class TrainerJob:
                     train_rows = [r for r in all_rows if r["ts"] < windows["test_start"]]
                     test_rows = [r for r in all_rows if r["ts"] >= windows["test_start"]]
                     if len(train_rows) < settings.trainer_min_train_rows or len(test_rows) < settings.trainer_min_test_rows:
-                        await session.execute(
-                            text(
-                                """
-                                UPDATE training_runs
-                                SET status = 'COMPLETED',
-                                    finished_at = :finished_at,
-                                    rows_train = :rows_train,
-                                    rows_test = :rows_test,
-                                    metrics_json = CAST(:metrics_json AS jsonb),
-                                    notes = :notes
-                                WHERE training_run_id = :training_run_id
-                                """
-                            ),
-                            {
-                                "training_run_id": run_id,
-                                "finished_at": now_utc,
+                        await self._mark_training_run_skipped(
+                            session=session,
+                            training_run_id=run_id,
+                            finished_at=now_utc,
+                            rows_train=len(train_rows),
+                            rows_test=len(test_rows),
+                            metrics_json={
+                                "rows_total": len(all_rows),
                                 "rows_train": len(train_rows),
                                 "rows_test": len(test_rows),
-                                "metrics_json": _to_json(
-                                    {
-                                        "rows_total": len(all_rows),
-                                        "rows_train": len(train_rows),
-                                        "rows_test": len(test_rows),
-                                        "skipped_reason": "insufficient_split_rows",
-                                    }
-                                ),
-                                "notes": "insufficient_split_rows",
+                                "skipped_reason": "insufficient_split_rows",
                             },
+                            notes="insufficient_split_rows",
                         )
                         await session.commit()
                         return {
