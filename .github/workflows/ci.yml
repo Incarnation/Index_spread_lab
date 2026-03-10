@@ -12,6 +12,10 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    env:
+      DATABASE_URL: "postgresql+asyncpg://user:pass@localhost:5432/testdb"
+      TRADIER_ACCESS_TOKEN: "ci-dummy-token"
+      TRADIER_ACCOUNT_ID: "CI000000"
 
     steps:
       - uses: actions/checkout@v4
