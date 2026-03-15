@@ -443,7 +443,14 @@ def _stats_for_rows(rows: list[dict[str, Any]]) -> dict[str, float | int | None]
             "tail_loss_proxy": None,
             "avg_margin_usage": None,
         }
-    pnls = [float(r["realized_pnl"]) for r in rows]
+    pnls = [float(r["realized_pnl"]) for r in rows
+            if r.get("realized_pnl") is not None and not math.isnan(float(r["realized_pnl"]))]
+    if not pnls:
+        return {
+            "count": 0, "wins": 0, "prob_tp50": None,
+            "expected_pnl": None, "pnl_std": None,
+            "tail_loss_proxy": None, "avg_margin_usage": None,
+        }
     wins = sum(1 for r in rows if bool(r["hit_tp50"]))
     margins = [float(r.get("margin_usage", 0.0)) for r in rows]
     return {

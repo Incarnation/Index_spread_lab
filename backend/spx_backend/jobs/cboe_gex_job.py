@@ -323,6 +323,8 @@ class CboeGexJob:
         skipped_items_by_reason: dict[str, int] = {}
         failed_items: list[dict[str, Any]] = []
 
+        agg_per_strike: dict[float, dict[str, float]] = {}
+
         for item in exposure_items:
             try:
                 # Build CBOE DTE labels with the same trading-slot indexing used
@@ -428,6 +430,15 @@ class CboeGexJob:
                             }
                         )
                         continue
+
+                    for strike, sdata in per_strike.items():
+                        agg = agg_per_strike.setdefault(
+                            strike,
+                            {"gex_calls": 0.0, "gex_puts": 0.0, "gex_net": 0.0},
+                        )
+                        agg["gex_calls"] += sdata["gex_calls"]
+                        agg["gex_puts"] += sdata["gex_puts"]
+                        agg["gex_net"] += sdata["gex_net"]
 
                     method = "cboe_mz_precomputed"
                     zero_gamma_level = self._zero_gamma_level(per_strike)
@@ -543,6 +554,41 @@ class CboeGexJob:
                     exc,
                 )
                 continue
+
+        if agg_per_strike and gex_snapshots_upserted > 0:
+            agg_gex_net = sum(s["gex_net"] for s in agg_per_strike.values())
+            agg_zero_gamma = self._zero_gamma_level(agg_per_strike)
+            try:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO context_snapshots (ts, gex_net, zero_gamma_level, notes_json)
+                        VALUES (:ts, :gex_net, :zero_gamma_level, CAST(:notes AS jsonb))
+                        ON CONFLICT (ts) DO UPDATE SET
+                          gex_net = EXCLUDED.gex_net,
+                          zero_gamma_level = EXCLUDED.zero_gamma_level,
+                          notes_json = EXCLUDED.notes_json
+                        """
+                    ),
+                    {
+                        "ts": batch_ts_utc,
+                        "gex_net": agg_gex_net,
+                        "zero_gamma_level": agg_zero_gamma,
+                        "notes": "{}",
+                    },
+                )
+                logger.info(
+                    "cboe_gex_job: context_snapshots upserted underlying={} gex_net={:.2f} zero_gamma={}",
+                    underlying,
+                    agg_gex_net,
+                    agg_zero_gamma,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "cboe_gex_job: context_snapshots upsert failed underlying={} error={}",
+                    underlying,
+                    exc,
+                )
 
         result.update(
             {
