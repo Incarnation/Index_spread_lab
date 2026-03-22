@@ -28,7 +28,6 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import databento as db
 import pandas as pd
 
 DATABENTO_API_KEY = os.getenv(
@@ -640,6 +639,8 @@ def main() -> None:
 
     if not args.phase:
         parser.error("Either --phase, --verify, or --verify-dbn is required")
+
+    import databento as db  # lazy: not needed for verify/verify-dbn paths
 
     client = db.Historical(DATABENTO_API_KEY)
     print(f"Databento client initialized. Output dir: {DATA_DIR}")

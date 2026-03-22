@@ -1,13 +1,16 @@
 """Tests for download_databento.py: trading day calendar and date-gap verification."""
 from __future__ import annotations
 
+import sys
 import tempfile
 from datetime import date
 from pathlib import Path
 
 import pytest
 
-from backend.scripts.download_databento import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from download_databento import (  # noqa: E402
     get_existing_dates,
     get_trading_days,
     verify_dbn,
@@ -120,7 +123,7 @@ class TestVerifyDbn:
 
     def test_all_dates_present(self, tmp_path: Path, monkeypatch):
         """When all trading days are present, results show no missing dates."""
-        import backend.scripts.download_databento as mod
+        import download_databento as mod
 
         monkeypatch.setattr(mod, "DATA_DIR", tmp_path)
 
@@ -134,7 +137,7 @@ class TestVerifyDbn:
 
     def test_detects_missing_dates(self, tmp_path: Path, monkeypatch):
         """When a date is removed, verify_dbn reports it as missing."""
-        import backend.scripts.download_databento as mod
+        import download_databento as mod
 
         monkeypatch.setattr(mod, "DATA_DIR", tmp_path)
 
@@ -151,7 +154,7 @@ class TestVerifyDbn:
 
     def test_detects_extra_dates(self, tmp_path: Path, monkeypatch):
         """Extra files outside the expected range are reported."""
-        import backend.scripts.download_databento as mod
+        import download_databento as mod
 
         monkeypatch.setattr(mod, "DATA_DIR", tmp_path)
 
