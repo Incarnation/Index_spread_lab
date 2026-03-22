@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     tradier_account_id: str
     mzdata_base_url: str = "https://mztrading-data.deno.dev"
 
-    snapshot_interval_minutes: int = 10
+    snapshot_interval_minutes: int = 15
     snapshot_underlying: str = "SPX"
     snapshot_dte_targets: str = "3,5,7"
     snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     snapshot_dte_tolerance_days: int = 1
     snapshot_strikes_each_side: int = 75
     spy_snapshot_enabled: bool = True
-    spy_snapshot_interval_minutes: int = 10
+    spy_snapshot_interval_minutes: int = 15
     spy_snapshot_underlying: str = "SPY"
     spy_snapshot_dte_targets: str = "3,5,7"
     spy_snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -44,50 +44,50 @@ class Settings(BaseSettings):
     spy_snapshot_strikes_each_side: int = 75
     spy_allow_snapshot_outside_rth: bool = False
     vix_snapshot_enabled: bool = False
-    vix_snapshot_interval_minutes: int = 10
+    vix_snapshot_interval_minutes: int = 15
     vix_snapshot_underlying: str = "VIX"
     vix_snapshot_dte_targets: str = "14,21,28"
     vix_snapshot_dte_mode: str = "range"  # "range" or "targets"
-    vix_snapshot_dte_min_days: int = 7
-    vix_snapshot_dte_max_days: int = 45
+    vix_snapshot_dte_min_days: int = 0
+    vix_snapshot_dte_max_days: int = 10
     vix_snapshot_range_fallback_enabled: bool = False
     vix_snapshot_range_fallback_count: int = 3
     vix_snapshot_dte_tolerance_days: int = 2
     vix_snapshot_strikes_each_side: int = 50
     vix_allow_snapshot_outside_rth: bool = False
     quote_symbols: str = "SPX,VIX,VIX9D,SPY"
-    quote_interval_minutes: int = 10
+    quote_interval_minutes: int = 15
     gex_enabled: bool = True
-    gex_interval_minutes: int = 5
+    gex_interval_minutes: int = 15
     gex_allow_outside_rth: bool = False
     gex_store_by_expiry: bool = True
     gex_spot_max_age_seconds: int = 600
     gex_contract_multiplier: int = 100
     gex_puts_negative: bool = True
     # Keep this >= number of expirations captured per snapshot cycle (e.g., 0-10 DTE => up to 11 snapshots).
-    gex_snapshot_batch_limit: int = 20
+    gex_snapshot_batch_limit: int = 50
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
-    cboe_gex_enabled: bool = False
-    cboe_gex_underlyings: str = ""
+    cboe_gex_enabled: bool = True
+    cboe_gex_underlyings: str = "SPX,SPY,VIX"
     cboe_gex_underlying: str = "SPX"
     cboe_gex_interval_minutes: int = 15
     cboe_gex_allow_outside_rth: bool = False
 
     decision_entry_times: str = "10:02,11:02,12:02"
     decision_dte_targets: str = "0,3,5,7,10"
-    decision_dte_tolerance_days: int = 1
+    decision_dte_tolerance_days: int = 0
     decision_delta_targets: str = "0.10,0.20"
     decision_spread_side: str = "put"
-    decision_spread_sides: str = ""
-    decision_spread_width_points: float = 25.0
+    decision_spread_sides: str = "put,call"
+    decision_spread_width_points: float = 10.0
     decision_contracts: int = 1
     decision_snapshot_max_age_minutes: int = 20
-    decision_max_trades_per_run: int = 4
+    decision_max_trades_per_run: int = 5
     decision_max_trades_per_day: int = 20
-    decision_max_open_trades: int = 15
-    decision_max_trades_per_side_per_day: int = 0
-    decision_max_open_trades_per_side: int = 0
+    decision_max_open_trades: int = 20
+    decision_max_trades_per_side_per_day: int = 10
+    decision_max_open_trades_per_side: int = 10
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
 
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     # ML label resolver (step 2)
     labeler_enabled: bool = True
     labeler_batch_limit: int = 200
-    labeler_min_age_minutes: int = 5
+    labeler_min_age_minutes: int = 10
     labeler_max_wait_hours: int = 336
     labeler_take_profit_pct: float = 0.50
     label_schema_version: str = "label_v1"
@@ -160,7 +160,7 @@ class Settings(BaseSettings):
 
     # Live trade PnL mark-to-market job
     trade_pnl_enabled: bool = True
-    trade_pnl_interval_minutes: int = 5
+    trade_pnl_interval_minutes: int = 10
     trade_pnl_allow_outside_rth: bool = False
     trade_pnl_mark_max_age_minutes: int = 30
     trade_pnl_take_profit_pct: float = 0.50
@@ -168,8 +168,8 @@ class Settings(BaseSettings):
     trade_pnl_contract_multiplier: int = 100
 
     # Aggregate PnL analytics refresher
-    performance_analytics_enabled: bool = False
-    performance_analytics_interval_minutes: int = 10
+    performance_analytics_enabled: bool = True
+    performance_analytics_interval_minutes: int = 15
 
     cors_origins: str = "http://localhost:5173"
 
@@ -179,7 +179,7 @@ class Settings(BaseSettings):
     market_clock_cache_seconds: int = 300
 
     # Staleness alerting
-    staleness_alert_enabled: bool = False
+    staleness_alert_enabled: bool = True
     staleness_alert_interval_minutes: int = 30
     staleness_quotes_max_minutes: int = 120
     staleness_snapshots_max_minutes: int = 120
