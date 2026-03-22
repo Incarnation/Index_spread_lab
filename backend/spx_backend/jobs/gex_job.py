@@ -276,16 +276,35 @@ class GexJob:
                                     },
                                 )
 
-                        # Update context_snapshots with gex fields.
+                        # Update context_snapshots with gex fields, carrying
+                        # forward quote values from underlying_quotes when
+                        # inserting a new row so spx_price/vix/etc. aren't NULL.
                         await session.execute(
                             text(
                                 """
-                                INSERT INTO context_snapshots (ts, gex_net, zero_gamma_level, notes_json)
-                                VALUES (:ts, :gex_net, :zero_gamma_level, CAST(:notes AS jsonb))
+                                INSERT INTO context_snapshots
+                                    (ts, gex_net, zero_gamma_level,
+                                     spx_price, spy_price, vix, vix9d, term_structure,
+                                     notes_json)
+                                VALUES (
+                                    :ts, :gex_net, :zero_gamma_level,
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    (SELECT CASE WHEN v.last > 0 THEN v9.last / v.last END
+                                     FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v,
+                                          (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v9),
+                                    CAST(:notes AS jsonb)
+                                )
                                 ON CONFLICT (ts) DO UPDATE SET
                                   gex_net = EXCLUDED.gex_net,
                                   zero_gamma_level = EXCLUDED.zero_gamma_level,
-                                  notes_json = EXCLUDED.notes_json
+                                  spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
+                                  spy_price = COALESCE(context_snapshots.spy_price, EXCLUDED.spy_price),
+                                  vix = COALESCE(context_snapshots.vix, EXCLUDED.vix),
+                                  vix9d = COALESCE(context_snapshots.vix9d, EXCLUDED.vix9d),
+                                  term_structure = COALESCE(context_snapshots.term_structure, EXCLUDED.term_structure)
                                 """
                             ),
                             {

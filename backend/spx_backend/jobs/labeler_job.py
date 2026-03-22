@@ -375,6 +375,36 @@ class LabelerJob:
 
             await session.commit()
 
+            # Cascade label_status to feature_snapshots when all
+            # candidates for a given feature_snapshot_id are resolved.
+            if resolved_count > 0:
+                fs_result = await session.execute(
+                    text(
+                        """
+                        UPDATE feature_snapshots fs
+                        SET label_status = 'resolved',
+                            resolved_at = NOW()
+                        WHERE fs.label_status = 'pending'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM trade_candidates tc
+                              WHERE tc.feature_snapshot_id = fs.feature_snapshot_id
+                                AND tc.label_status != 'resolved'
+                          )
+                          AND EXISTS (
+                              SELECT 1 FROM trade_candidates tc2
+                              WHERE tc2.feature_snapshot_id = fs.feature_snapshot_id
+                          )
+                        """
+                    )
+                )
+                fs_resolved = fs_result.rowcount
+                if fs_resolved > 0:
+                    await session.commit()
+                    logger.info(
+                        "labeler_job: feature_snapshots resolved={}",
+                        fs_resolved,
+                    )
+
         logger.info(
             "labeler_job: pending={} resolved={} errors={} skipped_fresh={}",
             pending_count,
