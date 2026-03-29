@@ -310,7 +310,7 @@ async def test_lifespan_wires_performance_analytics_job_when_enabled(monkeypatch
     monkeypatch.setattr(app_module, "PromotionGateJob", _FakeJob)
 
     monkeypatch.setattr(settings, "performance_analytics_enabled", True)
-    monkeypatch.setattr(settings, "performance_analytics_interval_minutes", 15)
+    monkeypatch.setattr(settings, "performance_analytics_interval_minutes", 5)
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
     monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)

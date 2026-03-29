@@ -90,7 +90,7 @@ def _normalized_rth_interval_minutes(interval_minutes: int, *, job_id: str) -> i
 
 
 def _build_rth_regular_trigger(*, interval_minutes: int, timezone: str, job_id: str) -> Any:
-    """Build a weekday RTH trigger spanning 09:30 through 15:50 ET.
+    """Build a weekday RTH trigger spanning 09:31 through 15:55 ET.
 
     Parameters
     ----------
@@ -104,14 +104,14 @@ def _build_rth_regular_trigger(*, interval_minutes: int, timezone: str, job_id: 
     Returns
     -------
     Any
-        An APScheduler trigger that fires at 09:30+ cadence in the opening
-        hour and then repeats every cadence interval from 10:00 to 15:50.
+        An APScheduler trigger that fires at 09:31+ cadence in the opening
+        hour and then repeats every cadence interval from 10:00 to 15:55.
     """
     from apscheduler.triggers.combining import OrTrigger
     from apscheduler.triggers.cron import CronTrigger
 
     cadence = _normalized_rth_interval_minutes(interval_minutes, job_id=job_id)
-    opening_minutes = ",".join(str(minute) for minute in range(30, 60, cadence))
+    opening_minutes = ",".join(str(minute) for minute in range(31, 60, cadence))
     session_minutes = ",".join(str(minute) for minute in range(0, 60, cadence))
     return OrTrigger(
         [
@@ -249,7 +249,7 @@ def _schedule_rth_window_job(
 ) -> None:
     """Schedule one job for RTH cadence with a guaranteed 16:00 ET run.
 
-    The regular trigger runs from 09:30 through 15:50 on weekdays at the
+    The regular trigger runs from 09:31 through 15:55 on weekdays at the
     configured cadence. A separate close trigger runs at 16:00 with
     ``force=True`` and is allowed only if a guarded run observed open market
     status earlier that date, which skips holiday executions.

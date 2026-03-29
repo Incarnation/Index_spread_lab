@@ -438,7 +438,7 @@ High-impact settings:
   - `CBOE_GEX_ENABLED`
   - `CBOE_GEX_UNDERLYINGS` (default `SPX,SPY,VIX`)
   - `CBOE_GEX_UNDERLYING` (legacy fallback during migration)
-  - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
+  - `CBOE_GEX_INTERVAL_MINUTES` (default `5`)
   - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
 - Staleness alerting:
   - `STALENESS_ALERT_ENABLED` (default `false`)
@@ -455,7 +455,7 @@ High-impact settings:
 
 Recommended SPY model-fitting profile:
 - `SPY_SNAPSHOT_ENABLED=true`
-- `SPY_SNAPSHOT_INTERVAL_MINUTES=10`
+- `SPY_SNAPSHOT_INTERVAL_MINUTES=5`
 - `SPY_SNAPSHOT_DTE_MODE=range`
 - `SPY_SNAPSHOT_DTE_MIN_DAYS=0`
 - `SPY_SNAPSHOT_DTE_MAX_DAYS=10`
@@ -464,7 +464,7 @@ Recommended SPY model-fitting profile:
 
 Recommended VIX model-fitting profile:
 - `VIX_SNAPSHOT_ENABLED=true`
-- `VIX_SNAPSHOT_INTERVAL_MINUTES=10`
+- `VIX_SNAPSHOT_INTERVAL_MINUTES=5`
 - `VIX_SNAPSHOT_DTE_MODE=range`
 - `VIX_SNAPSHOT_DTE_MIN_DAYS=7`
 - `VIX_SNAPSHOT_DTE_MAX_DAYS=45`

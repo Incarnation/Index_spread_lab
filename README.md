@@ -247,7 +247,7 @@ Primary knobs:
   - `CBOE_GEX_ENABLED`
   - `CBOE_GEX_UNDERLYINGS` (default `SPX,SPY,VIX`)
   - `CBOE_GEX_UNDERLYING` (legacy fallback during migration)
-  - `CBOE_GEX_INTERVAL_MINUTES` (default `15`)
+  - `CBOE_GEX_INTERVAL_MINUTES` (default `5`)
   - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
 - Staleness alerting:
   - `STALENESS_ALERT_ENABLED` (default `false`)

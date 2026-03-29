@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     tradier_account_id: str
     mzdata_base_url: str = "https://mztrading-data.deno.dev"
 
-    snapshot_interval_minutes: int = 15
+    snapshot_interval_minutes: int = 5
     snapshot_underlying: str = "SPX"
     snapshot_dte_targets: str = "3,5,7"
     snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     snapshot_dte_tolerance_days: int = 1
     snapshot_strikes_each_side: int = 75
     spy_snapshot_enabled: bool = True
-    spy_snapshot_interval_minutes: int = 15
+    spy_snapshot_interval_minutes: int = 5
     spy_snapshot_underlying: str = "SPY"
     spy_snapshot_dte_targets: str = "3,5,7"
     spy_snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     spy_snapshot_strikes_each_side: int = 75
     spy_allow_snapshot_outside_rth: bool = False
     vix_snapshot_enabled: bool = False
-    vix_snapshot_interval_minutes: int = 15
+    vix_snapshot_interval_minutes: int = 5
     vix_snapshot_underlying: str = "VIX"
     vix_snapshot_dte_targets: str = "14,21,28"
     vix_snapshot_dte_mode: str = "range"  # "range" or "targets"
@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     vix_snapshot_strikes_each_side: int = 50
     vix_allow_snapshot_outside_rth: bool = False
     quote_symbols: str = "SPX,VIX,VIX9D,SPY"
-    quote_interval_minutes: int = 15
+    quote_interval_minutes: int = 5
     gex_enabled: bool = True
-    gex_interval_minutes: int = 15
+    gex_interval_minutes: int = 5
     gex_allow_outside_rth: bool = False
     gex_store_by_expiry: bool = True
     gex_spot_max_age_seconds: int = 600
@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     cboe_gex_enabled: bool = True
     cboe_gex_underlyings: str = "SPX,SPY,VIX"
     cboe_gex_underlying: str = "SPX"
-    cboe_gex_interval_minutes: int = 15
+    cboe_gex_interval_minutes: int = 5
     cboe_gex_allow_outside_rth: bool = False
 
     decision_entry_times: str = "10:02,11:02,12:02"
@@ -160,7 +160,7 @@ class Settings(BaseSettings):
 
     # Live trade PnL mark-to-market job
     trade_pnl_enabled: bool = True
-    trade_pnl_interval_minutes: int = 10
+    trade_pnl_interval_minutes: int = 5
     trade_pnl_allow_outside_rth: bool = False
     trade_pnl_mark_max_age_minutes: int = 30
     trade_pnl_take_profit_pct: float = 0.50
@@ -169,7 +169,7 @@ class Settings(BaseSettings):
 
     # Aggregate PnL analytics refresher
     performance_analytics_enabled: bool = True
-    performance_analytics_interval_minutes: int = 15
+    performance_analytics_interval_minutes: int = 5
 
     cors_origins: str = "http://localhost:5173"
 
