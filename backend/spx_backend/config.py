@@ -158,6 +158,11 @@ class Settings(BaseSettings):
     decision_hybrid_max_pnl_std: float = 250.0
     decision_hybrid_require_active_model: bool = True
 
+    # EOD economic-events seeder
+    eod_events_enabled: bool = True
+    eod_events_hour: int = 16
+    eod_events_minute: int = 30
+
     # Live trade PnL mark-to-market job
     trade_pnl_enabled: bool = True
     trade_pnl_interval_minutes: int = 5

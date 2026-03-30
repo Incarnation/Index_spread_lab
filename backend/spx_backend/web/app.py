@@ -26,6 +26,7 @@ from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
 from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job, build_vix_snapshot_job
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
+from spx_backend.jobs.eod_events_job import EodEventsJob
 from spx_backend.market_clock import MarketClockCache
 from spx_backend.web.routers import admin, auth, public
 from spx_backend.web.routers.public import (
@@ -498,6 +499,27 @@ async def lifespan(app: FastAPI):
             minute=20,
             kwargs={"force": True},
             id="shadow_inference_job",
+            replace_existing=True,
+            max_instances=max_job_instances,
+            misfire_grace_time=misfire_grace_seconds,
+        )
+    if settings.eod_events_enabled:
+        eod_events_job = EodEventsJob()
+        eod_events_runner = _build_market_open_guarded_runner(
+            _build_serialized_run_once_runner(eod_events_job),
+            clock_cache=clock_cache,
+            timezone=settings.tz,
+            job_id="eod_events_job",
+            open_trading_days=open_trading_days,
+        )
+        scheduler.add_job(
+            eod_events_runner,
+            "cron",
+            day_of_week="mon-fri",
+            hour=settings.eod_events_hour,
+            minute=settings.eod_events_minute,
+            kwargs={"force": True},
+            id="eod_events_job",
             replace_existing=True,
             max_instances=max_job_instances,
             misfire_grace_time=misfire_grace_seconds,

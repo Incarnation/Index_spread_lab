@@ -550,3 +550,12 @@ CREATE INDEX IF NOT EXISTS idx_trade_performance_equity_curve_snapshot_mode_date
 CREATE INDEX IF NOT EXISTS idx_trade_performance_equity_curve_mode_date
   ON trade_performance_equity_curve (mode, bucket_date DESC);
 
+-- Economic event calendar (FOMC, CPI, NFP, OPEX) for feature derivation.
+CREATE TABLE IF NOT EXISTS economic_events (
+    date               DATE    NOT NULL,
+    event_type         TEXT    NOT NULL,
+    has_projections    BOOLEAN NOT NULL DEFAULT false,
+    is_triple_witching BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (date, event_type)
+);
+

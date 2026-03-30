@@ -36,9 +36,11 @@ from generate_training_data import (  # noqa: E402
     get_cbbo_snapshot_at,
     implied_vol_vec,
     load_context_snapshots,
+    load_frd_quotes,
     load_underlying_quotes,
     lookup_gex_context,
     lookup_intraday_value,
+    merge_underlying_quotes,
 )
 
 
@@ -803,3 +805,115 @@ class TestComputeOfflineGex:
             snapshot, inst_map, oi_df, spot, future_date,
         )
         assert gex_net is None
+
+
+# ===================================================================
+# FirstRateData loading and merging
+# ===================================================================
+
+
+class TestLoadFrdQuotes:
+    """load_frd_quotes should read parquet and produce uq-compatible schema."""
+
+    def test_loads_parquet_with_correct_schema(self, tmp_path: Path) -> None:
+        """Output should have columns ts, symbol, last (close renamed)."""
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(["2024-01-02 14:31:00", "2024-01-02 14:32:00"], utc=True),
+            "open": [18.5, 18.6],
+            "high": [18.7, 18.8],
+            "low": [18.4, 18.5],
+            "close": [18.6, 18.7],
+        })
+        pq = tmp_path / "vix_1min.parquet"
+        df.to_parquet(pq, index=False)
+        result = load_frd_quotes(pq, "VIX")
+        assert list(result.columns) == ["ts", "symbol", "last"]
+        assert len(result) == 2
+        assert result["symbol"].unique().tolist() == ["VIX"]
+        assert result["last"].iloc[0] == 18.6
+
+    def test_timestamps_are_utc(self, tmp_path: Path) -> None:
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(["2024-06-15 13:30:00"], utc=True),
+            "open": [5500.0], "high": [5510.0], "low": [5495.0], "close": [5505.0],
+        })
+        pq = tmp_path / "spx_1min.parquet"
+        df.to_parquet(pq, index=False)
+        result = load_frd_quotes(pq, "SPX")
+        assert str(result["ts"].dt.tz) == "UTC"
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        result = load_frd_quotes(tmp_path / "nonexistent.parquet", "VIX")
+        assert result.empty
+        assert list(result.columns) == ["ts", "symbol", "last"]
+
+
+class TestMergeUnderlyingQuotes:
+    """merge_underlying_quotes should combine production + FRD rows."""
+
+    def _ts(self, s: str) -> pd.Timestamp:
+        return pd.Timestamp(s, tz="UTC")
+
+    def test_production_takes_priority(self) -> None:
+        """When prod and FRD have the same (symbol, ts), prod wins."""
+        prod = pd.DataFrame({
+            "ts": [self._ts("2024-01-02 15:05:00")],
+            "symbol": ["VIX"],
+            "last": [20.0],
+        })
+        frd = pd.DataFrame({
+            "ts": [self._ts("2024-01-02 15:05:00")],
+            "symbol": ["VIX"],
+            "last": [19.9],
+        })
+        merged = merge_underlying_quotes(prod, frd)
+        vix_rows = merged[merged["symbol"] == "VIX"]
+        assert len(vix_rows) == 1
+        assert vix_rows.iloc[0]["last"] == 20.0
+
+    def test_frd_fills_gaps(self) -> None:
+        """FRD rows appear for timestamps not in production."""
+        prod = pd.DataFrame({
+            "ts": [self._ts("2024-06-01 15:00:00")],
+            "symbol": ["VIX"],
+            "last": [18.0],
+        })
+        frd = pd.DataFrame({
+            "ts": [self._ts("2024-01-02 15:00:00"), self._ts("2024-01-02 15:01:00")],
+            "symbol": ["VIX", "VIX"],
+            "last": [22.0, 22.1],
+        })
+        merged = merge_underlying_quotes(prod, frd)
+        assert len(merged) == 3
+
+    def test_multiple_symbols(self) -> None:
+        """Merging works across different symbols."""
+        prod = pd.DataFrame(columns=["ts", "symbol", "last"])
+        frd_vix = pd.DataFrame({
+            "ts": [self._ts("2024-01-02 15:00:00")],
+            "symbol": ["VIX"], "last": [20.0],
+        })
+        frd_vix9d = pd.DataFrame({
+            "ts": [self._ts("2024-01-02 15:00:00")],
+            "symbol": ["VIX9D"], "last": [22.0],
+        })
+        merged = merge_underlying_quotes(prod, frd_vix, frd_vix9d)
+        assert len(merged) == 2
+        assert set(merged["symbol"]) == {"VIX", "VIX9D"}
+
+    def test_sorted_by_ts(self) -> None:
+        prod = pd.DataFrame(columns=["ts", "symbol", "last"])
+        frd = pd.DataFrame({
+            "ts": [self._ts("2024-01-03 15:00:00"), self._ts("2024-01-02 15:00:00")],
+            "symbol": ["VIX", "VIX"],
+            "last": [21.0, 20.0],
+        })
+        merged = merge_underlying_quotes(prod, frd)
+        assert merged.iloc[0]["last"] == 20.0
+        assert merged.iloc[1]["last"] == 21.0
+
+    def test_all_empty_returns_empty(self) -> None:
+        empty = pd.DataFrame(columns=["ts", "symbol", "last"])
+        merged = merge_underlying_quotes(empty)
+        assert merged.empty
+        assert list(merged.columns) == ["ts", "symbol", "last"]

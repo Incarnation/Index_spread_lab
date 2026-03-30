@@ -1,8 +1,8 @@
 """Export production DB tables to CSV for offline training pipeline.
 
 Connects to the production PostgreSQL database using DATABASE_URL from
-the .env file, exports ``underlying_quotes`` and ``context_snapshots``
-to CSV files that the offline training pipeline can load.
+the .env file, exports ``underlying_quotes``, ``context_snapshots``, and
+``economic_events`` to CSV files that the offline training pipeline can load.
 
 Usage:
     python scripts/export_production_data.py [--start DATE] [--end DATE]
@@ -27,6 +27,7 @@ DATA_DIR = _BACKEND.parent / "data"
 
 UNDERLYING_QUOTES_CSV = DATA_DIR / "underlying_quotes_export.csv"
 CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
+ECONOMIC_EVENTS_CSV = DATA_DIR / "economic_events_export.csv"
 
 
 def _sync_url(async_url: str) -> str:
@@ -82,7 +83,7 @@ def export_underlying_quotes(
     int
         Number of rows exported.
     """
-    clauses = ["symbol IN ('SPX', 'SPY', 'VIX', 'VIX9D')"]
+    clauses = ["symbol IN ('SPX', 'SPY', 'VIX', 'VIX9D', 'VVIX', 'SKEW')"]
     params: dict = {}
     if start:
         clauses.append("ts >= :start")
@@ -154,6 +155,38 @@ def export_context_snapshots(
     return len(df)
 
 
+def export_economic_events(
+    engine,
+    *,
+    output: Path = ECONOMIC_EVENTS_CSV,
+) -> int:
+    """Export economic_events to CSV.
+
+    Parameters
+    ----------
+    engine:
+        SQLAlchemy synchronous engine.
+    output:
+        Destination CSV path.
+
+    Returns
+    -------
+    int
+        Number of rows exported.
+    """
+    query = text(
+        "SELECT date, event_type, has_projections, is_triple_witching "
+        "FROM economic_events ORDER BY date"
+    )
+
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output, index=False)
+    return len(df)
+
+
 def main() -> None:
     """CLI entry point for production data export."""
     parser = argparse.ArgumentParser(
@@ -169,7 +202,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--tables", default="all",
-        choices=["all", "underlying_quotes", "context_snapshots"],
+        choices=["all", "underlying_quotes", "context_snapshots", "economic_events"],
         help="Which table(s) to export (default: all)",
     )
     parser.add_argument(
@@ -219,6 +252,10 @@ def main() -> None:
     if args.tables in ("all", "context_snapshots"):
         n = export_context_snapshots(engine, start=args.start, end=args.end)
         print(f"  context_snapshots: {n} rows -> {CONTEXT_SNAPSHOTS_CSV}")
+
+    if args.tables in ("all", "economic_events"):
+        n = export_economic_events(engine)
+        print(f"  economic_events: {n} rows -> {ECONOMIC_EVENTS_CSV}")
 
     print("=" * 60)
     print("Done.\n")

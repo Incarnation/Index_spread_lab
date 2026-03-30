@@ -58,6 +58,12 @@ CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 OFFLINE_GEX_CSV = DATA_DIR / "offline_gex_cache.csv"
 OUTPUT_CSV = DATA_DIR / "training_candidates.csv"
 
+# FirstRateData 1-min index parquets (converted from raw .txt downloads)
+FRD_DIR = DATA_DIR / "firstratedata"
+FRD_SPX = FRD_DIR / "spx_1min.parquet"
+FRD_VIX = FRD_DIR / "vix_1min.parquet"
+FRD_VIX9D = FRD_DIR / "vix9d_1min.parquet"
+
 # ---------------------------------------------------------------------------
 # Pipeline constants (match production config defaults)
 # ---------------------------------------------------------------------------
@@ -217,11 +223,18 @@ def build_instrument_map(def_df: pd.DataFrame) -> dict[int, dict]:
     Parses put/call from ``instrument_class`` (preferred) and falls back
     to OCC raw_symbol position 12.  Strike comes from the ``strike_price``
     column; expiration is converted to a ``date``.
+
+    Only includes SPX/SPXW instruments -- SPY and VIX option definitions
+    (present in mixed-symbol Databento downloads) are filtered out.
     """
     result: dict[int, dict] = {}
     for _, row in def_df.iterrows():
         iid = int(row["instrument_id"])
         raw_sym = str(row.get("raw_symbol", ""))
+
+        # Mixed-symbol downloads may contain SPY/VIX options; skip them.
+        if not raw_sym.startswith("SPX"):
+            continue
 
         put_call = None
         ic = row.get("instrument_class")
@@ -374,6 +387,66 @@ def lookup_intraday_value(
     if matched.empty:
         return None
     return float(matched.iloc[-1]["last"])
+
+
+def load_frd_quotes(parquet_path: Path, symbol: str) -> pd.DataFrame:
+    """Load a FirstRateData 1-min parquet as an underlying-quotes DataFrame.
+
+    Converts the OHLC ``close`` column to ``last`` so the output schema
+    matches ``load_underlying_quotes`` (columns: ``ts``, ``symbol``,
+    ``last``).  This allows seamless merging with the production DB export.
+
+    Parameters
+    ----------
+    parquet_path : Path
+        Path to a FirstRateData parquet file (e.g. ``vix_1min.parquet``).
+    symbol : str
+        Symbol label to assign (e.g. ``"VIX"``).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ``ts`` (tz-aware UTC), ``symbol``, and
+        ``last``, sorted by timestamp.  Empty DataFrame if file missing.
+    """
+    if not parquet_path.exists():
+        return pd.DataFrame(columns=["ts", "symbol", "last"])
+    df = pd.read_parquet(parquet_path, columns=["ts", "close"])
+    df = df.rename(columns={"close": "last"})
+    df["symbol"] = symbol
+    return df[["ts", "symbol", "last"]].sort_values("ts").reset_index(drop=True)
+
+
+def merge_underlying_quotes(
+    production_df: pd.DataFrame,
+    *frd_dfs: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge production DB quotes with FirstRateData quotes.
+
+    Production rows take priority when timestamps overlap (within the same
+    symbol).  FirstRateData fills the gaps -- typically all dates before the
+    production DB started capturing data.
+
+    Parameters
+    ----------
+    production_df : pd.DataFrame
+        Underlying-quotes from ``load_underlying_quotes`` (may be empty).
+    *frd_dfs : pd.DataFrame
+        One or more DataFrames from ``load_frd_quotes``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Merged DataFrame with columns ``ts``, ``symbol``, ``last``.
+    """
+    parts = [d for d in (production_df, *frd_dfs) if not d.empty]
+    if not parts:
+        return pd.DataFrame(columns=["ts", "symbol", "last"])
+    combined = pd.concat(parts, ignore_index=True)
+    # Production rows appear first in concat, so keep="first" preserves them
+    # when there are duplicate (symbol, ts) pairs.
+    combined = combined.drop_duplicates(subset=["symbol", "ts"], keep="first")
+    return combined.sort_values("ts").reset_index(drop=True)
 
 
 def load_context_snapshots(csv_path: Path) -> pd.DataFrame:
@@ -1333,7 +1406,17 @@ def run_pipeline(
     spy_df = load_spy_equity()
     vix_daily = load_vix_csv(VIX_CSV)
     vix9d_daily = load_vix_csv(VIX9D_CSV)
-    uq_df = load_underlying_quotes(UNDERLYING_QUOTES_CSV)
+    prod_uq = load_underlying_quotes(UNDERLYING_QUOTES_CSV)
+
+    # FirstRateData 1-min parquets provide full-history intraday coverage
+    # for VIX (since 2008) and VIX9D (since 2013), plus SPX as a reference.
+    # Production DB rows take priority for any overlapping timestamps.
+    frd_spx = load_frd_quotes(FRD_SPX, "SPX")
+    frd_vix = load_frd_quotes(FRD_VIX, "VIX")
+    frd_vix9d = load_frd_quotes(FRD_VIX9D, "VIX9D")
+    uq_df = merge_underlying_quotes(prod_uq, frd_spx, frd_vix, frd_vix9d)
+    frd_total = len(frd_spx) + len(frd_vix) + len(frd_vix9d)
+
     cs_df = load_context_snapshots(CONTEXT_SNAPSHOTS_CSV)
 
     # Merge offline GEX cache into context snapshots (fills gaps before prod DB)
@@ -1359,7 +1442,7 @@ def run_pipeline(
     print(f"  SPY equity rows : {len(spy_df)}")
     print(f"  VIX daily dates : {len(vix_daily)}")
     print(f"  VIX9D daily dates: {len(vix9d_daily)}")
-    print(f"  Underlying quotes: {len(uq_df)} rows")
+    print(f"  Underlying quotes: {len(uq_df)} rows (prod={len(prod_uq)}, FRD={frd_total:,})")
     print(f"  Context snapshots: {len(cs_df)} rows ({gex_count} with GEX)", flush=True)
 
     # -- 3. Generate candidates --
