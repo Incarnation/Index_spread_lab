@@ -179,6 +179,36 @@ def _classify_cboe_wall_proximity(distance_ratio: float | None) -> str:
     return "far"
 
 
+def _classify_skew_regime(skew: float | None) -> str:
+    """Classify CBOE SKEW index into low/normal/elevated regimes.
+
+    SKEW typically ranges from ~100 to ~170. Below 120 indicates low
+    tail-risk pricing; above 145 reflects elevated perceived tail risk.
+    """
+    if skew is None:
+        return "unknown"
+    if skew < 120.0:
+        return "low"
+    if skew <= 145.0:
+        return "normal"
+    return "elevated"
+
+
+def _classify_vvix_regime(vvix: float | None) -> str:
+    """Classify VVIX (vol-of-VIX) into low/normal/elevated regimes.
+
+    VVIX typically ranges from ~60 to ~150+. Below 80 signals calm
+    vol expectations; above 105 indicates heightened vol-of-vol.
+    """
+    if vvix is None:
+        return "unknown"
+    if vvix < 80.0:
+        return "low"
+    if vvix <= 105.0:
+        return "normal"
+    return "elevated"
+
+
 def compute_max_drawdown(pnls: list[float]) -> float:
     """Compute max drawdown from a sequence of incremental PnLs."""
     equity = 0.0
@@ -342,6 +372,15 @@ def extract_candidate_features(
     cboe_regime = _classify_cboe_regime(expiry_gex_net)
     cboe_wall_proximity = _classify_cboe_wall_proximity(gamma_wall_distance_ratio)
 
+    skew = _as_float(candidate_json.get("skew"))
+    skew_regime = _classify_skew_regime(skew)
+    vvix = _as_float(candidate_json.get("vvix"))
+    vvix_regime = _classify_vvix_regime(vvix)
+
+    is_opex_day = bool(candidate_json.get("is_opex_day", False))
+    is_fomc_day = bool(candidate_json.get("is_fomc_day", False))
+    is_triple_witching = bool(candidate_json.get("is_triple_witching", False))
+
     contracts = _as_int(candidate_json.get("contracts")) or 1
     margin_usage = compute_margin_usage_dollars(
         max_loss_points=max_loss_points,
@@ -368,6 +407,11 @@ def extract_candidate_features(
         "spy_spx_ratio_regime": spy_spx_ratio_regime,
         "cboe_regime": cboe_regime,
         "cboe_wall_proximity": cboe_wall_proximity,
+        "skew_regime": skew_regime,
+        "vvix_regime": vvix_regime,
+        "is_opex_day": is_opex_day,
+        "is_fomc_day": is_fomc_day,
+        "is_triple_witching": is_triple_witching,
         "contracts": contracts,
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,

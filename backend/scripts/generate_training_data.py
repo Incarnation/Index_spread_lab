@@ -51,18 +51,17 @@ SPX_CBBO = DATABENTO_DIR / "spx" / "cbbo-1m"
 SPX_DEFS = DATABENTO_DIR / "spx" / "definition"
 SPX_STATS = DATABENTO_DIR / "spx" / "statistics"
 SPY_EQUITY_PATH = DATABENTO_DIR / "underlying" / "spy_equity_1m.parquet"
-VIX_CSV = DATA_DIR / "vix_history.csv"
-VIX9D_CSV = DATA_DIR / "vix9d_history.csv"
-UNDERLYING_QUOTES_CSV = DATA_DIR / "underlying_quotes_export.csv"
-CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 OFFLINE_GEX_CSV = DATA_DIR / "offline_gex_cache.csv"
 OUTPUT_CSV = DATA_DIR / "training_candidates.csv"
+ECONOMIC_CALENDAR_CSV = DATA_DIR / "economic_calendar.csv"
 
-# FirstRateData 1-min index parquets (converted from raw .txt downloads)
+# FirstRateData parquets (converted from raw .txt downloads)
 FRD_DIR = DATA_DIR / "firstratedata"
 FRD_SPX = FRD_DIR / "spx_1min.parquet"
 FRD_VIX = FRD_DIR / "vix_1min.parquet"
 FRD_VIX9D = FRD_DIR / "vix9d_1min.parquet"
+FRD_VVIX = FRD_DIR / "vvix_1min.parquet"
+FRD_SKEW = FRD_DIR / "skew_daily.parquet"
 
 # ---------------------------------------------------------------------------
 # Pipeline constants (match production config defaults)
@@ -329,34 +328,72 @@ def load_spy_equity() -> pd.DataFrame:
     return df[["ts", "close"]].sort_values("ts").reset_index(drop=True)
 
 
-def load_vix_csv(csv_path: Path) -> dict[date, float]:
-    """Load a CBOE daily CSV (VIX or VIX9D) into a date -> close mapping."""
-    out: dict[date, float] = {}
-    if not csv_path.exists():
-        return out
-    df = pd.read_csv(str(csv_path))
-    for _, row in df.iterrows():
-        try:
-            d = pd.to_datetime(row["DATE"]).date()
-            out[d] = float(row["CLOSE"])
-        except Exception:
-            continue
-    return out
+def load_daily_parquet(parquet_path: Path) -> dict[date, float]:
+    """Load a daily-granularity parquet and return a date -> close mapping.
+
+    Reads ``ts`` and ``close`` columns, groups by calendar date, takes the
+    last close per day.  Returns an empty dict when the file is missing.
+
+    Parameters
+    ----------
+    parquet_path : Path
+        Path to a parquet file with ``ts`` (tz-aware UTC) and ``close``
+        columns where each row is one daily observation.
+
+    Returns
+    -------
+    dict[date, float]
+        Mapping from trading date to the day's closing value.
+    """
+    if not parquet_path.exists():
+        return {}
+    df = pd.read_parquet(parquet_path, columns=["ts", "close"])
+    df["date"] = df["ts"].dt.date
+    daily = df.groupby("date")["close"].last()
+    return daily.to_dict()
 
 
-def load_underlying_quotes(csv_path: Path) -> pd.DataFrame:
-    """Load the production DB underlying_quotes export for intraday VIX/SPX.
+def load_economic_calendar(csv_path: Path) -> dict[date, dict]:
+    """Load the economic event calendar into a date -> flags mapping.
 
-    Returns a DataFrame with columns ``ts`` (tz-aware UTC), ``symbol``,
-    and ``last``, sorted by timestamp.  Returns an empty DataFrame when
-    the file does not exist.
+    Parses ``economic_calendar.csv`` which contains OPEX, FOMC, and triple-
+    witching events.  Returns a mapping from event dates to boolean flags.
+    Dates not present in the calendar have no entry (caller should default
+    to all-False).
+
+    Parameters
+    ----------
+    csv_path : Path
+        Path to the economic calendar CSV with columns ``date``,
+        ``event_type``, ``has_projections``, ``is_triple_witching``.
+
+    Returns
+    -------
+    dict[date, dict]
+        ``{date: {"is_opex": bool, "is_fomc": bool, "is_triple_witching": bool}}``.
+        A single date may have both OPEX and FOMC if they coincide; the
+        loader aggregates across all rows for a given date.
     """
     if not csv_path.exists():
-        return pd.DataFrame(columns=["ts", "symbol", "last"])
+        return {}
     df = pd.read_csv(str(csv_path))
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
-    df = df[["ts", "symbol", "last"]].dropna(subset=["last"])
-    return df.sort_values("ts").reset_index(drop=True)
+    out: dict[date, dict] = {}
+    for _, row in df.iterrows():
+        try:
+            d = pd.to_datetime(row["date"]).date()
+        except Exception:
+            continue
+        entry = out.setdefault(d, {
+            "is_opex": False, "is_fomc": False, "is_triple_witching": False,
+        })
+        evt = str(row.get("event_type", "")).upper()
+        if evt == "OPEX":
+            entry["is_opex"] = True
+        elif evt == "FOMC":
+            entry["is_fomc"] = True
+        if row.get("is_triple_witching") in (True, "True", "true", 1):
+            entry["is_triple_witching"] = True
+    return out
 
 
 def lookup_intraday_value(
@@ -449,8 +486,8 @@ def merge_underlying_quotes(
     return combined.sort_values("ts").reset_index(drop=True)
 
 
-def load_context_snapshots(csv_path: Path) -> pd.DataFrame:
-    """Load the production DB context_snapshots export for GEX data.
+def _load_offline_gex(csv_path: Path) -> pd.DataFrame:
+    """Load the offline GEX cache as the sole GEX context source.
 
     Returns a DataFrame with columns ``ts`` (tz-aware UTC), ``gex_net``,
     and ``zero_gamma_level``, sorted by timestamp.  Returns an empty
@@ -460,7 +497,11 @@ def load_context_snapshots(csv_path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=["ts", "gex_net", "zero_gamma_level"])
     df = pd.read_csv(str(csv_path))
     df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
-    return df.sort_values("ts").reset_index(drop=True)
+    needed_cols = ["ts", "gex_net", "zero_gamma_level"]
+    for col in needed_cols:
+        if col not in df.columns:
+            df[col] = None
+    return df[needed_cols].sort_values("ts").reset_index(drop=True)
 
 
 def lookup_gex_context(
@@ -826,6 +867,11 @@ def build_candidates_for_snapshot(
     vix: float | None,
     vix9d: float | None,
     term_structure: float | None,
+    vvix: float | None = None,
+    skew: float | None = None,
+    is_opex_day: bool = False,
+    is_fomc_day: bool = False,
+    is_triple_witching: bool = False,
     decision_dt: datetime,
     day_date: date,
     dte_target: int,
@@ -947,6 +993,11 @@ def build_candidates_for_snapshot(
         "vix": vix,
         "vix9d": vix9d,
         "term_structure": term_structure,
+        "vvix": vvix,
+        "skew": skew,
+        "is_opex_day": is_opex_day,
+        "is_fomc_day": is_fomc_day,
+        "is_triple_witching": is_triple_witching,
         "contracts": CONTRACTS,
     }]
 
@@ -1242,6 +1293,11 @@ def build_training_rows(
             "term_structure": c.get("term_structure"),
             "spy_price": c.get("spy_price"),
             "spx_price": c.get("spot"),
+            "vvix": c.get("vvix"),
+            "skew": c.get("skew"),
+            "is_opex_day": c.get("is_opex_day", False),
+            "is_fomc_day": c.get("is_fomc_day", False),
+            "is_triple_witching": c.get("is_triple_witching", False),
             "context": {
                 "vix": c.get("vix"),
                 "term_structure": c.get("term_structure"),
@@ -1404,46 +1460,31 @@ def run_pipeline(
     # -- 2. Load reference data --
     print("[PIPELINE] Loading reference data ...", flush=True)
     spy_df = load_spy_equity()
-    vix_daily = load_vix_csv(VIX_CSV)
-    vix9d_daily = load_vix_csv(VIX9D_CSV)
-    prod_uq = load_underlying_quotes(UNDERLYING_QUOTES_CSV)
 
-    # FirstRateData 1-min parquets provide full-history intraday coverage
-    # for VIX (since 2008) and VIX9D (since 2013), plus SPX as a reference.
-    # Production DB rows take priority for any overlapping timestamps.
+    # FRD 1-min parquets provide full-history intraday coverage.
+    empty_prod = pd.DataFrame(columns=["ts", "symbol", "last"])
     frd_spx = load_frd_quotes(FRD_SPX, "SPX")
     frd_vix = load_frd_quotes(FRD_VIX, "VIX")
     frd_vix9d = load_frd_quotes(FRD_VIX9D, "VIX9D")
-    uq_df = merge_underlying_quotes(prod_uq, frd_spx, frd_vix, frd_vix9d)
-    frd_total = len(frd_spx) + len(frd_vix) + len(frd_vix9d)
+    frd_vvix = load_frd_quotes(FRD_VVIX, "VVIX")
+    uq_df = merge_underlying_quotes(empty_prod, frd_spx, frd_vix, frd_vix9d, frd_vvix)
+    frd_total = len(frd_spx) + len(frd_vix) + len(frd_vix9d) + len(frd_vvix)
 
-    cs_df = load_context_snapshots(CONTEXT_SNAPSHOTS_CSV)
+    # Daily SKEW from parquet (one value per trading day)
+    skew_daily = load_daily_parquet(FRD_SKEW)
 
-    # Merge offline GEX cache into context snapshots (fills gaps before prod DB)
-    if OFFLINE_GEX_CSV.exists():
-        gex_cache = pd.read_csv(str(OFFLINE_GEX_CSV))
-        gex_cache["ts"] = pd.to_datetime(gex_cache["ts"], utc=True, format="ISO8601")
-        if not gex_cache.empty:
-            needed_cols = ["ts", "gex_net", "zero_gamma_level"]
-            for col in needed_cols:
-                if col not in gex_cache.columns:
-                    gex_cache[col] = None
-            cache_subset = gex_cache[needed_cols].copy()
-            if cs_df.empty:
-                cs_df = cache_subset
-            else:
-                existing_ts = set(cs_df["ts"].dropna())
-                new_rows = cache_subset[~cache_subset["ts"].isin(existing_ts)]
-                if not new_rows.empty:
-                    cs_df = pd.concat([cs_df, new_rows], ignore_index=True)
-                    cs_df = cs_df.sort_values("ts").reset_index(drop=True)
+    # Economic calendar (OPEX / FOMC / triple witching)
+    cal_map = load_economic_calendar(ECONOMIC_CALENDAR_CSV)
+
+    # Offline GEX cache is the sole GEX source
+    cs_df = _load_offline_gex(OFFLINE_GEX_CSV)
 
     gex_count = cs_df["gex_net"].notna().sum() if not cs_df.empty else 0
     print(f"  SPY equity rows : {len(spy_df)}")
-    print(f"  VIX daily dates : {len(vix_daily)}")
-    print(f"  VIX9D daily dates: {len(vix9d_daily)}")
-    print(f"  Underlying quotes: {len(uq_df)} rows (prod={len(prod_uq)}, FRD={frd_total:,})")
-    print(f"  Context snapshots: {len(cs_df)} rows ({gex_count} with GEX)", flush=True)
+    print(f"  Underlying quotes: {len(uq_df):,} rows (FRD={frd_total:,})")
+    print(f"  SKEW daily dates : {len(skew_daily)}")
+    print(f"  Calendar events  : {len(cal_map)}")
+    print(f"  GEX snapshots    : {len(cs_df)} rows ({gex_count} with GEX)", flush=True)
 
     # -- 3. Generate candidates --
     print("[PIPELINE] Generating candidates ...", flush=True)
@@ -1500,14 +1541,17 @@ def run_pipeline(
                 snapshot, inst_map, day_date, spy_price,
             )
 
-            # VIX / VIX9D: prefer production DB intraday, fall back to daily
             vix = lookup_intraday_value(uq_df, "VIX", dec_utc)
-            if vix is None:
-                vix = vix_daily.get(day_date)
             vix9d = lookup_intraday_value(uq_df, "VIX9D", dec_utc)
-            if vix9d is None:
-                vix9d = vix9d_daily.get(day_date)
             term_structure = (vix9d / vix) if vix and vix > 0 and vix9d else None
+            vvix = lookup_intraday_value(uq_df, "VVIX", dec_utc)
+            skew = skew_daily.get(day_date)
+
+            # Calendar event flags for this trading day
+            cal = cal_map.get(day_date, {})
+            is_opex = cal.get("is_opex", False)
+            is_fomc = cal.get("is_fomc", False)
+            is_tw = cal.get("is_triple_witching", False)
 
             # Precompute offline GEX for this decision time
             offline_gex_net: float | None = None
@@ -1531,6 +1575,11 @@ def run_pipeline(
                             vix=vix,
                             vix9d=vix9d,
                             term_structure=term_structure,
+                            vvix=vvix,
+                            skew=skew,
+                            is_opex_day=is_opex,
+                            is_fomc_day=is_fomc,
+                            is_triple_witching=is_tw,
                             decision_dt=dec_utc,
                             day_date=day_date,
                             dte_target=dte_target,

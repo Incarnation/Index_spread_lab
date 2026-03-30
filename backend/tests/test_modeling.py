@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from spx_backend.jobs.modeling import (
+    _classify_skew_regime,
+    _classify_vvix_regime,
     build_bucket_key,
     build_bucket_key_levels,
     build_legacy_bucket_key,
@@ -215,3 +217,121 @@ def test_predict_with_bucket_model_uses_relaxed_hierarchy_before_global() -> Non
     )
     assert pred["bucket_level"] in {"relaxed_market", "core", "global"}
     assert pred["bucket_level"] != "full"
+
+
+# ===================================================================
+# SKEW regime classifier
+# ===================================================================
+
+
+class TestSkewRegime:
+    """SKEW regime classification thresholds."""
+
+    def test_none_returns_unknown(self) -> None:
+        assert _classify_skew_regime(None) == "unknown"
+
+    def test_low(self) -> None:
+        assert _classify_skew_regime(110.0) == "low"
+
+    def test_normal(self) -> None:
+        assert _classify_skew_regime(130.0) == "normal"
+
+    def test_elevated(self) -> None:
+        assert _classify_skew_regime(155.0) == "elevated"
+
+    def test_boundary_120(self) -> None:
+        assert _classify_skew_regime(120.0) == "normal"
+
+    def test_boundary_145(self) -> None:
+        assert _classify_skew_regime(145.0) == "normal"
+
+    def test_just_above_145(self) -> None:
+        assert _classify_skew_regime(145.01) == "elevated"
+
+
+# ===================================================================
+# VVIX regime classifier
+# ===================================================================
+
+
+class TestVvixRegime:
+    """VVIX regime classification thresholds."""
+
+    def test_none_returns_unknown(self) -> None:
+        assert _classify_vvix_regime(None) == "unknown"
+
+    def test_low(self) -> None:
+        assert _classify_vvix_regime(70.0) == "low"
+
+    def test_normal(self) -> None:
+        assert _classify_vvix_regime(90.0) == "normal"
+
+    def test_elevated(self) -> None:
+        assert _classify_vvix_regime(120.0) == "elevated"
+
+    def test_boundary_80(self) -> None:
+        assert _classify_vvix_regime(80.0) == "normal"
+
+    def test_boundary_105(self) -> None:
+        assert _classify_vvix_regime(105.0) == "normal"
+
+
+# ===================================================================
+# New features in extract_candidate_features
+# ===================================================================
+
+
+class TestExtractNewFeatures:
+    """extract_candidate_features should handle SKEW, VVIX, and calendar flags."""
+
+    def test_skew_and_vvix_regimes(self) -> None:
+        features = extract_candidate_features(
+            candidate_json={
+                "spread_side": "put",
+                "target_dte": 3,
+                "delta_target": 0.10,
+                "credit_to_width": 0.06,
+                "skew": 135.0,
+                "vvix": 92.0,
+            },
+            max_loss_points=24.0,
+        )
+        assert features["skew_regime"] == "normal"
+        assert features["vvix_regime"] == "normal"
+
+    def test_missing_skew_vvix_default_unknown(self) -> None:
+        features = extract_candidate_features(
+            candidate_json={
+                "spread_side": "put",
+                "target_dte": 3,
+                "delta_target": 0.10,
+                "credit_to_width": 0.06,
+            },
+            max_loss_points=24.0,
+        )
+        assert features["skew_regime"] == "unknown"
+        assert features["vvix_regime"] == "unknown"
+
+    def test_calendar_flags_present(self) -> None:
+        features = extract_candidate_features(
+            candidate_json={
+                "spread_side": "put",
+                "target_dte": 3,
+                "is_opex_day": True,
+                "is_fomc_day": False,
+                "is_triple_witching": True,
+            },
+            max_loss_points=24.0,
+        )
+        assert features["is_opex_day"] is True
+        assert features["is_fomc_day"] is False
+        assert features["is_triple_witching"] is True
+
+    def test_calendar_flags_default_false(self) -> None:
+        features = extract_candidate_features(
+            candidate_json={"spread_side": "put", "target_dte": 3},
+            max_loss_points=24.0,
+        )
+        assert features["is_opex_day"] is False
+        assert features["is_fomc_day"] is False
+        assert features["is_triple_witching"] is False

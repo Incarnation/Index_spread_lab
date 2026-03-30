@@ -22,6 +22,7 @@ from generate_training_data import (  # noqa: E402
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     _evaluate_outcome,
+    _load_offline_gex,
     _mid,
     _time_to_expiry_years,
     bs_delta_vec,
@@ -35,9 +36,9 @@ from generate_training_data import (  # noqa: E402
     find_expiry_for_dte,
     get_cbbo_snapshot_at,
     implied_vol_vec,
-    load_context_snapshots,
+    load_daily_parquet,
+    load_economic_calendar,
     load_frd_quotes,
-    load_underlying_quotes,
     lookup_gex_context,
     lookup_intraday_value,
     merge_underlying_quotes,
@@ -336,6 +337,38 @@ class TestEvaluateOutcome:
         ]
         out = _evaluate_outcome(1.0, marks)
         assert out["hit_tp100_at_expiry"] is True
+
+    def test_tp50_and_tp100_both_true(self) -> None:
+        """TP50 fires on first mark, TP100 also true on last mark.
+
+        realized_pnl should use the TP50 exit (first mark), while
+        hit_tp100_at_expiry reflects the last mark.
+        """
+        marks = [
+            # Mark 1: exit_cost = 0.25 - 0.05 = 0.20 -> pnl = (1.0-0.20)*100 = $80 >= $50 TP50
+            {"short_bid": 0.20, "short_ask": 0.30, "long_bid": 0.02, "long_ask": 0.08},
+            # Mark 2 (expiry): exit_cost = 0.015-0.015 = 0 -> pnl = $100 >= $100 TP100
+            {"short_bid": 0.01, "short_ask": 0.02, "long_bid": 0.01, "long_ask": 0.02},
+        ]
+        out = _evaluate_outcome(1.0, marks)
+        assert out["resolved"] is True
+        assert out["hit_tp50"] is True
+        assert out["hit_tp100_at_expiry"] is True
+        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        # realized_pnl uses the TP50 mark ($80), not the expiry mark ($100)
+        assert 79.0 < out["realized_pnl"] < 81.0
+
+    def test_tp100_false_when_residual_value(self) -> None:
+        """Options still have value at expiry -- TP100 should be False."""
+        marks = [
+            # Spread still has residual value: exit_cost = 0.6-0.1 = 0.5
+            # pnl = (1.0 - 0.5)*100 = $50 -> TP50 fires
+            # But last mark has same residual -> pnl $50 < $100 TP100 threshold
+            {"short_bid": 0.50, "short_ask": 0.70, "long_bid": 0.05, "long_ask": 0.15},
+        ]
+        out = _evaluate_outcome(1.0, marks)
+        assert out["resolved"] is True
+        assert out["hit_tp100_at_expiry"] is False
 
     def test_invalid_marks_ignored(self) -> None:
         """Marks with zero bid/ask should be skipped."""
@@ -917,3 +950,130 @@ class TestMergeUnderlyingQuotes:
         merged = merge_underlying_quotes(empty)
         assert merged.empty
         assert list(merged.columns) == ["ts", "symbol", "last"]
+
+
+# ===================================================================
+# Daily parquet loading (SKEW)
+# ===================================================================
+
+
+class TestLoadDailyParquet:
+    """load_daily_parquet should return a date -> close mapping."""
+
+    def test_basic_load(self, tmp_path: Path) -> None:
+        df = pd.DataFrame({
+            "ts": pd.to_datetime([
+                "2026-01-02 22:15:00", "2026-01-03 22:15:00",
+            ], utc=True),
+            "open": [130.0, 132.0],
+            "high": [131.0, 133.0],
+            "low": [129.0, 131.0],
+            "close": [130.5, 132.5],
+        })
+        pq = tmp_path / "skew_daily.parquet"
+        df.to_parquet(pq, index=False)
+        result = load_daily_parquet(pq)
+        assert result[date(2026, 1, 2)] == 130.5
+        assert result[date(2026, 1, 3)] == 132.5
+
+    def test_takes_last_close_per_day(self, tmp_path: Path) -> None:
+        """When multiple rows share a date, the last close wins."""
+        df = pd.DataFrame({
+            "ts": pd.to_datetime([
+                "2026-01-02 15:00:00", "2026-01-02 22:15:00",
+            ], utc=True),
+            "open": [100.0, 100.0],
+            "high": [100.0, 100.0],
+            "low": [100.0, 100.0],
+            "close": [128.0, 130.5],
+        })
+        pq = tmp_path / "test.parquet"
+        df.to_parquet(pq, index=False)
+        result = load_daily_parquet(pq)
+        assert result[date(2026, 1, 2)] == 130.5
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        result = load_daily_parquet(tmp_path / "nonexistent.parquet")
+        assert result == {}
+
+
+# ===================================================================
+# Economic calendar loading
+# ===================================================================
+
+
+class TestLoadEconomicCalendar:
+    """load_economic_calendar should parse event types into boolean flags."""
+
+    def test_opex_event(self, tmp_path: Path) -> None:
+        csv = tmp_path / "cal.csv"
+        csv.write_text(
+            "date,event_type,has_projections,is_triple_witching\n"
+            "2026-01-16,OPEX,False,False\n"
+        )
+        result = load_economic_calendar(csv)
+        assert result[date(2026, 1, 16)]["is_opex"] is True
+        assert result[date(2026, 1, 16)]["is_fomc"] is False
+
+    def test_fomc_event(self, tmp_path: Path) -> None:
+        csv = tmp_path / "cal.csv"
+        csv.write_text(
+            "date,event_type,has_projections,is_triple_witching\n"
+            "2026-03-17,FOMC,True,False\n"
+        )
+        result = load_economic_calendar(csv)
+        assert result[date(2026, 3, 17)]["is_fomc"] is True
+        assert result[date(2026, 3, 17)]["is_opex"] is False
+
+    def test_triple_witching(self, tmp_path: Path) -> None:
+        csv = tmp_path / "cal.csv"
+        csv.write_text(
+            "date,event_type,has_projections,is_triple_witching\n"
+            "2026-03-20,OPEX,False,True\n"
+        )
+        result = load_economic_calendar(csv)
+        d = result[date(2026, 3, 20)]
+        assert d["is_opex"] is True
+        assert d["is_triple_witching"] is True
+
+    def test_multiple_events_same_date(self, tmp_path: Path) -> None:
+        """OPEX and FOMC on same date should merge flags."""
+        csv = tmp_path / "cal.csv"
+        csv.write_text(
+            "date,event_type,has_projections,is_triple_witching\n"
+            "2026-06-19,OPEX,False,True\n"
+            "2026-06-19,FOMC,True,False\n"
+        )
+        result = load_economic_calendar(csv)
+        d = result[date(2026, 6, 19)]
+        assert d["is_opex"] is True
+        assert d["is_fomc"] is True
+        assert d["is_triple_witching"] is True
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        result = load_economic_calendar(tmp_path / "nonexistent.csv")
+        assert result == {}
+
+
+# ===================================================================
+# Offline GEX loading
+# ===================================================================
+
+
+class TestLoadOfflineGex:
+    """_load_offline_gex should read the GEX cache CSV."""
+
+    def test_basic_load(self, tmp_path: Path) -> None:
+        csv = tmp_path / "gex.csv"
+        csv.write_text(
+            "ts,gex_net,zero_gamma_level\n"
+            "2026-01-02T15:05:00+00:00,1e9,5800.0\n"
+        )
+        df = _load_offline_gex(csv)
+        assert len(df) == 1
+        assert df.iloc[0]["gex_net"] == 1e9
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        df = _load_offline_gex(tmp_path / "nonexistent.csv")
+        assert df.empty
+        assert list(df.columns) == ["ts", "gex_net", "zero_gamma_level"]
