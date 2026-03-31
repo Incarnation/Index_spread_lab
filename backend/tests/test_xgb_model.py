@@ -524,6 +524,17 @@ class TestExtractXgbFeatures:
         assert features["short_delta"] == pytest.approx(-0.15)
         assert features["long_delta"] == pytest.approx(-0.08)
 
+    def test_zero_values_not_treated_as_missing(self) -> None:
+        """A flat key with value 0.0 should not fall through to nested legs."""
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        cj = {
+            "short_delta": 0.0,
+            "legs": {"short": {"delta": -0.12}, "long": {}},
+        }
+        features = extract_xgb_features(cj)
+        assert features["short_delta"] == 0.0
+
     def test_production_shaped_candidate_json(self) -> None:
         """Integration test with a realistic production candidate_json payload.
 

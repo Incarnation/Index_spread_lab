@@ -951,7 +951,9 @@ def extract_xgb_features(
     if credit_to_width is None and entry_credit and width_points and width_points > 0:
         credit_to_width = entry_credit / width_points
 
-    spot = _f("spot", ctx) or _f("spx_price", ctx)
+    spot = _f("spot", ctx)
+    if spot is None:
+        spot = _f("spx_price", ctx)
     spy_price = _f("spy_price", ctx)
 
     # Production candidate_json nests leg fields under "legs.short" / "legs.long";
@@ -961,10 +963,18 @@ def extract_xgb_features(
     short_leg = legs.get("short") or {}
     long_leg = legs.get("long") or {}
 
-    short_iv = _f("short_iv") or _as_float(short_leg.get("iv"))
-    long_iv = _f("long_iv") or _as_float(long_leg.get("iv"))
-    short_delta = _f("short_delta") or _as_float(short_leg.get("delta"))
-    long_delta = _f("long_delta") or _as_float(long_leg.get("delta"))
+    short_iv = _f("short_iv")
+    if short_iv is None:
+        short_iv = _as_float(short_leg.get("iv"))
+    long_iv = _f("long_iv")
+    if long_iv is None:
+        long_iv = _as_float(long_leg.get("iv"))
+    short_delta = _f("short_delta")
+    if short_delta is None:
+        short_delta = _as_float(short_leg.get("delta"))
+    long_delta = _f("long_delta")
+    if long_delta is None:
+        long_delta = _as_float(long_leg.get("delta"))
     gex_net = _f("offline_gex_net", cboe)
     if gex_net is None:
         gex_net = _f("expiry_gex_net", cboe)
