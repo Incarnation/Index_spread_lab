@@ -309,6 +309,8 @@ class FeatureBuilderJob:
         vix = _to_float(None if context is None else context.get("vix"))
         vix9d = _to_float(None if context is None else context.get("vix9d"))
         term_structure = _to_float(None if context is None else context.get("term_structure"))
+        vvix = _to_float(None if context is None else context.get("vvix"))
+        skew = _to_float(None if context is None else context.get("skew"))
         spy_price = _to_float(None if context is None else context.get("spy_price"))
         spx_price = _to_float(None if context is None else context.get("spx_price"))
         if spx_price is None:
@@ -332,6 +334,8 @@ class FeatureBuilderJob:
                 "vix": vix,
                 "vix9d": vix9d,
                 "term_structure": term_structure,
+                "vvix": vvix,
+                "skew": skew,
                 "vix_regime": classify_vix_regime(vix),
                 "term_structure_regime": classify_term_structure_regime(term_structure),
             },
@@ -377,6 +381,12 @@ class FeatureBuilderJob:
         spread_side = str(chosen.get("spread_side") or settings.decision_spread_side).lower()
         width_points = float(chosen.get("width_points") or settings.decision_spread_width_points)
         contracts = int(short_leg.get("qty") or settings.decision_contracts)
+        vix9d = _to_float(context.get("vix9d")) if isinstance(context, dict) else None
+        vvix = _to_float(context.get("vvix")) if isinstance(context, dict) else None
+        skew = _to_float(context.get("skew")) if isinstance(context, dict) else None
+
+        cal_flags = candidate.get("_calendar_flags") or {}
+
         return {
             "schema_version": settings.candidate_schema_version,
             "underlying": settings.snapshot_underlying,
@@ -391,8 +401,17 @@ class FeatureBuilderJob:
             "score": candidate["score"],
             "delta_diff": candidate["delta_diff"],
             "context_score": candidate.get("context_score"),
+            "spot": spx_price,
             "spy_price": spy_price,
             "spx_price": spx_price,
+            "vix": vix,
+            "vix9d": vix9d,
+            "term_structure": term_structure,
+            "vvix": vvix,
+            "skew": skew,
+            "is_opex_day": cal_flags.get("is_opex", False),
+            "is_fomc_day": cal_flags.get("is_fomc", False),
+            "is_triple_witching": cal_flags.get("is_triple_witching", False),
             "spy_spx_ratio": spy_spx_ratio,
             "spy_spx_ratio_regime": classify_spy_spx_ratio_regime(spy_spx_ratio),
             "vix_regime": classify_vix_regime(vix),
@@ -402,6 +421,31 @@ class FeatureBuilderJob:
             "context_flags": chosen.get("context_flags"),
             "cboe_context": cboe_context,
         }
+
+    async def _get_calendar_flags(self, session, today: date) -> dict:
+        """Query economic_events for today's calendar flags.
+
+        Returns a dict with boolean keys ``is_opex``, ``is_fomc``, and
+        ``is_triple_witching``.  Defaults to all-False when no events are
+        found for the given date.
+        """
+        rows = await session.execute(
+            text(
+                "SELECT event_type, is_triple_witching "
+                "FROM economic_events WHERE date = :d"
+            ),
+            {"d": today},
+        )
+        flags = {"is_opex": False, "is_fomc": False, "is_triple_witching": False}
+        for r in rows.fetchall():
+            evt = str(r.event_type).upper()
+            if evt == "OPEX":
+                flags["is_opex"] = True
+            elif evt == "FOMC":
+                flags["is_fomc"] = True
+            if r.is_triple_witching:
+                flags["is_triple_witching"] = True
+        return flags
 
     async def run_once(self, *, force: bool = False) -> dict:
         """Generate features and candidates for each target DTE."""
@@ -438,6 +482,9 @@ class FeatureBuilderJob:
             spot = await helper._get_spot_price(session, now_et, settings.snapshot_underlying)
             context = await helper._get_latest_context(session, now_et)
             context_ts = _iso_to_dt(context.get("ts")) if context else None
+
+            # Economic calendar flags for today
+            calendar_flags = await self._get_calendar_flags(session, now_et.date())
 
             for spread_side in spread_sides:
                 for target_dte in target_dtes:
@@ -528,9 +575,9 @@ class FeatureBuilderJob:
                         if candidate:
                             candidates.append(candidate)
 
-                    # Ranking is persisted to support model-vs-rules comparison later.
                     candidates.sort(key=lambda c: (-c["score"], c["delta_diff"]))
                     for rank, candidate in enumerate(candidates, start=1):
+                        candidate["_calendar_flags"] = calendar_flags
                         candidate_json = self._build_candidate_json(candidate, cboe_context=cboe_context)
                         candidate_hash = build_candidate_hash(candidate_json)
                         entry_credit = float(candidate["credit"])

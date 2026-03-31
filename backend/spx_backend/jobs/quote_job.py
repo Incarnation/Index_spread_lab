@@ -141,6 +141,8 @@ class QuoteJob:
                 vix9d = by_symbol.get("VIX9D", {}).get("last")
                 spx_price = by_symbol.get("SPX", {}).get("last")
                 spy_price = by_symbol.get("SPY", {}).get("last")
+                vvix = by_symbol.get("VVIX", {}).get("last")
+                skew = by_symbol.get("SKEW", {}).get("last")
                 term_structure = None
                 if vix and vix9d and vix > 0:
                     term_structure = vix9d / vix
@@ -148,14 +150,18 @@ class QuoteJob:
                 await session.execute(
                     text(
                         """
-                        INSERT INTO context_snapshots (ts, spx_price, spy_price, vix, vix9d, term_structure, notes_json)
-                        VALUES (:ts, :spx_price, :spy_price, :vix, :vix9d, :term_structure, CAST(:notes AS jsonb))
+                        INSERT INTO context_snapshots
+                          (ts, spx_price, spy_price, vix, vix9d, term_structure, vvix, skew, notes_json)
+                        VALUES
+                          (:ts, :spx_price, :spy_price, :vix, :vix9d, :term_structure, :vvix, :skew, CAST(:notes AS jsonb))
                         ON CONFLICT (ts) DO UPDATE SET
                           spx_price = EXCLUDED.spx_price,
                           spy_price = EXCLUDED.spy_price,
                           vix = EXCLUDED.vix,
                           vix9d = EXCLUDED.vix9d,
                           term_structure = EXCLUDED.term_structure,
+                          vvix = EXCLUDED.vvix,
+                          skew = EXCLUDED.skew,
                           notes_json = EXCLUDED.notes_json
                         """
                     ),
@@ -166,6 +172,8 @@ class QuoteJob:
                         "vix": vix,
                         "vix9d": vix9d,
                         "term_structure": term_structure,
+                        "vvix": vvix,
+                        "skew": skew,
                         "notes": json.dumps({"source": "tradier", "symbols": quote_symbols}),
                     },
                 )

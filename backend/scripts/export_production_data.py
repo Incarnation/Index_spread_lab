@@ -143,7 +143,7 @@ def export_context_snapshots(
     where = " AND ".join(clauses)
     query = text(
         f"SELECT ts, spx_price, spy_price, vix, vix9d, "
-        f"term_structure, gex_net, zero_gamma_level "
+        f"term_structure, vvix, skew, gex_net, zero_gamma_level "
         f"FROM context_snapshots WHERE {where} ORDER BY ts"
     )
 

@@ -579,7 +579,7 @@ class DecisionJob:
         rows = await session.execute(
             text(
                 """
-                SELECT option_symbol, strike, bid, ask, delta
+                SELECT option_symbol, strike, bid, ask, delta, mid_iv
                 FROM option_chain_rows
                 WHERE snapshot_id = :snapshot_id AND option_right = :right AND strike IS NOT NULL
                 """
@@ -596,15 +596,16 @@ class DecisionJob:
                 continue
             if ask <= 0 or bid < 0:
                 continue
-            out.append(
-                {
-                    "symbol": r.option_symbol,
-                    "strike": float(strike),
-                    "bid": float(bid),
-                    "ask": float(ask),
-                    "delta": float(delta),
-                }
-            )
+            entry: dict = {
+                "symbol": r.option_symbol,
+                "strike": float(strike),
+                "bid": float(bid),
+                "ask": float(ask),
+                "delta": float(delta),
+            }
+            if r.mid_iv is not None:
+                entry["iv"] = float(r.mid_iv)
+            out.append(entry)
         return out
 
     def _build_candidate(
@@ -667,21 +668,23 @@ class DecisionJob:
                 "symbol": short["symbol"],
                 "strike": short["strike"],
                 "delta": short["delta"],
+                "iv": short.get("iv"),
                 "bid": short["bid"],
                 "ask": short["ask"],
                 "mid": short_mid,
                 "qty": settings.decision_contracts,
-                "side": "STO" if spread_side.lower() == "put" or spread_side.lower() == "call" else "STO",
+                "side": "STO",
             },
             "long": {
                 "symbol": long["symbol"],
                 "strike": long["strike"],
                 "delta": long["delta"],
+                "iv": long.get("iv"),
                 "bid": long["bid"],
                 "ask": long["ask"],
                 "mid": long_mid,
                 "qty": settings.decision_contracts,
-                "side": "BTO" if spread_side.lower() == "put" or spread_side.lower() == "call" else "BTO",
+                "side": "BTO",
             },
         }
         strategy_params_json = {
@@ -1253,7 +1256,8 @@ class DecisionJob:
         row = await session.execute(
             text(
                 """
-                SELECT ts, spx_price, spy_price, vix, vix9d, term_structure, gex_net, zero_gamma_level
+                SELECT ts, spx_price, spy_price, vix, vix9d, term_structure,
+                       vvix, skew, gex_net, zero_gamma_level
                 FROM context_snapshots
                 WHERE ts <= :ts
                 ORDER BY ts DESC
@@ -1272,6 +1276,8 @@ class DecisionJob:
             "vix": result.vix,
             "vix9d": result.vix9d,
             "term_structure": result.term_structure,
+            "vvix": result.vvix,
+            "skew": result.skew,
             "gex_net": result.gex_net,
             "zero_gamma_level": result.zero_gamma_level,
         }
