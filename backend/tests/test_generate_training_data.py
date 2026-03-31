@@ -19,8 +19,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from generate_training_data import (  # noqa: E402
+    LABEL_MARK_INTERVAL_MINUTES,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    _downsample_marks,
     _evaluate_outcome,
     _load_offline_gex,
     _mid,
@@ -633,6 +635,99 @@ class TestStopLoss:
 
 
 # ===================================================================
+# Mark downsampling
+# ===================================================================
+
+
+class TestDownsampleMarks:
+    """_downsample_marks should filter marks to N-minute boundaries."""
+
+    def _mark(self, minute: int) -> dict:
+        """Build a minimal mark with the given minute value."""
+        return {
+            "ts": datetime(2026, 3, 15, 10, minute, tzinfo=timezone.utc),
+            "short_bid": 0.5, "short_ask": 0.6,
+            "long_bid": 0.1, "long_ask": 0.2,
+        }
+
+    def test_default_interval_is_5(self) -> None:
+        """Module constant should be 5 (matching production cadence)."""
+        assert LABEL_MARK_INTERVAL_MINUTES == 5
+
+    def test_keeps_5min_boundaries(self) -> None:
+        """Only marks at :00, :05, :10, ... should survive."""
+        marks = [self._mark(m) for m in range(0, 16)]
+        result = _downsample_marks(marks, interval_minutes=5)
+        minutes = [m["ts"].minute for m in result]
+        assert minutes == [0, 5, 10, 15]
+
+    def test_interval_1_keeps_all(self) -> None:
+        """interval=1 should be a no-op (keep every mark)."""
+        marks = [self._mark(m) for m in range(0, 5)]
+        result = _downsample_marks(marks, interval_minutes=1)
+        assert len(result) == 5
+
+    def test_empty_input(self) -> None:
+        result = _downsample_marks([], interval_minutes=5)
+        assert result == []
+
+    def test_no_marks_on_boundary(self) -> None:
+        """If no marks fall on a 5-min boundary, result is empty."""
+        marks = [self._mark(m) for m in [1, 2, 3, 4, 6, 7, 8, 9]]
+        result = _downsample_marks(marks, interval_minutes=5)
+        assert result == []
+
+    def test_all_marks_on_boundary(self) -> None:
+        """If all marks are on boundaries, all survive."""
+        marks = [self._mark(m) for m in [0, 10, 20, 30, 40, 50]]
+        result = _downsample_marks(marks, interval_minutes=5)
+        assert len(result) == 6
+
+    def test_preserves_mark_data(self) -> None:
+        """Filtered marks should retain all original fields."""
+        marks = [self._mark(5)]
+        result = _downsample_marks(marks, interval_minutes=5)
+        assert len(result) == 1
+        assert result[0]["short_bid"] == 0.5
+        assert result[0]["long_ask"] == 0.2
+
+    def test_custom_interval_10(self) -> None:
+        """With interval=10, only :00, :10, :20, ... survive."""
+        marks = [self._mark(m) for m in range(0, 31)]
+        result = _downsample_marks(marks, interval_minutes=10)
+        minutes = [m["ts"].minute for m in result]
+        assert minutes == [0, 10, 20, 30]
+
+    def test_tp50_removed_by_downsampling(self) -> None:
+        """A fleeting TP50 hit at minute :03 should vanish when downsampled.
+
+        With 1-min marks the trade hits TP50 at :03, but with 5-min marks
+        the only visible mark is the :05 one where the spread hasn't decayed.
+        """
+        # credit=1.0, max_profit=$100, TP50 at $50
+        marks_1min = [
+            # :03 -> exit_cost = 0.25-0.05 = 0.20 -> pnl = (1-0.20)*100 = $80 >= $50 TP50
+            {"ts": datetime(2026, 3, 15, 10, 3, tzinfo=timezone.utc),
+             "short_bid": 0.20, "short_ask": 0.30,
+             "long_bid": 0.02, "long_ask": 0.08},
+            # :05 -> exit_cost = 0.85-0.05 = 0.80 -> pnl = (1-0.80)*100 = $20 < $50
+            {"ts": datetime(2026, 3, 15, 10, 5, tzinfo=timezone.utc),
+             "short_bid": 0.80, "short_ask": 0.90,
+             "long_bid": 0.02, "long_ask": 0.08},
+        ]
+
+        # At 1-min: TP50 fires
+        out_1min = _evaluate_outcome(1.0, marks_1min)
+        assert out_1min["hit_tp50"] is True
+
+        # At 5-min: the :03 mark is gone, TP50 does NOT fire
+        marks_5min = _downsample_marks(marks_1min, interval_minutes=5)
+        assert len(marks_5min) == 1
+        out_5min = _evaluate_outcome(1.0, marks_5min)
+        assert out_5min["hit_tp50"] is False
+
+
+# ===================================================================
 # Underlying quotes / VIX intraday lookup
 # ===================================================================
 
@@ -1077,3 +1172,181 @@ class TestLoadOfflineGex:
         df = _load_offline_gex(tmp_path / "nonexistent.csv")
         assert df.empty
         assert list(df.columns) == ["ts", "gex_net", "zero_gamma_level"]
+
+
+# ===================================================================
+# Trajectory / dual-label tests
+# ===================================================================
+
+
+def _mark(short_mid: float, long_mid: float) -> dict:
+    """Build a mark from mid prices (bid = mid - 0.005, ask = mid + 0.005)."""
+    return {
+        "short_bid": short_mid - 0.005,
+        "short_ask": short_mid + 0.005,
+        "long_bid": long_mid - 0.005,
+        "long_ask": long_mid + 0.005,
+    }
+
+
+class TestTrajectoryLabels:
+    """_evaluate_outcome should return trajectory fields for SL sweep analysis.
+
+    credit = 1.0 throughout:
+      max_profit = $100, TP50 = $50, SL(2x) = -$200, TP100 = $100
+      pnl = (1.0 - (short_mid - long_mid)) * 100
+    """
+
+    def test_no_marks_has_trajectory_nulls(self) -> None:
+        out = _evaluate_outcome(1.0, [])
+        assert out["max_adverse_pnl"] is None
+        assert out["hit_stop_loss"] is False
+        assert out["hold_hit_tp50"] is False
+        assert out["hold_exit_reason"] == "NO_MARKS"
+
+    def test_tp50_only_no_sl(self) -> None:
+        """TP50 fires, SL never breached. Trajectory should show clean trade."""
+        # exit_cost = 0.4 - 0.05 = 0.35 -> pnl = (1-0.35)*100 = $65 >= $50
+        marks = [_mark(0.40, 0.05)]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        assert out["hit_stop_loss"] is False
+        assert out["recovered_after_sl"] is False
+        assert out["hold_hit_tp50"] is True
+        assert out["hold_exit_reason"] == "TAKE_PROFIT_50"
+        # max_adverse_pnl = 0.0 (initialized at entry; only mark is profitable)
+        assert out["max_adverse_pnl"] == pytest.approx(0.0, abs=0.01)
+        # min_pnl_before_tp50 = 0.0 (TP50 fires on first mark, no pre-TP50 dip)
+        assert out["min_pnl_before_tp50"] == pytest.approx(0.0, abs=0.01)
+        assert out["max_adverse_multiple"] == pytest.approx(0.0, abs=0.01)
+
+    def test_sl_then_recovery_to_tp50(self) -> None:
+        """Trade dips past SL on mark 1, then recovers to TP50 on mark 3."""
+        marks = [
+            # Mark 1: exit_cost=3.5-0.05=3.45 -> pnl=(1-3.45)*100 = -$245 < -$200 SL
+            _mark(3.50, 0.05),
+            # Mark 2: exit_cost=1.5-0.05=1.45 -> pnl=(1-1.45)*100 = -$45
+            _mark(1.50, 0.05),
+            # Mark 3: exit_cost=0.3-0.05=0.25 -> pnl=(1-0.25)*100 = $75 >= $50 TP50
+            _mark(0.30, 0.05),
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        # Backward-compatible: SL fires first
+        assert out["exit_reason"] == "STOP_LOSS"
+        assert out["hit_tp50"] is False
+        assert out["realized_pnl"] < -200
+
+        # Trajectory: SL hit, then TP50 hit → recovery
+        assert out["hit_stop_loss"] is True
+        assert out["recovered_after_sl"] is True
+        assert out["hold_hit_tp50"] is True
+        assert out["hold_exit_reason"] == "TAKE_PROFIT_50"
+        assert out["hold_realized_pnl"] == pytest.approx(75.0, abs=1)
+        assert out["max_adverse_pnl"] < -200
+        assert out["min_pnl_before_tp50"] < -200
+        assert out["final_pnl_at_expiry"] == pytest.approx(75.0, abs=1)
+
+    def test_sl_no_recovery(self) -> None:
+        """Trade dips past SL and never recovers."""
+        marks = [
+            # exit_cost=4.0-0.05=3.95 -> pnl=(1-3.95)*100=-$295 SL
+            _mark(4.00, 0.05),
+            # exit_cost=2.5-0.1=2.40 -> pnl=(1-2.40)*100=-$140 (better but no TP50)
+            _mark(2.50, 0.10),
+            # exit_cost=1.5-0.1=1.40 -> pnl=(1-1.40)*100=-$40 (still negative)
+            _mark(1.50, 0.10),
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "STOP_LOSS"
+        assert out["hit_stop_loss"] is True
+        assert out["recovered_after_sl"] is False
+        assert out["hold_hit_tp50"] is False
+        assert out["hold_exit_reason"] == "EXPIRY_OR_LAST_MARK"
+        assert out["hold_realized_pnl"] == pytest.approx(-40.0, abs=2)
+        assert out["max_adverse_pnl"] < -200
+        assert out["final_pnl_at_expiry"] == pytest.approx(-40.0, abs=2)
+
+    def test_sl_recovery_to_tp100(self) -> None:
+        """Trade dips past SL, then options expire worthless (TP100)."""
+        marks = [
+            # SL hit: exit_cost=3.5 -> pnl=-$245
+            _mark(3.50, 0.05),
+            # Recovery: exit_cost≈0 -> pnl=$100 TP100
+            _mark(0.01, 0.01),
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "STOP_LOSS"
+        assert out["recovered_after_sl"] is True
+        assert out["hold_hit_tp50"] is True
+        assert out["final_is_tp100"] is True
+        assert out["hold_hit_tp100_at_expiry"] is True
+        assert out["final_pnl_at_expiry"] >= 100.0
+
+    def test_max_adverse_multiple(self) -> None:
+        """max_adverse_multiple should be worst PnL / max_profit."""
+        # pnl = (1.0 - (2.0-0.05))*100 = (1.0-1.95)*100 = -$95
+        marks = [_mark(2.00, 0.05)]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["max_adverse_pnl"] == pytest.approx(-95.0, abs=1)
+        # max_profit = $100, so multiple = -95/100 = -0.95
+        assert out["max_adverse_multiple"] == pytest.approx(-0.95, abs=0.02)
+
+    def test_expiry_no_events(self) -> None:
+        """Neither SL nor TP50 fires — trade expires with small loss."""
+        # pnl = (1.0-(1.2-0.05))*100 = (1.0-1.15)*100 = -$15
+        marks = [_mark(1.20, 0.05)]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "EXPIRY_OR_LAST_MARK"
+        assert out["hit_stop_loss"] is False
+        assert out["hold_hit_tp50"] is False
+        assert out["hold_exit_reason"] == "EXPIRY_OR_LAST_MARK"
+        assert out["final_pnl_at_expiry"] == pytest.approx(-15.0, abs=1)
+        assert out["final_is_tp100"] is False
+
+    def test_min_pnl_before_tp50_tracks_drawdown_before_tp50(self) -> None:
+        """min_pnl_before_tp50 stops tracking after TP50 fires."""
+        marks = [
+            # pnl = (1-1.95)*100 = -$95 (pre-TP50 drawdown)
+            _mark(2.00, 0.05),
+            # pnl = (1-0.35)*100 = $65 TP50 fires
+            _mark(0.40, 0.05),
+            # pnl = (1-5.95)*100 = -$495 (post-TP50, should NOT affect min_pnl_before)
+            _mark(6.00, 0.05),
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["min_pnl_before_tp50"] == pytest.approx(-95.0, abs=1)
+        # max_adverse_pnl spans ALL marks including post-TP50
+        assert out["max_adverse_pnl"] < -400
+
+    def test_backward_compat_sl_before_tp50(self) -> None:
+        """Original fields should match old behavior: SL before TP50 → STOP_LOSS."""
+        marks = [
+            _mark(3.50, 0.05),   # SL fires (-$245)
+            _mark(0.30, 0.05),   # TP50 fires (+$75)
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "STOP_LOSS"
+        assert out["hit_tp50"] is False
+        assert out["resolved"] is True
+
+    def test_backward_compat_tp50_before_sl(self) -> None:
+        """If TP50 fires first, SL is irrelevant for backward-compat fields."""
+        marks = [
+            _mark(0.30, 0.05),   # TP50 fires first ($75)
+            _mark(3.50, 0.05),   # SL fires later (-$245, but trade already closed)
+        ]
+        out = _evaluate_outcome(1.0, marks)
+
+        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        assert out["hit_tp50"] is True
+        # hit_stop_loss is True because SL WAS breached (just after TP50)
+        assert out["hit_stop_loss"] is True
+        assert out["recovered_after_sl"] is False

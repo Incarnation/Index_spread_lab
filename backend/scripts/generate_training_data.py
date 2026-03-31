@@ -76,6 +76,7 @@ SPREAD_SIDES = ["put", "call"]
 WIDTH_POINTS = 10.0
 TAKE_PROFIT_PCT = 0.50
 STOP_LOSS_PCT = 2.00
+LABEL_MARK_INTERVAL_MINUTES = 5
 CONTRACT_MULT = 100
 CONTRACTS = 1
 MIN_MID_PRICE = 0.05
@@ -1016,30 +1017,90 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (b + a) / 2.0
 
 
-def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
-    """Evaluate credit-spread outcome from forward marks.
+def _downsample_marks(
+    marks: list[dict], interval_minutes: int = LABEL_MARK_INTERVAL_MINUTES,
+) -> list[dict]:
+    """Keep only marks whose minute is divisible by *interval_minutes*.
 
-    Mirrors production ``trade_pnl_job`` close logic:
-    - Stop-loss fires when PnL <= -(STOP_LOSS_PCT * max_profit)
-    - TP50 hit when PnL >= TAKE_PROFIT_PCT * max_profit
-    - Stop-loss is checked first each bar (if both trigger in the same
-      minute, the stop-loss takes precedence)
-    - If neither fires, the last mark's PnL is used as the realized outcome
+    Mirrors the production snapshot cadence (e.g. every 5 minutes) so that
+    the offline labeler doesn't catch fleeting intraday touches that the
+    production system would never observe.
 
     Parameters
     ----------
-    entry_credit : float      Credit received at entry (positive).
-    marks        : list[dict] Forward CBBO marks with short/long bid/ask.
+    marks            : list of mark dicts, each with a ``ts`` datetime key.
+    interval_minutes : keep marks where ``ts.minute % interval == 0``.
+                       A value of 1 means keep every mark (no filtering).
 
     Returns
     -------
-    dict  Outcome fields to merge into the candidate.
+    list[dict]  Filtered marks (same order, always a subset of input).
     """
+    if interval_minutes <= 1:
+        return marks
+    return [m for m in marks if m["ts"].minute % interval_minutes == 0]
+
+
+def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
+    """Evaluate credit-spread outcome from forward marks with full trajectory.
+
+    Iterates ALL marks without early-returning at stop-loss, capturing
+    trajectory data that enables analysis of any SL level (1x-5x) and any
+    exit rule (TP50 vs hold-to-expiry) from a single pipeline run.
+
+    Backward-compatible fields (``hit_tp50``, ``realized_pnl``,
+    ``exit_reason``) preserve the original with-SL semantics.  New fields
+    capture the full PnL trajectory and hold-through outcomes.
+
+    Parameters
+    ----------
+    entry_credit : float
+        Credit received at entry (positive).
+    marks : list[dict]
+        Forward CBBO marks with short/long bid/ask.
+
+    Returns
+    -------
+    dict
+        Outcome fields including backward-compatible (with-SL) columns and
+        new trajectory / hold-through columns.
+
+        Trajectory columns
+        ------------------
+        max_adverse_pnl       : worst PnL seen across all marks.
+        max_adverse_multiple  : max_adverse_pnl / max_profit (e.g. -2.3).
+        min_pnl_before_tp50   : worst PnL before TP50 first triggered; used
+                                to determine which SL levels would fire
+                                before TP50 for the sweep analysis.
+        first_tp50_pnl        : PnL at the first TP50 trigger (None if never).
+        final_pnl_at_expiry   : PnL at the very last mark.
+        final_is_tp100        : True if last mark PnL >= full credit.
+        hit_stop_loss         : True if PnL breached -2x credit at any point.
+        recovered_after_sl    : True if 2x SL breached, then TP50 fired later.
+
+        Hold-through columns (no-SL + close-at-TP50 strategy)
+        ------------------------------------------------------
+        hold_hit_tp50            : TP50 fires at any point ignoring SL.
+        hold_realized_pnl        : PnL under hold-to-TP50 or hold-to-expiry.
+        hold_exit_reason         : exit type under hold strategy.
+        hold_hit_tp100_at_expiry : True if final PnL >= full credit.
+    """
+    _trajectory_nulls = {
+        "max_adverse_pnl": None, "max_adverse_multiple": None,
+        "min_pnl_before_tp50": None, "first_tp50_pnl": None,
+        "final_pnl_at_expiry": None, "final_is_tp100": False,
+        "hit_stop_loss": False, "recovered_after_sl": False,
+        "hold_hit_tp50": False, "hold_realized_pnl": None,
+        "hold_exit_reason": "NO_MARKS",
+        "hold_hit_tp100_at_expiry": False,
+    }
+
     if not marks:
         return {
             "resolved": False, "hit_tp50": False,
             "hit_tp100_at_expiry": False,
             "realized_pnl": None, "exit_reason": "NO_MARKS",
+            **_trajectory_nulls,
         }
 
     max_profit = entry_credit * CONTRACT_MULT * CONTRACTS
@@ -1047,7 +1108,11 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     sl_thr = max_profit * STOP_LOSS_PCT
     tp100_thr = max_profit
 
+    max_adverse_pnl: float = 0.0
+    min_pnl_before_tp50: float = 0.0
     first_tp50_pnl: float | None = None
+    sl_breach_pnl: float | None = None
+    sl_breached_before_tp50: bool = False
     last_pnl: float | None = None
 
     for m in marks:
@@ -1059,35 +1124,80 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         pnl = (entry_credit - exit_cost) * CONTRACT_MULT * CONTRACTS
         last_pnl = pnl
 
-        if pnl <= -sl_thr:
-            return {
-                "resolved": True, "hit_tp50": False,
-                "hit_tp100_at_expiry": False,
-                "realized_pnl": pnl, "exit_reason": "STOP_LOSS",
-            }
+        max_adverse_pnl = min(max_adverse_pnl, pnl)
+
+        if first_tp50_pnl is None:
+            min_pnl_before_tp50 = min(min_pnl_before_tp50, pnl)
+
+        if sl_breach_pnl is None and pnl <= -sl_thr:
+            sl_breach_pnl = pnl
+            if first_tp50_pnl is None:
+                sl_breached_before_tp50 = True
 
         if first_tp50_pnl is None and pnl >= tp_thr:
             first_tp50_pnl = pnl
 
     if last_pnl is None:
+        _trajectory_nulls["hold_exit_reason"] = "NO_VALID_MARKS"
         return {
             "resolved": False, "hit_tp50": False,
             "hit_tp100_at_expiry": False,
             "realized_pnl": None, "exit_reason": "NO_VALID_MARKS",
+            **_trajectory_nulls,
         }
 
-    hit_tp100 = bool(last_pnl >= tp100_thr)
+    max_adverse_multiple = (
+        max_adverse_pnl / max_profit if max_profit > 0 else None
+    )
+    final_is_tp100 = bool(last_pnl >= tp100_thr)
+    hit_stop_loss = sl_breach_pnl is not None
+    recovered_after_sl = sl_breached_before_tp50 and first_tp50_pnl is not None
 
+    # --- Original outcome (backward-compatible with-SL) ---
+    if sl_breached_before_tp50:
+        orig_exit = "STOP_LOSS"
+        orig_pnl = sl_breach_pnl
+        orig_tp50 = False
+        orig_tp100 = False
+    elif first_tp50_pnl is not None:
+        orig_exit = "TAKE_PROFIT_50"
+        orig_pnl = first_tp50_pnl
+        orig_tp50 = True
+        orig_tp100 = final_is_tp100
+    else:
+        orig_exit = "EXPIRY_OR_LAST_MARK"
+        orig_pnl = last_pnl
+        orig_tp50 = False
+        orig_tp100 = final_is_tp100
+
+    # --- Hold-through outcome (ignore SL, still close at TP50) ---
     if first_tp50_pnl is not None:
-        return {
-            "resolved": True, "hit_tp50": True,
-            "hit_tp100_at_expiry": hit_tp100,
-            "realized_pnl": first_tp50_pnl, "exit_reason": "TAKE_PROFIT_50",
-        }
+        hold_exit = "TAKE_PROFIT_50"
+        hold_pnl = first_tp50_pnl
+        hold_tp50 = True
+    else:
+        hold_exit = "EXPIRY_OR_LAST_MARK"
+        hold_pnl = last_pnl
+        hold_tp50 = False
+
     return {
-        "resolved": True, "hit_tp50": False,
-        "hit_tp100_at_expiry": hit_tp100,
-        "realized_pnl": last_pnl, "exit_reason": "EXPIRY_OR_LAST_MARK",
+        "resolved": True,
+        "hit_tp50": orig_tp50,
+        "hit_tp100_at_expiry": orig_tp100,
+        "realized_pnl": orig_pnl,
+        "exit_reason": orig_exit,
+        "max_adverse_pnl": max_adverse_pnl,
+        "max_adverse_multiple": max_adverse_multiple,
+        "min_pnl_before_tp50": min_pnl_before_tp50,
+        "first_tp50_pnl": first_tp50_pnl,
+        "final_pnl_at_expiry": last_pnl,
+        "final_is_tp100": final_is_tp100,
+        "hit_stop_loss": hit_stop_loss,
+        "recovered_after_sl": recovered_after_sl,
+        "hold_hit_tp50": hold_tp50,
+        "hold_realized_pnl": hold_pnl,
+        "hold_exit_reason": hold_exit,
+        "hold_hit_tp100_at_expiry": final_is_tp100,
     }
 
 
@@ -1193,6 +1303,8 @@ def label_candidates(
                 })
 
         marks.sort(key=lambda m: m["ts"])
+        marks = _downsample_marks(marks)
+
         c.update(_evaluate_outcome(c["entry_credit"], marks))
         labeled.append(c)
 
@@ -1790,6 +1902,127 @@ def precompute_offline_gex_to_csv(
 
 
 # ===================================================================
+# RELABEL EXISTING CSV WITH TRAJECTORY DATA
+# ===================================================================
+
+TRAJECTORY_COLUMNS = [
+    "max_adverse_pnl", "max_adverse_multiple", "min_pnl_before_tp50",
+    "first_tp50_pnl", "final_pnl_at_expiry", "final_is_tp100",
+    "hit_stop_loss", "recovered_after_sl",
+    "hold_hit_tp50", "hold_realized_pnl", "hold_exit_reason",
+    "hold_hit_tp100_at_expiry",
+]
+
+
+def relabel_from_csv(
+    csv_path: Path = OUTPUT_CSV,
+    output_path: Path | None = None,
+) -> None:
+    """Re-label the existing training CSV with full trajectory data.
+
+    Only SL trades need CBBO data reloaded (their marks were discarded on
+    the original early-return).  TP50 and EXPIRY trades get new columns
+    inferred from existing data -- no CBBO reload needed.
+
+    Parameters
+    ----------
+    csv_path : Path
+        Input CSV (default ``training_candidates.csv``).
+    output_path : Path | None
+        Where to write the enhanced CSV.  Defaults to overwriting the input.
+    """
+    if output_path is None:
+        output_path = csv_path
+
+    t0 = time.time()
+    df = pd.read_csv(str(csv_path))
+    print(f"[RELABEL] Loaded {len(df)} rows from {csv_path}", flush=True)
+
+    sl_mask = df["exit_reason"] == "STOP_LOSS"
+    sl_count = sl_mask.sum()
+    non_sl_count = len(df) - sl_count
+    print(f"[RELABEL] SL trades to re-evaluate: {sl_count}", flush=True)
+    print(f"[RELABEL] Non-SL trades (inferred): {non_sl_count}", flush=True)
+
+    # --- Infer trajectory columns for non-SL trades ---
+    # TP50 trades: SL never breached before TP50, so hold outcome = same.
+    # EXPIRY trades: neither SL nor TP50, so hold outcome = same.
+    for col in TRAJECTORY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    non_sl = ~sl_mask
+    df.loc[non_sl, "hit_stop_loss"] = False
+    df.loc[non_sl, "recovered_after_sl"] = False
+    df.loc[non_sl, "hold_hit_tp50"] = df.loc[non_sl, "hit_tp50"]
+    df.loc[non_sl, "hold_realized_pnl"] = df.loc[non_sl, "realized_pnl"]
+    df.loc[non_sl, "hold_exit_reason"] = df.loc[non_sl, "exit_reason"]
+    df.loc[non_sl, "hold_hit_tp100_at_expiry"] = df.loc[non_sl, "hit_tp100_at_expiry"]
+    # TP50 trades closed before expiry, so final_pnl is unknown; leave None
+    # max_adverse_pnl / min_pnl_before_tp50 also unknown without marks
+
+    if sl_count == 0:
+        print("[RELABEL] No SL trades to re-evaluate. Saving.", flush=True)
+        df.to_csv(str(output_path), index=False)
+        elapsed = time.time() - t0
+        print(f"[RELABEL] Done in {elapsed:.1f}s → {output_path}", flush=True)
+        return
+
+    # --- Re-label SL trades by reloading CBBO marks ---
+    spxw_days = set(_available_day_files(SPXW_CBBO))
+    spx_days = set(_available_day_files(SPX_CBBO))
+    trading_days = sorted(spxw_days | spx_days)
+    print(f"[RELABEL] {len(trading_days)} trading days available", flush=True)
+
+    sl_rows = df[sl_mask].to_dict("records")
+
+    # label_candidates expects list[dict] with entry info keys
+    required_keys = [
+        "day", "expiry", "entry_dt", "entry_credit",
+        "short_symbol", "long_symbol",
+        "short_instrument_id", "long_instrument_id",
+    ]
+    candidates = []
+    for row in sl_rows:
+        c = {k: row[k] for k in required_keys}
+        candidates.append(c)
+
+    print(f"[RELABEL] Re-labeling {len(candidates)} SL candidates ...", flush=True)
+    relabeled = label_candidates(candidates, trading_days)
+    print(f"[RELABEL] Re-labeled {len(relabeled)} candidates", flush=True)
+
+    # Write the new trajectory columns back into the DataFrame
+    sl_indices = df.index[sl_mask].tolist()
+    for idx, c in zip(sl_indices, relabeled):
+        for col in TRAJECTORY_COLUMNS:
+            df.at[idx, col] = c.get(col)
+        # Also update backward-compatible fields (should match, but
+        # ensures consistency with the new _evaluate_outcome logic)
+        df.at[idx, "hit_tp50"] = c.get("hit_tp50", False)
+        df.at[idx, "realized_pnl"] = c.get("realized_pnl")
+        df.at[idx, "exit_reason"] = c.get("exit_reason", "STOP_LOSS")
+        df.at[idx, "hit_tp100_at_expiry"] = c.get("hit_tp100_at_expiry", False)
+
+    df.to_csv(str(output_path), index=False)
+    elapsed = time.time() - t0
+    print(f"\n[RELABEL] Done in {elapsed:.1f}s → {output_path}", flush=True)
+
+    # Summary stats
+    sl_df = df[sl_mask]
+    recovered = sl_df["recovered_after_sl"].sum()
+    hold_tp50 = sl_df["hold_hit_tp50"].sum()
+    print(f"[RELABEL] SL trades that would recover (hit TP50 after SL): "
+          f"{recovered}/{sl_count} ({recovered/sl_count*100:.1f}%)", flush=True)
+    print(f"[RELABEL] SL trades where TP50 fires at any point: "
+          f"{hold_tp50}/{sl_count} ({hold_tp50/sl_count*100:.1f}%)", flush=True)
+
+    hold_pnl_mean = sl_df["hold_realized_pnl"].mean()
+    orig_pnl_mean = sl_df["realized_pnl"].mean()
+    print(f"[RELABEL] SL trade avg PnL — close at SL: ${orig_pnl_mean:.0f}, "
+          f"hold through: ${hold_pnl_mean:.0f}", flush=True)
+
+
+# ===================================================================
 # CLI
 # ===================================================================
 
@@ -1814,10 +2047,29 @@ def main() -> None:
         "--precompute-gex", action="store_true",
         help="Precompute offline GEX to CSV cache instead of running the pipeline",
     )
+    parser.add_argument(
+        "--relabel", action="store_true",
+        help="Re-label existing training_candidates.csv with trajectory data "
+             "(reloads CBBO marks for SL trades only, ~3-5 hours)",
+    )
+    parser.add_argument(
+        "--model", type=str, default="bucket", choices=["bucket", "xgboost"],
+        help="Model type: 'bucket' (default) runs full pipeline, "
+             "'xgboost' reads existing training_candidates.csv and trains XGBoost",
+    )
     args = parser.parse_args()
 
     if args.precompute_gex:
         precompute_offline_gex_to_csv(max_days=args.max_days)
+        return
+
+    if args.relabel:
+        relabel_from_csv()
+        return
+
+    if args.model == "xgboost":
+        from xgb_model import main as xgb_main
+        xgb_main()
         return
 
     run_pipeline(
