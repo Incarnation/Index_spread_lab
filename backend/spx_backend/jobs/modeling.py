@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import math
 import statistics
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 FULL_BUCKET_DIMENSIONS: tuple[str, ...] = (
@@ -875,5 +876,200 @@ def predict_with_bucket_model(*, model_payload: dict[str, Any], features: dict[s
         "pnl_std": pnl_std,
         "margin_usage": margin_usage,
         "utility_score": utility_score,
+    }
+
+
+# ===================================================================
+# XGBoost entry model helpers (live inference)
+# ===================================================================
+
+_XGB_CONTINUOUS = [
+    "vix", "vix9d", "term_structure", "vvix", "skew",
+    "delta_target", "credit_to_width", "entry_credit", "width_points",
+    "spot", "spy_price",
+    "short_iv", "long_iv", "short_delta", "long_delta",
+    "offline_gex_net", "offline_zero_gamma",
+    "max_loss",
+]
+
+_XGB_ORDINAL = ["dte_target", "entry_hour"]
+_XGB_BINARY = ["is_opex_day", "is_fomc_day", "is_triple_witching"]
+
+
+def extract_xgb_features(
+    candidate_json: dict[str, Any],
+    *,
+    max_loss_points: float | None = None,
+    contract_multiplier: int = 100,
+    candidate_ts: datetime | None = None,
+) -> dict[str, Any]:
+    """Extract continuous features for the XGBoost entry model.
+
+    Maps the same ``candidate_json`` payload used by
+    ``extract_candidate_features`` into the flat continuous/ordinal/binary
+    columns that the offline ``xgb_model.py`` expects, plus engineered
+    interaction features.
+
+    Parameters
+    ----------
+    candidate_json:
+        Raw candidate payload from trade_candidates.
+    max_loss_points:
+        Used to derive ``max_loss`` in dollar terms.
+    contract_multiplier:
+        Dollar multiplier per point.
+    candidate_ts:
+        Candidate timestamp; used to derive ``entry_hour`` (ET).
+        Falls back to ``candidate_json["entry_dt"]`` if not provided.
+
+    Returns
+    -------
+    dict with feature names as keys and float/int values.
+    """
+    ctx = candidate_json.get("context") or {}
+    cboe = candidate_json.get("cboe_context") or {}
+
+    def _f(key: str, *fallback_dicts: dict) -> float | None:
+        v = _as_float(candidate_json.get(key))
+        if v is not None:
+            return v
+        for d in fallback_dicts:
+            v = _as_float(d.get(key))
+            if v is not None:
+                return v
+        return None
+
+    vix = _f("vix", ctx)
+    vix9d = _f("vix9d", ctx)
+    term_structure = _f("term_structure", ctx)
+    vvix = _f("vvix", ctx)
+    skew = _f("skew", ctx)
+    delta_target = _f("delta_target")
+    entry_credit = _f("entry_credit")
+    width_points = _f("width_points")
+    credit_to_width = _f("credit_to_width")
+    if credit_to_width is None and entry_credit and width_points and width_points > 0:
+        credit_to_width = entry_credit / width_points
+
+    spot = _f("spot", ctx) or _f("spx_price", ctx)
+    spy_price = _f("spy_price", ctx)
+
+    # Production candidate_json nests leg fields under "legs.short" / "legs.long";
+    # offline training CSVs have flat "short_iv" etc.  Try top-level first, then
+    # fall back to the nested leg structure.
+    legs = candidate_json.get("legs") or {}
+    short_leg = legs.get("short") or {}
+    long_leg = legs.get("long") or {}
+
+    short_iv = _f("short_iv") or _as_float(short_leg.get("iv"))
+    long_iv = _f("long_iv") or _as_float(long_leg.get("iv"))
+    short_delta = _f("short_delta") or _as_float(short_leg.get("delta"))
+    long_delta = _f("long_delta") or _as_float(long_leg.get("delta"))
+    gex_net = _f("offline_gex_net", cboe)
+    if gex_net is None:
+        gex_net = _f("expiry_gex_net", cboe)
+    zero_gamma = _f("offline_zero_gamma", cboe)
+
+    contracts = _as_int(candidate_json.get("contracts")) or 1
+    ml_points = max_loss_points
+    if ml_points is None:
+        ml_points = _as_float(candidate_json.get("max_loss"))
+    max_loss = (ml_points or 0.0) * contracts * contract_multiplier if ml_points else None
+
+    target_dte = _as_int(candidate_json.get("target_dte"))
+    spread_side = str(candidate_json.get("spread_side") or "unknown").lower()
+    is_put = 1 if spread_side == "put" else 0
+
+    is_opex = int(bool(candidate_json.get("is_opex_day", False)))
+    is_fomc = int(bool(candidate_json.get("is_fomc_day", False)))
+    is_tw = int(bool(candidate_json.get("is_triple_witching", False)))
+
+    # Entry hour (Eastern Time)
+    entry_hour: int | None = None
+    if candidate_ts is not None:
+        et = candidate_ts.astimezone(ZoneInfo("America/New_York"))
+        entry_hour = et.hour
+    else:
+        raw_dt = candidate_json.get("entry_dt") or candidate_json.get("ts")
+        if raw_dt:
+            try:
+                parsed = datetime.fromisoformat(str(raw_dt))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                entry_hour = parsed.astimezone(ZoneInfo("America/New_York")).hour
+            except (ValueError, TypeError):
+                pass
+
+    features = {
+        "vix": vix, "vix9d": vix9d, "term_structure": term_structure,
+        "vvix": vvix, "skew": skew, "delta_target": delta_target,
+        "credit_to_width": credit_to_width, "entry_credit": entry_credit,
+        "width_points": width_points, "spot": spot, "spy_price": spy_price,
+        "short_iv": short_iv, "long_iv": long_iv,
+        "short_delta": short_delta, "long_delta": long_delta,
+        "offline_gex_net": gex_net, "offline_zero_gamma": zero_gamma,
+        "max_loss": max_loss,
+        "dte_target": target_dte, "entry_hour": entry_hour,
+        "is_opex_day": is_opex, "is_fomc_day": is_fomc, "is_triple_witching": is_tw,
+        "is_put": is_put,
+        # Engineered
+        "vix_x_delta": (vix or 0) * (delta_target or 0),
+        "dte_x_credit": (target_dte or 0) * (credit_to_width or 0),
+        "gex_sign": (1.0 if (gex_net or 0) > 0 else (-1.0 if (gex_net or 0) < 0 else 0.0)),
+    }
+    return features
+
+
+def predict_xgb_entry(
+    model_payload: dict[str, Any],
+    features: dict[str, Any],
+) -> dict[str, Any]:
+    """Score a candidate using an XGBoost entry model stored in model_payload.
+
+    Loads XGBoost Booster objects from the JSON strings stored in the
+    payload, builds a DMatrix from the feature dict, and returns
+    probability_win / expected_pnl / utility_score matching the
+    interface of ``predict_with_bucket_model``.
+
+    Parameters
+    ----------
+    model_payload:
+        Must contain ``classifier_json``, ``regressor_json``, and
+        ``feature_names``.  ``model_type`` should be ``"xgb_entry_v1"``.
+    features:
+        Dict from ``extract_xgb_features``.
+
+    Returns
+    -------
+    dict with probability_win, expected_pnl, utility_score, and source.
+    """
+    import numpy as np
+    import xgboost as xgb
+
+    feature_names: list[str] = model_payload["feature_names"]
+    row = [float(features.get(fn) or 0) if features.get(fn) is not None else float("nan")
+           for fn in feature_names]
+    dmat = xgb.DMatrix(np.array([row]), feature_names=feature_names)
+
+    cls_booster = xgb.Booster()
+    cls_booster.load_model(bytearray(model_payload["classifier_json"].encode("utf-8")))
+    reg_booster = xgb.Booster()
+    reg_booster.load_model(bytearray(model_payload["regressor_json"].encode("utf-8")))
+
+    prob_win = float(cls_booster.predict(dmat)[0])
+    expected_pnl = float(reg_booster.predict(dmat)[0])
+    utility_score = prob_win * max(expected_pnl, 0.0)
+
+    return {
+        "source": "xgb_entry_v1",
+        "probability_win": prob_win,
+        "expected_pnl": expected_pnl,
+        "utility_score": utility_score,
+        "bucket_key": None,
+        "bucket_level": None,
+        "bucket_count": 0,
+        "tail_loss_proxy": 0.0,
+        "pnl_std": 0.0,
+        "margin_usage": 0.0,
     }
 

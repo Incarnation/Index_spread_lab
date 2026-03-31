@@ -35,7 +35,7 @@ CONTINUOUS_FEATURES = [
     "max_loss",
 ]
 
-ORDINAL_FEATURES = ["dte_target"]
+ORDINAL_FEATURES = ["dte_target", "entry_hour"]
 
 BINARY_FEATURES = ["is_opex_day", "is_fomc_day", "is_triple_witching"]
 
@@ -104,6 +104,12 @@ def build_feature_matrix(
     """
     X = pd.DataFrame()
 
+    # Derive entry_hour (Eastern Time) from entry_dt if available
+    if "entry_hour" not in df.columns and "entry_dt" in df.columns:
+        dt = pd.to_datetime(df["entry_dt"], utc=True, errors="coerce")
+        df = df.copy()
+        df["entry_hour"] = dt.dt.tz_convert("America/New_York").dt.hour
+
     for col in CONTINUOUS_FEATURES:
         X[col] = pd.to_numeric(df[col], errors="coerce") if col in df.columns else np.nan
 
@@ -127,8 +133,12 @@ def build_feature_matrix(
     X["dte_x_credit"] = X["dte_target"].astype(float) * X["credit_to_width"]
     X["gex_sign"] = np.sign(X["offline_gex_net"])
 
-    y_tp50 = df[TARGET_CLS].astype(int) if TARGET_CLS in df.columns else pd.Series(0, index=df.index)
-    y_pnl = pd.to_numeric(df[TARGET_REG], errors="coerce") if TARGET_REG in df.columns else pd.Series(0.0, index=df.index)
+    # Prefer hold-based labels (no SL) when available; fall back to originals
+    cls_col = "hold_hit_tp50" if "hold_hit_tp50" in df.columns else TARGET_CLS
+    reg_col = "hold_realized_pnl" if "hold_realized_pnl" in df.columns else TARGET_REG
+
+    y_tp50 = df[cls_col].astype(int) if cls_col in df.columns else pd.Series(0, index=df.index)
+    y_pnl = pd.to_numeric(df[reg_col], errors="coerce") if reg_col in df.columns else pd.Series(0.0, index=df.index)
 
     return X, y_tp50, y_pnl
 
@@ -490,6 +500,310 @@ def train_final_model(df: pd.DataFrame) -> dict[str, Any]:
 
 
 # ===================================================================
+# ENTRY MODEL (rolling walk-forward, hold-based labels)
+# ===================================================================
+
+HOLD_TARGET_CLS = "hold_hit_tp50"
+HOLD_TARGET_REG = "hold_realized_pnl"
+
+
+def _resolve_targets(df: pd.DataFrame) -> tuple[str, str]:
+    """Pick hold-based targets if available, else fall back to originals.
+
+    Returns (cls_col, reg_col) column names present in *df*.
+    """
+    cls_col = HOLD_TARGET_CLS if HOLD_TARGET_CLS in df.columns else TARGET_CLS
+    reg_col = HOLD_TARGET_REG if HOLD_TARGET_REG in df.columns else TARGET_REG
+    return cls_col, reg_col
+
+
+def build_entry_feature_matrix(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Build feature matrix using hold-based labels for the entry model.
+
+    Identical feature engineering to ``build_feature_matrix`` but uses
+    ``hold_hit_tp50`` / ``hold_realized_pnl`` when available, falling
+    back to original columns for backward compatibility.
+
+    Parameters
+    ----------
+    df : Raw training CSV DataFrame.
+
+    Returns
+    -------
+    X, y_cls, y_pnl
+    """
+    X = pd.DataFrame()
+
+    if "entry_hour" not in df.columns and "entry_dt" in df.columns:
+        dt = pd.to_datetime(df["entry_dt"], utc=True, errors="coerce")
+        df = df.copy()
+        df["entry_hour"] = dt.dt.tz_convert("America/New_York").dt.hour
+
+    for col in CONTINUOUS_FEATURES:
+        X[col] = pd.to_numeric(df[col], errors="coerce") if col in df.columns else np.nan
+
+    for col in ORDINAL_FEATURES:
+        X[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64") if col in df.columns else pd.NA
+
+    for col in BINARY_FEATURES:
+        X[col] = df[col].astype(int) if col in df.columns else 0
+
+    X["is_put"] = (df["spread_side"].str.lower() == "put").astype(int) if "spread_side" in df.columns else 0
+
+    X["vix_x_delta"] = X["vix"] * X["delta_target"]
+    X["dte_x_credit"] = X["dte_target"].astype(float) * X["credit_to_width"]
+    X["gex_sign"] = np.sign(X["offline_gex_net"])
+
+    cls_col, reg_col = _resolve_targets(df)
+    y_cls = df[cls_col].astype(int) if cls_col in df.columns else pd.Series(0, index=df.index)
+    y_pnl = pd.to_numeric(df[reg_col], errors="coerce") if reg_col in df.columns else pd.Series(0.0, index=df.index)
+
+    return X, y_cls, y_pnl
+
+
+def walk_forward_rolling(
+    df: pd.DataFrame,
+    train_months: int = 8,
+    test_months: int = 2,
+    step_months: int = 1,
+) -> dict[str, Any]:
+    """Rolling walk-forward validation with overlapping windows.
+
+    Sorts by ``day``, then slides a (train_months, test_months) window
+    forward by step_months.  Aggregates metrics across all windows.
+
+    Parameters
+    ----------
+    df            : Raw training CSV DataFrame.
+    train_months  : Length of each training window in months.
+    test_months   : Length of each test window in months.
+    step_months   : How far to advance the window each step.
+
+    Returns
+    -------
+    dict with per-window results and aggregated metrics.
+    """
+    from dateutil.relativedelta import relativedelta
+
+    df_sorted = df.sort_values("day").reset_index(drop=True)
+    df_sorted["_day_dt"] = pd.to_datetime(df_sorted["day"])
+
+    first_day = df_sorted["_day_dt"].iloc[0]
+    last_day = df_sorted["_day_dt"].iloc[-1]
+
+    windows: list[dict[str, Any]] = []
+    all_test_preds: list[pd.DataFrame] = []
+    all_test_labels: list[pd.Series] = []
+    all_test_pnls: list[pd.Series] = []
+    win_idx = 0
+
+    train_start = first_day
+    while True:
+        train_end = train_start + relativedelta(months=train_months)
+        test_end = train_end + relativedelta(months=test_months)
+        if train_end > last_day:
+            break
+
+        train_mask = (df_sorted["_day_dt"] >= train_start) & (df_sorted["_day_dt"] < train_end)
+        test_mask = (df_sorted["_day_dt"] >= train_end) & (df_sorted["_day_dt"] < test_end)
+        train_df = df_sorted[train_mask]
+        test_df = df_sorted[test_mask]
+
+        if len(train_df) < 100 or len(test_df) < 30:
+            train_start += relativedelta(months=step_months)
+            continue
+
+        X_train_full, y_cls_train_full, y_pnl_train_full = build_entry_feature_matrix(train_df)
+        X_test, y_cls_test, y_pnl_test = build_entry_feature_matrix(test_df)
+
+        val_split = int(len(X_train_full) * 0.9)
+        X_train = X_train_full.iloc[:val_split]
+        y_cls_train = y_cls_train_full.iloc[:val_split]
+        y_pnl_train = y_pnl_train_full.iloc[:val_split]
+        X_val = X_train_full.iloc[val_split:]
+        y_cls_val = y_cls_train_full.iloc[val_split:]
+        y_pnl_val = y_pnl_train_full.iloc[val_split:]
+
+        t0 = time.time()
+        models = train_xgb_models(
+            X_train, y_cls_train, y_pnl_train,
+            X_val, y_cls_val, y_pnl_val,
+        )
+        elapsed = time.time() - t0
+
+        preds = predict_xgb(models, X_test)
+        y_pred_prob = preds["prob_tp50"].values
+        y_pred_pnl = preds["predicted_pnl"].values
+
+        brier = brier_score_loss(y_cls_test.values, y_pred_prob)
+        mae = mean_absolute_error(y_pnl_test.values, y_pred_pnl)
+
+        clf = models["classifier"]
+        feat_names = models["feature_names"]
+        importances = clf.feature_importances_
+        top_idx = np.argsort(importances)[::-1][:15]
+        fi = [{"feature": feat_names[i], "importance": float(importances[i])} for i in top_idx]
+
+        tp50_count = int(y_cls_test.sum())
+        total = len(y_cls_test)
+        resolved_pnls = y_pnl_test.values.tolist()
+
+        win_result = {
+            "window": win_idx,
+            "train_count": len(train_df),
+            "test_count": len(test_df),
+            "train_days": f"{train_df['day'].iloc[0]} .. {train_df['day'].iloc[-1]}",
+            "test_days": f"{test_df['day'].iloc[0]} .. {test_df['day'].iloc[-1]}",
+            "train_time_s": elapsed,
+            "brier": brier,
+            "mae": mae,
+            "tp50_rate": tp50_count / max(total, 1),
+            "expectancy": sum(resolved_pnls) / max(total, 1),
+            "max_drawdown": _max_drawdown(resolved_pnls),
+            "feature_importance": fi,
+        }
+        windows.append(win_result)
+        all_test_preds.append(preds)
+        all_test_labels.append(y_cls_test)
+        all_test_pnls.append(y_pnl_test)
+        win_idx += 1
+        train_start += relativedelta(months=step_months)
+
+    if not windows:
+        return {"error": "No valid walk-forward windows (insufficient data)"}
+
+    pooled_probs = np.concatenate([p["prob_tp50"].values for p in all_test_preds])
+    pooled_labels = np.concatenate([l.values for l in all_test_labels])
+    pooled_pnls = np.concatenate([p.values for p in all_test_pnls])
+
+    agg_brier = brier_score_loss(pooled_labels, pooled_probs)
+    agg_mae = float(np.mean(np.abs(pooled_pnls - np.concatenate([p["predicted_pnl"].values for p in all_test_preds]))))
+    agg_calibration = _calibration_by_decile(pooled_labels, pooled_probs)
+
+    # Threshold tuning on pooled test predictions
+    threshold_results = []
+    for thr in [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
+        mask = pooled_probs >= thr
+        n_taken = int(mask.sum())
+        if n_taken == 0:
+            threshold_results.append({"threshold": thr, "trades_taken": 0, "win_rate": 0.0,
+                                      "avg_pnl": 0.0, "total_pnl": 0.0})
+            continue
+        win_rate = float(pooled_labels[mask].mean())
+        avg_pnl = float(pooled_pnls[mask].mean())
+        total_pnl = float(pooled_pnls[mask].sum())
+        threshold_results.append({"threshold": thr, "trades_taken": n_taken, "win_rate": win_rate,
+                                  "avg_pnl": avg_pnl, "total_pnl": total_pnl})
+
+    best_thr = max(threshold_results, key=lambda x: x["total_pnl"])
+
+    return {
+        "windows": windows,
+        "n_windows": len(windows),
+        "pooled_test_count": len(pooled_labels),
+        "aggregated_metrics": {
+            "brier_score": agg_brier,
+            "mae_pnl": agg_mae,
+            "tp50_rate": float(pooled_labels.mean()),
+            "expectancy": float(pooled_pnls.mean()),
+            "max_drawdown": _max_drawdown(pooled_pnls.tolist()),
+            "calibration_by_decile": agg_calibration,
+        },
+        "threshold_tuning": threshold_results,
+        "recommended_threshold": best_thr["threshold"],
+    }
+
+
+def _extract_entry_rules(
+    test_df: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Derive human-readable ENTER/SKIP rules from dimensional slices.
+
+    For each slice, computes hold-label TP50 rate and avg PnL, then
+    compares to the overall baseline.
+
+    Parameters
+    ----------
+    test_df : Test-set rows (must include hold label columns and features).
+
+    Returns
+    -------
+    List of rule dicts sorted by avg_pnl descending.
+    """
+    cls_col, reg_col = _resolve_targets(test_df)
+    if cls_col not in test_df.columns or reg_col not in test_df.columns:
+        return []
+
+    baseline_tp50 = test_df[cls_col].mean()
+    baseline_pnl = pd.to_numeric(test_df[reg_col], errors="coerce").mean()
+    rules: list[dict[str, Any]] = []
+
+    def _add(condition: str, sub: pd.DataFrame) -> None:
+        if len(sub) < 5:
+            return
+        tp50_rate = float(sub[cls_col].mean())
+        avg_pnl = float(pd.to_numeric(sub[reg_col], errors="coerce").mean())
+        action = "ENTER" if avg_pnl > baseline_pnl else "SKIP"
+        rules.append({
+            "condition": condition,
+            "action": action,
+            "tp50_rate": tp50_rate,
+            "avg_pnl": avg_pnl,
+            "lift_vs_baseline": tp50_rate - baseline_tp50,
+            "pnl_vs_baseline": avg_pnl - baseline_pnl,
+            "n_trades": len(sub),
+        })
+
+    # DTE
+    for dte in sorted(test_df["dte_target"].dropna().unique()):
+        _add(f"dte={int(dte)}", test_df[test_df["dte_target"] == dte])
+
+    # Spread side
+    if "spread_side" in test_df.columns:
+        for side in test_df["spread_side"].dropna().unique():
+            _add(f"side={side}", test_df[test_df["spread_side"] == side])
+
+    # Delta
+    for delta in sorted(test_df["delta_target"].dropna().unique()):
+        _add(f"delta={delta:.2f}", test_df[test_df["delta_target"] == delta])
+
+    # VIX buckets
+    if "vix" in test_df.columns:
+        vix = pd.to_numeric(test_df["vix"], errors="coerce")
+        for lo, hi in [(0, 15), (15, 20), (20, 25), (25, 30), (30, 100)]:
+            mask = (vix >= lo) & (vix < hi)
+            _add(f"vix=[{lo},{hi})", test_df[mask])
+
+    # Entry hour (ET)
+    if "entry_hour" not in test_df.columns and "entry_dt" in test_df.columns:
+        dt = pd.to_datetime(test_df["entry_dt"], utc=True, errors="coerce")
+        test_df = test_df.copy()
+        test_df["entry_hour"] = dt.dt.tz_convert("America/New_York").dt.hour
+    if "entry_hour" in test_df.columns:
+        for hr in sorted(test_df["entry_hour"].dropna().unique()):
+            _add(f"hour_et={int(hr)}", test_df[test_df["entry_hour"] == hr])
+
+    # Calendar flags
+    for flag in BINARY_FEATURES:
+        if flag in test_df.columns:
+            mask = test_df[flag].astype(int) == 1
+            if mask.sum() >= 5:
+                _add(f"{flag}=True", test_df[mask])
+                _add(f"{flag}=False", test_df[~mask])
+
+    # GEX sign
+    if "offline_gex_net" in test_df.columns:
+        gex = pd.to_numeric(test_df["offline_gex_net"], errors="coerce")
+        _add("gex>0", test_df[gex > 0])
+        _add("gex<=0", test_df[gex <= 0])
+
+    rules.sort(key=lambda r: r["avg_pnl"], reverse=True)
+    return rules
+
+
+# ===================================================================
 # HOLD-VS-CLOSE MODEL (requires trajectory columns from --relabel)
 # ===================================================================
 
@@ -805,10 +1119,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode", type=str, default="tp50",
-        choices=["tp50", "hold-vs-close"],
+        choices=["tp50", "hold-vs-close", "entry"],
         help="'tp50' trains TP50 + PnL models (default). "
-             "'hold-vs-close' trains SL risk + hold decision models "
-             "(requires --relabel trajectory data).",
+             "'hold-vs-close' trains SL risk + hold decision models. "
+             "'entry' trains entry classifier with rolling walk-forward "
+             "and threshold tuning (requires --relabel trajectory data).",
     )
     args = parser.parse_args()
 
@@ -823,6 +1138,9 @@ def main() -> None:
 
     if args.mode == "hold-vs-close":
         _run_hold_vs_close(df)
+        return
+    if args.mode == "entry":
+        _run_entry(df, csv_path, args.save_dir)
         return
 
     _run_tp50(df, csv_path, args.save_dir)
@@ -930,6 +1248,100 @@ def _run_hold_vs_close(df: pd.DataFrame) -> None:
 
     print(f"\n{'=' * 60}")
     print("[XGB] Done.")
+
+
+def _run_entry(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> None:
+    """Entry model: rolling walk-forward with hold labels + threshold tuning."""
+    cls_col, reg_col = _resolve_targets(df)
+    print(f"[ENTRY] Labels: cls={cls_col}, reg={reg_col}")
+    print("[ENTRY] Rolling walk-forward validation (8-month train / 2-month test / 1-month step) ...")
+
+    results = walk_forward_rolling(df)
+    if "error" in results:
+        print(f"[ERROR] {results['error']}")
+        return
+
+    am = results["aggregated_metrics"]
+    windows = results["windows"]
+    thr_results = results["threshold_tuning"]
+
+    print(f"\n{'=' * 70}")
+    print("ENTRY MODEL — ROLLING WALK-FORWARD RESULTS")
+    print(f"{'=' * 70}")
+    print(f"  Windows      : {results['n_windows']}")
+    print(f"  Pooled test  : {results['pooled_test_count']} rows")
+
+    for w in windows:
+        print(f"\n  Window {w['window']}: train={w['train_count']} ({w['train_days']}), "
+              f"test={w['test_count']} ({w['test_days']})")
+        print(f"    Brier={w['brier']:.4f}  MAE=${w['mae']:.2f}  "
+              f"TP50={w['tp50_rate']:.1%}  E[PnL]=${w['expectancy']:.2f}  "
+              f"MaxDD=${w['max_drawdown']:.0f}  time={w['train_time_s']:.1f}s")
+
+    print(f"\n  --- Aggregated Metrics (pooled across all windows) ---")
+    print(f"  Brier score   : {am['brier_score']:.4f}")
+    print(f"  MAE (PnL)     : ${am['mae_pnl']:.2f}")
+    print(f"  TP50 rate     : {am['tp50_rate']:.1%}")
+    print(f"  Expectancy    : ${am['expectancy']:.2f}")
+    print(f"  Max drawdown  : ${am['max_drawdown']:.0f}")
+
+    print(f"\n  --- Calibration (predicted vs actual TP50 by decile) ---")
+    print(f"  {'Decile':>6} {'Pred Lo':>8} {'Pred Hi':>8} {'Mean Pred':>10} {'Actual':>8} {'Count':>6}")
+    for row in am["calibration_by_decile"]:
+        print(f"  {row['decile']:>6d} {row['prob_lo']:>8.3f} {row['prob_hi']:>8.3f} "
+              f"{row['mean_predicted']:>10.3f} {row['actual_rate']:>8.3f} {row['count']:>6d}")
+
+    print(f"\n  --- Threshold Tuning (pooled test set) ---")
+    print(f"  {'Threshold':>10} {'Trades':>8} {'Win Rate':>10} {'Avg PnL':>10} {'Total PnL':>12}")
+    for t in thr_results:
+        marker = " <-- best" if t["threshold"] == results["recommended_threshold"] else ""
+        print(f"  {t['threshold']:>10.2f} {t['trades_taken']:>8d} {t['win_rate']:>10.1%} "
+              f"${t['avg_pnl']:>9.2f} ${t['total_pnl']:>11,.0f}{marker}")
+    print(f"\n  Recommended decision_hybrid_min_probability = {results['recommended_threshold']:.2f}")
+
+    # Feature importances (average across windows)
+    all_fi: dict[str, list[float]] = {}
+    for w in windows:
+        for f in w["feature_importance"]:
+            all_fi.setdefault(f["feature"], []).append(f["importance"])
+    avg_fi = sorted(
+        [{"feature": k, "importance": float(np.mean(v))} for k, v in all_fi.items()],
+        key=lambda x: x["importance"], reverse=True,
+    )
+    print(f"\n  --- Top Feature Importances (avg across windows) ---")
+    for i, f in enumerate(avg_fi[:15], 1):
+        print(f"  {i:>2}. {f['feature']:<25s} {f['importance']:.4f}")
+
+    # Entry rules from the last window's test data
+    df_sorted = df.sort_values("day").reset_index(drop=True)
+    rules = _extract_entry_rules(df_sorted.tail(int(len(df_sorted) * 0.25)))
+    if rules:
+        print(f"\n  --- Entry Rules (sorted by avg PnL) ---")
+        baseline_pnl = pd.to_numeric(df_sorted.tail(int(len(df_sorted) * 0.25))[_resolve_targets(df_sorted)[1]],
+                                      errors="coerce").mean()
+        print(f"  Baseline avg PnL: ${baseline_pnl:.2f}")
+        for r in rules[:25]:
+            print(f"  {r['condition']:<30s} → {r['action']:<6s} "
+                  f"TP50={r['tp50_rate']:.0%}, "
+                  f"${r['avg_pnl']:>+8,.0f}/trade, "
+                  f"lift={r['lift_vs_baseline']:>+.1%}, "
+                  f"n={r['n_trades']}")
+
+    print(f"\n{'=' * 70}")
+
+    # Train final model on all data and save
+    print("\n[ENTRY] Training final model on all data ...")
+    df_sorted_all = df.sort_values("day").reset_index(drop=True)
+    X_full, y_cls, y_pnl = build_entry_feature_matrix(df_sorted_all)
+    val_split = int(len(X_full) * 0.9)
+    models = train_xgb_models(
+        X_full.iloc[:val_split], y_cls.iloc[:val_split], y_pnl.iloc[:val_split],
+        X_full.iloc[val_split:], y_cls.iloc[val_split:], y_pnl.iloc[val_split:],
+    )
+    save_dir = Path(save_dir_arg) if save_dir_arg else csv_path.parent / "xgb_entry_model"
+    save_model(models, save_dir)
+    print(f"[ENTRY] Model saved to {save_dir}/")
+    print("[ENTRY] Done.")
 
 
 if __name__ == "__main__":

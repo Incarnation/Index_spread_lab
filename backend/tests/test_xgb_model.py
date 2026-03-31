@@ -19,12 +19,16 @@ from xgb_model import (  # noqa: E402
     CONTINUOUS_FEATURES,
     ORDINAL_FEATURES,
     _calibration_by_decile,
+    _extract_entry_rules,
     _max_drawdown,
+    _resolve_targets,
+    build_entry_feature_matrix,
     build_feature_matrix,
     load_model,
     predict_xgb,
     save_model,
     train_xgb_models,
+    walk_forward_rolling,
     walk_forward_validate_xgb,
 )
 
@@ -44,9 +48,10 @@ def _make_synthetic_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
     rng = np.random.RandomState(seed)
     days = pd.date_range("2025-06-01", periods=n, freq="B").strftime("%Y-%m-%d")
 
+    entry_dts = pd.date_range("2025-06-01", periods=n, freq="B", tz="UTC")
     df = pd.DataFrame({
         "day": days,
-        "entry_dt": days,
+        "entry_dt": entry_dts.strftime("%Y-%m-%d %H:%M:%S+00:00"),
         "expiry": days,
         "spread_side": rng.choice(["put", "call"], n),
         "dte_target": rng.choice([0, 3, 5, 7, 10], n),
@@ -77,6 +82,9 @@ def _make_synthetic_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
         "hit_tp100_at_expiry": rng.choice([True, False], n, p=[0.15, 0.85]),
         "realized_pnl": rng.uniform(-500, 200, n),
         "exit_reason": rng.choice(["TAKE_PROFIT_50", "EXPIRY_OR_LAST_MARK", "STOP_LOSS"], n),
+        "hold_hit_tp50": rng.choice([True, False], n, p=[0.75, 0.25]),
+        "hold_realized_pnl": rng.uniform(-400, 250, n),
+        "hold_exit_reason": rng.choice(["TAKE_PROFIT_50", "EXPIRY_OR_LAST_MARK"], n),
     })
     return df
 
@@ -308,3 +316,348 @@ class TestMaxDrawdown:
         # peak:       100, 100, 100, 200
         # drawdown:   0, 50, 100, 0
         assert dd == 100.0
+
+
+# ===================================================================
+# Entry model features
+# ===================================================================
+
+
+class TestEntryHourFeature:
+    """entry_hour should be derived from entry_dt in Eastern Time."""
+
+    def test_entry_hour_extracted(self) -> None:
+        df = _make_synthetic_df(20)
+        X, _, _ = build_feature_matrix(df)
+        assert "entry_hour" in X.columns
+        assert X["entry_hour"].notna().all()
+
+    def test_entry_hour_in_entry_matrix(self) -> None:
+        df = _make_synthetic_df(20)
+        X, _, _ = build_entry_feature_matrix(df)
+        assert "entry_hour" in X.columns
+
+
+class TestResolveTargets:
+    """_resolve_targets should prefer hold labels when available."""
+
+    def test_prefers_hold_labels(self) -> None:
+        df = _make_synthetic_df(10)
+        cls_col, reg_col = _resolve_targets(df)
+        assert cls_col == "hold_hit_tp50"
+        assert reg_col == "hold_realized_pnl"
+
+    def test_falls_back_to_original(self) -> None:
+        df = _make_synthetic_df(10).drop(columns=["hold_hit_tp50", "hold_realized_pnl"])
+        cls_col, reg_col = _resolve_targets(df)
+        assert cls_col == "hit_tp50"
+        assert reg_col == "realized_pnl"
+
+
+class TestBuildEntryFeatureMatrix:
+    """build_entry_feature_matrix should use hold-based labels."""
+
+    def test_shape_matches_build_feature_matrix(self) -> None:
+        df = _make_synthetic_df(50)
+        X1, _, _ = build_feature_matrix(df)
+        X2, _, _ = build_entry_feature_matrix(df)
+        assert X1.shape == X2.shape
+
+    def test_uses_hold_labels(self) -> None:
+        df = _make_synthetic_df(50)
+        _, y_cls, y_pnl = build_entry_feature_matrix(df)
+        expected_cls = df["hold_hit_tp50"].astype(int)
+        pd.testing.assert_series_equal(y_cls, expected_cls, check_names=False)
+
+
+class TestRollingWalkForward:
+    """Rolling walk-forward should produce valid windowed results."""
+
+    @staticmethod
+    def _make_dense_df(n: int = 1200, seed: int = 42) -> pd.DataFrame:
+        """Generate dense data spanning ~12 months with multiple rows per day."""
+        rng = np.random.RandomState(seed)
+        days = pd.date_range("2025-03-01", periods=n // 4, freq="B")
+        chosen = pd.to_datetime(rng.choice(days, n)).sort_values()
+        df = _make_synthetic_df(n)
+        df["day"] = chosen.strftime("%Y-%m-%d").values
+        df["entry_dt"] = [f"{d.strftime('%Y-%m-%d')} 13:00:00+00:00" for d in chosen]
+        return df
+
+    def test_returns_windows(self) -> None:
+        df = self._make_dense_df(1200)
+        result = walk_forward_rolling(df, train_months=4, test_months=2, step_months=2)
+        assert "error" not in result
+        assert result["n_windows"] >= 1
+        assert "aggregated_metrics" in result
+        assert "threshold_tuning" in result
+        assert "recommended_threshold" in result
+
+    def test_threshold_tuning_populated(self) -> None:
+        df = self._make_dense_df(1200)
+        result = walk_forward_rolling(df, train_months=4, test_months=2, step_months=2)
+        if "error" in result:
+            pytest.skip("Insufficient data for walk-forward")
+        thr = result["threshold_tuning"]
+        assert len(thr) >= 4
+        for t in thr:
+            assert "threshold" in t
+            assert "trades_taken" in t
+            assert "win_rate" in t
+
+    def test_insufficient_data(self) -> None:
+        df = _make_synthetic_df(20)
+        result = walk_forward_rolling(df, train_months=8, test_months=2, step_months=1)
+        assert "error" in result
+
+
+class TestExtractEntryRules:
+    """Entry rule extraction should produce ENTER/SKIP recommendations."""
+
+    def test_returns_rules(self) -> None:
+        df = _make_synthetic_df(200)
+        rules = _extract_entry_rules(df)
+        assert len(rules) > 0
+        for r in rules:
+            assert r["action"] in ("ENTER", "SKIP")
+            assert "tp50_rate" in r
+            assert "avg_pnl" in r
+            assert "n_trades" in r
+
+    def test_rules_sorted_by_pnl(self) -> None:
+        df = _make_synthetic_df(200)
+        rules = _extract_entry_rules(df)
+        if len(rules) >= 2:
+            pnls = [r["avg_pnl"] for r in rules]
+            assert pnls == sorted(pnls, reverse=True)
+
+
+# ===================================================================
+# Production integration: extract_xgb_features + predict_xgb_entry
+# ===================================================================
+
+
+class TestExtractXgbFeatures:
+    """extract_xgb_features should extract continuous features from candidate_json."""
+
+    def test_basic_extraction(self) -> None:
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        cj = {
+            "vix": 18.5, "vix9d": 20.0, "term_structure": 1.08,
+            "vvix": 95.0, "skew": 135.0, "delta_target": 0.10,
+            "credit_to_width": 0.08, "entry_credit": 0.80,
+            "width_points": 10.0, "spot": 5800.0, "spy_price": 580.0,
+            "short_iv": 0.20, "long_iv": 0.18, "short_delta": -0.10,
+            "long_delta": -0.05, "offline_gex_net": 1e9,
+            "offline_zero_gamma": 5900.0, "max_loss": 9.2,
+            "target_dte": 7, "spread_side": "put",
+            "is_opex_day": False, "is_fomc_day": True, "is_triple_witching": False,
+        }
+        features = extract_xgb_features(cj)
+        assert features["vix"] == 18.5
+        assert features["is_put"] == 1
+        assert features["is_fomc_day"] == 1
+        assert features["gex_sign"] == 1.0
+        assert features["vix_x_delta"] == pytest.approx(18.5 * 0.10)
+
+    def test_missing_fields_return_none(self) -> None:
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        features = extract_xgb_features({})
+        assert features["vix"] is None
+        assert features["is_put"] == 0
+        assert features["entry_hour"] is None
+
+    def test_entry_hour_from_candidate_ts(self) -> None:
+        from datetime import datetime, timezone
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        ts = datetime(2025, 6, 15, 17, 0, 0, tzinfo=timezone.utc)
+        features = extract_xgb_features({}, candidate_ts=ts)
+        assert features["entry_hour"] is not None
+        assert isinstance(features["entry_hour"], int)
+
+    def test_spot_fallback_to_spx_price(self) -> None:
+        """When 'spot' is absent, should fall back to 'spx_price' at top level or context."""
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        cj = {"spx_price": 5850.0, "context": {"spy_price": 585.0}}
+        features = extract_xgb_features(cj)
+        assert features["spot"] == 5850.0
+
+        cj2 = {"context": {"spx_price": 5900.0}}
+        features2 = extract_xgb_features(cj2)
+        assert features2["spot"] == 5900.0
+
+    def test_nested_leg_iv_extraction(self) -> None:
+        """IV should be extracted from legs.short.iv / legs.long.iv when flat keys are absent."""
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        cj = {
+            "legs": {
+                "short": {"strike": 5800, "delta": -0.12, "iv": 0.22, "bid": 2.0, "ask": 2.5},
+                "long": {"strike": 5790, "delta": -0.06, "iv": 0.19, "bid": 0.8, "ask": 1.2},
+            },
+        }
+        features = extract_xgb_features(cj)
+        assert features["short_iv"] == pytest.approx(0.22)
+        assert features["long_iv"] == pytest.approx(0.19)
+        assert features["short_delta"] == pytest.approx(-0.12)
+        assert features["long_delta"] == pytest.approx(-0.06)
+
+    def test_flat_keys_take_priority_over_nested_legs(self) -> None:
+        """Top-level flat keys should be preferred over nested leg values."""
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        cj = {
+            "short_iv": 0.30, "long_iv": 0.25,
+            "short_delta": -0.15, "long_delta": -0.08,
+            "legs": {
+                "short": {"iv": 0.22, "delta": -0.12},
+                "long": {"iv": 0.19, "delta": -0.06},
+            },
+        }
+        features = extract_xgb_features(cj)
+        assert features["short_iv"] == pytest.approx(0.30)
+        assert features["long_iv"] == pytest.approx(0.25)
+        assert features["short_delta"] == pytest.approx(-0.15)
+        assert features["long_delta"] == pytest.approx(-0.08)
+
+    def test_production_shaped_candidate_json(self) -> None:
+        """Integration test with a realistic production candidate_json payload.
+
+        Exercises context fallbacks, nested leg extraction, calendar flags,
+        and CBOE context -- the full path that feature_builder_job produces.
+        """
+        from spx_backend.jobs.modeling import extract_xgb_features
+
+        production_cj = {
+            "schema_version": 2,
+            "underlying": "SPXW",
+            "snapshot_id": 42,
+            "expiration": "2026-03-27",
+            "target_dte": 3,
+            "delta_target": 0.10,
+            "spread_side": "put",
+            "width_points": 10.0,
+            "contracts": 1,
+            "entry_credit": 0.85,
+            "score": 0.92,
+            "delta_diff": 0.003,
+            "spot": 5820.0,
+            "spy_price": 582.0,
+            "spx_price": 5820.0,
+            "vix": 17.2,
+            "vix9d": 19.5,
+            "term_structure": 1.134,
+            "vvix": 88.5,
+            "skew": 142.3,
+            "is_opex_day": True,
+            "is_fomc_day": False,
+            "is_triple_witching": False,
+            "spy_spx_ratio": 0.1,
+            "legs": {
+                "short": {
+                    "symbol": "SPXW260327P05810",
+                    "strike": 5810.0,
+                    "delta": -0.10,
+                    "iv": 0.185,
+                    "bid": 1.50,
+                    "ask": 2.00,
+                    "mid": 1.75,
+                    "qty": 1,
+                    "side": "STO",
+                },
+                "long": {
+                    "symbol": "SPXW260327P05800",
+                    "strike": 5800.0,
+                    "delta": -0.06,
+                    "iv": 0.175,
+                    "bid": 0.60,
+                    "ask": 1.10,
+                    "mid": 0.85,
+                    "qty": 1,
+                    "side": "BTO",
+                },
+            },
+            "context": {
+                "ts": "2026-03-25T14:30:00+00:00",
+                "spx_price": 5820.0,
+                "spy_price": 582.0,
+                "vix": 17.2,
+                "vix9d": 19.5,
+                "term_structure": 1.134,
+                "vvix": 88.5,
+                "skew": 142.3,
+                "gex_net": -5e9,
+                "zero_gamma_level": 5850.0,
+            },
+            "cboe_context": {
+                "offline_gex_net": 2.5e9,
+                "offline_zero_gamma": 5860.0,
+            },
+        }
+
+        features = extract_xgb_features(production_cj)
+
+        assert features["spot"] == 5820.0
+        assert features["spy_price"] == 582.0
+        assert features["vix"] == 17.2
+        assert features["vix9d"] == 19.5
+        assert features["term_structure"] == pytest.approx(1.134)
+        assert features["vvix"] == 88.5
+        assert features["skew"] == 142.3
+        assert features["delta_target"] == 0.10
+        assert features["entry_credit"] == 0.85
+        assert features["width_points"] == 10.0
+        assert features["credit_to_width"] == pytest.approx(0.085)
+        assert features["short_iv"] == pytest.approx(0.185)
+        assert features["long_iv"] == pytest.approx(0.175)
+        assert features["short_delta"] == pytest.approx(-0.10)
+        assert features["long_delta"] == pytest.approx(-0.06)
+        assert features["offline_gex_net"] == pytest.approx(2.5e9)
+        assert features["offline_zero_gamma"] == 5860.0
+        assert features["dte_target"] == 3
+        assert features["is_put"] == 1
+        assert features["is_opex_day"] == 1
+        assert features["is_fomc_day"] == 0
+        assert features["is_triple_witching"] == 0
+        assert features["vix_x_delta"] == pytest.approx(17.2 * 0.10)
+        assert features["dte_x_credit"] == pytest.approx(3 * 0.085)
+        assert features["gex_sign"] == 1.0
+
+
+class TestPredictXgbEntry:
+    """predict_xgb_entry should score candidates using a model payload."""
+
+    def test_returns_prediction_dict(self) -> None:
+        from spx_backend.jobs.modeling import predict_xgb_entry
+
+        df = _make_synthetic_df(100)
+        X, y_cls, y_pnl = build_feature_matrix(df)
+        models = train_xgb_models(X, y_cls, y_pnl)
+
+        save_dir = Path("/tmp/test_xgb_predict_entry")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_model(models, save_dir)
+
+        cls_json = (save_dir / "classifier.json").read_text()
+        reg_json = (save_dir / "regressor.json").read_text()
+
+        payload = {
+            "model_type": "xgb_entry_v1",
+            "classifier_json": cls_json,
+            "regressor_json": reg_json,
+            "feature_names": models["feature_names"],
+        }
+
+        features = {fn: float(X.iloc[0][fn]) if pd.notna(X.iloc[0][fn]) else None
+                    for fn in models["feature_names"]}
+
+        pred = predict_xgb_entry(payload, features)
+        assert "probability_win" in pred
+        assert "expected_pnl" in pred
+        assert "utility_score" in pred
+        assert 0 <= pred["probability_win"] <= 1
+        assert pred["source"] == "xgb_entry_v1"

@@ -290,8 +290,9 @@ def build_gex_buckets(df: pd.DataFrame) -> dict[str, pd.Series]:
 
 
 def extract_entry_hour(df: pd.DataFrame) -> pd.Series:
-    """Extract UTC hour from entry_dt for slicing."""
-    return pd.to_datetime(df["entry_dt"]).dt.hour
+    """Extract Eastern Time hour from entry_dt for slicing."""
+    dt = pd.to_datetime(df["entry_dt"], utc=True)
+    return dt.dt.tz_convert("America/New_York").dt.hour
 
 
 # -------------------------------------------------------------------
@@ -472,7 +473,7 @@ def main() -> None:
                 df["_entry_hour"] = extract_entry_hour(df)
                 hour_slices = slice_by_dimension(df, sl_m, er, "_entry_hour")
                 if hour_slices:
-                    print(f"\n  By entry hour (UTC):")
+                    print(f"\n  By entry hour (ET):")
                     for s in hour_slices:
                         print(f"    {int(s['slice']):>5}:00: "
                               f"{s['n_trades']:>5} trades, "

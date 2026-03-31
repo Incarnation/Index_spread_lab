@@ -11,7 +11,12 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
-from spx_backend.jobs.modeling import extract_candidate_features, predict_with_bucket_model
+from spx_backend.jobs.modeling import (
+    extract_candidate_features,
+    extract_xgb_features,
+    predict_with_bucket_model,
+    predict_xgb_entry,
+)
 
 
 def _to_json(value: dict | None) -> str | None:
@@ -183,14 +188,27 @@ class ShadowInferenceJob:
             ).fetchall()
 
             inserted = 0
+            model_type = (model["model_payload"].get("model_type") or "bucket_empirical_v1")
             for row in candidate_rows:
                 candidate_json = row.candidate_json if isinstance(row.candidate_json, dict) else {}
-                features = extract_candidate_features(
-                    candidate_json=candidate_json,
-                    max_loss_points=(float(row.max_loss) if row.max_loss is not None else None),
-                    contract_multiplier=settings.label_contract_multiplier,
-                )
-                pred = predict_with_bucket_model(model_payload=model["model_payload"], features=features)
+                max_loss_pts = float(row.max_loss) if row.max_loss is not None else None
+                candidate_ts = row.ts if hasattr(row, "ts") else None
+
+                if model_type == "xgb_entry_v1":
+                    features = extract_xgb_features(
+                        candidate_json=candidate_json,
+                        max_loss_points=max_loss_pts,
+                        contract_multiplier=settings.label_contract_multiplier,
+                        candidate_ts=candidate_ts,
+                    )
+                    pred = predict_xgb_entry(model_payload=model["model_payload"], features=features)
+                else:
+                    features = extract_candidate_features(
+                        candidate_json=candidate_json,
+                        max_loss_points=max_loss_pts,
+                        contract_multiplier=settings.label_contract_multiplier,
+                    )
+                    pred = predict_with_bucket_model(model_payload=model["model_payload"], features=features)
                 probability_win = float(pred["probability_win"])
                 expected_pnl = float(pred["expected_pnl"])
                 bucket_count = int(pred.get("bucket_count") or 0)

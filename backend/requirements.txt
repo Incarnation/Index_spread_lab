@@ -22,3 +22,5 @@ pyjwt>=2.8
 passlib[bcrypt]>=1.7
 # Pin bcrypt: 4.1+ removed __about__, breaking passlib; 72-byte limit is bcrypt spec.
 bcrypt>=4.0,<4.1
+xgboost>=2.0
+scikit-learn>=1.4
