@@ -365,9 +365,11 @@ class TradePnlJob:
                 take_profit_target = trade.take_profit_target
                 if take_profit_target is None and trade.max_profit is not None:
                     take_profit_target = float(trade.max_profit) * settings.trade_pnl_take_profit_pct
-                stop_loss_target = trade.stop_loss_target
-                if stop_loss_target is None and trade.max_profit is not None:
-                    stop_loss_target = float(trade.max_profit) * settings.trade_pnl_stop_loss_pct
+                stop_loss_target = None
+                if settings.trade_pnl_stop_loss_enabled:
+                    stop_loss_target = trade.stop_loss_target
+                    if stop_loss_target is None and trade.max_profit is not None:
+                        stop_loss_target = float(trade.max_profit) * settings.trade_pnl_stop_loss_pct
 
                 close_reason = None
                 if take_profit_target is not None and pnl >= float(take_profit_target):

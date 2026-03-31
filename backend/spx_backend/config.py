@@ -169,6 +169,7 @@ class Settings(BaseSettings):
     trade_pnl_allow_outside_rth: bool = False
     trade_pnl_mark_max_age_minutes: int = 30
     trade_pnl_take_profit_pct: float = 0.50
+    trade_pnl_stop_loss_enabled: bool = True
     trade_pnl_stop_loss_pct: float = 2.00
     trade_pnl_contract_multiplier: int = 100
 

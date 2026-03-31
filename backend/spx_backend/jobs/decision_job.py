@@ -1031,7 +1031,11 @@ class DecisionJob:
         max_profit = max(entry_credit, 0.0) * contracts * multiplier
         max_loss = max(width_points - entry_credit, 0.0) * contracts * multiplier
         take_profit_target = max_profit * settings.trade_pnl_take_profit_pct
-        stop_loss_target = max_profit * settings.trade_pnl_stop_loss_pct
+        stop_loss_target = (
+            max_profit * settings.trade_pnl_stop_loss_pct
+            if settings.trade_pnl_stop_loss_enabled
+            else None
+        )
 
         expiration_raw = chosen.get("expiration")
         expiration: date | None = None

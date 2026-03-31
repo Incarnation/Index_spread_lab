@@ -163,6 +163,7 @@ class TestRunOnce:
             mock_settings.trade_pnl_allow_outside_rth = True
             mock_settings.trade_pnl_mark_max_age_minutes = 30
             mock_settings.trade_pnl_take_profit_pct = 0.50
+            mock_settings.trade_pnl_stop_loss_enabled = True
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
@@ -281,6 +282,71 @@ class TestRunOnce:
         assert result["closed"] >= 1
         close_calls = [c for c in session.calls if "STOP_LOSS" in str(c[1].get("exit_reason", ""))]
         assert len(close_calls) > 0
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_disabled_no_close(self):
+        """When trade_pnl_stop_loss_enabled is False, deep-loss trade stays open."""
+        self.mock_settings.trade_pnl_stop_loss_enabled = False
+        now_utc = datetime.now(tz=UTC)
+        trade = _make_trade(
+            trade_id=30, entry_credit=2.0, max_profit=200.0,
+            expiration=date.today() + timedelta(days=5),
+        )
+        deep_loss_mark = _make_mark(
+            short_bid=5.0, short_ask=5.2, long_bid=0.1, long_ask=0.3,
+            ts=now_utc - timedelta(minutes=1),
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {30: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 1, "entry_price": 3.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 1, "entry_price": 1.0},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=deep_loss_mark),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["closed"] == 0
+        assert result["updated"] >= 1
+        sl_calls = [c for c in session.calls if "STOP_LOSS" in str(c[1].get("exit_reason", ""))]
+        assert len(sl_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_disabled_existing_target_ignored(self):
+        """Trade with stop_loss_target already set in DB is not closed when flag is off."""
+        self.mock_settings.trade_pnl_stop_loss_enabled = False
+        now_utc = datetime.now(tz=UTC)
+        trade = _make_trade(
+            trade_id=31, entry_credit=2.0, max_profit=200.0,
+            stop_loss_target=200.0,
+            expiration=date.today() + timedelta(days=5),
+        )
+        deep_loss_mark = _make_mark(
+            short_bid=5.0, short_ask=5.2, long_bid=0.1, long_ask=0.3,
+            ts=now_utc - timedelta(minutes=1),
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {31: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 1, "entry_price": 3.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 1, "entry_price": 1.0},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=deep_loss_mark),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["closed"] == 0
+        assert result["updated"] >= 1
+        sl_calls = [c for c in session.calls if "STOP_LOSS" in str(c[1].get("exit_reason", ""))]
+        assert len(sl_calls) == 0
 
     @pytest.mark.asyncio
     async def test_expired_trade_closes(self):
