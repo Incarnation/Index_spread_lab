@@ -15,14 +15,18 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from xgb_model import (  # noqa: E402
+    BIG_LOSS_THRESHOLD,
     BINARY_FEATURES,
     CONTINUOUS_FEATURES,
     ORDINAL_FEATURES,
+    V2_EXTRA_FEATURES,
+    _add_v2_features,
     _calibration_by_decile,
     _extract_entry_rules,
     _max_drawdown,
     _resolve_targets,
     build_entry_feature_matrix,
+    build_entry_v2_feature_matrix,
     build_feature_matrix,
     load_model,
     predict_xgb,
@@ -30,6 +34,12 @@ from xgb_model import (  # noqa: E402
     train_xgb_models,
     walk_forward_rolling,
     walk_forward_validate_xgb,
+)
+
+from backtest_entry import (  # noqa: E402
+    _compute_metrics,
+    collect_oos_predictions,
+    run_strategies,
 )
 
 
@@ -672,3 +682,154 @@ class TestPredictXgbEntry:
         assert "utility_score" in pred
         assert 0 <= pred["probability_win"] <= 1
         assert pred["source"] == "xgb_entry_v1"
+
+
+# ===================================================================
+# V2 loss-avoidance model
+# ===================================================================
+
+
+class TestAddV2Features:
+    """_add_v2_features should add the expected extra columns."""
+
+    def test_adds_extra_columns(self) -> None:
+        df = _make_synthetic_df(50)
+        X, _, _ = build_entry_feature_matrix(df)
+        n_before = X.shape[1]
+        X = _add_v2_features(X, df)
+        assert X.shape[1] > n_before
+        for col in ["is_call", "iv_skew_ratio", "credit_to_max_loss", "gex_abs",
+                     "vix_change_1d", "recent_loss_rate_5d"]:
+            assert col in X.columns, f"Missing column: {col}"
+
+    def test_is_call_complement_of_is_put(self) -> None:
+        df = _make_synthetic_df(30)
+        X, _, _ = build_entry_feature_matrix(df)
+        X = _add_v2_features(X, df)
+        assert ((X["is_put"] + X["is_call"]) == 1).all()
+
+    def test_iv_skew_ratio_positive(self) -> None:
+        df = _make_synthetic_df(30)
+        X, _, _ = build_entry_feature_matrix(df)
+        X = _add_v2_features(X, df)
+        valid = X["iv_skew_ratio"].dropna()
+        assert (valid > 0).all()
+
+
+class TestBuildEntryV2FeatureMatrix:
+    """V2 feature matrix should have extra features and loss target."""
+
+    def test_shape_larger_than_v1(self) -> None:
+        df = _make_synthetic_df(50)
+        X1, _, _ = build_entry_feature_matrix(df)
+        X2, _, _ = build_entry_v2_feature_matrix(df)
+        assert X2.shape[1] > X1.shape[1]
+
+    def test_loss_target_is_binary(self) -> None:
+        df = _make_synthetic_df(100)
+        _, y_loss, _ = build_entry_v2_feature_matrix(df)
+        assert set(y_loss.unique()).issubset({0, 1})
+
+    def test_loss_target_matches_threshold(self) -> None:
+        df = _make_synthetic_df(100)
+        _, y_loss, _ = build_entry_v2_feature_matrix(df)
+        pnl = pd.to_numeric(df["hold_realized_pnl"], errors="coerce")
+        expected = (pnl < BIG_LOSS_THRESHOLD).astype(int)
+        pd.testing.assert_series_equal(y_loss, expected, check_names=False)
+
+    def test_v2_trains_and_predicts(self) -> None:
+        df = _make_synthetic_df(200)
+        X, y_cls, y_pnl = build_entry_v2_feature_matrix(df)
+        models = train_xgb_models(X, y_cls, y_pnl)
+        preds = predict_xgb(models, X)
+        assert 0 <= preds["prob_tp50"].min()
+        assert preds["prob_tp50"].max() <= 1
+
+
+class TestWalkForwardV2:
+    """Rolling walk-forward with V2 features should work."""
+
+    @staticmethod
+    def _make_dense_df(n: int = 1200, seed: int = 42) -> pd.DataFrame:
+        rng = np.random.RandomState(seed)
+        days = pd.date_range("2025-03-01", periods=n // 4, freq="B")
+        chosen = pd.to_datetime(rng.choice(days, n)).sort_values()
+        df = _make_synthetic_df(n)
+        df["day"] = chosen.strftime("%Y-%m-%d").values
+        df["entry_dt"] = [f"{d.strftime('%Y-%m-%d')} 13:00:00+00:00" for d in chosen]
+        return df
+
+    def test_v2_walk_forward_runs(self) -> None:
+        df = self._make_dense_df(1200)
+        result = walk_forward_rolling(
+            df,
+            train_months=4, test_months=2, step_months=2,
+            build_features_fn=build_entry_v2_feature_matrix,
+        )
+        assert "error" not in result
+        assert result["n_windows"] >= 1
+
+    def test_v2_threshold_inverted_for_loss(self) -> None:
+        """With is_big_loss as target (mean < 0.5), thresholds should be inverted."""
+        df = self._make_dense_df(1200)
+        result = walk_forward_rolling(
+            df,
+            train_months=4, test_months=2, step_months=2,
+            build_features_fn=build_entry_v2_feature_matrix,
+        )
+        if "error" in result:
+            pytest.skip("Insufficient data")
+        thresholds = [t["threshold"] for t in result["threshold_tuning"]]
+        assert min(thresholds) < 0.30
+
+
+# ===================================================================
+# Backtest framework
+# ===================================================================
+
+
+class TestComputeMetrics:
+    """_compute_metrics should produce valid strategy results."""
+
+    def test_basic_metrics(self) -> None:
+        pnls = np.array([100, 50, -200, 75, 30])
+        days = np.array(["2025-06-01", "2025-06-01", "2025-06-02", "2025-06-02", "2025-06-03"])
+        r = _compute_metrics(pnls, days, "test", 10)
+        assert r.trades_taken == 5
+        assert r.trades_skipped == 5
+        assert r.total_pnl == 55.0
+        assert r.win_rate == 0.8
+        assert r.profit_factor > 0
+        assert len(r.equity_curve) == 5
+
+    def test_empty_produces_zeros(self) -> None:
+        r = _compute_metrics(np.array([]), np.array([]), "empty", 5)
+        assert r.trades_taken == 0
+        assert r.total_pnl == 0
+
+    def test_all_winners_infinite_pf(self) -> None:
+        pnls = np.array([100, 200, 50])
+        days = np.array(["2025-06-01"] * 3)
+        r = _compute_metrics(pnls, days, "winners", 3)
+        assert r.profit_factor == float("inf")
+
+
+class TestRunStrategies:
+    """run_strategies should produce multiple strategy results."""
+
+    def test_produces_results(self) -> None:
+        df = _make_synthetic_df(100)
+        df["prob_tp50"] = np.random.RandomState(42).uniform(0, 1, 100)
+        df["predicted_pnl"] = np.random.RandomState(42).uniform(-200, 200, 100)
+        results = run_strategies(df)
+        assert len(results) > 3
+        for r in results:
+            assert r.trades_taken >= 0
+
+    def test_v2_strategies(self) -> None:
+        df = _make_synthetic_df(100)
+        df["prob_tp50"] = np.random.RandomState(42).uniform(0, 0.3, 100)
+        df["predicted_pnl"] = np.random.RandomState(42).uniform(-200, 200, 100)
+        results = run_strategies(df, is_v2=True)
+        v2_names = [r.name for r in results if r.name.startswith("V2")]
+        assert len(v2_names) >= 5

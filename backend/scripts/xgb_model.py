@@ -563,11 +563,99 @@ def build_entry_feature_matrix(
     return X, y_cls, y_pnl
 
 
+# ===================================================================
+# ENTRY V2: loss-avoidance features & targets
+# ===================================================================
+
+BIG_LOSS_THRESHOLD = -200.0
+
+V2_EXTRA_FEATURES = [
+    "is_call", "iv_skew_ratio", "credit_to_max_loss", "gex_abs",
+    "vix_change_1d", "recent_loss_rate_5d",
+]
+
+
+def _add_v2_features(X: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+    """Append loss-avoidance features to an existing feature matrix.
+
+    Parameters
+    ----------
+    X  : Feature matrix from ``build_entry_feature_matrix``.
+    df : Original DataFrame (same index as X) with raw columns.
+
+    Returns
+    -------
+    X with extra columns appended in-place.
+    """
+    X["is_call"] = 1 - X["is_put"]
+
+    short_iv = pd.to_numeric(df["short_iv"], errors="coerce") if "short_iv" in df.columns else pd.Series(np.nan, index=df.index)
+    long_iv = pd.to_numeric(df["long_iv"], errors="coerce") if "long_iv" in df.columns else pd.Series(np.nan, index=df.index)
+    X["iv_skew_ratio"] = short_iv / long_iv.replace(0, np.nan)
+
+    ec = pd.to_numeric(df["entry_credit"], errors="coerce") if "entry_credit" in df.columns else pd.Series(np.nan, index=df.index)
+    ml = pd.to_numeric(df["max_loss"], errors="coerce") if "max_loss" in df.columns else pd.Series(np.nan, index=df.index)
+    X["credit_to_max_loss"] = ec / ml.replace(0, np.nan)
+
+    gex = pd.to_numeric(df["offline_gex_net"], errors="coerce") if "offline_gex_net" in df.columns else pd.Series(0.0, index=df.index)
+    X["gex_abs"] = gex.abs()
+
+    # vix_change_1d: requires day-level VIX. Group by day, compute diff, merge.
+    if "vix" in df.columns and "day" in df.columns:
+        day_vix = df.groupby("day")["vix"].first().sort_index()
+        day_vix_change = day_vix.astype(float).diff().rename("vix_change_1d")
+        X["vix_change_1d"] = df["day"].map(day_vix_change).astype(float)
+    else:
+        X["vix_change_1d"] = np.nan
+
+    # recent_loss_rate_5d: rolling 5-day loss rate from prior trades.
+    # Uses hold_realized_pnl to define losers; computed per-day then mapped.
+    reg_col = "hold_realized_pnl" if "hold_realized_pnl" in df.columns else "realized_pnl"
+    if reg_col in df.columns and "day" in df.columns:
+        pnl_col = pd.to_numeric(df[reg_col], errors="coerce")
+        day_loss_rate = df.assign(_loss=(pnl_col < BIG_LOSS_THRESHOLD).astype(int)).groupby("day")["_loss"].mean().sort_index()
+        rolling_5d = day_loss_rate.rolling(5, min_periods=1).mean().shift(1).rename("recent_loss_rate_5d")
+        X["recent_loss_rate_5d"] = df["day"].map(rolling_5d).astype(float)
+    else:
+        X["recent_loss_rate_5d"] = np.nan
+
+    return X
+
+
+def build_entry_v2_feature_matrix(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Build V2 feature matrix targeting loss avoidance.
+
+    Adds extra features on top of the V1 matrix and uses
+    ``is_big_loss`` as the classifier target (inverted: 1 = big loss)
+    and ``hold_realized_pnl`` as the regressor target.
+
+    Parameters
+    ----------
+    df : Raw training CSV DataFrame.
+
+    Returns
+    -------
+    X, y_is_big_loss, y_pnl
+    """
+    X, _, y_pnl = build_entry_feature_matrix(df)
+    X = _add_v2_features(X, df.reset_index(drop=True))
+
+    reg_col = "hold_realized_pnl" if "hold_realized_pnl" in df.columns else "realized_pnl"
+    pnl = pd.to_numeric(df[reg_col], errors="coerce")
+    y_big_loss = (pnl < BIG_LOSS_THRESHOLD).astype(int)
+
+    return X, y_big_loss, y_pnl
+
+
 def walk_forward_rolling(
     df: pd.DataFrame,
     train_months: int = 8,
     test_months: int = 2,
     step_months: int = 1,
+    build_features_fn=None,
+    cls_params: dict | None = None,
 ) -> dict[str, Any]:
     """Rolling walk-forward validation with overlapping windows.
 
@@ -580,6 +668,8 @@ def walk_forward_rolling(
     train_months  : Length of each training window in months.
     test_months   : Length of each test window in months.
     step_months   : How far to advance the window each step.
+    build_features_fn : Feature builder (defaults to build_entry_feature_matrix).
+    cls_params    : Override default classifier hyperparameters.
 
     Returns
     -------
@@ -592,6 +682,9 @@ def walk_forward_rolling(
 
     first_day = df_sorted["_day_dt"].iloc[0]
     last_day = df_sorted["_day_dt"].iloc[-1]
+
+    if build_features_fn is None:
+        build_features_fn = build_entry_feature_matrix
 
     windows: list[dict[str, Any]] = []
     all_test_preds: list[pd.DataFrame] = []
@@ -615,8 +708,8 @@ def walk_forward_rolling(
             train_start += relativedelta(months=step_months)
             continue
 
-        X_train_full, y_cls_train_full, y_pnl_train_full = build_entry_feature_matrix(train_df)
-        X_test, y_cls_test, y_pnl_test = build_entry_feature_matrix(test_df)
+        X_train_full, y_cls_train_full, y_pnl_train_full = build_features_fn(train_df)
+        X_test, y_cls_test, y_pnl_test = build_features_fn(test_df)
 
         val_split = int(len(X_train_full) * 0.9)
         X_train = X_train_full.iloc[:val_split]
@@ -630,6 +723,7 @@ def walk_forward_rolling(
         models = train_xgb_models(
             X_train, y_cls_train, y_pnl_train,
             X_val, y_cls_val, y_pnl_val,
+            cls_params=cls_params,
         )
         elapsed = time.time() - t0
 
@@ -682,16 +776,27 @@ def walk_forward_rolling(
     agg_mae = float(np.mean(np.abs(pooled_pnls - np.concatenate([p["predicted_pnl"].values for p in all_test_preds]))))
     agg_calibration = _calibration_by_decile(pooled_labels, pooled_probs)
 
-    # Threshold tuning on pooled test predictions
+    # Threshold tuning on pooled test predictions.
+    # For V1 (TP50 classifier): take when prob >= thr (higher = better).
+    # For V2 (loss classifier): take when prob < thr (lower = safer).
+    # Detect direction from mean label: if > 0.5, classifier predicts "good" (V1 style).
+    label_mean = float(pooled_labels.mean())
+    higher_is_better = label_mean > 0.5
+
+    if higher_is_better:
+        thr_range = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+    else:
+        thr_range = [0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50]
+
     threshold_results = []
-    for thr in [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
-        mask = pooled_probs >= thr
+    for thr in thr_range:
+        mask = pooled_probs >= thr if higher_is_better else pooled_probs < thr
         n_taken = int(mask.sum())
         if n_taken == 0:
             threshold_results.append({"threshold": thr, "trades_taken": 0, "win_rate": 0.0,
                                       "avg_pnl": 0.0, "total_pnl": 0.0})
             continue
-        win_rate = float(pooled_labels[mask].mean())
+        win_rate = float((pooled_pnls[mask] > 0).mean())
         avg_pnl = float(pooled_pnls[mask].mean())
         total_pnl = float(pooled_pnls[mask].sum())
         threshold_results.append({"threshold": thr, "trades_taken": n_taken, "win_rate": win_rate,
@@ -1119,11 +1224,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode", type=str, default="tp50",
-        choices=["tp50", "hold-vs-close", "entry"],
+        choices=["tp50", "hold-vs-close", "entry", "entry-v2"],
         help="'tp50' trains TP50 + PnL models (default). "
              "'hold-vs-close' trains SL risk + hold decision models. "
-             "'entry' trains entry classifier with rolling walk-forward "
-             "and threshold tuning (requires --relabel trajectory data).",
+             "'entry' trains entry classifier with rolling walk-forward. "
+             "'entry-v2' loss-avoidance model with extra features and "
+             "asymmetric weighting (requires --relabel trajectory data).",
     )
     args = parser.parse_args()
 
@@ -1141,6 +1247,9 @@ def main() -> None:
         return
     if args.mode == "entry":
         _run_entry(df, csv_path, args.save_dir)
+        return
+    if args.mode == "entry-v2":
+        _run_entry_v2(df, csv_path, args.save_dir)
         return
 
     _run_tp50(df, csv_path, args.save_dir)
@@ -1342,6 +1451,102 @@ def _run_entry(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> No
     save_model(models, save_dir)
     print(f"[ENTRY] Model saved to {save_dir}/")
     print("[ENTRY] Done.")
+
+
+def _run_entry_v2(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> None:
+    """Loss-avoidance entry model: predict P(big_loss) with asymmetric weighting."""
+    reg_col = "hold_realized_pnl" if "hold_realized_pnl" in df.columns else "realized_pnl"
+    pnl = pd.to_numeric(df[reg_col], errors="coerce")
+    big_loss_rate = (pnl < BIG_LOSS_THRESHOLD).mean()
+    print(f"[ENTRY-V2] Big loss (< ${BIG_LOSS_THRESHOLD:.0f}) rate: {big_loss_rate:.1%}")
+
+    # Asymmetric weighting: missed loser costs ~$592, skipped winner costs ~$78
+    # scale_pos_weight = cost_of_FN / cost_of_FP ≈ 592/78 ≈ 7.6
+    pos_weight = 7.0
+    v2_cls_params = {
+        **DEFAULT_CLS_PARAMS,
+        "scale_pos_weight": pos_weight,
+    }
+    print(f"[ENTRY-V2] scale_pos_weight={pos_weight:.1f}")
+    print("[ENTRY-V2] Rolling walk-forward (8/2/1 months) ...")
+
+    results = walk_forward_rolling(
+        df,
+        build_features_fn=build_entry_v2_feature_matrix,
+        cls_params=v2_cls_params,
+    )
+    if "error" in results:
+        print(f"[ERROR] {results['error']}")
+        return
+
+    am = results["aggregated_metrics"]
+    windows = results["windows"]
+
+    print(f"\n{'=' * 70}")
+    print("ENTRY-V2 — LOSS-AVOIDANCE MODEL RESULTS")
+    print(f"{'=' * 70}")
+    print(f"  Windows      : {results['n_windows']}")
+    print(f"  Pooled test  : {results['pooled_test_count']} rows")
+
+    for w in windows:
+        print(f"\n  Window {w['window']}: train={w['train_count']} ({w['train_days']}), "
+              f"test={w['test_count']} ({w['test_days']})")
+        print(f"    Brier={w['brier']:.4f}  MAE=${w['mae']:.2f}  "
+              f"BigLoss={w['tp50_rate']:.1%}  E[PnL]=${w['expectancy']:.2f}  "
+              f"MaxDD=${w['max_drawdown']:.0f}  time={w['train_time_s']:.1f}s")
+
+    print(f"\n  --- Aggregated Metrics ---")
+    print(f"  Brier score    : {am['brier_score']:.4f}")
+    print(f"  MAE (PnL)      : ${am['mae_pnl']:.2f}")
+    print(f"  Big-loss rate  : {am['tp50_rate']:.1%}")
+    print(f"  Expectancy     : ${am['expectancy']:.2f}")
+    print(f"  Max drawdown   : ${am['max_drawdown']:.0f}")
+
+    # For V2, threshold tuning means: SKIP trade when P(big_loss) > threshold
+    # Lower threshold = more aggressive filtering (skip more)
+    pooled_probs = np.concatenate([
+        np.array(results["_all_test_probs"]) if "_all_test_probs" in results else []
+    ]) if "_all_test_probs" in results else None
+
+    # Re-derive pooled predictions from threshold_tuning for the report
+    thr_results = results["threshold_tuning"]
+    print(f"\n  --- Loss-Avoidance Threshold Tuning ---")
+    print(f"  (Classifier predicts P(big_loss); SKIP when P > threshold)")
+    print(f"  {'Threshold':>10} {'Trades':>8} {'Win Rate':>10} {'Avg PnL':>10} {'Total PnL':>12}")
+    for t in thr_results:
+        marker = " <-- best" if t["threshold"] == results["recommended_threshold"] else ""
+        print(f"  {t['threshold']:>10.2f} {t['trades_taken']:>8d} {t['win_rate']:>10.1%} "
+              f"${t['avg_pnl']:>9.2f} ${t['total_pnl']:>11,.0f}{marker}")
+
+    # Feature importances
+    all_fi: dict[str, list[float]] = {}
+    for w in windows:
+        for f in w["feature_importance"]:
+            all_fi.setdefault(f["feature"], []).append(f["importance"])
+    avg_fi = sorted(
+        [{"feature": k, "importance": float(np.mean(v))} for k, v in all_fi.items()],
+        key=lambda x: x["importance"], reverse=True,
+    )
+    print(f"\n  --- Top Feature Importances (loss-avoidance model) ---")
+    for i, f in enumerate(avg_fi[:20], 1):
+        print(f"  {i:>2}. {f['feature']:<25s} {f['importance']:.4f}")
+
+    print(f"\n{'=' * 70}")
+
+    # Train final model and save
+    print("\n[ENTRY-V2] Training final model on all data ...")
+    df_sorted = df.sort_values("day").reset_index(drop=True)
+    X_full, y_cls, y_pnl = build_entry_v2_feature_matrix(df_sorted)
+    val_split = int(len(X_full) * 0.9)
+    models = train_xgb_models(
+        X_full.iloc[:val_split], y_cls.iloc[:val_split], y_pnl.iloc[:val_split],
+        X_full.iloc[val_split:], y_cls.iloc[val_split:], y_pnl.iloc[val_split:],
+        cls_params=v2_cls_params,
+    )
+    save_dir = Path(save_dir_arg) if save_dir_arg else csv_path.parent / "xgb_entry_v2_model"
+    save_model(models, save_dir)
+    print(f"[ENTRY-V2] Model saved to {save_dir}/")
+    print("[ENTRY-V2] Done.")
 
 
 if __name__ == "__main__":
