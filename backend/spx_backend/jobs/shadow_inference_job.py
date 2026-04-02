@@ -211,18 +211,35 @@ class ShadowInferenceJob:
                     pred = predict_with_bucket_model(model_payload=model["model_payload"], features=features)
                 probability_win = float(pred["probability_win"])
                 expected_pnl = float(pred["expected_pnl"])
-                bucket_count = int(pred.get("bucket_count") or 0)
-                pnl_std = float(pred.get("pnl_std") or 0.0)
                 raw_utility = float(pred["utility_score"])
-                uncertainty_penalty = compute_uncertainty_penalty(bucket_count=bucket_count, pnl_std=pnl_std)
-                score_raw = raw_utility - uncertainty_penalty
-                uncertainty_level = classify_uncertainty_level(bucket_count=bucket_count, pnl_std=pnl_std)
-                decision_hint = classify_prediction(
-                    probability_win=probability_win,
-                    expected_pnl=expected_pnl,
-                    bucket_count=bucket_count,
-                    pnl_std=pnl_std,
-                )
+
+                if model_type == "xgb_entry_v1":
+                    # XGBoost models have no bucket-based uncertainty; skip
+                    # the bucket_count / pnl_std penalties that assume the
+                    # bucket_empirical pipeline.
+                    score_raw = raw_utility
+                    uncertainty_penalty = 0.0
+                    uncertainty_level = "n/a"
+                    decision_hint = (
+                        "TRADE"
+                        if (probability_win >= settings.decision_hybrid_min_probability
+                            and expected_pnl >= settings.decision_hybrid_min_expected_pnl)
+                        else "SKIP"
+                    )
+                    bucket_count = 0
+                    pnl_std = 0.0
+                else:
+                    bucket_count = int(pred.get("bucket_count") or 0)
+                    pnl_std = float(pred.get("pnl_std") or 0.0)
+                    uncertainty_penalty = compute_uncertainty_penalty(bucket_count=bucket_count, pnl_std=pnl_std)
+                    score_raw = raw_utility - uncertainty_penalty
+                    uncertainty_level = classify_uncertainty_level(bucket_count=bucket_count, pnl_std=pnl_std)
+                    decision_hint = classify_prediction(
+                        probability_win=probability_win,
+                        expected_pnl=expected_pnl,
+                        bucket_count=bucket_count,
+                        pnl_std=pnl_std,
+                    )
 
                 meta_json = {
                     "model_name": model["model_name"],
