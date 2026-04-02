@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+from loguru import logger
 from sqlalchemy import text
 
 from spx_backend.database.connection import engine
@@ -70,14 +72,38 @@ def _sql_dir() -> Path:
     return Path(__file__).resolve().parent / "sql"
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Remove ``--`` line comments and ``/* */`` block comments from raw SQL.
+
+    This prevents asyncpg from choking on comment-only fragments that survive
+    the semicolon split in :func:`_execute_sql_file`.  String literals
+    containing ``--`` are not used in our migration files so the simple regex
+    approach is safe here.
+    """
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", "", sql)
+    return sql
+
+
 async def _execute_sql_file(path: Path) -> None:
-    """Execute SQL file statement-by-statement for asyncpg compatibility."""
-    sql = path.read_text(encoding="utf-8")
+    """Execute SQL file statement-by-statement for asyncpg compatibility.
+
+    Parameters
+    ----------
+    path:
+        Filesystem path to a ``.sql`` file.  Comments are stripped before
+        splitting on ``;`` so comment-only fragments never reach the driver.
+    """
+    raw_sql = path.read_text(encoding="utf-8")
+    sql = _strip_sql_comments(raw_sql)
     async with engine.begin() as conn:
-        # Execute statement-by-statement (asyncpg won't reliably accept multi-statement executes).
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         for stmt in statements:
-            await conn.exec_driver_sql(stmt)
+            try:
+                await conn.exec_driver_sql(stmt)
+            except Exception:
+                logger.error("sql_exec_failed file={} statement={!r}", path.name, stmt[:120])
+                raise
 
 
 def _migrations_dir() -> Path:

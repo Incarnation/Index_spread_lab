@@ -242,6 +242,7 @@ class ShadowInferenceJob:
                     )
 
                 meta_json = {
+                    "decision_hint": decision_hint,
                     "model_name": model["model_name"],
                     "model_version": model["version"],
                     "rollout_status": model["rollout_status"],

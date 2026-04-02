@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     """If True, skip running quote/snapshot/gex jobs once on startup (server becomes ready immediately). Scheduler still runs jobs on their intervals."""
     skip_startup_warmup: bool = False
+    skip_init_db: bool = False
+    """Skip schema/migration DDL on startup.  Useful for local dev against a
+    production database where ``CREATE INDEX IF NOT EXISTS`` blocks on table
+    locks held by autovacuum."""
     tz: str = "America/New_York"
 
     database_url: str
@@ -75,7 +79,7 @@ class Settings(BaseSettings):
     cboe_gex_allow_outside_rth: bool = False
 
     decision_entry_times: str = "10:02,11:02,12:02"
-    decision_dte_targets: str = "0,3,5,7,10"
+    decision_dte_targets: str = "3,5,7,10"
     decision_dte_tolerance_days: int = 0
     decision_delta_targets: str = "0.10,0.20"
     decision_spread_side: str = "put"
@@ -136,7 +140,7 @@ class Settings(BaseSettings):
     shadow_inference_enabled: bool = True
     shadow_inference_batch_limit: int = 500
     shadow_inference_lookback_minutes: int = 1440
-    shadow_inference_model_name: str = "cand_bucket_v1"
+    shadow_inference_model_name: str = "spx_credit_spread_v1"
 
     # Promotion gate evaluator (step 5)
     promotion_gate_enabled: bool = True
@@ -151,7 +155,7 @@ class Settings(BaseSettings):
 
     # Hybrid execution policy (step 6)
     decision_hybrid_enabled: bool = False
-    decision_hybrid_model_name: str = "cand_bucket_v1"
+    decision_hybrid_model_name: str = "spx_credit_spread_v1"
     decision_hybrid_min_probability: float = 0.50
     decision_hybrid_min_expected_pnl: float = 0.0
     decision_hybrid_min_bucket_count: int = 8

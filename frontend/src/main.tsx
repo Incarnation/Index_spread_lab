@@ -1,44 +1,49 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
-import "@mantine/core/styles.css";
-import { MantineProvider } from "@mantine/core";
+import "./index.css";
 import { AuthProvider } from "./contexts/AuthContext";
-import { DashboardApp } from "./DashboardApp";
-import { AuthAuditPage } from "./pages/AuthAuditPage";
+import { AppShell } from "./app/AppShell";
 import { LoginPage } from "./pages/LoginPage";
+import { OverviewPage } from "./pages/OverviewPage";
+import { TradesPage } from "./pages/TradesPage";
+import { DecisionsPage } from "./pages/DecisionsPage";
+import { ModelMonitorPage } from "./pages/ModelMonitorPage";
+import { PerformancePage } from "./pages/PerformancePage";
+import { GexPage } from "./pages/GexPage";
+import { AdminPage } from "./pages/AdminPage";
+import { BacktestPage } from "./pages/BacktestPage";
+import { AuthAuditPage } from "./pages/AuthAuditPage";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <MantineProvider defaultColorScheme="light">
-      <ErrorBoundary>
-        <BrowserRouter>
-          <AuthProvider>
-            <Routes>
-              <Route path="/login" element={<LoginPage />} />
-              <Route
-                path="/admin/auth-audit"
-                element={
-                  <ProtectedRoute>
-                    <AuthAuditPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/*"
-                element={
-                  <ProtectedRoute>
-                    <DashboardApp />
-                  </ProtectedRoute>
-                }
-              />
-            </Routes>
-          </AuthProvider>
-        </BrowserRouter>
-      </ErrorBoundary>
-    </MantineProvider>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AuthProvider>
+          <Routes>
+            <Route path="/login" element={<LoginPage />} />
+            <Route
+              element={
+                <ProtectedRoute>
+                  <AppShell />
+                </ProtectedRoute>
+              }
+            >
+              <Route index element={<OverviewPage />} />
+              <Route path="trades" element={<TradesPage />} />
+              <Route path="decisions" element={<DecisionsPage />} />
+              <Route path="model" element={<ModelMonitorPage />} />
+              <Route path="performance" element={<PerformancePage />} />
+              <Route path="gex" element={<GexPage />} />
+              <Route path="admin" element={<AdminPage />} />
+              <Route path="admin/auth-audit" element={<AuthAuditPage />} />
+              <Route path="backtest" element={<BacktestPage />} />
+            </Route>
+          </Routes>
+        </AuthProvider>
+      </BrowserRouter>
+    </ErrorBoundary>
   </React.StrictMode>
 );
-

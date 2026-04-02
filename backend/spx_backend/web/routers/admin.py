@@ -283,7 +283,7 @@ async def admin_auth_audit(
 
 @router.get("/api/admin/preflight")
 async def admin_preflight(
-    current_user: UserOut = Depends(get_current_user),
+    current_user: UserOut = Depends(require_admin),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Return one-call pipeline health summary with freshness diagnostics."""

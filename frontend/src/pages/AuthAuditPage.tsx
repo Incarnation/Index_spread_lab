@@ -3,48 +3,29 @@
  * Admin-only; non-admins are redirected to the dashboard.
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Alert, Box, Button, Code, Container, Group, Loader, Modal, Stack, Table, Text, Title } from "@mantine/core";
-import { useAuth } from "../contexts/AuthContext";
-import { fetchAuthAudit, type AuthAuditEvent, type AuthAuditResponse } from "../api";
+import { useAuth } from "@/contexts/AuthContext";
+import { fetchAuthAudit, type AuthAuditEvent, type AuthAuditResponse } from "@/api";
+import { DataTable } from "@/components/shared/DataTable";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { X } from "lucide-react";
 
 const PAGE_SIZE = 100;
 
-/** Format ISO timestamp in user's local timezone for display. */
 function formatAuditTime(iso: string | null): string {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    dateStyle: "medium",
-    timeStyle: "medium",
-  });
+  return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" });
 }
 
-/**
- * Derive a short browser/device label from User-Agent (Chrome, Safari, Firefox, etc.).
- * Most browsers send a UA starting with "Mozilla/5.0" for legacy reasons; we parse the real engine.
- */
 function formatUserAgentShort(ua: string | null): string {
-  if (!ua || !ua.trim()) return "—";
+  if (!ua?.trim()) return "—";
   const s = ua.trim();
-  // Order matters: Chrome includes "Safari", Edge includes "Chrome"
-  if (s.includes("Edg/")) {
-    const m = s.match(/Edg\/([\d.]+)/);
-    return m ? `Edge ${m[1]}` : "Edge";
-  }
-  if (s.includes("Chrome/") && !s.includes("Chromium")) {
-    const m = s.match(/Chrome\/([\d.]+)/);
-    return m ? `Chrome ${m[1]}` : "Chrome";
-  }
-  if (s.includes("Firefox/")) {
-    const m = s.match(/Firefox\/([\d.]+)/);
-    return m ? `Firefox ${m[1]}` : "Firefox";
-  }
-  if (s.includes("Safari/") && !s.includes("Chrome")) {
-    const m = s.match(/Version\/([\d.]+).*Safari/);
-    return m ? `Safari ${m[1]}` : "Safari";
-  }
+  if (s.includes("Edg/")) return s.match(/Edg\/([\d.]+)/)?.[0] ?? "Edge";
+  if (s.includes("Chrome/") && !s.includes("Chromium")) return s.match(/Chrome\/([\d.]+)/)?.[0] ?? "Chrome";
+  if (s.includes("Firefox/")) return s.match(/Firefox\/([\d.]+)/)?.[0] ?? "Firefox";
+  if (s.includes("Safari/") && !s.includes("Chrome")) return s.match(/Version\/([\d.]+)/)?.[0] ?? "Safari";
   return s.length > 50 ? `${s.slice(0, 47)}…` : s;
 }
 
@@ -55,14 +36,13 @@ export function AuthAuditPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(0);
-  const [detailsModalEvent, setDetailsModalEvent] = useState<AuthAuditEvent | null>(null);
+  const [detail, setDetail] = useState<AuthAuditEvent | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetchAuthAudit(PAGE_SIZE, page * PAGE_SIZE, null, null);
-      setData(res);
+      setData(await fetchAuthAudit(PAGE_SIZE, page * PAGE_SIZE, null, null));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load audit log");
       if (e instanceof Error && (e.message.includes("403") || e.message.includes("Forbidden"))) {
@@ -75,147 +55,103 @@ export function AuthAuditPage() {
 
   useEffect(() => {
     if (!user) return;
-    if (!user.is_admin) {
-      navigate("/", { replace: true });
-      return;
-    }
+    if (!user.is_admin) { navigate("/", { replace: true }); return; }
     load();
   }, [user, load, navigate]);
 
-  if (!user) return null;
-  if (!user.is_admin) return null;
+  if (!user?.is_admin) return null;
 
   return (
-    <Box bg="gray.0" mih="100vh" py="xl">
-      <Container size="xl">
-        <Box mb="lg">
-          <Button variant="subtle" size="xs" component={Link} to="/">
-            ← Dashboard
-          </Button>
-        </Box>
-        <Title order={2} mb="xs">
-          Auth Audit Log
-        </Title>
-        <Text c="dimmed" size="sm" mb="md">
-          Login, logout, and session expiry events. Admin only.
-        </Text>
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold text-foreground">Auth Audit Log</h2>
+          <p className="text-sm text-muted-foreground">Login, logout, and session expiry events. Admin only.</p>
+        </div>
+        <Button variant="ghost" size="sm" asChild>
+          <Link to="/">← Dashboard</Link>
+        </Button>
+      </div>
 
-        {error && (
-          <Alert color="red" title="Error" mb="md">
-            {error}
-          </Alert>
-        )}
+      {error && (
+        <div className="rounded-md bg-loss-bg border border-loss/30 p-3 text-sm text-loss">{error}</div>
+      )}
 
-        {loading && (
-          <Loader size="sm" />
-        )}
+      {loading && <p className="text-sm text-muted">Loading...</p>}
 
-        {!loading && data && (
-          <>
-            <Text size="sm" c="dimmed" mb="sm">
-              Total: {data.total} · Showing {data.events.length} (offset {data.offset})
-            </Text>
-            <Table striped highlightOnHover withTableBorder>
-              <Table.Thead>
-                <Table.Tr>
-                  <Table.Th>Time</Table.Th>
-                  <Table.Th>Event</Table.Th>
-                  <Table.Th>User</Table.Th>
-                  <Table.Th>IP</Table.Th>
-                  <Table.Th>Country</Table.Th>
-                  <Table.Th>Browser</Table.Th>
-                  <Table.Th></Table.Th>
-                </Table.Tr>
-              </Table.Thead>
-              <Table.Tbody>
-                {data.events.map((ev: AuthAuditEvent) => (
-                  <Table.Tr key={ev.id}>
-                    <Table.Td>{formatAuditTime(ev.occurred_at)}</Table.Td>
-                    <Table.Td>{ev.event_type}</Table.Td>
-                    <Table.Td>{ev.username ?? (ev.user_id != null ? `id:${ev.user_id}` : "—")}</Table.Td>
-                    <Table.Td>{ev.ip_address ?? "—"}</Table.Td>
-                    <Table.Td>{ev.country ?? "—"}</Table.Td>
-                    <Table.Td>
-                      <Text size="xs" title={ev.user_agent ?? undefined}>
-                        {formatUserAgentShort(ev.user_agent)}
-                      </Text>
-                    </Table.Td>
-                    <Table.Td>
-                      <Button
-                        variant="subtle"
-                        size="xs"
-                        onClick={() => setDetailsModalEvent(ev)}
-                      >
-                        View details
-                      </Button>
-                    </Table.Td>
-                  </Table.Tr>
-                ))}
-              </Table.Tbody>
-            </Table>
+      {!loading && data && (
+        <>
+          <p className="text-xs text-muted-foreground">
+            Total: {data.total} · Showing {data.events.length} (offset {data.offset})
+          </p>
 
-            <Modal
-              title="Event details"
-              opened={detailsModalEvent !== null}
-              onClose={() => setDetailsModalEvent(null)}
-              size="lg"
-            >
-              {detailsModalEvent && (
-                <Stack gap="md">
-                  <Text size="sm" c="dimmed">
-                    {formatAuditTime(detailsModalEvent.occurred_at)} · {detailsModalEvent.event_type} · {detailsModalEvent.username ?? "—"}
-                  </Text>
-                  {(detailsModalEvent.geo_json && Object.keys(detailsModalEvent.geo_json).length > 0) ||
-                   (detailsModalEvent.details && Object.keys(detailsModalEvent.details).length > 0) ? (
-                    <>
-                      {(detailsModalEvent.geo_json ?? (detailsModalEvent.details as { geo?: Record<string, unknown> })?.geo) && (
-                        <>
-                          <Text size="sm" fw={600}>Geo / IP lookup (full)</Text>
-                          <Code block style={{ whiteSpace: "pre", maxHeight: 360, overflow: "auto" }}>
-                            {JSON.stringify(
-                              detailsModalEvent.geo_json ?? (detailsModalEvent.details as { geo?: Record<string, unknown> })?.geo,
-                              null,
-                              2
-                            )}
-                          </Code>
-                        </>
-                      )}
-                      {detailsModalEvent.details && Object.keys(detailsModalEvent.details).filter((k) => k !== "geo").length > 0 && (
-                        <>
-                          <Text size="sm" fw={600}>Other details</Text>
-                          <Code block style={{ whiteSpace: "pre", maxHeight: 200, overflow: "auto" }}>
-                            {JSON.stringify(detailsModalEvent.details, null, 2)}
-                          </Code>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <Text size="sm" c="dimmed">No additional details stored for this event.</Text>
-                  )}
-                </Stack>
-              )}
-            </Modal>
-            <Group mt="md" gap="xs">
-              <Button
-                variant="light"
-                size="xs"
-                disabled={page === 0}
-                onClick={() => setPage((p) => Math.max(0, p - 1))}
-              >
-                Previous
-              </Button>
-              <Button
-                variant="light"
-                size="xs"
-                disabled={data.offset + data.events.length >= data.total}
-                onClick={() => setPage((p) => p + 1)}
-              >
-                Next
-              </Button>
-            </Group>
-          </>
-        )}
-      </Container>
-    </Box>
+          <DataTable
+            columns={[
+              { key: "occurred_at", header: "Time", render: (ev: AuthAuditEvent) => formatAuditTime(ev.occurred_at) },
+              {
+                key: "event_type",
+                header: "Event",
+                render: (ev: AuthAuditEvent) => (
+                  <Badge variant={ev.event_type === "login" ? "profit" : ev.event_type === "logout" ? "muted" : "warning"}>
+                    {ev.event_type}
+                  </Badge>
+                ),
+              },
+              { key: "username", header: "User", render: (ev: AuthAuditEvent) => ev.username ?? (ev.user_id != null ? `id:${ev.user_id}` : "—") },
+              { key: "ip_address", header: "IP", render: (ev: AuthAuditEvent) => ev.ip_address ?? "—" },
+              { key: "country", header: "Country", render: (ev: AuthAuditEvent) => ev.country ?? "—" },
+              { key: "user_agent", header: "Browser", render: (ev: AuthAuditEvent) => (
+                <span className="text-xs" title={ev.user_agent ?? undefined}>{formatUserAgentShort(ev.user_agent)}</span>
+              )},
+            ]}
+            data={data.events}
+            keyFn={(ev) => ev.id}
+            onRowClick={setDetail}
+          />
+
+          <div className="flex gap-2">
+            <Button variant="ghost" size="sm" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+              Previous
+            </Button>
+            <Button variant="ghost" size="sm" disabled={data.offset + data.events.length >= data.total} onClick={() => setPage((p) => p + 1)}>
+              Next
+            </Button>
+          </div>
+        </>
+      )}
+
+      {/* Detail drawer */}
+      {detail && (
+        <div className="fixed inset-y-0 right-0 z-50 w-[480px] border-l border-border bg-card shadow-2xl overflow-y-auto">
+          <div className="flex items-center justify-between p-4 border-b border-border">
+            <h3 className="text-sm font-medium text-foreground">Event Details</h3>
+            <Button variant="ghost" size="icon" onClick={() => setDetail(null)}>
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="p-4 space-y-3 text-sm">
+            <p className="text-muted-foreground">
+              {formatAuditTime(detail.occurred_at)} · {detail.event_type} · {detail.username ?? "—"}
+            </p>
+            {detail.geo_json && Object.keys(detail.geo_json).length > 0 && (
+              <div>
+                <span className="text-xs text-muted font-medium">Geo / IP Lookup</span>
+                <pre className="mt-1 rounded-md bg-background p-3 text-xs text-foreground-secondary overflow-x-auto max-h-64">
+                  {JSON.stringify(detail.geo_json, null, 2)}
+                </pre>
+              </div>
+            )}
+            {detail.details && Object.keys(detail.details).length > 0 && (
+              <div>
+                <span className="text-xs text-muted font-medium">Other Details</span>
+                <pre className="mt-1 rounded-md bg-background p-3 text-xs text-foreground-secondary overflow-x-auto max-h-48">
+                  {JSON.stringify(detail.details, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

@@ -5,8 +5,7 @@
 
 import React from "react";
 import { Navigate, useLocation } from "react-router-dom";
-import { Box, Loader, Text } from "@mantine/core";
-import { useAuth } from "../contexts/AuthContext";
+import { useAuth } from "@/contexts/AuthContext";
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { token, loading } = useAuth();
@@ -14,12 +13,12 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
   if (loading) {
     return (
-      <Box ta="center" py="xl">
-        <Loader size="lg" />
-        <Text size="sm" c="dimmed" mt="sm">
-          Checking auth…
-        </Text>
-      </Box>
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <div className="text-center">
+          <div className="mx-auto h-6 w-6 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+          <p className="mt-3 text-sm text-muted">Checking auth…</p>
+        </div>
+      </div>
     );
   }
 

@@ -55,39 +55,6 @@ async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Respo
   return r;
 }
 
-/**
- * Build admin auth headers when an API key is provided (optional; JWT is primary).
- */
-function adminHeaders(apiKey?: string): HeadersInit | undefined {
-  if (!apiKey) return undefined;
-  const trimmed = apiKey.trim();
-  if (!trimmed) return undefined;
-  const normalized =
-    trimmed.length >= 2 &&
-    ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))
-      ? trimmed.slice(1, -1).trim()
-      : trimmed;
-  return normalized ? { "X-API-Key": normalized } : undefined;
-}
-
-export type ChainSnapshot = {
-  snapshot_id: number;
-  ts: string;
-  underlying: string;
-  target_dte: number;
-  expiration: string;
-  checksum: string;
-};
-
-/**
- * Fetch recent chain snapshot metadata for the dashboard table.
- */
-export async function fetchChainSnapshots(limit = 50): Promise<ChainSnapshot[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/chain-snapshots?limit=${encodeURIComponent(limit)}`));
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = await safeJson<{ items: ChainSnapshot[] }>(r);
-  return data.items;
-}
 
 export type RunSnapshotResult = {
   skipped: boolean;
@@ -104,10 +71,9 @@ export type RunSnapshotResult = {
 /**
  * Trigger a manual snapshot run through the admin endpoint.
  */
-export async function runSnapshotNow(apiKey?: string): Promise<RunSnapshotResult> {
+export async function runSnapshotNow(): Promise<RunSnapshotResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-snapshot`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<RunSnapshotResult>(r);
@@ -123,10 +89,9 @@ export type RunQuotesResult = {
 /**
  * Trigger a manual quote ingestion run through the admin endpoint.
  */
-export async function runQuotesNow(apiKey?: string): Promise<RunQuotesResult> {
+export async function runQuotesNow(): Promise<RunQuotesResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-quotes`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<RunQuotesResult>(r);
@@ -164,10 +129,9 @@ export type RunDecisionResult = {
 /**
  * Trigger the decision engine immediately through the admin endpoint.
  */
-export async function runDecisionNow(apiKey?: string): Promise<RunDecisionResult> {
+export async function runDecisionNow(): Promise<RunDecisionResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-decision`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<RunDecisionResult>(r);
@@ -185,10 +149,9 @@ export type RunTradePnlResult = {
 /**
  * Trigger live trade mark-to-market updates immediately.
  */
-export async function runTradePnlNow(apiKey?: string): Promise<RunTradePnlResult> {
+export async function runTradePnlNow(): Promise<RunTradePnlResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-trade-pnl`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<RunTradePnlResult>(r);
@@ -205,10 +168,9 @@ export type GenericAdminRunResult = {
 /**
  * Trigger a manual GEX computation run.
  */
-export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runGexNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-gex`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -217,10 +179,9 @@ export async function runGexNow(apiKey?: string): Promise<GenericAdminRunResult>
 /**
  * Trigger a manual feature-builder run.
  */
-export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runFeatureBuilderNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-feature-builder`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -229,10 +190,9 @@ export async function runFeatureBuilderNow(apiKey?: string): Promise<GenericAdmi
 /**
  * Trigger a manual labeler run.
  */
-export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runLabelerNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-labeler`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -241,10 +201,9 @@ export async function runLabelerNow(apiKey?: string): Promise<GenericAdminRunRes
 /**
  * Trigger a manual trainer run.
  */
-export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runTrainerNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-trainer`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -253,10 +212,9 @@ export async function runTrainerNow(apiKey?: string): Promise<GenericAdminRunRes
 /**
  * Trigger a manual shadow-inference run.
  */
-export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runShadowInferenceNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-shadow-inference`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -265,10 +223,9 @@ export async function runShadowInferenceNow(apiKey?: string): Promise<GenericAdm
 /**
  * Trigger a manual promotion-gate run.
  */
-export async function runPromotionGatesNow(apiKey?: string): Promise<GenericAdminRunResult> {
+export async function runPromotionGatesNow(): Promise<GenericAdminRunResult> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/run-promotion-gates`), {
     method: "POST",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<GenericAdminRunResult>(r);
@@ -295,10 +252,6 @@ export type GexCurvePoint = {
   gex_puts: number | null;
 };
 
-export type GexExpirationItem = {
-  expiration: string;
-  dte_days: number | null;
-};
 
 /**
  * Fetch recent GEX snapshot aggregates for the panel selector.
@@ -328,16 +281,6 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ dte_days: number[] }>(r);
   return data.dte_days;
-}
-
-/**
- * Fetch available expirations for the selected GEX batch.
- */
-export async function fetchGexExpirations(snapshotId: number): Promise<GexExpirationItem[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/gex/expirations?snapshot_id=${encodeURIComponent(snapshotId)}`));
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const data = await safeJson<{ items: GexExpirationItem[] }>(r);
-  return data.items;
 }
 
 /**
@@ -436,84 +379,6 @@ export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROL
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: TradeRow[] }>(r);
   return data.items;
-}
-
-export type LabelMetricsSummary = {
-  resolved: number;
-  tp50: number;
-  tp100_at_expiry: number;
-  tp50_rate: number | null;
-  tp100_at_expiry_rate: number | null;
-  avg_realized_pnl: number | null;
-};
-
-export type LabelMetricsBySide = {
-  spread_side: string;
-  resolved: number;
-  tp50: number;
-  tp100_at_expiry: number;
-  tp50_rate: number | null;
-  tp100_at_expiry_rate: number | null;
-  avg_realized_pnl: number | null;
-};
-
-export type LabelMetricsResponse = {
-  lookback_days: number;
-  window_start_utc: string;
-  summary: LabelMetricsSummary;
-  by_side: LabelMetricsBySide[];
-};
-
-/**
- * Fetch TP50/TP100 label metrics for the selected lookback window.
- */
-export async function fetchLabelMetrics(lookbackDays = 90): Promise<LabelMetricsResponse> {
-  const r = await fetchWithAuth(apiUrl(`/api/label-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<LabelMetricsResponse>(r);
-}
-
-export type StrategyMetricsSummary = {
-  resolved: number;
-  tp50: number;
-  tp100_at_expiry: number;
-  tp50_rate: number | null;
-  tp100_at_expiry_rate: number | null;
-  expectancy: number | null;
-  avg_realized_pnl: number | null;
-  max_drawdown: number | null;
-  tail_loss_proxy: number | null;
-  avg_margin_usage: number | null;
-};
-
-export type StrategyMetricsBySide = {
-  spread_side: string;
-  resolved: number;
-  tp50: number;
-  tp100_at_expiry: number;
-  tp50_rate: number | null;
-  tp100_at_expiry_rate: number | null;
-  expectancy: number | null;
-  avg_realized_pnl: number | null;
-  max_drawdown: number | null;
-  tail_loss_proxy: number | null;
-  avg_margin_usage: number | null;
-};
-
-export type StrategyMetricsResponse = {
-  lookback_days: number;
-  window_start_utc: string;
-  summary: StrategyMetricsSummary;
-  by_side: StrategyMetricsBySide[];
-};
-
-/**
- * Fetch strategy quality/risk metrics (expectancy, drawdown, tail proxy, margin).
- */
-export async function fetchStrategyMetrics(lookbackDays = 90): Promise<StrategyMetricsResponse> {
-  const r = await fetchWithAuth(apiUrl(`/api/strategy-metrics?lookback_days=${encodeURIComponent(lookbackDays)}`));
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<StrategyMetricsResponse>(r);
 }
 
 export type PerformanceAnalyticsMode = "realized" | "combined";
@@ -741,26 +606,12 @@ export type AdminPreflightResponse = {
 /**
  * Fetch admin preflight diagnostics for pipeline freshness and warning state.
  */
-export async function fetchAdminPreflight(apiKey?: string): Promise<AdminPreflightResponse> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`), {
-    method: "GET",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
-  });
+export async function fetchAdminPreflight(): Promise<AdminPreflightResponse> {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<AdminPreflightResponse>(r);
 }
 
-/**
- * Delete one persisted trade decision by ID.
- */
-export async function deleteTradeDecision(decisionId: number, apiKey?: string): Promise<{ deleted: boolean; decision_id: number }> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/trade-decisions/${encodeURIComponent(decisionId)}`), {
-    method: "DELETE",
-    headers: { ...authHeaders(), ...adminHeaders(apiKey) },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<{ deleted: boolean; decision_id: number }>(r);
-}
 
 /** Single auth audit log entry (admin-only). */
 export type AuthAuditEvent = {
@@ -799,5 +650,163 @@ export async function fetchAuthAudit(
   const r = await fetchWithAuth(apiUrl(`/api/admin/auth-audit?${params.toString()}`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<AuthAuditResponse>(r);
+}
+
+// ---------------------------------------------------------------------------
+// Model monitoring endpoints (Phase 3)
+// ---------------------------------------------------------------------------
+
+export type ModelPredictionRow = {
+  prediction_id: number;
+  candidate_id: number | null;
+  model_version_id: number;
+  model_name: string;
+  model_version: string;
+  probability_win: number | null;
+  expected_value: number | null;
+  score_raw: number | null;
+  decision_hint: string | null;
+  created_at: string | null;
+  hold_realized_pnl: number | null;
+  hold_hit_tp50: string | null;
+  hold_exit_reason: string | null;
+  realized_pnl: number | null;
+  label_status: string | null;
+};
+
+export type ModelPredictionsResponse = {
+  total: number;
+  limit: number;
+  offset: number;
+  items: ModelPredictionRow[];
+};
+
+/**
+ * Fetch paginated model predictions with outcome data for the prediction browser.
+ */
+export async function fetchModelPredictions(
+  limit = 50,
+  offset = 0,
+  modelVersionId?: number,
+  decision?: string,
+  dateFrom?: string,
+  dateTo?: string
+): Promise<ModelPredictionsResponse> {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (modelVersionId != null) params.set("model_version_id", String(modelVersionId));
+  if (decision) params.set("decision", decision);
+  if (dateFrom) params.set("date_from", dateFrom);
+  if (dateTo) params.set("date_to", dateTo);
+  const r = await fetchWithAuth(apiUrl(`/api/model-predictions?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<ModelPredictionsResponse>(r);
+}
+
+export type AccuracyWindow = {
+  period: string | null;
+  total: number;
+  true_positive: number;
+  false_positive: number;
+  true_negative: number;
+  false_negative: number;
+  accuracy: number | null;
+  precision: number | null;
+  recall: number | null;
+  avg_pnl_traded: number | null;
+  avg_pnl_skipped: number | null;
+};
+
+export type ModelAccuracyResponse = {
+  model_name: string;
+  window: string;
+  windows: AccuracyWindow[];
+};
+
+/**
+ * Fetch accuracy metrics aggregated over time windows (weekly/monthly).
+ */
+export async function fetchModelAccuracy(modelName?: string, window = "week"): Promise<ModelAccuracyResponse> {
+  const params = new URLSearchParams({ window });
+  if (modelName) params.set("model_name", modelName);
+  const r = await fetchWithAuth(apiUrl(`/api/model-accuracy?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<ModelAccuracyResponse>(r);
+}
+
+export type CalibrationBin = {
+  bin_lower: number;
+  bin_upper: number;
+  predicted_avg: number;
+  observed_rate: number | null;
+  count: number;
+};
+
+export type ModelCalibrationResponse = {
+  model_name: string;
+  bins: CalibrationBin[];
+};
+
+/**
+ * Fetch calibration curve data for the model monitor.
+ */
+export async function fetchModelCalibration(modelName?: string, bins = 10): Promise<ModelCalibrationResponse> {
+  const params = new URLSearchParams({ bins: String(bins) });
+  if (modelName) params.set("model_name", modelName);
+  const r = await fetchWithAuth(apiUrl(`/api/model-calibration?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<ModelCalibrationResponse>(r);
+}
+
+export type ModelPnlAttributionResponse = {
+  model_name: string;
+  baseline_pnl: number;
+  model_pnl: number;
+  saved_pnl: number;
+  missed_pnl: number;
+  net_impact: number;
+  trade_count: number;
+  skip_count: number;
+  total_candidates: number;
+};
+
+/**
+ * Fetch PnL attribution comparing model-filtered vs baseline trades.
+ */
+export async function fetchModelPnlAttribution(modelName?: string): Promise<ModelPnlAttributionResponse> {
+  const params = new URLSearchParams();
+  if (modelName) params.set("model_name", modelName);
+  const query = params.toString();
+  const r = await fetchWithAuth(apiUrl(`/api/model-pnl-attribution${query ? `?${query}` : ""}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<ModelPnlAttributionResponse>(r);
+}
+
+export type BacktestStrategyResult = {
+  name: string;
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  total_pnl: number;
+  avg_pnl: number;
+  profit_factor: number | null;
+  sharpe: number | null;
+  max_drawdown: number;
+  equity_curve: { date: string; cumulative_pnl: number }[];
+  monthly: { month: string; pnl: number; trades: number }[];
+};
+
+export type BacktestResponse = {
+  strategies: BacktestStrategyResult[];
+  generated_at: string | null;
+};
+
+/**
+ * Fetch precomputed backtest strategy comparison results.
+ */
+export async function fetchBacktestResults(): Promise<BacktestResponse> {
+  const r = await fetchWithAuth(apiUrl("/api/backtest-results"));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<BacktestResponse>(r);
 }
 

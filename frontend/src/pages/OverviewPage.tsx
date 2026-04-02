@@ -1,0 +1,200 @@
+import { useEffect, useState } from "react";
+import { StatCard } from "@/components/shared/StatCard";
+import { DataTable } from "@/components/shared/DataTable";
+import { Badge } from "@/components/ui/badge";
+import { formatCurrency, formatDateTime, timeAgo } from "@/lib/utils";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
+import {
+  fetchTrades,
+  fetchPerformanceAnalytics,
+  fetchAdminPreflight,
+  type TradeRow,
+  type PerformanceAnalyticsResponse,
+  type AdminPreflightResponse,
+} from "@/api";
+import {
+  TrendingUp,
+  TrendingDown,
+  BarChart3,
+  Activity,
+  Wallet,
+  Target,
+} from "lucide-react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
+
+/**
+ * Overview / Home page -- cockpit view with key stats, mini equity curve, and recent trades.
+ */
+export function OverviewPage() {
+  const { tick } = useAutoRefresh(30_000);
+  const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [perf, setPerf] = useState<PerformanceAnalyticsResponse | null>(null);
+  const [preflight, setPreflight] = useState<AdminPreflightResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    Promise.all([
+      fetchTrades(100).then(setTrades),
+      fetchPerformanceAnalytics(90, "realized").then(setPerf),
+      fetchAdminPreflight().then(setPreflight).catch(() => {}),
+    ])
+      .catch((e) => setError(e.message ?? "Failed to load data"))
+      .finally(() => setLoading(false));
+  }, [tick]);
+
+  const openTrades = trades.filter((t) => t.status === "OPEN");
+  const closedTrades = trades.filter((t) => t.status === "CLOSED");
+  const summary = perf?.summary;
+
+  const todayPnl = (() => {
+    const today = new Date().toISOString().slice(0, 10);
+    const curve = perf?.equity_curve || [];
+    const todayPoint = curve.find((p) => p.date === today);
+    return todayPoint?.daily_pnl ?? null;
+  })();
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-lg font-semibold text-foreground">Overview</h2>
+
+      {error && (
+        <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
+      )}
+
+      {/* KPI stat cards */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
+        <StatCard
+          title="Open Trades"
+          value={String(openTrades.length)}
+          icon={Activity}
+          subtitle={`${closedTrades.length} closed`}
+        />
+        <StatCard
+          title="Today's PnL"
+          value={todayPnl != null ? formatCurrency(todayPnl) : "—"}
+          icon={todayPnl != null && todayPnl >= 0 ? TrendingUp : TrendingDown}
+          trend={todayPnl != null ? (todayPnl >= 0 ? "up" : "down") : undefined}
+        />
+        <StatCard
+          title="Total PnL"
+          value={summary ? formatCurrency(summary.net_pnl) : "—"}
+          icon={Wallet}
+          trend={summary ? (summary.net_pnl >= 0 ? "up" : "down") : undefined}
+        />
+        <StatCard
+          title="Win Rate"
+          value={summary?.win_rate != null ? `${(summary.win_rate * 100).toFixed(1)}%` : "—"}
+          icon={Target}
+          subtitle={summary ? `${summary.trade_count} trades` : undefined}
+        />
+        <StatCard
+          title="Profit Factor"
+          value={summary?.profit_factor != null ? summary.profit_factor.toFixed(2) : "—"}
+          icon={BarChart3}
+        />
+        <StatCard
+          title="Max Drawdown"
+          value={summary?.max_drawdown != null ? formatCurrency(summary.max_drawdown) : "—"}
+          icon={TrendingDown}
+          trend={summary?.max_drawdown != null ? "down" : undefined}
+        />
+      </div>
+
+      {/* Mini equity curve */}
+      {perf && perf.equity_curve.length > 0 && (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <h3 className="mb-3 text-sm font-medium text-muted">Equity Curve (90d)</h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={perf.equity_curve}>
+              <XAxis
+                dataKey="date"
+                tick={{ fontSize: 10, fill: "#6b6b80" }}
+                tickLine={false}
+                axisLine={{ stroke: "#1e1e2e" }}
+              />
+              <YAxis
+                tick={{ fontSize: 10, fill: "#6b6b80" }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
+              />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: "#111118",
+                  border: "1px solid #1e1e2e",
+                  borderRadius: "6px",
+                  fontSize: "12px",
+                  color: "#e4e4ef",
+                }}
+                formatter={(v: number | undefined) => [formatCurrency(v ?? 0), "Cumulative PnL"]}
+              />
+              <Line
+                type="monotone"
+                dataKey="cumulative_pnl"
+                stroke="#10b981"
+                strokeWidth={1.5}
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* Recent trades */}
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium text-muted">Recent Trades</h3>
+        <DataTable
+          columns={[
+            { key: "trade_id", header: "ID", className: "w-16" },
+            { key: "status", header: "Status", render: (r: TradeRow) => (
+              <Badge variant={r.status === "OPEN" ? "profit" : "muted"}>{r.status}</Badge>
+            )},
+            { key: "entry_time", header: "Entered", render: (r: TradeRow) => formatDateTime(r.entry_time) },
+            { key: "expiration", header: "Expiry" },
+            { key: "target_dte", header: "DTE" },
+            { key: "contracts", header: "Qty" },
+            {
+              key: "pnl",
+              header: "PnL",
+              className: "text-right",
+              render: (r: TradeRow) => {
+                const pnl = r.status === "OPEN" ? r.current_pnl : r.realized_pnl;
+                return (
+                  <span className={pnl != null && pnl >= 0 ? "text-profit" : "text-loss"}>
+                    {formatCurrency(pnl)}
+                  </span>
+                );
+              },
+            },
+            { key: "last_mark_ts", header: "Updated", render: (r: TradeRow) => timeAgo(r.last_mark_ts ?? r.entry_time) },
+          ]}
+          data={trades.slice(0, 15)}
+          keyFn={(r) => r.trade_id}
+          emptyMessage={loading ? "Loading..." : "No trades"}
+        />
+      </div>
+
+      {/* Pipeline status */}
+      {preflight && preflight.warnings.length > 0 && (
+        <div className="rounded-lg border border-warning/30 bg-warning-bg p-3">
+          <h4 className="text-xs font-medium text-warning mb-1">Pipeline Warnings</h4>
+          <ul className="space-y-0.5">
+            {preflight.warnings.map((w, i) => (
+              <li key={i} className="text-xs text-warning/80">{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -292,7 +292,10 @@ async def lifespan(app: FastAPI):
     ingestion cycle, then yields control to the ASGI app. On shutdown it
     attempts a graceful scheduler stop.
     """
-    await init_db()
+    if settings.skip_init_db:
+        logger.info("init_db: skipped (SKIP_INIT_DB=true)")
+    else:
+        await init_db()
 
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED

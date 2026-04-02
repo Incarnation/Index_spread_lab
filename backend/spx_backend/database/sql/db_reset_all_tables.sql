@@ -30,5 +30,6 @@ DROP TABLE IF EXISTS chain_snapshots;
 DROP TABLE IF EXISTS context_snapshots;
 DROP TABLE IF EXISTS underlying_quotes;
 DROP TABLE IF EXISTS market_clock_audit;
+DROP TABLE IF EXISTS economic_events;
 DROP TABLE IF EXISTS auth_audit_log;
 DROP TABLE IF EXISTS users;

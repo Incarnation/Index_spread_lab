@@ -1,5 +1,4 @@
 import React from "react";
-import { Alert, Button, Stack, Text, Title } from "@mantine/core";
 
 type ErrorBoundaryProps = { children: React.ReactNode };
 type ErrorBoundaryState = { hasError: boolean; error: Error | null };
@@ -29,19 +28,20 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
   render() {
     if (this.state.hasError) {
       return (
-        <Stack align="center" justify="center" mih="50vh" p="xl">
-          <Alert color="red" title="Something went wrong" w="100%" maw={600}>
-            <Title order={4} mb="sm">
-              An unexpected error occurred
-            </Title>
-            <Text size="sm" mb="md" style={{ fontFamily: "monospace", wordBreak: "break-word" }}>
+        <div className="flex min-h-[50vh] items-center justify-center p-8">
+          <div className="w-full max-w-lg rounded-lg border border-loss/30 bg-loss-bg p-6">
+            <h3 className="text-base font-semibold text-loss">Something went wrong</h3>
+            <p className="mt-2 text-sm text-foreground-secondary break-words font-mono">
               {this.state.error?.message || "Unknown error"}
-            </Text>
-            <Button variant="outline" color="red" onClick={this.handleReset}>
+            </p>
+            <button
+              onClick={this.handleReset}
+              className="mt-4 rounded-md border border-loss/30 bg-transparent px-4 py-2 text-sm text-loss hover:bg-loss/10 transition-colors"
+            >
               Try again
-            </Button>
-          </Alert>
-        </Stack>
+            </button>
+          </div>
+        </div>
       );
     }
     return this.props.children;

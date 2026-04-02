@@ -1153,6 +1153,360 @@ async def get_gex_curve(
     }
 
 
+@router.get("/api/model-predictions")
+async def list_model_predictions(
+    limit: int = 50,
+    offset: int = 0,
+    model_version_id: int | None = None,
+    decision: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return paginated model predictions joined with candidate outcomes.
+
+    Joins model_predictions -> trade_candidates (for outcome labels) and
+    model_versions (for model metadata). Supports filtering by model version,
+    decision hint, and date range.
+    """
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    where_parts: list[str] = []
+    params: dict[str, object] = {"limit": limit, "offset": offset}
+
+    if model_version_id is not None:
+        where_parts.append("mp.model_version_id = :mv_id")
+        params["mv_id"] = model_version_id
+    if decision:
+        where_parts.append("COALESCE(mp.meta_json->>'decision_hint', mp.decision) = :decision")
+        params["decision"] = decision.strip().upper()
+    if date_from:
+        where_parts.append("mp.created_at >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where_parts.append("mp.created_at <= :date_to")
+        params["date_to"] = date_to
+
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    r = await db.execute(
+        text(
+            f"""
+            SELECT
+              mp.prediction_id,
+              mp.candidate_id,
+              mp.model_version_id,
+              mv.model_name,
+              mv.version AS model_version,
+              mp.probability_win,
+              mp.expected_value,
+              mp.score_raw,
+              mp.meta_json,
+              mp.decision,
+              mp.created_at,
+              tc.realized_pnl,
+              tc.hit_tp50_before_sl_or_expiry AS hit_tp50,
+              tc.label_json->>'hold_realized_pnl' AS hold_realized_pnl,
+              tc.label_json->>'hold_hit_tp50' AS hold_hit_tp50,
+              tc.label_json->>'hold_exit_reason' AS hold_exit_reason,
+              tc.label_status
+            FROM model_predictions mp
+            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
+            {where_clause}
+            ORDER BY mp.created_at DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        params,
+    )
+    rows = r.fetchall()
+
+    count_r = await db.execute(
+        text(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM model_predictions mp
+            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
+            {where_clause}
+            """
+        ),
+        {k: v for k, v in params.items() if k not in ("limit", "offset")},
+    )
+    total = int((count_r.fetchone() or (0,))[0])
+
+    items = []
+    for row in rows:
+        meta = row.meta_json if isinstance(row.meta_json, dict) else {}
+        items.append({
+            "prediction_id": row.prediction_id,
+            "candidate_id": row.candidate_id,
+            "model_version_id": row.model_version_id,
+            "model_name": row.model_name,
+            "model_version": row.model_version,
+            "probability_win": float(row.probability_win) if row.probability_win is not None else None,
+            "expected_value": float(row.expected_value) if row.expected_value is not None else None,
+            "score_raw": float(row.score_raw) if row.score_raw is not None else None,
+            "decision_hint": meta.get("decision_hint") or getattr(row, "decision", None),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "hold_realized_pnl": _try_float(row.hold_realized_pnl),
+            "hold_hit_tp50": row.hold_hit_tp50,
+            "hold_exit_reason": row.hold_exit_reason,
+            "realized_pnl": float(row.realized_pnl) if row.realized_pnl is not None else None,
+            "label_status": row.label_status,
+        })
+
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@router.get("/api/model-accuracy")
+async def get_model_accuracy(
+    model_name: str | None = None,
+    window: str = "week",
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return accuracy metrics aggregated over time windows.
+
+    Computes precision, recall, accuracy for the TRADE decision by comparing
+    model predictions against actual trade outcomes (hold_realized_pnl >= 0 = win).
+    """
+    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
+    trunc = "week" if window == "week" else "month"
+
+    r = await db.execute(
+        text(
+            f"""
+            WITH pred_outcomes AS (
+              SELECT
+                date_trunc(:trunc, mp.created_at) AS period,
+                COALESCE(mp.meta_json->>'decision_hint', mp.decision) AS decision_hint,
+                CASE
+                  WHEN tc.label_status = 'resolved' AND tc.realized_pnl IS NOT NULL
+                    THEN CASE WHEN tc.realized_pnl >= 0 THEN true ELSE false END
+                  ELSE NULL
+                END AS actual_win,
+                tc.realized_pnl
+              FROM model_predictions mp
+              JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+              LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
+              WHERE mv.model_name = :model_name
+                AND tc.label_status = 'resolved'
+            )
+            SELECT
+              period,
+              COUNT(*) AS total,
+              SUM(CASE WHEN decision_hint = 'TRADE' AND actual_win = true THEN 1 ELSE 0 END) AS true_positive,
+              SUM(CASE WHEN decision_hint = 'TRADE' AND actual_win = false THEN 1 ELSE 0 END) AS false_positive,
+              SUM(CASE WHEN decision_hint = 'SKIP' AND actual_win = false THEN 1 ELSE 0 END) AS true_negative,
+              SUM(CASE WHEN decision_hint = 'SKIP' AND actual_win = true THEN 1 ELSE 0 END) AS false_negative,
+              AVG(CASE WHEN decision_hint = 'TRADE' THEN realized_pnl END) AS avg_pnl_traded,
+              AVG(CASE WHEN decision_hint = 'SKIP' THEN realized_pnl END) AS avg_pnl_skipped
+            FROM pred_outcomes
+            WHERE period IS NOT NULL
+            GROUP BY period
+            ORDER BY period ASC
+            """
+        ),
+        {"model_name": selected_model, "trunc": trunc},
+    )
+    rows = r.fetchall()
+
+    windows = []
+    for row in rows:
+        tp = int(row.true_positive or 0)
+        fp = int(row.false_positive or 0)
+        tn = int(row.true_negative or 0)
+        fn = int(row.false_negative or 0)
+        total = tp + fp + tn + fn
+        accuracy = (tp + tn) / total if total > 0 else None
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / (tp + fn) if (tp + fn) > 0 else None
+        windows.append({
+            "period": row.period.isoformat() if row.period else None,
+            "total": total,
+            "true_positive": tp,
+            "false_positive": fp,
+            "true_negative": tn,
+            "false_negative": fn,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "avg_pnl_traded": float(row.avg_pnl_traded) if row.avg_pnl_traded is not None else None,
+            "avg_pnl_skipped": float(row.avg_pnl_skipped) if row.avg_pnl_skipped is not None else None,
+        })
+
+    return {"model_name": selected_model, "window": trunc, "windows": windows}
+
+
+@router.get("/api/model-calibration")
+async def get_model_calibration(
+    model_name: str | None = None,
+    bins: int = 10,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return calibration curve data: predicted probability bins vs observed win rate.
+
+    Bins predictions by probability_win decile and computes the observed outcome
+    rate per bin to assess model calibration.
+    """
+    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
+    bins = max(2, min(bins, 20))
+    bin_width = 1.0 / bins
+
+    r = await db.execute(
+        text(
+            """
+            SELECT
+              mp.probability_win,
+              CASE
+                WHEN tc.label_status = 'resolved' AND tc.realized_pnl IS NOT NULL
+                  THEN CASE WHEN tc.realized_pnl >= 0 THEN 1.0 ELSE 0.0 END
+                ELSE NULL
+              END AS actual_outcome
+            FROM model_predictions mp
+            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
+            WHERE mv.model_name = :model_name
+              AND mp.probability_win IS NOT NULL
+              AND tc.label_status = 'resolved'
+            """
+        ),
+        {"model_name": selected_model},
+    )
+    rows = r.fetchall()
+
+    bin_data: list[dict[str, list[float]]] = [{"predicted": [], "actual": []} for _ in range(bins)]
+    for row in rows:
+        prob = float(row.probability_win)
+        actual = float(row.actual_outcome) if row.actual_outcome is not None else None
+        if actual is None:
+            continue
+        bin_idx = min(int(prob / bin_width), bins - 1)
+        bin_data[bin_idx]["predicted"].append(prob)
+        bin_data[bin_idx]["actual"].append(actual)
+
+    result_bins = []
+    for i, bd in enumerate(bin_data):
+        bin_lower = i * bin_width
+        bin_upper = (i + 1) * bin_width
+        count = len(bd["predicted"])
+        predicted_avg = sum(bd["predicted"]) / count if count > 0 else (bin_lower + bin_upper) / 2
+        observed_rate = sum(bd["actual"]) / count if count > 0 else None
+        result_bins.append({
+            "bin_lower": round(bin_lower, 3),
+            "bin_upper": round(bin_upper, 3),
+            "predicted_avg": round(predicted_avg, 4),
+            "observed_rate": round(observed_rate, 4) if observed_rate is not None else None,
+            "count": count,
+        })
+
+    return {"model_name": selected_model, "bins": result_bins}
+
+
+@router.get("/api/model-pnl-attribution")
+async def get_model_pnl_attribution(
+    model_name: str | None = None,
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Return PnL attribution comparing model-filtered trades vs baseline.
+
+    baseline_pnl: total PnL if all candidates were traded.
+    model_pnl: total PnL of candidates the model said TRADE.
+    saved_pnl: losses avoided by skipping (negative PnL candidates that were SKIPped).
+    missed_pnl: wins missed by skipping (positive PnL candidates that were SKIPped).
+    """
+    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
+
+    r = await db.execute(
+        text(
+            """
+            SELECT
+              COALESCE(mp.meta_json->>'decision_hint', mp.decision) AS decision_hint,
+              tc.realized_pnl
+            FROM model_predictions mp
+            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
+            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
+            WHERE mv.model_name = :model_name
+              AND tc.label_status = 'resolved'
+              AND tc.realized_pnl IS NOT NULL
+            """
+        ),
+        {"model_name": selected_model},
+    )
+    rows = r.fetchall()
+
+    baseline_pnl = 0.0
+    model_pnl = 0.0
+    saved_pnl = 0.0
+    missed_pnl = 0.0
+    trade_count = 0
+    skip_count = 0
+
+    for row in rows:
+        pnl = float(row.realized_pnl)
+        hint = (row.decision_hint or "").upper()
+        baseline_pnl += pnl
+        if hint == "TRADE":
+            model_pnl += pnl
+            trade_count += 1
+        else:
+            skip_count += 1
+            if pnl < 0:
+                saved_pnl += abs(pnl)
+            else:
+                missed_pnl += pnl
+
+    return {
+        "model_name": selected_model,
+        "baseline_pnl": round(baseline_pnl, 2),
+        "model_pnl": round(model_pnl, 2),
+        "saved_pnl": round(saved_pnl, 2),
+        "missed_pnl": round(missed_pnl, 2),
+        "net_impact": round(model_pnl - baseline_pnl, 2),
+        "trade_count": trade_count,
+        "skip_count": skip_count,
+        "total_candidates": trade_count + skip_count,
+    }
+
+
+@router.get("/api/backtest-results")
+async def get_backtest_results(
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
+    """Return precomputed backtest results if available.
+
+    Reads from a JSON file generated by the offline backtest_entry.py script.
+    Returns an empty strategies list if no results file exists yet.
+    """
+    import json
+    from pathlib import Path
+
+    results_path = Path(__file__).resolve().parents[3] / "scripts" / "backtest_results.json"
+    if not results_path.exists():
+        return {"strategies": [], "generated_at": None}
+    try:
+        raw = json.loads(results_path.read_text())
+        return {"strategies": raw.get("strategies", []), "generated_at": raw.get("generated_at")}
+    except Exception:
+        return {"strategies": [], "generated_at": None}
+
+
+def _try_float(val: object) -> float | None:
+    """Attempt to convert a value to float, returning None on failure."""
+    if val is None:
+        return None
+    try:
+        return float(val)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
 @router.get("/", response_class=HTMLResponse)
 async def home(
     current_user: UserOut = Depends(get_current_user),
