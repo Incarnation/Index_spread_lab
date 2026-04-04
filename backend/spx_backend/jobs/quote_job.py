@@ -162,6 +162,8 @@ class QuoteJob:
                           term_structure = EXCLUDED.term_structure,
                           vvix = EXCLUDED.vvix,
                           skew = EXCLUDED.skew,
+                          gex_net = COALESCE(context_snapshots.gex_net, EXCLUDED.gex_net),
+                          zero_gamma_level = COALESCE(context_snapshots.zero_gamma_level, EXCLUDED.zero_gamma_level),
                           notes_json = EXCLUDED.notes_json
                         """
                     ),

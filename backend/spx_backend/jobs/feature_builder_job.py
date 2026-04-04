@@ -387,6 +387,9 @@ class FeatureBuilderJob:
 
         cal_flags = candidate.get("_calendar_flags") or {}
 
+        entry_credit = candidate["credit"]
+        credit_to_width = (entry_credit / width_points) if width_points > 0 else None
+
         return {
             "schema_version": settings.candidate_schema_version,
             "underlying": settings.snapshot_underlying,
@@ -397,7 +400,8 @@ class FeatureBuilderJob:
             "spread_side": spread_side,
             "width_points": width_points,
             "contracts": contracts,
-            "entry_credit": candidate["credit"],
+            "entry_credit": entry_credit,
+            "credit_to_width": credit_to_width,
             "score": candidate["score"],
             "delta_diff": candidate["delta_diff"],
             "context_score": candidate.get("context_score"),
@@ -412,6 +416,8 @@ class FeatureBuilderJob:
             "is_opex_day": cal_flags.get("is_opex", False),
             "is_fomc_day": cal_flags.get("is_fomc", False),
             "is_triple_witching": cal_flags.get("is_triple_witching", False),
+            "is_cpi_day": cal_flags.get("is_cpi", False),
+            "is_nfp_day": cal_flags.get("is_nfp", False),
             "spy_spx_ratio": spy_spx_ratio,
             "spy_spx_ratio_regime": classify_spy_spx_ratio_regime(spy_spx_ratio),
             "vix_regime": classify_vix_regime(vix),
@@ -425,9 +431,9 @@ class FeatureBuilderJob:
     async def _get_calendar_flags(self, session, today: date) -> dict:
         """Query economic_events for today's calendar flags.
 
-        Returns a dict with boolean keys ``is_opex``, ``is_fomc``, and
-        ``is_triple_witching``.  Defaults to all-False when no events are
-        found for the given date.
+        Returns a dict with boolean keys ``is_opex``, ``is_fomc``,
+        ``is_triple_witching``, ``is_cpi``, and ``is_nfp``.  Defaults to
+        all-False when no events are found for the given date.
         """
         rows = await session.execute(
             text(
@@ -436,13 +442,20 @@ class FeatureBuilderJob:
             ),
             {"d": today},
         )
-        flags = {"is_opex": False, "is_fomc": False, "is_triple_witching": False}
+        flags = {
+            "is_opex": False, "is_fomc": False, "is_triple_witching": False,
+            "is_cpi": False, "is_nfp": False,
+        }
         for r in rows.fetchall():
             evt = str(r.event_type).upper()
             if evt == "OPEX":
                 flags["is_opex"] = True
             elif evt == "FOMC":
                 flags["is_fomc"] = True
+            elif evt == "CPI":
+                flags["is_cpi"] = True
+            elif evt == "NFP":
+                flags["is_nfp"] = True
             if r.is_triple_witching:
                 flags["is_triple_witching"] = True
         return flags

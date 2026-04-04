@@ -1,8 +1,9 @@
 """Export production DB tables to CSV for offline training pipeline.
 
 Connects to the production PostgreSQL database using DATABASE_URL from
-the .env file, exports ``underlying_quotes``, ``context_snapshots``, and
-``economic_events`` to CSV files that the offline training pipeline can load.
+the .env file, exports ``underlying_quotes``, ``context_snapshots``,
+``economic_events``, and ``trade_candidates`` to CSV files that the
+offline training pipeline can load.
 
 Usage:
     python scripts/export_production_data.py [--start DATE] [--end DATE]
@@ -17,6 +18,8 @@ import os
 import sys
 from pathlib import Path
 
+import json
+
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -28,6 +31,7 @@ DATA_DIR = _BACKEND.parent / "data"
 UNDERLYING_QUOTES_CSV = DATA_DIR / "underlying_quotes_export.csv"
 CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 ECONOMIC_EVENTS_CSV = DATA_DIR / "economic_events_export.csv"
+TRADE_CANDIDATES_CSV = DATA_DIR / "trade_candidates_export.csv"
 
 
 def _sync_url(async_url: str) -> str:
@@ -187,6 +191,144 @@ def export_economic_events(
     return len(df)
 
 
+def _flatten_candidate(row) -> dict:
+    """Flatten a trade_candidates DB row into a training-compatible dict.
+
+    Maps the nested ``candidate_json`` (with ``legs.short``, ``legs.long``,
+    ``context``, label columns) into the flat column layout expected by the
+    offline training CSV (``training_candidates.csv``).
+
+    Parameters
+    ----------
+    row:
+        A SQLAlchemy Row with ``ts``, ``candidate_json``, ``label_json``,
+        ``realized_pnl``, ``hit_tp50_before_sl_or_expiry``, and
+        ``hit_tp100_at_expiry``.
+
+    Returns
+    -------
+    dict
+        Flat dictionary matching the training CSV column schema.
+    """
+    cj = row.candidate_json if isinstance(row.candidate_json, dict) else json.loads(row.candidate_json)
+    lj = row.label_json if isinstance(row.label_json, dict) else (json.loads(row.label_json) if row.label_json else {})
+
+    legs = cj.get("legs") or {}
+    short = legs.get("short") or {}
+    long_leg = legs.get("long") or {}
+
+    ctx = cj.get("context") or {}
+    cboe = cj.get("cboe_context") or {}
+
+    width = cj.get("width_points")
+    credit = cj.get("entry_credit")
+    credit_to_width = credit / width if credit and width and width > 0 else None
+    max_loss = (width - credit) * (cj.get("contracts") or 1) * 100 if credit and width else None
+
+    return {
+        "entry_dt": str(row.ts),
+        "day": str(row.ts.date()) if hasattr(row.ts, "date") else None,
+        "dte_target": cj.get("target_dte"),
+        "expiry": cj.get("expiration"),
+        "spread_side": cj.get("spread_side"),
+        "delta_target": cj.get("delta_target"),
+        "short_instrument_id": None,
+        "long_instrument_id": None,
+        "short_symbol": short.get("symbol"),
+        "long_symbol": long_leg.get("symbol"),
+        "short_strike": short.get("strike"),
+        "long_strike": long_leg.get("strike"),
+        "short_bid": short.get("bid"),
+        "short_ask": short.get("ask"),
+        "short_mid": short.get("mid"),
+        "short_delta": short.get("delta"),
+        "short_iv": short.get("iv"),
+        "long_bid": long_leg.get("bid"),
+        "long_ask": long_leg.get("ask"),
+        "long_mid": long_leg.get("mid"),
+        "long_delta": long_leg.get("delta"),
+        "long_iv": long_leg.get("iv"),
+        "entry_credit": credit,
+        "width_points": width,
+        "max_loss": max_loss,
+        "credit_to_width": credit_to_width,
+        "spot": cj.get("spot") or cj.get("spx_price"),
+        "spy_price": cj.get("spy_price"),
+        "vix": cj.get("vix") or ctx.get("vix"),
+        "vix9d": cj.get("vix9d") or ctx.get("vix9d"),
+        "term_structure": cj.get("term_structure") or ctx.get("term_structure"),
+        "vvix": cj.get("vvix") or ctx.get("vvix"),
+        "skew": cj.get("skew") or ctx.get("skew"),
+        "is_opex_day": cj.get("is_opex_day", False),
+        "is_fomc_day": cj.get("is_fomc_day", False),
+        "is_triple_witching": cj.get("is_triple_witching", False),
+        "is_cpi_day": cj.get("is_cpi_day", False),
+        "is_nfp_day": cj.get("is_nfp_day", False),
+        "contracts": cj.get("contracts"),
+        "offline_gex_net": cboe.get("expiry_gex_net") or ctx.get("gex_net"),
+        "offline_zero_gamma": ctx.get("zero_gamma_level"),
+        "resolved": True,
+        "hit_tp50": row.hit_tp50_before_sl_or_expiry,
+        "hit_tp100_at_expiry": row.hit_tp100_at_expiry,
+        "realized_pnl": row.realized_pnl,
+        "exit_reason": lj.get("exit_reason"),
+    }
+
+
+def export_trade_candidates(
+    engine,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    output: Path = TRADE_CANDIDATES_CSV,
+) -> int:
+    """Export resolved trade_candidates to a flat CSV matching the training schema.
+
+    Each row's ``candidate_json`` is flattened so the output is directly
+    compatible with the offline training CSV (``training_candidates.csv``).
+
+    Parameters
+    ----------
+    engine:
+        SQLAlchemy synchronous engine.
+    start:
+        ISO date string for lower bound (inclusive).  None = no lower bound.
+    end:
+        ISO date string for upper bound (exclusive).  None = no upper bound.
+    output:
+        Destination CSV path.
+
+    Returns
+    -------
+    int
+        Number of rows exported.
+    """
+    clauses = ["label_status = 'resolved'"]
+    params: dict = {}
+    if start:
+        clauses.append("ts >= :start")
+        params["start"] = start
+    if end:
+        clauses.append("ts < :end")
+        params["end"] = end
+
+    where = " AND ".join(clauses)
+    query = text(
+        f"SELECT ts, candidate_json, label_json, "
+        f"realized_pnl, hit_tp50_before_sl_or_expiry, hit_tp100_at_expiry "
+        f"FROM trade_candidates WHERE {where} ORDER BY ts"
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    flat = [_flatten_candidate(r) for r in rows]
+    df = pd.DataFrame(flat)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output, index=False)
+    return len(df)
+
+
 def main() -> None:
     """CLI entry point for production data export."""
     parser = argparse.ArgumentParser(
@@ -202,7 +344,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--tables", default="all",
-        choices=["all", "underlying_quotes", "context_snapshots", "economic_events"],
+        choices=["all", "underlying_quotes", "context_snapshots", "economic_events", "trade_candidates"],
         help="Which table(s) to export (default: all)",
     )
     parser.add_argument(
@@ -256,6 +398,10 @@ def main() -> None:
     if args.tables in ("all", "economic_events"):
         n = export_economic_events(engine)
         print(f"  economic_events: {n} rows -> {ECONOMIC_EVENTS_CSV}")
+
+    if args.tables in ("all", "trade_candidates"):
+        n = export_trade_candidates(engine, start=args.start, end=args.end)
+        print(f"  trade_candidates: {n} rows -> {TRADE_CANDIDATES_CSV}")
 
     print("=" * 60)
     print("Done.\n")

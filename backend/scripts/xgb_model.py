@@ -37,7 +37,7 @@ CONTINUOUS_FEATURES = [
 
 ORDINAL_FEATURES = ["dte_target", "entry_hour"]
 
-BINARY_FEATURES = ["is_opex_day", "is_fomc_day", "is_triple_witching"]
+BINARY_FEATURES = ["is_opex_day", "is_fomc_day", "is_triple_witching", "is_cpi_day", "is_nfp_day"]
 
 CATEGORICAL_FEATURES = ["spread_side"]
 

@@ -381,6 +381,8 @@ def extract_candidate_features(
     is_opex_day = bool(candidate_json.get("is_opex_day", False))
     is_fomc_day = bool(candidate_json.get("is_fomc_day", False))
     is_triple_witching = bool(candidate_json.get("is_triple_witching", False))
+    is_cpi_day = bool(candidate_json.get("is_cpi_day", False))
+    is_nfp_day = bool(candidate_json.get("is_nfp_day", False))
 
     contracts = _as_int(candidate_json.get("contracts")) or 1
     margin_usage = compute_margin_usage_dollars(
@@ -413,6 +415,8 @@ def extract_candidate_features(
         "is_opex_day": is_opex_day,
         "is_fomc_day": is_fomc_day,
         "is_triple_witching": is_triple_witching,
+        "is_cpi_day": is_cpi_day,
+        "is_nfp_day": is_nfp_day,
         "contracts": contracts,
         "margin_usage": margin_usage,
         "delta_bucket": delta_bucket,
@@ -893,7 +897,7 @@ _XGB_CONTINUOUS = [
 ]
 
 _XGB_ORDINAL = ["dte_target", "entry_hour"]
-_XGB_BINARY = ["is_opex_day", "is_fomc_day", "is_triple_witching"]
+_XGB_BINARY = ["is_opex_day", "is_fomc_day", "is_triple_witching", "is_cpi_day", "is_nfp_day"]
 
 
 def extract_xgb_features(
@@ -915,9 +919,10 @@ def extract_xgb_features(
     candidate_json:
         Raw candidate payload from trade_candidates.
     max_loss_points:
-        Used to derive ``max_loss`` in dollar terms.
+        Max loss in spread points (width - credit).  Stored directly as
+        the ``max_loss`` feature to match the offline training CSV scale.
     contract_multiplier:
-        Dollar multiplier per point.
+        Retained for API compatibility; no longer used for max_loss.
     candidate_ts:
         Candidate timestamp; used to derive ``entry_hour`` (ET).
         Falls back to ``candidate_json["entry_dt"]`` if not provided.
@@ -980,11 +985,13 @@ def extract_xgb_features(
         gex_net = _f("expiry_gex_net", cboe)
     zero_gamma = _f("offline_zero_gamma", cboe)
 
-    contracts = _as_int(candidate_json.get("contracts")) or 1
     ml_points = max_loss_points
     if ml_points is None:
         ml_points = _as_float(candidate_json.get("max_loss"))
-    max_loss = (ml_points or 0.0) * contracts * contract_multiplier if ml_points else None
+    # Keep max_loss in points (width - credit) to match the offline training
+    # CSV.  Previous formula multiplied by contracts * contract_multiplier,
+    # producing dollar values ~100x larger than training splits.
+    max_loss = ml_points
 
     target_dte = _as_int(candidate_json.get("target_dte"))
     spread_side = str(candidate_json.get("spread_side") or "unknown").lower()
@@ -993,6 +1000,8 @@ def extract_xgb_features(
     is_opex = int(bool(candidate_json.get("is_opex_day", False)))
     is_fomc = int(bool(candidate_json.get("is_fomc_day", False)))
     is_tw = int(bool(candidate_json.get("is_triple_witching", False)))
+    is_cpi = int(bool(candidate_json.get("is_cpi_day", False)))
+    is_nfp = int(bool(candidate_json.get("is_nfp_day", False)))
 
     # Entry hour (Eastern Time)
     entry_hour: int | None = None
@@ -1021,6 +1030,7 @@ def extract_xgb_features(
         "max_loss": max_loss,
         "dte_target": target_dte, "entry_hour": entry_hour,
         "is_opex_day": is_opex, "is_fomc_day": is_fomc, "is_triple_witching": is_tw,
+        "is_cpi_day": is_cpi, "is_nfp_day": is_nfp,
         "is_put": is_put,
         # Engineered
         "vix_x_delta": (vix or 0) * (delta_target or 0),

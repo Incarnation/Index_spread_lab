@@ -371,8 +371,9 @@ def load_economic_calendar(csv_path: Path) -> dict[date, dict]:
     Returns
     -------
     dict[date, dict]
-        ``{date: {"is_opex": bool, "is_fomc": bool, "is_triple_witching": bool}}``.
-        A single date may have both OPEX and FOMC if they coincide; the
+        ``{date: {"is_opex": bool, "is_fomc": bool, "is_triple_witching": bool,
+        "is_cpi": bool, "is_nfp": bool}}``.
+        A single date may have multiple events if they coincide; the
         loader aggregates across all rows for a given date.
     """
     if not csv_path.exists():
@@ -386,12 +387,17 @@ def load_economic_calendar(csv_path: Path) -> dict[date, dict]:
             continue
         entry = out.setdefault(d, {
             "is_opex": False, "is_fomc": False, "is_triple_witching": False,
+            "is_cpi": False, "is_nfp": False,
         })
         evt = str(row.get("event_type", "")).upper()
         if evt == "OPEX":
             entry["is_opex"] = True
         elif evt == "FOMC":
             entry["is_fomc"] = True
+        elif evt == "CPI":
+            entry["is_cpi"] = True
+        elif evt == "NFP":
+            entry["is_nfp"] = True
         if row.get("is_triple_witching") in (True, "True", "true", 1):
             entry["is_triple_witching"] = True
     return out
@@ -873,6 +879,8 @@ def build_candidates_for_snapshot(
     is_opex_day: bool = False,
     is_fomc_day: bool = False,
     is_triple_witching: bool = False,
+    is_cpi_day: bool = False,
+    is_nfp_day: bool = False,
     decision_dt: datetime,
     day_date: date,
     dte_target: int,
@@ -999,6 +1007,8 @@ def build_candidates_for_snapshot(
         "is_opex_day": is_opex_day,
         "is_fomc_day": is_fomc_day,
         "is_triple_witching": is_triple_witching,
+        "is_cpi_day": is_cpi_day,
+        "is_nfp_day": is_nfp_day,
         "contracts": CONTRACTS,
     }]
 
@@ -1410,6 +1420,8 @@ def build_training_rows(
             "is_opex_day": c.get("is_opex_day", False),
             "is_fomc_day": c.get("is_fomc_day", False),
             "is_triple_witching": c.get("is_triple_witching", False),
+            "is_cpi_day": c.get("is_cpi_day", False),
+            "is_nfp_day": c.get("is_nfp_day", False),
             "context": {
                 "vix": c.get("vix"),
                 "term_structure": c.get("term_structure"),
@@ -1664,6 +1676,8 @@ def run_pipeline(
             is_opex = cal.get("is_opex", False)
             is_fomc = cal.get("is_fomc", False)
             is_tw = cal.get("is_triple_witching", False)
+            is_cpi = cal.get("is_cpi", False)
+            is_nfp = cal.get("is_nfp", False)
 
             # Precompute offline GEX for this decision time
             offline_gex_net: float | None = None
@@ -1692,6 +1706,8 @@ def run_pipeline(
                             is_opex_day=is_opex,
                             is_fomc_day=is_fomc,
                             is_triple_witching=is_tw,
+                            is_cpi_day=is_cpi,
+                            is_nfp_day=is_nfp,
                             decision_dt=dec_utc,
                             day_date=day_date,
                             dte_target=dte_target,

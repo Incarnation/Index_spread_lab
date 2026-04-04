@@ -285,7 +285,7 @@ class GexJob:
                                 INSERT INTO context_snapshots
                                     (ts, gex_net, zero_gamma_level,
                                      spx_price, spy_price, vix, vix9d, term_structure,
-                                     notes_json)
+                                     vvix, skew, notes_json)
                                 VALUES (
                                     :ts, :gex_net, :zero_gamma_level,
                                     (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
@@ -295,6 +295,8 @@ class GexJob:
                                     (SELECT CASE WHEN v.last > 0 THEN v9.last / v.last END
                                      FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v,
                                           (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v9),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VVIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                                     CAST(:notes AS jsonb)
                                 )
                                 ON CONFLICT (ts) DO UPDATE SET
@@ -304,7 +306,9 @@ class GexJob:
                                   spy_price = COALESCE(context_snapshots.spy_price, EXCLUDED.spy_price),
                                   vix = COALESCE(context_snapshots.vix, EXCLUDED.vix),
                                   vix9d = COALESCE(context_snapshots.vix9d, EXCLUDED.vix9d),
-                                  term_structure = COALESCE(context_snapshots.term_structure, EXCLUDED.term_structure)
+                                  term_structure = COALESCE(context_snapshots.term_structure, EXCLUDED.term_structure),
+                                  vvix = COALESCE(context_snapshots.vvix, EXCLUDED.vvix),
+                                  skew = COALESCE(context_snapshots.skew, EXCLUDED.skew)
                                 """
                             ),
                             {
