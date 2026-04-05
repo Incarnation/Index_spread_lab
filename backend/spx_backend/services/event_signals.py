@@ -126,16 +126,17 @@ class EventSignalDetector:
         Dict suitable for ``_evaluate()``.
         """
         lookback = today - timedelta(days=5)
+        upper = today + timedelta(days=1)
         async with engine.connect() as conn:
             rows = await conn.execute(text(
                 "SELECT symbol, date_trunc('day', ts)::date AS d, "
                 "  (array_agg(last ORDER BY ts DESC))[1] AS close "
                 "FROM underlying_quotes "
-                "WHERE ts >= :lb AND ts < :today + interval '1 day' "
+                "WHERE ts >= :lb AND ts < :upper "
                 "  AND symbol IN ('SPX', 'VIX', 'VIX9D') "
                 "GROUP BY symbol, d "
                 "ORDER BY d"
-            ), {"lb": lookback, "today": today})
+            ), {"lb": lookback, "upper": upper})
             data = rows.fetchall()
 
         spx_by_day: dict[date, float] = {}
