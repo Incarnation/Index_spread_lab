@@ -17,10 +17,12 @@ import argparse
 import gc
 import json
 import math
+import os
 import sys
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -52,6 +54,7 @@ SPX_DEFS = DATABENTO_DIR / "spx" / "definition"
 SPX_STATS = DATABENTO_DIR / "spx" / "statistics"
 SPY_EQUITY_PATH = DATABENTO_DIR / "underlying" / "spy_equity_1m.parquet"
 OFFLINE_GEX_CSV = DATA_DIR / "offline_gex_cache.csv"
+CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 OUTPUT_CSV = DATA_DIR / "training_candidates.csv"
 ECONOMIC_CALENDAR_CSV = DATA_DIR / "economic_calendar.csv"
 
@@ -69,9 +72,9 @@ FRD_SKEW = FRD_DIR / "skew_daily.parquet"
 ET = ZoneInfo("America/New_York")
 SPY_SPX_RATIO = 10.024
 RISK_FREE_RATE = 0.043
-DECISION_MINUTES_ET = [(10, 2), (11, 2), (12, 2)]
-DTE_TARGETS = [0, 3, 5, 7, 10]
-DELTA_TARGETS = [0.10, 0.20]
+DECISION_MINUTES_ET = [(9, 45), (10, 15), (10, 45), (11, 15), (11, 45), (12, 15)]
+DTE_TARGETS = [0, 1, 2, 3, 5, 7]
+DELTA_TARGETS = [0.05, 0.10, 0.15, 0.20, 0.25]
 SPREAD_SIDES = ["put", "call"]
 WIDTH_POINTS = 10.0
 TAKE_PROFIT_PCT = 0.50
@@ -493,22 +496,65 @@ def merge_underlying_quotes(
     return combined.sort_values("ts").reset_index(drop=True)
 
 
-def _load_offline_gex(csv_path: Path) -> pd.DataFrame:
-    """Load the offline GEX cache as the sole GEX context source.
+def _load_gex_csv(csv_path: Path) -> pd.DataFrame:
+    """Load a single GEX CSV (offline cache or production export).
 
-    Returns a DataFrame with columns ``ts`` (tz-aware UTC), ``gex_net``,
-    and ``zero_gamma_level``, sorted by timestamp.  Returns an empty
-    DataFrame when the file does not exist.
+    Returns a DataFrame with at least ``ts`` (tz-aware UTC), ``gex_net``,
+    and ``zero_gamma_level`` columns, sorted by timestamp.  Returns an
+    empty DataFrame when the file does not exist.
     """
+    empty = pd.DataFrame(columns=["ts", "gex_net", "zero_gamma_level"])
     if not csv_path.exists():
-        return pd.DataFrame(columns=["ts", "gex_net", "zero_gamma_level"])
+        return empty
     df = pd.read_csv(str(csv_path))
+    if df.empty:
+        return empty
     df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
-    needed_cols = ["ts", "gex_net", "zero_gamma_level"]
-    for col in needed_cols:
+    for col in ("gex_net", "zero_gamma_level"):
         if col not in df.columns:
             df[col] = None
-    return df[needed_cols].sort_values("ts").reset_index(drop=True)
+    return df[["ts", "gex_net", "zero_gamma_level"]].sort_values("ts").reset_index(drop=True)
+
+
+def _load_merged_gex(
+    offline_path: Path = OFFLINE_GEX_CSV,
+    production_path: Path = CONTEXT_SNAPSHOTS_CSV,
+) -> pd.DataFrame:
+    """Load and merge offline GEX cache with production context_snapshots.
+
+    Production rows (from the live system) take priority when timestamps
+    overlap with the offline Databento-computed cache.  The offline cache
+    covers historical dates before the production system was running.
+
+    Parameters
+    ----------
+    offline_path : Path
+        CSV with columns ``ts, gex_net, zero_gamma_level`` (offline cache).
+    production_path : Path
+        CSV exported from the ``context_snapshots`` DB table via
+        ``export_production_data.py``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Merged GEX DataFrame with ``ts, gex_net, zero_gamma_level``.
+    """
+    offline = _load_gex_csv(offline_path)
+    production = _load_gex_csv(production_path)
+
+    prod_gex = production[production["gex_net"].notna()]
+
+    if prod_gex.empty:
+        return offline
+    if offline.empty:
+        return prod_gex
+
+    # Production rows win on timestamp overlap (round to nearest minute)
+    combined = pd.concat([prod_gex, offline], ignore_index=True)
+    combined["_ts_rounded"] = combined["ts"].dt.round("min")
+    combined = combined.drop_duplicates(subset=["_ts_rounded"], keep="first")
+    combined = combined.drop(columns=["_ts_rounded"])
+    return combined.sort_values("ts").reset_index(drop=True)
 
 
 def lookup_gex_context(
@@ -1324,6 +1370,185 @@ def label_candidates(
     return labeled
 
 
+# -- keep old name accessible as fallback alias --
+label_candidates_sequential = label_candidates
+
+
+def _extract_marks_for_day(
+    args: tuple[str, list[tuple]],
+) -> list[tuple[int, list[dict]]]:
+    """Worker function: load one day's CBBO once and extract marks for every candidate needing it.
+
+    Top-level function so it can be pickled by multiprocessing.Pool.
+
+    Parameters
+    ----------
+    args : tuple
+        ``(day_str, candidate_requests)`` where *candidate_requests* is a list
+        of ``(cand_idx, short_sym, long_sym, s_iid_fallback, l_iid_fallback,
+        entry_dt_iso)`` tuples.
+
+    Returns
+    -------
+    list[tuple[int, list[dict]]]
+        ``(candidate_index, marks)`` pairs for every candidate that had at
+        least one matching mark on this day.
+    """
+    day_str, candidate_requests = args
+
+    cbbo = load_cbbo(day_str)
+    if cbbo is None:
+        return []
+    def_df = load_definitions(day_str)
+    if def_df is None:
+        return []
+
+    imap = build_instrument_map(def_df)
+    sym_to_iid: dict[str, int] = {v["raw_symbol"]: k for k, v in imap.items()}
+
+    # Vectorized pre-index: instrument_id -> ndarray of [ts, bid, ask] rows.
+    # Replaces the expensive per-candidate DataFrame.isin() + groupby.
+    idx: dict[int, np.ndarray] = {}
+    for iid, grp in cbbo.groupby("instrument_id"):
+        idx[int(iid)] = grp[["ts", "bid_px_00", "ask_px_00"]].values
+
+    results: list[tuple[int, list[dict]]] = []
+
+    for ci, short_sym, long_sym, s_iid_fb, l_iid_fb, entry_dt_iso in candidate_requests:
+        entry_dt = datetime.fromisoformat(entry_dt_iso)
+
+        s_iid = sym_to_iid.get(short_sym, s_iid_fb)
+        l_iid = sym_to_iid.get(long_sym, l_iid_fb)
+
+        s_rows = idx.get(s_iid)
+        l_rows = idx.get(l_iid)
+        if s_rows is None or l_rows is None:
+            continue
+
+        # Timestamp-keyed dicts for O(1) intersection
+        s_dict = {ts: (bid, ask) for ts, bid, ask in s_rows}
+        l_dict = {ts: (bid, ask) for ts, bid, ask in l_rows}
+
+        marks: list[dict] = []
+        for ts_val in sorted(set(s_dict) & set(l_dict)):
+            ts_pd = pd.Timestamp(ts_val)
+            if ts_pd.tzinfo is None:
+                ts_pd = ts_pd.tz_localize("UTC")
+            ts_dt = ts_pd.to_pydatetime()
+            if ts_dt <= entry_dt:
+                continue
+            s_bid, s_ask = s_dict[ts_val]
+            l_bid, l_ask = l_dict[ts_val]
+            marks.append({
+                "ts": ts_dt,
+                "short_bid": float(s_bid),
+                "short_ask": float(s_ask),
+                "long_bid": float(l_bid),
+                "long_ask": float(l_ask),
+            })
+
+        if marks:
+            results.append((ci, marks))
+
+    return results
+
+
+def label_candidates_fast(
+    candidates: list[dict],
+    trading_days: list[str],
+    *,
+    workers: int = 8,
+) -> list[dict]:
+    """Label candidates using inverted day-iteration with optional multiprocessing.
+
+    Instead of scanning the full CBBO DataFrame per candidate, this flips the
+    loop: for each forward day, load CBBO once, pre-index by instrument_id,
+    and extract marks for ALL candidates needing that day in a single pass.
+    Multiprocessing distributes forward days across *workers* processes.
+
+    Parameters
+    ----------
+    candidates   : list of candidate dicts (must include ``day``, ``expiry``,
+                   ``entry_dt``, ``short_symbol``, ``long_symbol``,
+                   ``short_instrument_id``, ``long_instrument_id``,
+                   ``entry_credit``).
+    trading_days : sorted list of ``YYYYMMDD`` strings covering the data range.
+    workers      : number of parallel workers (1 = sequential, no Pool overhead).
+
+    Returns
+    -------
+    list[dict]
+        Candidates augmented with outcome fields from ``_evaluate_outcome``.
+    """
+    if not candidates:
+        return []
+
+    # Phase 1: build extraction plan — forward_day -> [(cand_idx, ...)]
+    plan: dict[str, list[tuple]] = defaultdict(list)
+    for ci, c in enumerate(candidates):
+        entry_date = date.fromisoformat(c["day"])
+        expiry_date = date.fromisoformat(c["expiry"])
+        for d in trading_days:
+            d_date = date(int(d[:4]), int(d[4:6]), int(d[6:]))
+            if entry_date <= d_date <= expiry_date:
+                plan[d].append((
+                    ci,
+                    c["short_symbol"],
+                    c["long_symbol"],
+                    c["short_instrument_id"],
+                    c["long_instrument_id"],
+                    c["entry_dt"],
+                ))
+
+    n_forward_days = len(plan)
+    print(
+        f"  Extraction plan: {n_forward_days} forward days "
+        f"for {len(candidates)} candidates",
+        flush=True,
+    )
+
+    # Phase 2: extract marks per day (parallel or sequential)
+    all_marks: list[list[dict]] = [[] for _ in candidates]
+    day_args = sorted(plan.items())
+
+    if workers > 1 and n_forward_days > 1:
+        actual_workers = min(workers, n_forward_days)
+        print(f"  Using {actual_workers} workers for mark extraction", flush=True)
+        with Pool(actual_workers) as pool:
+            for di, day_results in enumerate(
+                pool.imap_unordered(_extract_marks_for_day, day_args),
+            ):
+                for ci, marks in day_results:
+                    all_marks[ci].extend(marks)
+                if (di + 1) % 10 == 0 or di + 1 == n_forward_days:
+                    print(
+                        f"  Extracted marks: {di + 1}/{n_forward_days} forward days",
+                        flush=True,
+                    )
+    else:
+        for di, day_item in enumerate(day_args):
+            day_results = _extract_marks_for_day(day_item)
+            for ci, marks in day_results:
+                all_marks[ci].extend(marks)
+            if (di + 1) % 10 == 0 or di + 1 == n_forward_days:
+                print(
+                    f"  Extracted marks: {di + 1}/{n_forward_days} forward days",
+                    flush=True,
+                )
+
+    # Phase 3: sort, downsample, evaluate outcomes
+    print("  Evaluating outcomes ...", flush=True)
+    for ci, c in enumerate(candidates):
+        marks = sorted(all_marks[ci], key=lambda m: m["ts"])
+        marks = _downsample_marks(marks)
+        c.update(_evaluate_outcome(c["entry_credit"], marks))
+        if (ci + 1) % 5000 == 0:
+            print(f"  Evaluated {ci + 1}/{len(candidates)} candidates", flush=True)
+
+    print(f"  Labeling complete: {len(candidates)} candidates", flush=True)
+    return candidates
+
+
 # ===================================================================
 # FEATURE ENGINEERING
 # ===================================================================
@@ -1554,7 +1779,11 @@ def deploy_model(
 # ===================================================================
 
 def run_pipeline(
-    *, max_days: int | None = None, deploy: bool = False, verbose: bool = True,
+    *,
+    max_days: int | None = None,
+    deploy: bool = False,
+    verbose: bool = True,
+    workers: int = 8,
 ) -> None:
     """Execute the full offline training pipeline end-to-end.
 
@@ -1600,8 +1829,8 @@ def run_pipeline(
     # Economic calendar (OPEX / FOMC / triple witching)
     cal_map = load_economic_calendar(ECONOMIC_CALENDAR_CSV)
 
-    # Offline GEX cache is the sole GEX source
-    cs_df = _load_offline_gex(OFFLINE_GEX_CSV)
+    # Merge production context_snapshots (authoritative) with offline GEX cache (historical)
+    cs_df = _load_merged_gex()
 
     gex_count = cs_df["gex_net"].notna().sum() if not cs_df.empty else 0
     print(f"  SPY equity rows : {len(spy_df)}")
@@ -1650,20 +1879,23 @@ def run_pipeline(
             if snapshot.empty:
                 continue
 
-            # SPY price at decision time
-            spy_mask = (
-                (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
-                & (spy_df["ts"] <= dec_utc)
-            )
-            spy_rows = spy_df[spy_mask]
-            if spy_rows.empty:
-                continue
-            spy_price = float(spy_rows.iloc[-1]["close"])
-
-            # SPX spot: prefer put-call parity, fall back to SPY * ratio
-            spx_spot = derive_spx_from_parity(
-                snapshot, inst_map, day_date, spy_price,
-            )
+            # SPX spot: prefer FRD SPX direct price, fall back to SPY + parity
+            spx_spot_frd = lookup_intraday_value(uq_df, "SPX", dec_utc)
+            if spx_spot_frd is not None:
+                spx_spot = spx_spot_frd
+                spy_price = spx_spot / SPY_SPX_RATIO
+            else:
+                spy_mask = (
+                    (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
+                    & (spy_df["ts"] <= dec_utc)
+                )
+                spy_rows = spy_df[spy_mask]
+                if spy_rows.empty:
+                    continue
+                spy_price = float(spy_rows.iloc[-1]["close"])
+                spx_spot = derive_spx_from_parity(
+                    snapshot, inst_map, day_date, spy_price,
+                )
 
             vix = lookup_intraday_value(uq_df, "VIX", dec_utc)
             vix9d = lookup_intraday_value(uq_df, "VIX9D", dec_utc)
@@ -1734,8 +1966,8 @@ def run_pipeline(
         return
 
     # -- 4. Label candidates --
-    print("[PIPELINE] Labeling candidates (forward-looking) ...", flush=True)
-    labeled = label_candidates(all_candidates, trading_days)
+    print(f"[PIPELINE] Labeling candidates (forward-looking, workers={workers}) ...", flush=True)
+    labeled = label_candidates_fast(all_candidates, trading_days, workers=workers)
     resolved = [c for c in labeled if c.get("resolved")]
     print(f"[PIPELINE] Labeled: {len(labeled)}, Resolved: {len(resolved)}", flush=True)
 
@@ -1839,8 +2071,12 @@ def precompute_offline_gex_to_csv(
         trading_days = trading_days[:max_days]
 
     spy_df = load_spy_equity()
+    frd_spx = load_frd_quotes(FRD_SPX, "SPX")
+    empty_prod = pd.DataFrame(columns=["ts", "symbol", "last"])
+    uq_df = merge_underlying_quotes(empty_prod, frd_spx)
     print(f"[GEX-PRECOMPUTE] {len(trading_days)} trading days, "
-          f"SPY equity: {len(spy_df)} rows", flush=True)
+          f"SPY equity: {len(spy_df)} rows, FRD SPX: {len(frd_spx)} rows",
+          flush=True)
 
     rows: list[dict] = []
 
@@ -1878,15 +2114,21 @@ def precompute_offline_gex_to_csv(
             if snapshot.empty:
                 continue
 
-            spy_mask = (
-                (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
-                & (spy_df["ts"] <= dec_utc)
-            )
-            spy_rows = spy_df[spy_mask]
-            if spy_rows.empty:
-                continue
-            spy_price = float(spy_rows.iloc[-1]["close"])
-            spx_spot = derive_spx_from_parity(snapshot, inst_map, day_date, spy_price)
+            # SPX spot: prefer FRD SPX direct price, fall back to SPY + parity
+            spx_spot_frd = lookup_intraday_value(uq_df, "SPX", dec_utc)
+            if spx_spot_frd is not None:
+                spx_spot = spx_spot_frd
+                spy_price = spx_spot / SPY_SPX_RATIO
+            else:
+                spy_mask = (
+                    (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
+                    & (spy_df["ts"] <= dec_utc)
+                )
+                spy_rows = spy_df[spy_mask]
+                if spy_rows.empty:
+                    continue
+                spy_price = float(spy_rows.iloc[-1]["close"])
+                spx_spot = derive_spx_from_parity(snapshot, inst_map, day_date, spy_price)
 
             gex_net, zero_gamma = compute_offline_gex(
                 snapshot, inst_map, oi_df, spx_spot, day_date,
@@ -2073,6 +2315,11 @@ def main() -> None:
         help="Model type: 'bucket' (default) runs full pipeline, "
              "'xgboost' reads existing training_candidates.csv and trains XGBoost",
     )
+    parser.add_argument(
+        "--workers", type=int, default=min(8, os.cpu_count() or 1),
+        help="Number of parallel workers for the labeling step "
+             "(default: min(8, cpu_count))",
+    )
     args = parser.parse_args()
 
     if args.precompute_gex:
@@ -2092,6 +2339,7 @@ def main() -> None:
         max_days=args.max_days,
         deploy=args.deploy,
         verbose=not args.quiet,
+        workers=args.workers,
     )
 
 

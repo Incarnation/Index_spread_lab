@@ -39,6 +39,8 @@ ALL_APP_TABLES = [
     "trade_performance_breakdowns",
     "trade_performance_equity_curve",
     "economic_events",
+    "portfolio_state",
+    "portfolio_trades",
 ]
 
 # Tables dropped by ML-only reset (db_reset_ml_tables.sql).

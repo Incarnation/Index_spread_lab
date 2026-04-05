@@ -1,0 +1,1568 @@
+"""Capital-budgeted backtest engine with scheduled + event-driven layers.
+
+Simulates a fixed-capital portfolio with configurable:
+  - Position sizing (gradual lot scaling or fixed)
+  - Monthly drawdown stop-loss
+  - Scheduled trade selection (calls-only or both, by credit_to_width)
+  - Event-driven signals (SPX drop, VIX spike, rally avoidance, etc.)
+  - Exhaustive parameter grid search with CSV export
+
+Usage::
+
+    # Single run with defaults ($20k, 2/day, 15% monthly stop)
+    python scripts/backtest_strategy.py
+
+    # Custom single run
+    python scripts/backtest_strategy.py --capital 20000 --max-trades 2 --monthly-stop 0.15
+
+    # Exhaustive optimizer (sweeps ~1000+ configs, exports CSV)
+    python scripts/backtest_strategy.py --optimize
+
+    # Quick comparison of preset configs
+    python scripts/backtest_strategy.py --compare
+
+Continuous Improvement Workflow
+-------------------------------
+**Weekly** -- Compare live paper-trade PnL against backtest expectations.
+Check that win-rate and average trade PnL are within 1 standard deviation
+of the backtest distribution.  Investigate if 3+ consecutive losing days
+occur that the backtest did not predict.
+
+**Monthly** -- After accumulating a full calendar month of live data:
+
+1. Download latest Databento data and regenerate ``training_candidates.csv``::
+
+       python scripts/download_databento.py --phase full
+       python scripts/generate_training_data.py --workers 4
+
+2. Re-run the optimizer with the expanded dataset::
+
+       python scripts/backtest_strategy.py --optimize
+
+3. Run walk-forward validation to check for drift::
+
+       python scripts/backtest_strategy.py --walkforward
+
+4. If the current config's out-of-sample Sharpe drops >30% vs the
+   original walkforward result for 2+ consecutive months, re-select
+   the best config from the updated Pareto frontier and update
+   ``.env`` PORTFOLIO_*/EVENT_* values accordingly.
+
+**On new data sources** -- When adding FRD data for earlier years (2022-2024),
+regenerate the full training set and re-run ``--optimize --walkforward``
+to validate the strategy on the longer history.  Larger datasets
+reduce overfitting risk and increase confidence in parameter choices.
+"""
+from __future__ import annotations
+
+import argparse
+import itertools
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
+RESULTS_CSV = DATA_DIR / "backtest_results.csv"
+
+MARGIN_PER_LOT = 1000  # 10-pt wide SPX spread, $100/pt multiplier
+
+
+# ===================================================================
+# Configuration dataclasses
+# ===================================================================
+
+
+@dataclass
+class PortfolioConfig:
+    """All portfolio-level parameters.
+
+    Every field is configurable for the grid-search optimizer.
+    Defaults reflect the recommended starting configuration.
+    """
+
+    starting_capital: float = 20_000
+    max_trades_per_day: int = 2
+    monthly_drawdown_limit: float | None = 0.15
+    lot_per_equity: float = 10_000
+    max_equity_risk_pct: float = 0.10
+    max_margin_pct: float = 0.30
+    calls_only: bool = True
+    min_dte: int | None = None
+    max_delta: float | None = None
+
+
+@dataclass
+class EventConfig:
+    """All event-driven signal parameters.
+
+    When ``enabled`` is False the event layer is skipped entirely
+    and all other fields are ignored by the optimizer.
+    """
+
+    enabled: bool = False
+
+    # Budget allocation
+    budget_mode: str = "shared"        # "shared" or "separate"
+    max_event_trades: int = 1          # only used in "separate" mode
+
+    # SPX drop triggers (previous-day return)
+    spx_drop_threshold: float = -0.01  # e.g. -0.01 = drop > 1%
+    spx_drop_2d_threshold: float = -0.02
+
+    # VIX triggers
+    vix_spike_threshold: float = 0.15  # VIX % change > 15%
+    vix_elevated_threshold: float = 25.0
+
+    # Term structure
+    term_inversion_threshold: float = 1.0  # VIX/VIX9D > 1.0
+
+    # Event-driven trade parameters
+    side_preference: str = "puts"      # "puts", "calls", or "best"
+    min_dte: int = 5
+    max_dte: int = 7
+    min_delta: float = 0.15
+    max_delta: float = 0.25
+
+    # Rally avoidance
+    rally_avoidance: bool = False
+    rally_threshold: float = 0.01
+
+
+@dataclass
+class FullConfig:
+    """Combines portfolio and event configs into a single searchable unit."""
+
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    event: EventConfig = field(default_factory=EventConfig)
+
+    def flat_dict(self) -> dict[str, Any]:
+        """Flatten both configs into a single dict for CSV export."""
+        d: dict[str, Any] = {}
+        for k, v in asdict(self.portfolio).items():
+            d[f"p_{k}"] = v
+        for k, v in asdict(self.event).items():
+            d[f"e_{k}"] = v
+        return d
+
+
+# ===================================================================
+# Core classes
+# ===================================================================
+
+
+@dataclass
+class DayRecord:
+    """One row in the equity-curve output."""
+
+    day: str
+    equity: float
+    daily_pnl: float
+    n_trades: int
+    lots: int
+    status: str
+    month_start_equity: float
+    event_signals: str = ""
+
+
+class PortfolioManager:
+    """Tracks equity, enforces risk limits, computes lot sizes.
+
+    Parameters
+    ----------
+    config : PortfolioConfig with all strategy parameters.
+    """
+
+    def __init__(self, config: PortfolioConfig) -> None:
+        self.cfg = config
+        self.equity = config.starting_capital
+        self.month_start_equity = config.starting_capital
+        self._current_month: str | None = None
+        self._month_stopped = False
+        self._trades_today = 0
+        self._lots_today: int | None = None
+
+    def begin_day(self, day: str) -> None:
+        """Reset daily counters; handle month rollover."""
+        month_key = day[:7]
+        if month_key != self._current_month:
+            self._current_month = month_key
+            self.month_start_equity = self.equity
+            self._month_stopped = False
+        self._trades_today = 0
+        self._lots_today = None
+
+    def can_trade(self) -> bool:
+        """Return True if a new trade is allowed right now."""
+        if self._month_stopped:
+            return False
+        if self.equity < MARGIN_PER_LOT:
+            return False
+        limit = self.cfg.monthly_drawdown_limit
+        if limit is not None and self.equity < self.month_start_equity * (1 - limit):
+            self._month_stopped = True
+            return False
+        if self._trades_today >= self.cfg.max_trades_per_day:
+            return False
+        return True
+
+    @property
+    def is_month_stopped(self) -> bool:
+        return self._month_stopped
+
+    def compute_lots(self) -> int:
+        """Lot count for the next trade, cached per day for consistency."""
+        if self._lots_today is not None:
+            return self._lots_today
+
+        raw = max(1, int(self.equity / self.cfg.lot_per_equity))
+        max_by_risk = max(1, int(self.equity * self.cfg.max_equity_risk_pct / MARGIN_PER_LOT))
+        self._lots_today = min(raw, max_by_risk)
+        return self._lots_today
+
+    def record_trade(self, pnl_per_lot: float, lots: int) -> float:
+        """Apply a settled trade. Returns total PnL."""
+        total_pnl = pnl_per_lot * lots
+        self.equity += total_pnl
+        self._trades_today += 1
+        return total_pnl
+
+    def status_label(self) -> str:
+        if self._month_stopped:
+            return "monthly_stop"
+        if self.equity < MARGIN_PER_LOT:
+            return "insufficient_capital"
+        if self._trades_today >= self.cfg.max_trades_per_day:
+            return "daily_limit"
+        return "ok"
+
+
+class EventSignalDetector:
+    """Evaluate market conditions and return active event signals.
+
+    Requires a ``day_signals`` DataFrame precomputed from the daily
+    aggregates (SPX return, VIX change, etc.).
+
+    Parameters
+    ----------
+    config : EventConfig with all trigger thresholds.
+    """
+
+    def __init__(self, config: EventConfig) -> None:
+        self.cfg = config
+
+    def detect(self, day_row: pd.Series) -> list[str]:
+        """Return list of active signal names for today.
+
+        Parameters
+        ----------
+        day_row : Series with keys ``prev_spx_return``, ``prev_spx_return_2d``,
+            ``prev_vix_pct_change``, ``vix``, ``term_structure``.
+        """
+        if not self.cfg.enabled:
+            return []
+
+        signals: list[str] = []
+        prev_ret = day_row.get("prev_spx_return")
+        prev_ret_2d = day_row.get("prev_spx_return_2d")
+        prev_vix_chg = day_row.get("prev_vix_pct_change")
+        vix = day_row.get("vix")
+        ts = day_row.get("term_structure")
+
+        if prev_ret is not None and prev_ret < self.cfg.spx_drop_threshold:
+            signals.append("spx_drop_1d")
+        if prev_ret_2d is not None and prev_ret_2d < self.cfg.spx_drop_2d_threshold:
+            signals.append("spx_drop_2d")
+        if prev_vix_chg is not None and prev_vix_chg > self.cfg.vix_spike_threshold:
+            signals.append("vix_spike")
+        if vix is not None and vix > self.cfg.vix_elevated_threshold:
+            signals.append("vix_elevated")
+        if ts is not None and ts > self.cfg.term_inversion_threshold:
+            signals.append("term_inversion")
+        if self.cfg.rally_avoidance and prev_ret is not None and prev_ret > self.cfg.rally_threshold:
+            signals.append("rally")
+
+        return signals
+
+
+class ScheduledSelector:
+    """Deterministic scheduled-layer candidate selection.
+
+    Picks the best candidate per decision time by ``credit_to_width``,
+    then returns the top-N across the day.
+
+    Parameters
+    ----------
+    config : PortfolioConfig controlling side/DTE/delta filters.
+    max_n : Maximum candidates to return.
+    """
+
+    def __init__(self, config: PortfolioConfig, max_n: int) -> None:
+        self.cfg = config
+        self.max_n = max_n
+
+    def select(self, day_df: pd.DataFrame) -> pd.DataFrame:
+        """Return up to ``max_n`` candidates for today."""
+        c = day_df
+        if self.cfg.calls_only:
+            c = c[c["spread_side"] == "call"]
+        if self.cfg.min_dte is not None:
+            c = c[c["dte_target"] >= self.cfg.min_dte]
+        if self.cfg.max_delta is not None:
+            c = c[c["delta_target"] <= self.cfg.max_delta]
+        if c.empty:
+            return c.head(0)
+
+        best = (
+            c.sort_values("credit_to_width", ascending=False)
+            .groupby("entry_dt")
+            .head(1)
+        )
+        return best.sort_values("credit_to_width", ascending=False).head(self.max_n)
+
+
+class EventSelector:
+    """Event-layer candidate selection, activated on signal days.
+
+    Parameters
+    ----------
+    config : EventConfig controlling side/DTE/delta for event trades.
+    max_n : Maximum event candidates to return.
+    """
+
+    def __init__(self, config: EventConfig, max_n: int) -> None:
+        self.cfg = config
+        self.max_n = max_n
+
+    def select(self, day_df: pd.DataFrame, signals: list[str]) -> pd.DataFrame:
+        """Return up to ``max_n`` event-driven candidates.
+
+        Parameters
+        ----------
+        day_df : All candidates for the day.
+        signals : Active signal names from EventSignalDetector.
+        """
+        if not signals or not self.cfg.enabled:
+            return day_df.head(0)
+
+        c = day_df.copy()
+
+        has_drop = any(s.startswith("spx_drop") or s == "vix_spike" or s == "vix_elevated"
+                       for s in signals)
+        has_rally = "rally" in signals
+
+        # Side preference
+        if has_drop and self.cfg.side_preference == "puts":
+            c = c[c["spread_side"] == "put"]
+        elif has_rally and self.cfg.side_preference == "calls":
+            c = c[c["spread_side"] == "call"]
+
+        # DTE/delta range for event trades
+        c = c[(c["dte_target"] >= self.cfg.min_dte) & (c["dte_target"] <= self.cfg.max_dte)]
+        c = c[(c["delta_target"] >= self.cfg.min_delta) & (c["delta_target"] <= self.cfg.max_delta)]
+
+        if c.empty:
+            return c.head(0)
+
+        best = (
+            c.sort_values("credit_to_width", ascending=False)
+            .groupby("entry_dt")
+            .head(1)
+        )
+        return best.sort_values("credit_to_width", ascending=False).head(self.max_n)
+
+
+# ===================================================================
+# Precompute daily signals
+# ===================================================================
+
+
+def precompute_daily_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a per-day DataFrame with lagged market features for event detection.
+
+    Parameters
+    ----------
+    df : Full training_candidates DataFrame.
+
+    Returns
+    -------
+    DataFrame indexed by ``day`` with columns used by EventSignalDetector.
+    """
+    daily = (
+        df.groupby("day")
+        .agg(spot=("spot", "first"), vix=("vix", "first"),
+             vix9d=("vix9d", "first"), term_structure=("term_structure", "first"))
+        .reset_index()
+        .sort_values("day")
+        .reset_index(drop=True)
+    )
+    daily["spx_return"] = daily["spot"].pct_change()
+    daily["spx_return_2d"] = daily["spot"].pct_change(2)
+    daily["vix_pct_change"] = daily["vix"].pct_change()
+
+    daily["prev_spx_return"] = daily["spx_return"].shift(1)
+    daily["prev_spx_return_2d"] = daily["spx_return_2d"].shift(1)
+    daily["prev_vix_pct_change"] = daily["vix_pct_change"].shift(1)
+
+    return daily.set_index("day")
+
+
+# ===================================================================
+# Backtest engine
+# ===================================================================
+
+
+@dataclass
+class BacktestResult:
+    """Complete output from a single backtest run."""
+
+    config: FullConfig
+    label: str
+    curve: list[DayRecord]
+    final_equity: float
+    total_return_pct: float
+    annualised_return_pct: float
+    max_drawdown_pct: float
+    trough: float
+    total_trades: int
+    days_traded: int
+    days_stopped: int
+    win_days: int
+    sharpe: float
+    monthly: pd.DataFrame
+
+
+def _precompute_day_selections(df: pd.DataFrame) -> dict[str, dict]:
+    """Pre-group candidates by day and pre-sort by credit_to_width.
+
+    Returns a dict keyed by day with pre-filtered views for fast selection.
+    """
+    df_sorted = df.sort_values("credit_to_width", ascending=False)
+    result: dict[str, dict] = {}
+
+    for day, grp in df_sorted.groupby("day"):
+        calls = grp[grp["spread_side"] == "call"]
+        puts = grp[grp["spread_side"] == "put"]
+
+        call_best = calls.groupby("entry_dt").head(1) if not calls.empty else calls
+        put_best = puts.groupby("entry_dt").head(1) if not puts.empty else puts
+        all_best = grp.groupby("entry_dt").head(1) if not grp.empty else grp
+
+        result[day] = {
+            "all": grp,
+            "call": calls,
+            "put": puts,
+            "call_best_per_dt": call_best,
+            "put_best_per_dt": put_best,
+            "all_best_per_dt": all_best,
+        }
+    return result
+
+
+def _fast_sched_select(precomp: dict, pc: PortfolioConfig, max_n: int) -> pd.DataFrame:
+    """Pick top-N scheduled candidates from pre-sorted data."""
+    if pc.calls_only:
+        cands = precomp["call_best_per_dt"]
+    else:
+        cands = precomp["all_best_per_dt"]
+    if pc.min_dte is not None:
+        cands = cands[cands["dte_target"] >= pc.min_dte]
+    if pc.max_delta is not None:
+        cands = cands[cands["delta_target"] <= pc.max_delta]
+    return cands.head(max_n)
+
+
+def _fast_event_select(precomp: dict, ec: EventConfig, signals: list[str], max_n: int) -> pd.DataFrame:
+    """Pick top-N event candidates from pre-sorted data."""
+    has_drop = any(s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated") for s in signals)
+
+    if has_drop and ec.side_preference == "puts":
+        cands = precomp["put"]
+    elif ec.side_preference == "calls":
+        cands = precomp["call"]
+    else:
+        cands = precomp["all"]
+
+    mask = (
+        (cands["dte_target"] >= ec.min_dte) & (cands["dte_target"] <= ec.max_dte) &
+        (cands["delta_target"] >= ec.min_delta) & (cands["delta_target"] <= ec.max_delta)
+    )
+    filtered = cands[mask]
+    if filtered.empty:
+        return filtered.head(0)
+    return filtered.groupby("entry_dt").head(1).head(max_n)
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    daily_signals: pd.DataFrame,
+    config: FullConfig,
+    label: str = "",
+    day_precomp: dict[str, dict] | None = None,
+) -> BacktestResult:
+    """Simulate the full strategy on historical candidates.
+
+    Parameters
+    ----------
+    df : Full training_candidates DataFrame.
+    daily_signals : Precomputed daily signal features (from ``precompute_daily_signals``).
+    config : Combined portfolio + event configuration.
+    label : Human-readable name for this run.
+    day_precomp : Optional pre-computed per-day candidate selections
+        (from ``_precompute_day_selections``). Avoids repeated sorting.
+
+    Returns
+    -------
+    BacktestResult with equity curve, metrics, and monthly breakdown.
+    """
+    pc = config.portfolio
+    ec = config.event
+    effective_pc = pc
+    if ec.enabled and ec.budget_mode == "separate":
+        effective_pc = PortfolioConfig(**{**vars(pc),
+            "max_trades_per_day": pc.max_trades_per_day + ec.max_event_trades})
+
+    pm = PortfolioManager(effective_pc)
+    event_det = EventSignalDetector(ec)
+
+    if day_precomp is None:
+        day_precomp = _precompute_day_selections(df)
+
+    days = sorted(day_precomp.keys())
+    curve: list[DayRecord] = []
+
+    for day in days:
+        pm.begin_day(day)
+
+        if not pm.can_trade():
+            curve.append(DayRecord(
+                day=day, equity=pm.equity, daily_pnl=0, n_trades=0,
+                lots=0, status=pm.status_label(),
+                month_start_equity=pm.month_start_equity,
+            ))
+            continue
+
+        precomp = day_precomp[day]
+
+        signals: list[str] = []
+        if day in daily_signals.index:
+            day_row = daily_signals.loc[day]
+            signals = event_det.detect(day_row)
+
+        skip_scheduled = ec.rally_avoidance and "rally" in signals
+
+        lots = pm.compute_lots()
+        daily_pnl = 0.0
+        trades_placed = 0
+
+        # --- Event trades first ---
+        drop_signals = [s for s in signals if s != "rally"]
+        event_trades_placed = 0
+        if ec.enabled and drop_signals:
+            evt_max = ec.max_event_trades
+            event_candidates = _fast_event_select(precomp, ec, drop_signals, evt_max)
+
+            for pnl_val in event_candidates["realized_pnl"].values:
+                if not pm.can_trade() or event_trades_placed >= evt_max:
+                    break
+                trade_pnl = pm.record_trade(float(pnl_val), lots)
+                daily_pnl += trade_pnl
+                trades_placed += 1
+                event_trades_placed += 1
+
+        # --- Scheduled trades ---
+        if not skip_scheduled:
+            if ec.enabled and ec.budget_mode == "shared":
+                sched_limit = max(0, pc.max_trades_per_day - event_trades_placed)
+            else:
+                sched_limit = pc.max_trades_per_day
+            sched_candidates = _fast_sched_select(precomp, pc, sched_limit)
+            for pnl_val in sched_candidates["realized_pnl"].values:
+                if not pm.can_trade():
+                    break
+                trade_pnl = pm.record_trade(float(pnl_val), lots)
+                daily_pnl += trade_pnl
+                trades_placed += 1
+
+        status = "traded" if trades_placed > 0 else ("rally_skip" if skip_scheduled else "no_candidates")
+        curve.append(DayRecord(
+            day=day, equity=pm.equity, daily_pnl=daily_pnl,
+            n_trades=trades_placed, lots=lots, status=status,
+            month_start_equity=pm.month_start_equity,
+            event_signals=",".join(signals) if signals else "",
+        ))
+
+    # --- Compute summary metrics ---
+    ec_df = pd.DataFrame([vars(r) for r in curve])
+    final = pm.equity
+    cap = pc.starting_capital
+    n_days = len(days)
+
+    cummax = ec_df["equity"].cummax()
+    dd_series = (cummax - ec_df["equity"]) / cummax
+    max_dd_pct = float(dd_series.max()) * 100 if len(dd_series) > 0 else 0
+
+    traded_mask = ec_df["n_trades"] > 0
+    stopped_mask = ec_df["status"] == "monthly_stop"
+    days_traded = int(traded_mask.sum())
+    days_stopped = int(stopped_mask.sum())
+    win_days = int((ec_df.loc[traded_mask, "daily_pnl"] > 0).sum()) if days_traded > 0 else 0
+
+    traded_pnl = ec_df.loc[traded_mask, "daily_pnl"]
+    sharpe = 0.0
+    if len(traded_pnl) > 1 and traded_pnl.std() > 0:
+        sharpe = float(traded_pnl.mean() / traded_pnl.std() * np.sqrt(252))
+
+    total_ret = (final / cap - 1) * 100 if cap > 0 else 0
+    ann_ret = ((final / cap) ** (252 / max(n_days, 1)) - 1) * 100 if cap > 0 else 0
+
+    # Monthly breakdown
+    ec_df["month"] = pd.to_datetime(ec_df["day"]).dt.to_period("M")
+    monthly_rows: list[dict[str, Any]] = []
+    running_eq = cap
+    for month, grp in ec_df.groupby("month"):
+        m_pnl = grp["daily_pnl"].sum()
+        m_ret = m_pnl / running_eq * 100 if running_eq > 0 else 0
+        m_traded = (grp["n_trades"] > 0).sum()
+        m_stopped = (grp["status"] == "monthly_stop").sum()
+        m_win = (grp.loc[grp["n_trades"] > 0, "daily_pnl"] > 0).sum()
+        m_worst = grp["daily_pnl"].min()
+        m_end = grp["equity"].iloc[-1]
+        m_lots = grp.loc[grp["n_trades"] > 0, "lots"]
+        m_avg_lots = float(m_lots.mean()) if len(m_lots) > 0 else 0
+        m_events = (grp["event_signals"] != "").sum()
+
+        monthly_rows.append({
+            "month": str(month), "pnl": m_pnl, "return_pct": m_ret,
+            "end_equity": m_end, "avg_lots": m_avg_lots,
+            "days_traded": int(m_traded), "days_stopped": int(m_stopped),
+            "win_days": int(m_win), "worst_day": m_worst, "event_days": int(m_events),
+        })
+        running_eq = m_end
+
+    return BacktestResult(
+        config=config, label=label, curve=curve,
+        final_equity=final, total_return_pct=total_ret,
+        annualised_return_pct=ann_ret, max_drawdown_pct=max_dd_pct,
+        trough=float(ec_df["equity"].min()),
+        total_trades=int(ec_df["n_trades"].sum()),
+        days_traded=days_traded, days_stopped=days_stopped,
+        win_days=win_days, sharpe=sharpe,
+        monthly=pd.DataFrame(monthly_rows),
+    )
+
+
+# ===================================================================
+# Grid-search optimizer
+# ===================================================================
+
+
+def _build_optimizer_grid() -> list[FullConfig]:
+    """Generate all valid parameter combinations for the exhaustive search.
+
+    Returns
+    -------
+    List of FullConfig objects covering the full parameter space.
+    Invalid combos (e.g. event params when event is disabled) are pruned.
+    """
+    configs: list[FullConfig] = []
+
+    portfolio_grid = list(itertools.product(
+        [20_000],                          # starting_capital
+        [1, 2, 3],                         # max_trades_per_day
+        [0.10, 0.15, 0.20, None],         # monthly_drawdown_limit
+        [10_000, 20_000, 999_999],         # lot_per_equity
+        [True, False],                     # calls_only
+        [None],                            # min_dte (None = no filter)
+        [None],                            # max_delta (None = no filter)
+    ))
+
+    # No-event configs
+    for cap, trades, mstop, lpe, co, mdte, mdelta in portfolio_grid:
+        pc = PortfolioConfig(
+            starting_capital=cap, max_trades_per_day=trades,
+            monthly_drawdown_limit=mstop, lot_per_equity=lpe,
+            calls_only=co, min_dte=mdte, max_delta=mdelta,
+        )
+        configs.append(FullConfig(portfolio=pc, event=EventConfig(enabled=False)))
+
+    # Event configs (only meaningful subsets)
+    event_grid = list(itertools.product(
+        ["shared", "separate"],            # budget_mode
+        [1, 2],                            # max_event_trades
+        [-0.005, -0.01, -0.015],           # spx_drop_threshold
+        ["puts", "best"],                  # side_preference
+        [3, 5],                            # event min_dte
+        [5, 7, 10],                        # event max_dte
+        [0.10, 0.15],                      # event min_delta
+        [0.20, 0.25],                      # event max_delta
+        [True, False],                     # rally_avoidance
+    ))
+
+    # Pair event configs with a focused set of portfolio configs
+    portfolio_for_events = list(itertools.product(
+        [20_000],                          # starting_capital
+        [2, 3],                            # max_trades_per_day
+        [0.15],                            # monthly_drawdown_limit
+        [10_000],                          # lot_per_equity
+        [True, False],                     # calls_only
+    ))
+
+    for (cap, trades, mstop, lpe, co) in portfolio_for_events:
+        for (bmode, evt_max, drop_thr, side, emin_dte, emax_dte,
+             emin_d, emax_d, rally) in event_grid:
+
+            if emin_dte > emax_dte:
+                continue
+            if emin_d > emax_d:
+                continue
+            if bmode == "shared" and evt_max > 1:
+                continue  # shared mode ignores max_event_trades
+
+            pc = PortfolioConfig(
+                starting_capital=cap, max_trades_per_day=trades,
+                monthly_drawdown_limit=mstop, lot_per_equity=lpe,
+                calls_only=co,
+            )
+            evc = EventConfig(
+                enabled=True, budget_mode=bmode,
+                max_event_trades=evt_max,
+                spx_drop_threshold=drop_thr,
+                side_preference=side,
+                min_dte=emin_dte, max_dte=emax_dte,
+                min_delta=emin_d, max_delta=emax_d,
+                rally_avoidance=rally,
+            )
+            configs.append(FullConfig(portfolio=pc, event=evc))
+
+    return configs
+
+
+def run_optimizer(
+    df: pd.DataFrame,
+    daily_signals: pd.DataFrame,
+    output_csv: Path = RESULTS_CSV,
+) -> pd.DataFrame:
+    """Run exhaustive grid search and export results.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame.
+    daily_signals : Precomputed daily signal features.
+    output_csv : Path to write the full results CSV.
+
+    Returns
+    -------
+    DataFrame with one row per config, sorted by Sharpe descending.
+    """
+    configs = _build_optimizer_grid()
+    print(f"\nOptimizer: {len(configs):,} configurations to evaluate")
+
+    print("Pre-computing per-day candidate selections ...")
+    day_precomp = _precompute_day_selections(df)
+
+    rows: list[dict[str, Any]] = []
+    t0 = time.time()
+
+    for i, cfg in enumerate(configs):
+        result = run_backtest(df, daily_signals, cfg, day_precomp=day_precomp)
+        row = cfg.flat_dict()
+        row.update({
+            "final_equity": result.final_equity,
+            "return_pct": result.total_return_pct,
+            "ann_return_pct": result.annualised_return_pct,
+            "max_dd_pct": result.max_drawdown_pct,
+            "trough": result.trough,
+            "sharpe": result.sharpe,
+            "total_trades": result.total_trades,
+            "days_traded": result.days_traded,
+            "days_stopped": result.days_stopped,
+            "win_days": result.win_days,
+            "win_rate": result.win_days / max(result.days_traded, 1),
+        })
+        rows.append(row)
+
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            remaining = (len(configs) - i - 1) / rate
+            print(f"  {i+1:,}/{len(configs):,} done  "
+                  f"({rate:.0f}/sec, ~{remaining:.0f}s remaining)")
+
+    elapsed = time.time() - t0
+    print(f"  Completed {len(configs):,} configs in {elapsed:.1f}s "
+          f"({len(configs)/elapsed:.0f}/sec)")
+
+    results_df = pd.DataFrame(rows)
+    results_df.to_csv(output_csv, index=False)
+    print(f"\n  Full results exported to {output_csv}")
+
+    return results_df.sort_values("sharpe", ascending=False).reset_index(drop=True)
+
+
+# ===================================================================
+# Preset comparison configs
+# ===================================================================
+
+
+def _build_comparison_configs() -> list[tuple[str, FullConfig]]:
+    """Hand-picked configs for quick side-by-side comparison."""
+    return [
+        ("$20k | 2/day | 15% stop | gradual | calls", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 2/day | 20% stop | gradual | calls", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.20, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 2/day | no stop  | gradual | calls", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=None, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 1/day | 15% stop | gradual | calls", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=1,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 2/day | 15% stop | fixed 1 | calls", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=999_999, calls_only=True),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 2/day | 15% stop | gradual | both sides", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=False),
+            event=EventConfig(enabled=False),
+        )),
+        ("$20k | 2+1ev | 15% stop | shared  | drop puts", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=True, budget_mode="shared", spx_drop_threshold=-0.01,
+                              side_preference="puts", min_dte=5, max_dte=7, min_delta=0.15, max_delta=0.25),
+        )),
+        ("$20k | 2+1ev | 15% stop | separate | drop puts", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=True, budget_mode="separate", max_event_trades=1,
+                              spx_drop_threshold=-0.01, side_preference="puts",
+                              min_dte=5, max_dte=7, min_delta=0.15, max_delta=0.25),
+        )),
+        ("$20k | 2/day | 15% stop | gradual | calls + rally avoid", FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000, calls_only=True),
+            event=EventConfig(enabled=True, rally_avoidance=True, rally_threshold=0.01),
+        )),
+    ]
+
+
+# ===================================================================
+# Display helpers
+# ===================================================================
+
+
+def print_summary(result: BacktestResult) -> None:
+    """Print a one-block summary of a backtest result."""
+    r = result
+    cap = r.config.portfolio.starting_capital
+    print(f"\n{'=' * 80}")
+    print(f"  {r.label}")
+    print(f"{'=' * 80}")
+    print(f"  Start: ${cap:,.0f}  ->  Final: ${r.final_equity:,.0f}  "
+          f"({r.total_return_pct:+.1f}%)")
+    print(f"  Annualised: {r.annualised_return_pct:+.0f}%  |  "
+          f"Max DD: {r.max_drawdown_pct:.1f}%  |  Trough: ${r.trough:,.0f}")
+    print(f"  Sharpe: {r.sharpe:.2f}  |  "
+          f"Trades: {r.total_trades}  |  "
+          f"Traded {r.days_traded}d  Stopped {r.days_stopped}d  "
+          f"Win {r.win_days}/{r.days_traded} "
+          f"({r.win_days / max(r.days_traded, 1) * 100:.0f}%)")
+
+
+def print_monthly(result: BacktestResult) -> None:
+    """Print month-by-month breakdown."""
+    print(f"\n{'Month':>8}  {'PnL':>10}  {'Return':>8}  {'Equity':>10}  "
+          f"{'Lots':>5}  {'Traded':>7}  {'Stopped':>8}  {'Events':>7}  {'Worst Day':>10}")
+    print("-" * 90)
+    for _, row in result.monthly.iterrows():
+        print(f"{row['month']:>8}  ${row['pnl']:>9,.0f}  "
+              f"{row['return_pct']:>+6.1f}%  ${row['end_equity']:>9,.0f}  "
+              f"{row['avg_lots']:>5.1f}  {int(row['days_traded']):>5}d  "
+              f"{int(row['days_stopped']):>6}d  {int(row['event_days']):>5}d  "
+              f"${row['worst_day']:>9,.0f}")
+
+
+def print_comparison_table(results: list[BacktestResult]) -> None:
+    """Print a compact comparison of multiple configs."""
+    print(f"\n{'=' * 115}")
+    print("  CONFIGURATION COMPARISON")
+    print(f"{'=' * 115}")
+    print(f"{'Configuration':<50} {'Final':>10} {'Return':>8} "
+          f"{'MaxDD':>6} {'Trough':>10} {'Sharpe':>7} "
+          f"{'Trades':>7} {'Stopped':>8}")
+    print("-" * 115)
+    for r in results:
+        print(f"{r.label:<50} ${r.final_equity:>9,.0f} "
+              f"{r.total_return_pct:>+6.0f}% "
+              f"{r.max_drawdown_pct:>5.0f}% "
+              f"${r.trough:>9,.0f} "
+              f"{r.sharpe:>7.2f} "
+              f"{r.total_trades:>7} "
+              f"{r.days_stopped:>6}d")
+
+
+def print_optimizer_top(results_df: pd.DataFrame, metric: str, n: int = 10) -> None:
+    """Print the top-N configs from the optimizer by a given metric."""
+    asc = metric == "max_dd_pct"
+    top = results_df.sort_values(metric, ascending=asc).head(n)
+
+    print(f"\n{'=' * 115}")
+    print(f"  TOP {n} BY {metric.upper()}")
+    print(f"{'=' * 115}")
+    cols = ["p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
+            "p_calls_only", "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
+            "e_rally_avoidance", "final_equity", "return_pct", "max_dd_pct",
+            "sharpe", "total_trades", "days_stopped"]
+    display_cols = [c for c in cols if c in top.columns]
+    print(top[display_cols].to_string(index=False))
+
+
+# ===================================================================
+# Analysis: parameter importance, Pareto frontier, robustness
+# ===================================================================
+
+
+PARETO_CSV = DATA_DIR / "pareto_frontier.csv"
+WALKFORWARD_CSV = DATA_DIR / "walkforward_results.csv"
+
+# Parameters that vary in the optimizer grid and are worth analyzing
+ANALYSIS_PARAMS = [
+    "p_max_trades_per_day",
+    "p_monthly_drawdown_limit",
+    "p_lot_per_equity",
+    "p_calls_only",
+    "e_enabled",
+    "e_budget_mode",
+    "e_spx_drop_threshold",
+    "e_rally_avoidance",
+    "e_side_preference",
+]
+
+
+def _deduplicate_results(rdf: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    """Collapse configs that produce identical outcome metrics.
+
+    Parameters
+    ----------
+    rdf : Full optimizer results DataFrame.
+
+    Returns
+    -------
+    Tuple of (deduplicated DataFrame keeping first of each group,
+    original count, unique count).
+    """
+    metric_cols = ["final_equity", "return_pct", "max_dd_pct", "sharpe",
+                   "total_trades", "days_traded", "days_stopped", "win_days"]
+    rounded = rdf[metric_cols].round(4)
+    dedup = rdf.loc[~rounded.duplicated(keep="first")]
+    return dedup, len(rdf), len(dedup)
+
+
+def _parameter_importance(rdf: pd.DataFrame) -> None:
+    """Print grouped-mean tables showing how each parameter affects outcomes.
+
+    For each parameter in ANALYSIS_PARAMS, groups the results by that
+    parameter's values and prints the mean Sharpe, return, and max DD,
+    plus the spread (max-min) across values.
+    """
+    metrics = ["sharpe", "return_pct", "max_dd_pct"]
+    print(f"\n{'=' * 100}")
+    print("  PARAMETER IMPORTANCE (mean metric by parameter value)")
+    print(f"{'=' * 100}")
+
+    importance: list[tuple[str, float]] = []
+
+    for param in ANALYSIS_PARAMS:
+        if param not in rdf.columns:
+            continue
+        grouped = rdf.groupby(param)[metrics].mean()
+        if len(grouped) < 2:
+            continue
+
+        sharpe_spread = grouped["sharpe"].max() - grouped["sharpe"].min()
+        importance.append((param, sharpe_spread))
+
+        print(f"\n  {param} (Sharpe spread: {sharpe_spread:.2f})")
+        print(f"  {'Value':<25} {'Sharpe':>8} {'Return%':>10} {'MaxDD%':>8}")
+        print("  " + "-" * 55)
+        for val, row in grouped.iterrows():
+            val_str = str(val) if val is not None else "None"
+            print(f"  {val_str:<25} {row['sharpe']:>8.2f} "
+                  f"{row['return_pct']:>+9.0f}% {row['max_dd_pct']:>7.1f}%")
+
+    importance.sort(key=lambda x: -x[1])
+    print(f"\n{'=' * 100}")
+    print("  PARAMETER RANKING (by Sharpe spread across values)")
+    print(f"{'=' * 100}")
+    for rank, (param, spread) in enumerate(importance, 1):
+        print(f"  {rank}. {param:<35} spread = {spread:.2f}")
+
+
+def extract_pareto_frontier(rdf: pd.DataFrame) -> pd.DataFrame:
+    """Find Pareto-optimal configs: no other config has both higher Sharpe AND lower max DD.
+
+    Parameters
+    ----------
+    rdf : Optimizer results DataFrame with ``sharpe`` and ``max_dd_pct`` columns.
+
+    Returns
+    -------
+    DataFrame with only Pareto-optimal rows, sorted by Sharpe descending.
+    """
+    is_pareto = np.ones(len(rdf), dtype=bool)
+    sharpe_vals = rdf["sharpe"].values
+    dd_vals = rdf["max_dd_pct"].values
+
+    for i in range(len(rdf)):
+        if not is_pareto[i]:
+            continue
+        # A point is dominated if any other point has >= sharpe AND <= dd (and strictly better on at least one)
+        for j in range(len(rdf)):
+            if i == j or not is_pareto[j]:
+                continue
+            if sharpe_vals[j] >= sharpe_vals[i] and dd_vals[j] <= dd_vals[i]:
+                if sharpe_vals[j] > sharpe_vals[i] or dd_vals[j] < dd_vals[i]:
+                    is_pareto[i] = False
+                    break
+
+    return rdf[is_pareto].sort_values("sharpe", ascending=False).reset_index(drop=True)
+
+
+def _print_pareto(pareto: pd.DataFrame) -> None:
+    """Print the Pareto frontier in a readable table."""
+    print(f"\n{'=' * 130}")
+    print(f"  PARETO FRONTIER (Sharpe vs Max DD) -- {len(pareto)} optimal configs")
+    print(f"{'=' * 130}")
+    cols = ["p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
+            "p_calls_only", "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
+            "e_rally_avoidance", "final_equity", "return_pct", "max_dd_pct",
+            "sharpe", "win_rate"]
+    display_cols = [c for c in cols if c in pareto.columns]
+    print(pareto[display_cols].to_string(index=False))
+
+
+def _robustness_check(
+    df: pd.DataFrame,
+    daily_signals: pd.DataFrame,
+    rdf: pd.DataFrame,
+    top_n: int = 20,
+) -> None:
+    """Re-run top-N configs and report monthly consistency.
+
+    Flags configs that depend on 1-2 monster months vs. those that
+    are consistently profitable across the period.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame.
+    daily_signals : Precomputed daily signal features.
+    rdf : Optimizer results DataFrame.
+    top_n : Number of top configs to re-evaluate.
+    """
+    print(f"\n{'=' * 140}")
+    print(f"  ROBUSTNESS CHECK (monthly consistency for top-{top_n} by Sharpe)")
+    print(f"{'=' * 140}")
+
+    top = rdf.sort_values("sharpe", ascending=False).head(top_n)
+    day_precomp = _precompute_day_selections(df)
+
+    print(f"  {'#':>3} {'Trades/d':>8} {'Stop':>6} {'Lots':>8} {'Calls':>6} "
+          f"{'Events':>7} {'Sharpe':>7} {'Return':>8} {'MaxDD':>6} "
+          f"{'Profit Mo':>10} {'Worst Mo':>10} {'Best Mo':>9} {'Consistency':>12}")
+    print("  " + "-" * 135)
+
+    for rank, (_, row) in enumerate(top.iterrows(), 1):
+        cfg = _row_to_config(row)
+        result = run_backtest(df, daily_signals, cfg, day_precomp=day_precomp)
+        m = result.monthly
+        n_months = len(m)
+        profitable_months = int((m["pnl"] > 0).sum())
+        worst_month_pct = float(m["return_pct"].min())
+        best_month_pct = float(m["return_pct"].max())
+        consistency = profitable_months / max(n_months, 1)
+
+        stop_str = f"{row.get('p_monthly_drawdown_limit', '')}"
+        lots_str = "grad" if row.get("p_lot_per_equity", 0) < 100_000 else "fixed"
+        evt_str = "yes" if row.get("e_enabled") else "no"
+
+        print(f"  {rank:>3} {int(row.get('p_max_trades_per_day', 0)):>8} "
+              f"{stop_str:>6} {lots_str:>8} {str(row.get('p_calls_only', '')):>6} "
+              f"{evt_str:>7} {row['sharpe']:>7.2f} {row['return_pct']:>+7.0f}% "
+              f"{row['max_dd_pct']:>5.0f}% "
+              f"{profitable_months:>5}/{n_months:<4} "
+              f"{worst_month_pct:>+9.1f}% {best_month_pct:>+8.1f}% "
+              f"{consistency:>11.0%}")
+
+
+def _row_to_config(row: pd.Series) -> FullConfig:
+    """Reconstruct a FullConfig from an optimizer results CSV row.
+
+    Parameters
+    ----------
+    row : One row from the optimizer results DataFrame.
+
+    Returns
+    -------
+    FullConfig with portfolio and event settings from the row.
+    """
+    dd_limit = row.get("p_monthly_drawdown_limit")
+    if pd.isna(dd_limit):
+        dd_limit = None
+
+    pc = PortfolioConfig(
+        starting_capital=float(row.get("p_starting_capital", 20_000)),
+        max_trades_per_day=int(row.get("p_max_trades_per_day", 2)),
+        monthly_drawdown_limit=dd_limit,
+        lot_per_equity=float(row.get("p_lot_per_equity", 10_000)),
+        calls_only=bool(row.get("p_calls_only", True)),
+    )
+    ec = EventConfig(
+        enabled=bool(row.get("e_enabled", False)),
+        budget_mode=str(row.get("e_budget_mode", "shared")),
+        max_event_trades=int(row.get("e_max_event_trades", 1)),
+        spx_drop_threshold=float(row.get("e_spx_drop_threshold", -0.01)),
+        side_preference=str(row.get("e_side_preference", "puts")),
+        min_dte=int(row.get("e_min_dte", 5)),
+        max_dte=int(row.get("e_max_dte", 7)),
+        min_delta=float(row.get("e_min_delta", 0.15)),
+        max_delta=float(row.get("e_max_delta", 0.25)),
+        rally_avoidance=bool(row.get("e_rally_avoidance", False)),
+        rally_threshold=float(row.get("e_rally_threshold", 0.01)),
+    )
+    return FullConfig(portfolio=pc, event=ec)
+
+
+def run_analysis(results_csv: Path) -> pd.DataFrame:
+    """Load optimizer CSV and print full analysis (A1-A4).
+
+    Parameters
+    ----------
+    results_csv : Path to the optimizer results CSV.
+
+    Returns
+    -------
+    The Pareto-frontier DataFrame (also exported to CSV).
+    """
+    rdf = pd.read_csv(results_csv)
+    print(f"\nLoaded {len(rdf):,} optimizer results from {results_csv}")
+
+    # A4: Dedup
+    dedup, orig, unique = _deduplicate_results(rdf)
+    print(f"  {unique} unique result profiles out of {orig} configs "
+          f"({orig - unique} duplicates)")
+
+    # A1: Parameter importance
+    _parameter_importance(dedup)
+
+    # A2: Pareto frontier
+    pareto = extract_pareto_frontier(dedup)
+    _print_pareto(pareto)
+    pareto.to_csv(PARETO_CSV, index=False)
+    print(f"\n  Pareto frontier exported to {PARETO_CSV}")
+
+    return pareto
+
+
+# ===================================================================
+# Walk-forward validation
+# ===================================================================
+
+WALKFORWARD_WINDOWS = [
+    {
+        "name": "W1",
+        "train_start": "2025-03-01", "train_end": "2025-08-31",
+        "test_start": "2025-09-01", "test_end": "2025-11-30",
+    },
+    {
+        "name": "W2",
+        "train_start": "2025-06-01", "train_end": "2025-11-30",
+        "test_start": "2025-12-01", "test_end": "2026-02-28",
+    },
+    {
+        "name": "W3",
+        "train_start": "2025-09-01", "train_end": "2026-02-28",
+        "test_start": "2026-03-01", "test_end": "2026-04-30",
+    },
+]
+
+
+def walkforward_split(
+    df: pd.DataFrame,
+    train_start: str,
+    train_end: str,
+    test_start: str,
+    test_end: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split training candidates into train/test by date range.
+
+    Parameters
+    ----------
+    df : Full training candidates DataFrame with ``day`` column.
+    train_start, train_end : Inclusive date boundaries for training slice.
+    test_start, test_end : Inclusive date boundaries for test slice.
+
+    Returns
+    -------
+    Tuple of (train_df, test_df).
+    """
+    train = df[(df["day"] >= train_start) & (df["day"] <= train_end)]
+    test = df[(df["day"] >= test_start) & (df["day"] <= test_end)]
+    return train, test
+
+
+def _run_window_optimizer(
+    df_slice: pd.DataFrame,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """Run the full optimizer grid on a data slice and return top-N rows.
+
+    Parameters
+    ----------
+    df_slice : Subset of training candidates for this window.
+    top_n : Number of top configs to return.
+
+    Returns
+    -------
+    DataFrame with top-N rows by Sharpe, including all config columns.
+    """
+    daily_signals = precompute_daily_signals(df_slice)
+    day_precomp = _precompute_day_selections(df_slice)
+    configs = _build_optimizer_grid()
+
+    rows: list[dict[str, Any]] = []
+    for cfg in configs:
+        result = run_backtest(df_slice, daily_signals, cfg, day_precomp=day_precomp)
+        row = cfg.flat_dict()
+        row.update({
+            "final_equity": result.final_equity,
+            "return_pct": result.total_return_pct,
+            "max_dd_pct": result.max_drawdown_pct,
+            "sharpe": result.sharpe,
+            "total_trades": result.total_trades,
+            "days_traded": result.days_traded,
+            "win_rate": result.win_days / max(result.days_traded, 1),
+        })
+        rows.append(row)
+
+    results_df = pd.DataFrame(rows)
+    return results_df.sort_values("sharpe", ascending=False).head(top_n).reset_index(drop=True)
+
+
+def _config_signature(row: pd.Series) -> str:
+    """Build a short human-readable label for a config row."""
+    trades = int(row.get("p_max_trades_per_day", 0))
+    stop = row.get("p_monthly_drawdown_limit")
+    stop_s = f"{stop:.0%}" if pd.notna(stop) and stop else "none"
+    lots = "grad" if row.get("p_lot_per_equity", 0) < 100_000 else "fixed"
+    calls = "C" if row.get("p_calls_only") else "B"
+    evt = "E" if row.get("e_enabled") else ""
+    bm = row.get("e_budget_mode", "")[0].upper() if row.get("e_enabled") else ""
+    return f"{trades}/d|{stop_s}|{lots}|{calls}{evt}{bm}"
+
+
+def _config_key(row: pd.Series) -> tuple:
+    """Build a hashable key from the config columns of a results row."""
+    return tuple(
+        row.get(c) for c in [
+            "p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
+            "p_calls_only", "e_enabled", "e_budget_mode", "e_max_event_trades",
+            "e_spx_drop_threshold", "e_side_preference", "e_min_dte", "e_max_dte",
+            "e_min_delta", "e_max_delta", "e_rally_avoidance",
+        ]
+    )
+
+
+def run_walkforward(
+    df: pd.DataFrame,
+    output_csv: Path = WALKFORWARD_CSV,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """Run rolling walk-forward validation across all windows.
+
+    For each window, runs the full optimizer on the train slice, then
+    evaluates the top-N train configs on the test slice (out-of-sample).
+
+    Parameters
+    ----------
+    df : Full training candidates DataFrame.
+    output_csv : Path to export detailed results.
+    top_n : Number of top configs per window.
+
+    Returns
+    -------
+    DataFrame with per-window, per-config train vs test comparison.
+    """
+    all_rows: list[dict[str, Any]] = []
+    config_appearances: dict[tuple, list[str]] = {}
+
+    for window in WALKFORWARD_WINDOWS:
+        wname = window["name"]
+        print(f"\n{'=' * 100}")
+        print(f"  WALK-FORWARD {wname}: "
+              f"Train {window['train_start']} to {window['train_end']}  |  "
+              f"Test {window['test_start']} to {window['test_end']}")
+        print(f"{'=' * 100}")
+
+        train_df, test_df = walkforward_split(
+            df, window["train_start"], window["train_end"],
+            window["test_start"], window["test_end"],
+        )
+        train_days = train_df["day"].nunique()
+        test_days = test_df["day"].nunique()
+        print(f"  Train: {len(train_df):,} candidates, {train_days} days")
+        print(f"  Test:  {len(test_df):,} candidates, {test_days} days")
+
+        if train_days < 10 or test_days < 5:
+            print("  SKIP: insufficient data in this window")
+            continue
+
+        print(f"  Optimizing on train set ({len(_build_optimizer_grid()):,} configs) ...")
+        t0 = time.time()
+        top_train = _run_window_optimizer(train_df, top_n=top_n)
+        train_elapsed = time.time() - t0
+        print(f"  Train optimization done in {train_elapsed:.0f}s")
+
+        test_signals = precompute_daily_signals(test_df)
+        test_precomp = _precompute_day_selections(test_df)
+
+        print(f"\n  {'#':>3} {'Config':<30} {'Tr Sharpe':>10} {'Te Sharpe':>10} "
+              f"{'Tr Ret':>8} {'Te Ret':>8} {'Tr DD':>6} {'Te DD':>6} {'Verdict':>10}")
+        print("  " + "-" * 100)
+
+        for rank, (_, trow) in enumerate(top_train.iterrows(), 1):
+            cfg = _row_to_config(trow)
+            test_result = run_backtest(test_df, test_signals, cfg, day_precomp=test_precomp)
+
+            train_sharpe = float(trow["sharpe"])
+            test_sharpe = test_result.sharpe
+            train_ret = float(trow["return_pct"])
+            test_ret = test_result.total_return_pct
+            train_dd = float(trow["max_dd_pct"])
+            test_dd = test_result.max_drawdown_pct
+
+            # Verdict: how well does train performance predict test
+            if test_sharpe > 0 and test_ret > 0:
+                verdict = "PASS" if test_sharpe >= train_sharpe * 0.3 else "WEAK"
+            elif test_ret > 0:
+                verdict = "MARGINAL"
+            else:
+                verdict = "FAIL"
+
+            sig = _config_signature(trow)
+            key = _config_key(trow)
+            if key not in config_appearances:
+                config_appearances[key] = []
+            config_appearances[key].append(wname)
+
+            print(f"  {rank:>3} {sig:<30} {train_sharpe:>10.2f} {test_sharpe:>10.2f} "
+                  f"{train_ret:>+7.0f}% {test_ret:>+7.0f}% "
+                  f"{train_dd:>5.0f}% {test_dd:>5.0f}% {verdict:>10}")
+
+            row_out = trow.to_dict()
+            row_out.update({
+                "window": wname,
+                "rank_in_window": rank,
+                "train_sharpe": train_sharpe,
+                "test_sharpe": test_sharpe,
+                "train_return_pct": train_ret,
+                "test_return_pct": test_ret,
+                "train_max_dd_pct": train_dd,
+                "test_max_dd_pct": test_dd,
+                "verdict": verdict,
+            })
+            all_rows.append(row_out)
+
+    # Cross-window summary
+    print(f"\n{'=' * 100}")
+    print("  CROSS-WINDOW SUMMARY: configs appearing in top-10 across multiple windows")
+    print(f"{'=' * 100}")
+
+    multi_window = {k: v for k, v in config_appearances.items() if len(v) > 1}
+    if multi_window:
+        wf_df = pd.DataFrame(all_rows)
+        print(f"\n  {len(multi_window)} configs appear in 2+ windows:\n")
+
+        for key, windows in sorted(multi_window.items(), key=lambda x: -len(x[1])):
+            matches = wf_df[wf_df.apply(lambda r: _config_key(r) == key, axis=1)]
+            if matches.empty:
+                continue
+            sig = _config_signature(matches.iloc[0])
+            avg_test_sharpe = matches["test_sharpe"].mean()
+            avg_test_ret = matches["test_return_pct"].mean()
+            wlist = ",".join(windows)
+            print(f"  {sig:<35} windows=[{wlist}]  "
+                  f"avg_test_sharpe={avg_test_sharpe:.2f}  "
+                  f"avg_test_return={avg_test_ret:+.0f}%")
+    else:
+        print("\n  No config appeared in the top-10 of more than one window.")
+        print("  This suggests high regime-dependence; consider simpler / more robust configs.")
+
+    results_df = pd.DataFrame(all_rows)
+    if not results_df.empty:
+        results_df.to_csv(output_csv, index=False)
+        print(f"\n  Walk-forward results exported to {output_csv}")
+
+    return results_df
+
+
+# ===================================================================
+# CLI
+# ===================================================================
+
+
+def main() -> None:
+    """Entry point for the backtest CLI."""
+    parser = argparse.ArgumentParser(
+        description="Capital-budgeted backtest with scheduled + event-driven layers",
+    )
+    parser.add_argument("--csv", type=str, default=str(DEFAULT_CSV),
+                        help="Path to training_candidates.csv")
+    parser.add_argument("--capital", type=float, default=20_000)
+    parser.add_argument("--max-trades", type=int, default=2)
+    parser.add_argument("--monthly-stop", type=float, default=0.15,
+                        help="Monthly drawdown stop (0 to disable)")
+    parser.add_argument("--lot-per-equity", type=float, default=10_000)
+    parser.add_argument("--both-sides", action="store_true", default=False)
+    parser.add_argument("--min-dte", type=int, default=None)
+    parser.add_argument("--max-delta", type=float, default=None)
+
+    # Event params
+    parser.add_argument("--event", action="store_true", default=False,
+                        help="Enable event-driven layer")
+    parser.add_argument("--event-budget", type=str, default="shared",
+                        choices=["shared", "separate"])
+    parser.add_argument("--event-max-trades", type=int, default=1)
+    parser.add_argument("--event-drop-threshold", type=float, default=-0.01)
+    parser.add_argument("--event-side", type=str, default="puts",
+                        choices=["puts", "calls", "best"])
+    parser.add_argument("--event-min-dte", type=int, default=5)
+    parser.add_argument("--event-max-dte", type=int, default=7)
+    parser.add_argument("--event-min-delta", type=float, default=0.15)
+    parser.add_argument("--event-max-delta", type=float, default=0.25)
+    parser.add_argument("--rally-avoid", action="store_true", default=False)
+    parser.add_argument("--rally-threshold", type=float, default=0.01)
+
+    # Modes
+    parser.add_argument("--compare", action="store_true", default=False,
+                        help="Run preset comparison configs")
+    parser.add_argument("--optimize", action="store_true", default=False,
+                        help="Run exhaustive grid-search optimizer")
+    parser.add_argument("--analyze", action="store_true", default=False,
+                        help="Deep-dive optimizer results (param importance, Pareto, robustness)")
+    parser.add_argument("--walkforward", action="store_true", default=False,
+                        help="Rolling walk-forward validation (train/test splits)")
+    parser.add_argument("--output-csv", type=str, default=str(RESULTS_CSV),
+                        help="CSV output path for optimizer results")
+
+    args = parser.parse_args()
+
+    # --analyze only needs the results CSV, not the full training data
+    if args.analyze:
+        results_path = Path(args.output_csv)
+        if not results_path.exists():
+            print(f"ERROR: Results CSV not found: {results_path}", file=sys.stderr)
+            print("  Run --optimize first to generate it.", file=sys.stderr)
+            sys.exit(1)
+        pareto = run_analysis(results_path)
+
+        csv_path = Path(args.csv)
+        if csv_path.exists():
+            print("\nLoading training data for robustness check ...")
+            df = pd.read_csv(csv_path)
+            daily_signals = precompute_daily_signals(df)
+            rdf = pd.read_csv(results_path)
+            _robustness_check(df, daily_signals, rdf, top_n=20)
+        else:
+            print("\n  (skipping robustness check -- training CSV not found)")
+        return
+
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading {csv_path} ...")
+    df = pd.read_csv(csv_path)
+    print(f"  {len(df):,} candidates across {df['day'].nunique()} trading days")
+    print(f"  Period: {df['day'].min()} to {df['day'].max()}")
+
+    print("Precomputing daily signals ...")
+    daily_signals = precompute_daily_signals(df)
+
+    if args.walkforward:
+        run_walkforward(df, output_csv=Path(args.output_csv.replace("backtest_results", "walkforward_results")))
+
+    elif args.optimize:
+        results_df = run_optimizer(df, daily_signals, Path(args.output_csv))
+        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
+            print_optimizer_top(results_df, metric)
+
+    elif args.compare:
+        presets = _build_comparison_configs()
+        results = []
+        for label, cfg in presets:
+            r = run_backtest(df, daily_signals, cfg, label)
+            results.append(r)
+        print_comparison_table(results)
+        print("\n\nDetailed monthly breakdown for recommended config:")
+        print_summary(results[0])
+        print_monthly(results[0])
+
+    else:
+        pc = PortfolioConfig(
+            starting_capital=args.capital,
+            max_trades_per_day=args.max_trades,
+            monthly_drawdown_limit=args.monthly_stop if args.monthly_stop > 0 else None,
+            lot_per_equity=args.lot_per_equity,
+            calls_only=not args.both_sides,
+            min_dte=args.min_dte,
+            max_delta=args.max_delta,
+        )
+        evc = EventConfig(
+            enabled=args.event,
+            budget_mode=args.event_budget,
+            max_event_trades=args.event_max_trades,
+            spx_drop_threshold=args.event_drop_threshold,
+            side_preference=args.event_side,
+            min_dte=args.event_min_dte,
+            max_dte=args.event_max_dte,
+            min_delta=args.event_min_delta,
+            max_delta=args.event_max_delta,
+            rally_avoidance=args.rally_avoid,
+            rally_threshold=args.rally_threshold,
+        )
+        cfg = FullConfig(portfolio=pc, event=evc)
+
+        stop_label = f"{pc.monthly_drawdown_limit:.0%} stop" if pc.monthly_drawdown_limit else "no stop"
+        lots_label = "gradual" if pc.lot_per_equity < 100_000 else "fixed"
+        event_label = " + events" if evc.enabled else ""
+        label = (f"${pc.starting_capital/1000:.0f}k | "
+                 f"{pc.max_trades_per_day}/day | "
+                 f"{stop_label} | {lots_label}{event_label}")
+
+        result = run_backtest(df, daily_signals, cfg, label)
+        print_summary(result)
+        print_monthly(result)
+
+
+if __name__ == "__main__":
+    main()

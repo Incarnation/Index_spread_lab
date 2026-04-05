@@ -200,6 +200,42 @@ class Settings(BaseSettings):
     email_alert_recipient: str = ""
     email_alert_sender: str = "alerts@indexspreadlab.app"
 
+    # ─── Capital-budgeted portfolio management ─────────────────────
+    portfolio_starting_capital: float = 20_000
+    portfolio_max_trades_per_day: int = 2
+    portfolio_max_trades_per_run: int = 1
+    """Max trades placed per single decision run.  Set < max_trades_per_day
+    to stagger entries across scheduled entry times."""
+    portfolio_monthly_drawdown_limit: float = 0.15
+    """Fractional drawdown from month-start equity that triggers a stop.
+    Set to 0 to disable."""
+    portfolio_lot_per_equity: float = 10_000
+    """Gradual scaling: 1 lot per this many $ of equity."""
+    portfolio_max_equity_risk_pct: float = 0.10
+    portfolio_max_margin_pct: float = 0.30
+    portfolio_calls_only: bool = True
+    portfolio_enabled: bool = False
+    """Gate for the new portfolio-managed decision path.
+    When False the legacy ML/rules pipeline runs unchanged."""
+
+    # ─── Event-driven signal layer ───────────────────────────────
+    event_enabled: bool = False
+    event_budget_mode: str = "shared"
+    """'shared' (events eat into scheduled budget) or 'separate' (own allocation)."""
+    event_max_trades: int = 1
+    event_spx_drop_threshold: float = -0.01
+    event_spx_drop_2d_threshold: float = -0.02
+    event_vix_spike_threshold: float = 0.15
+    event_vix_elevated_threshold: float = 25.0
+    event_term_inversion_threshold: float = 1.0
+    event_side_preference: str = "puts"
+    event_min_dte: int = 5
+    event_max_dte: int = 7
+    event_min_delta: float = 0.15
+    event_max_delta: float = 0.25
+    event_rally_avoidance: bool = False
+    event_rally_threshold: float = 0.01
+
     # Auth: JWT and user registration (multiple users, in-house auth).
     jwt_secret: str = ""  # set JWT_SECRET in env for auth; auth endpoints error if empty
     jwt_algorithm: str = "HS256"

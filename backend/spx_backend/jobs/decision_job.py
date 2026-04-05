@@ -11,6 +11,8 @@ from sqlalchemy import text
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services.portfolio_manager import PortfolioManager as ProdPortfolioManager
+from spx_backend.services.event_signals import EventSignalDetector as ProdEventSignalDetector
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
@@ -81,6 +83,180 @@ class DecisionJob:
             "selection_meta": selection_meta,
         }
 
+    async def _run_portfolio_managed(self, *, now_et: datetime, force: bool) -> dict:
+        """Portfolio-managed decision path using capital budgeting.
+
+        Replaces the legacy ML-gated scoring with credit_to_width ranking,
+        enforces portfolio risk limits, and processes event-driven signals.
+
+        Parameters
+        ----------
+        now_et : Current ET timestamp.
+        force : Bypass entry-time and RTH checks.
+
+        Returns
+        -------
+        dict with the standard run-result payload.
+        """
+        entry_slot = now_et.hour
+        pm = ProdPortfolioManager()
+        event_det = ProdEventSignalDetector()
+
+        await pm.begin_day(now_et.date())
+
+        if not pm.can_trade():
+            return self._build_run_result(
+                now_et=now_et, skipped=True,
+                reason=f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}",
+                selection_meta={"equity": pm.equity, "month_stopped": pm.is_month_stopped},
+            )
+
+        signals = await event_det.detect(now_et.date())
+        skip_scheduled = settings.event_rally_avoidance and "rally" in signals
+
+        spread_sides = ["call"] if settings.portfolio_calls_only else settings.decision_spread_sides_list()
+        decision_dtes = settings.decision_dte_targets_list()
+        delta_targets = settings.decision_delta_targets_list()
+
+        async with SessionLocal() as session:
+            spot = await self._get_spot_price(session, now_et, settings.snapshot_underlying)
+            context = await self._get_latest_context(session, now_et)
+
+            candidates: list[dict] = []
+            for spread_side in spread_sides:
+                for target_dte in decision_dtes:
+                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    if snapshot is None:
+                        continue
+                    options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
+                    if not options:
+                        continue
+                    for delta_target in delta_targets:
+                        candidate = self._build_candidate(
+                            options=options, target_dte=snapshot["target_dte"],
+                            delta_target=delta_target, spread_side=spread_side,
+                            width_points=settings.decision_spread_width_points,
+                            snapshot_id=snapshot["snapshot_id"],
+                            expiration=snapshot["expiration"],
+                            spot=spot, context=context,
+                        )
+                        if candidate:
+                            candidates.append(candidate)
+
+            if not candidates:
+                return self._build_run_result(now_et=now_et, skipped=True, reason="no_candidates")
+
+            # Rank by credit_to_width (credit / spread width)
+            width = settings.decision_spread_width_points
+            for c in candidates:
+                c["credit_to_width"] = c["credit"] / width if width > 0 else 0
+
+            ranked = sorted(candidates, key=lambda c: -c["credit_to_width"])
+            lots = pm.compute_lots()
+
+            # Event trades first on signal days
+            event_trades_placed = 0
+            drop_signals = [s for s in signals if s != "rally"]
+            decisions_created: list[dict] = []
+            trades_created: list[int] = []
+
+            run_limit = settings.portfolio_max_trades_per_run
+
+            if settings.event_enabled and drop_signals:
+                event_cap = min(settings.event_max_trades, run_limit)
+                event_candidates = [
+                    c for c in ranked
+                    if c["target_dte"] >= settings.event_min_dte
+                    and c["target_dte"] <= settings.event_max_dte
+                    and abs(c.get("delta_diff", 0)) <= settings.event_max_delta
+                ]
+                for c in event_candidates[:event_cap]:
+                    if not pm.can_trade():
+                        break
+                    decision_id = await self._insert_decision(
+                        session=session, now_et=now_et, entry_slot=entry_slot,
+                        target_dte=c["target_dte"], delta_target=c["delta_target"],
+                        decision="TRADE", reason=None,
+                        chain_snapshot_id=c["snapshot_id"], score=c["credit_to_width"],
+                        chosen_legs_json=c["chosen_legs_json"],
+                        strategy_params_json=c["strategy_params_json"],
+                        decision_source="portfolio_event",
+                    )
+                    trade_id = await self._create_trade_from_decision(
+                        session=session, decision_id=decision_id,
+                        now_et=now_et, chosen=c, candidate_ref={},
+                        contracts_override=lots,
+                    )
+                    await pm.record_trade(trade_id, c["credit"], lots,
+                                          source="event",
+                                          event_signal=",".join(drop_signals))
+                    decisions_created.append({
+                        "decision_id": int(decision_id), "trade_id": int(trade_id),
+                        "target_dte": c["target_dte"], "delta_target": c["delta_target"],
+                        "spread_side": (c.get("chosen_legs_json") or {}).get("spread_side", ""),
+                        "score": c["credit_to_width"], "decision_source": "portfolio_event",
+                    })
+                    trades_created.append(int(trade_id))
+                    event_trades_placed += 1
+
+            # Scheduled trades (capped by per-run stagger limit)
+            if not skip_scheduled:
+                sched_limit = min(run_limit, settings.portfolio_max_trades_per_day)
+                if settings.event_enabled and settings.event_budget_mode == "shared":
+                    sched_limit = max(0, sched_limit - event_trades_placed)
+                sched_candidates = ranked[:sched_limit * 2]  # over-fetch for dedup
+                seen_keys: set[tuple] = set()
+                placed = 0
+                for c in sched_candidates:
+                    if placed >= sched_limit or not pm.can_trade():
+                        break
+                    key = self._candidate_dedupe_key(c)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    decision_id = await self._insert_decision(
+                        session=session, now_et=now_et, entry_slot=entry_slot,
+                        target_dte=c["target_dte"], delta_target=c["delta_target"],
+                        decision="TRADE", reason=None,
+                        chain_snapshot_id=c["snapshot_id"], score=c["credit_to_width"],
+                        chosen_legs_json=c["chosen_legs_json"],
+                        strategy_params_json=c["strategy_params_json"],
+                        decision_source="portfolio_scheduled",
+                    )
+                    trade_id = await self._create_trade_from_decision(
+                        session=session, decision_id=decision_id,
+                        now_et=now_et, chosen=c, candidate_ref={},
+                        contracts_override=lots,
+                    )
+                    await pm.record_trade(trade_id, c["credit"], lots, source="scheduled")
+                    decisions_created.append({
+                        "decision_id": int(decision_id), "trade_id": int(trade_id),
+                        "target_dte": c["target_dte"], "delta_target": c["delta_target"],
+                        "spread_side": (c.get("chosen_legs_json") or {}).get("spread_side", ""),
+                        "score": c["credit_to_width"], "decision_source": "portfolio_scheduled",
+                    })
+                    trades_created.append(int(trade_id))
+                    placed += 1
+
+            await session.commit()
+
+        return self._build_run_result(
+            now_et=now_et,
+            skipped=len(trades_created) == 0,
+            reason=None if trades_created else "no_trades_after_filters",
+            decisions_created=decisions_created,
+            trades_created=trades_created,
+            selection_meta={
+                "mode": "portfolio_managed",
+                "equity": pm.equity,
+                "lots": lots,
+                "event_signals": signals,
+                "event_trades": event_trades_placed,
+                "candidates_total": len(candidates),
+            },
+        )
+
     async def run_once(self, *, force: bool = False) -> dict:
         """Run one decision cycle and persist top-N trades.
 
@@ -106,6 +282,9 @@ class DecisionJob:
         if (not force) and (not settings.decision_allow_outside_rth):
             if not await self._market_open(now_et):
                 return self._build_run_result(now_et=now_et, skipped=True, reason="market_closed")
+
+        if settings.portfolio_enabled:
+            return await self._run_portfolio_managed(now_et=now_et, force=force)
 
         decision_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
@@ -1018,8 +1197,15 @@ class DecisionJob:
         chosen: dict,
         candidate_ref: dict,
         model_version_id: int | None = None,
+        contracts_override: int | None = None,
     ) -> int:
-        """Insert one OPEN trade and its legs from the chosen decision candidate."""
+        """Insert one OPEN trade and its legs from the chosen decision candidate.
+
+        Parameters
+        ----------
+        contracts_override : When set (e.g. from PortfolioManager.compute_lots()),
+            overrides the static ``settings.decision_contracts`` for lot sizing.
+        """
         chosen_legs = chosen.get("chosen_legs_json") or {}
         short_leg = chosen_legs.get("short") or {}
         long_leg = chosen_legs.get("long") or {}
@@ -1027,7 +1213,7 @@ class DecisionJob:
         if spread_side not in {"put", "call"}:
             spread_side = settings.decision_spread_side.lower()
 
-        contracts = int(settings.decision_contracts or 1)
+        contracts = contracts_override if contracts_override is not None else int(settings.decision_contracts or 1)
         multiplier = int(settings.trade_pnl_contract_multiplier)
         width_points = float(chosen_legs.get("width_points") or settings.decision_spread_width_points)
         entry_credit = float(chosen.get("credit") or 0.0)
