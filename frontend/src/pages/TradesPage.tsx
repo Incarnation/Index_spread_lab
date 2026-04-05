@@ -2,18 +2,21 @@ import { useEffect, useState } from "react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { DataTable } from "@/components/shared/DataTable";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { formatCurrency, formatDateTime, timeAgo } from "@/lib/utils";
 import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { fetchTrades, type TradeRow } from "@/api";
 
 /**
  * Trades page -- open positions and closed trade history with PnL.
+ * Includes source-based filtering (All / Scheduled / Event).
  */
 export function TradesPage() {
   const { tick } = useAutoRefresh(30_000);
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [sourceFilter, setSourceFilter] = useState<"all" | "scheduled" | "event">("all");
 
   useEffect(() => {
     setLoading(true);
@@ -24,8 +27,16 @@ export function TradesPage() {
       .finally(() => setLoading(false));
   }, [tick]);
 
-  const openTrades = trades.filter((t) => t.status === "OPEN");
-  const closedTrades = trades.filter((t) => t.status === "CLOSED");
+  const filteredBySource =
+    sourceFilter === "all"
+      ? trades
+      : trades.filter((t) => t.trade_source?.includes(sourceFilter));
+
+  const openTrades = filteredBySource.filter((t) => t.status === "OPEN");
+  const closedTrades = filteredBySource.filter((t) => t.status === "CLOSED");
+
+  const scheduledCount = trades.filter((t) => t.trade_source?.includes("scheduled")).length;
+  const eventCount = trades.filter((t) => t.trade_source?.includes("event")).length;
 
   const columns = [
     { key: "trade_id", header: "ID", className: "w-16" },
@@ -35,6 +46,15 @@ export function TradesPage() {
       render: (r: TradeRow) => (
         <Badge variant={r.status === "OPEN" ? "profit" : "muted"}>{r.status}</Badge>
       ),
+    },
+    {
+      key: "trade_source",
+      header: "Source",
+      render: (r: TradeRow) => {
+        if (r.trade_source?.includes("event")) return <Badge variant="warning">Event</Badge>;
+        if (r.trade_source?.includes("scheduled")) return <Badge variant="profit">Sched</Badge>;
+        return <span className="text-xs text-muted-foreground">{r.trade_source || "—"}</span>;
+      },
     },
     {
       key: "side",
@@ -47,7 +67,7 @@ export function TradesPage() {
     { key: "entry_time", header: "Entered", render: (r: TradeRow) => formatDateTime(r.entry_time) },
     { key: "expiration", header: "Expiry" },
     { key: "target_dte", header: "DTE" },
-    { key: "contracts", header: "Qty" },
+    { key: "contracts", header: "Lots" },
     {
       key: "entry_credit",
       header: "Credit",
@@ -90,7 +110,25 @@ export function TradesPage() {
 
   return (
     <div className="space-y-4">
-      <h2 className="text-lg font-semibold text-foreground">Trades</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-foreground">Trades</h2>
+        <div className="flex gap-1">
+          {(["all", "scheduled", "event"] as const).map((f) => (
+            <Button
+              key={f}
+              variant={sourceFilter === f ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setSourceFilter(f)}
+            >
+              {f === "all"
+                ? `All (${trades.length})`
+                : f === "scheduled"
+                  ? `Scheduled (${scheduledCount})`
+                  : `Event (${eventCount})`}
+            </Button>
+          ))}
+        </div>
+      </div>
 
       {error && (
         <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
@@ -100,7 +138,7 @@ export function TradesPage() {
         <TabsList>
           <TabsTrigger value="open">Open ({openTrades.length})</TabsTrigger>
           <TabsTrigger value="closed">Closed ({closedTrades.length})</TabsTrigger>
-          <TabsTrigger value="all">All ({trades.length})</TabsTrigger>
+          <TabsTrigger value="all">All ({filteredBySource.length})</TabsTrigger>
         </TabsList>
 
         <TabsContent value="open">
@@ -124,7 +162,7 @@ export function TradesPage() {
         <TabsContent value="all">
           <DataTable
             columns={columns}
-            data={trades}
+            data={filteredBySource}
             keyFn={(r) => r.trade_id}
             emptyMessage={loading ? "Loading..." : "No trades"}
           />

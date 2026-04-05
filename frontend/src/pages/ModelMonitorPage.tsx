@@ -12,6 +12,7 @@ import {
   fetchModelCalibration,
   fetchModelPnlAttribution,
   fetchModelPredictions,
+  fetchPortfolioConfig,
   type ModelOpsResponse,
   type ModelAccuracyResponse,
   type ModelCalibrationResponse,
@@ -33,7 +34,7 @@ import {
   ReferenceLine,
   Legend,
 } from "recharts";
-import { Brain, Activity, Database, AlertTriangle, TrendingUp, TrendingDown } from "lucide-react";
+import { Brain, Activity, Database, AlertTriangle, TrendingUp, TrendingDown, Info } from "lucide-react";
 
 /**
  * Model Monitor page -- comprehensive model health dashboard with:
@@ -53,6 +54,7 @@ export function ModelMonitorPage() {
   const [predictions, setPredictions] = useState<ModelPredictionsResponse | null>(null);
   const [predPage, setPredPage] = useState(0);
   const [predFilter, setPredFilter] = useState<"all" | "TRADE" | "SKIP">("all");
+  const [portfolioEnabled, setPortfolioEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -62,6 +64,9 @@ export function ModelMonitorPage() {
       fetchModelAccuracy().then(setAccuracy),
       fetchModelCalibration().then(setCalibration),
       fetchModelPnlAttribution().then(setAttribution),
+      fetchPortfolioConfig()
+        .then((cfg) => setPortfolioEnabled(cfg.portfolio.enabled))
+        .catch(() => {}),
     ]).catch((e) => setError(e.message ?? "Failed to load model data"));
   }, [tick]);
 
@@ -89,6 +94,16 @@ export function ModelMonitorPage() {
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold text-foreground">Model Monitor</h2>
+
+      {portfolioEnabled && (
+        <div className="rounded-lg border border-accent/30 bg-accent/5 p-3 flex items-start gap-2">
+          <Info className="h-4 w-4 text-accent mt-0.5 shrink-0" />
+          <p className="text-sm text-accent">
+            Portfolio management is active. ML models are running in shadow mode &mdash;
+            predictions are logged but do not influence trade decisions.
+          </p>
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>

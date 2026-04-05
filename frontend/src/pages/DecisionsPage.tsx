@@ -8,7 +8,19 @@ import { fetchTradeDecisions, type TradeDecision } from "@/api";
 import { X } from "lucide-react";
 
 /**
+ * Map raw decision_source values to display-friendly badge labels and variants.
+ */
+function sourceLabel(src: string | undefined): { text: string; variant: "profit" | "warning" | "muted" } {
+  if (!src) return { text: "—", variant: "muted" };
+  if (src.includes("event")) return { text: "Event", variant: "warning" };
+  if (src.includes("scheduled") || src.includes("portfolio")) return { text: "Scheduled", variant: "profit" };
+  if (src.includes("hybrid") || src.includes("model")) return { text: "ML Model", variant: "muted" };
+  return { text: src, variant: "muted" };
+}
+
+/**
  * Decisions page -- trade entry/skip log with reasoning and model scores.
+ * Shows decision_source as a badge and portfolio-related metadata in the drawer.
  */
 export function DecisionsPage() {
   const { tick } = useAutoRefresh(30_000);
@@ -58,11 +70,18 @@ export function DecisionsPage() {
               <Badge variant={r.decision === "TRADE" ? "profit" : "loss"}>{r.decision}</Badge>
             ),
           },
+          {
+            key: "decision_source",
+            header: "Source",
+            render: (r: TradeDecision) => {
+              const { text, variant } = sourceLabel(r.decision_source);
+              return <Badge variant={variant}>{text}</Badge>;
+            },
+          },
           { key: "ts", header: "Time", render: (r: TradeDecision) => formatDateTime(r.ts) },
           { key: "target_dte", header: "DTE" },
           { key: "delta_target", header: "Delta", render: (r: TradeDecision) => r.delta_target?.toFixed(2) ?? "—" },
           { key: "score", header: "Score", render: (r: TradeDecision) => r.score?.toFixed(2) ?? "—" },
-          { key: "decision_source", header: "Source" },
           { key: "reason", header: "Reason", render: (r: TradeDecision) => (
             <span className="max-w-[200px] truncate block text-xs text-muted-foreground">{r.reason || "—"}</span>
           )},
@@ -89,6 +108,15 @@ export function DecisionsPage() {
                 <div><Badge variant={selected.decision === "TRADE" ? "profit" : "loss"}>{selected.decision}</Badge></div>
               </div>
               <div>
+                <span className="text-xs text-muted">Source</span>
+                <div>
+                  {(() => {
+                    const { text, variant } = sourceLabel(selected.decision_source);
+                    return <Badge variant={variant}>{text}</Badge>;
+                  })()}
+                </div>
+              </div>
+              <div>
                 <span className="text-xs text-muted">Time</span>
                 <div className="text-foreground-secondary">{formatDateTime(selected.ts)}</div>
               </div>
@@ -104,11 +132,48 @@ export function DecisionsPage() {
                 <span className="text-xs text-muted">Score</span>
                 <div className="text-foreground-secondary">{selected.score ?? "—"}</div>
               </div>
-              <div>
-                <span className="text-xs text-muted">Source</span>
-                <div className="text-foreground-secondary">{selected.decision_source}</div>
-              </div>
             </div>
+
+            {/* Portfolio / selection metadata */}
+            {selected.strategy_params_json && (
+              <div>
+                <span className="text-xs text-muted">Selection Meta</span>
+                <div className="mt-1 grid grid-cols-2 gap-2 text-sm">
+                  {selected.strategy_params_json.equity != null && (
+                    <div>
+                      <span className="text-xs text-muted-foreground">Equity</span>
+                      <div className="text-foreground-secondary">${Number(selected.strategy_params_json.equity).toLocaleString()}</div>
+                    </div>
+                  )}
+                  {selected.strategy_params_json.lots != null && (
+                    <div>
+                      <span className="text-xs text-muted-foreground">Lots</span>
+                      <div className="text-foreground-secondary">{String(selected.strategy_params_json.lots)}</div>
+                    </div>
+                  )}
+                  {selected.strategy_params_json.event_signals != null && (
+                    <div className="col-span-2">
+                      <span className="text-xs text-muted-foreground">Event Signals</span>
+                      <div className="flex flex-wrap gap-1 mt-0.5">
+                        {(Array.isArray(selected.strategy_params_json.event_signals)
+                          ? (selected.strategy_params_json.event_signals as string[])
+                          : [String(selected.strategy_params_json.event_signals)]
+                        ).map((sig) => (
+                          <Badge key={sig} variant="warning" className="text-xs">{sig}</Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {selected.strategy_params_json.mode != null && (
+                    <div>
+                      <span className="text-xs text-muted-foreground">Mode</span>
+                      <div className="text-foreground-secondary">{String(selected.strategy_params_json.mode)}</div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {selected.reason && (
               <div>
                 <span className="text-xs text-muted">Reason</span>
@@ -125,7 +190,7 @@ export function DecisionsPage() {
             )}
             {selected.strategy_params_json && (
               <div>
-                <span className="text-xs text-muted">Strategy Params</span>
+                <span className="text-xs text-muted">Full Strategy Params</span>
                 <pre className="mt-1 rounded-md bg-background p-3 text-xs text-foreground-secondary overflow-x-auto">
                   {JSON.stringify(selected.strategy_params_json, null, 2)}
                 </pre>

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Router package exports for public and admin API route groups."""
+"""Router package exports for public, admin, and portfolio API route groups."""
 
-from spx_backend.web.routers import admin, public
+from spx_backend.web.routers import admin, portfolio, public
 
-__all__ = ["public", "admin"]
+__all__ = ["public", "admin", "portfolio"]
 

@@ -28,7 +28,7 @@ from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.jobs.eod_events_job import EodEventsJob
 from spx_backend.market_clock import MarketClockCache
-from spx_backend.web.routers import admin, auth, public
+from spx_backend.web.routers import admin, auth, portfolio, public
 from spx_backend.web.routers.public import (
     get_performance_analytics,
     get_gex_curve,
@@ -626,6 +626,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(public.router)
 app.include_router(admin.router)
+app.include_router(portfolio.router)
 
 __all__ = [
     "app",

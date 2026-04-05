@@ -10,6 +10,7 @@ import {
   Settings,
   FlaskConical,
   ShieldCheck,
+  Wallet,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -17,12 +18,13 @@ import { useState } from "react";
 
 const NAV_ITEMS: { to: string; icon: typeof LayoutDashboard; label: string; end?: boolean }[] = [
   { to: "/", icon: LayoutDashboard, label: "Overview", end: true },
+  { to: "/portfolio", icon: Wallet, label: "Portfolio" },
   { to: "/trades", icon: TrendingUp, label: "Trades" },
   { to: "/decisions", icon: ArrowLeftRight, label: "Decisions" },
   { to: "/model", icon: Brain, label: "Model Monitor" },
   { to: "/performance", icon: BarChart3, label: "Performance" },
   { to: "/gex", icon: Activity, label: "GEX / Market" },
-  { to: "/backtest", icon: FlaskConical, label: "Backtest" },
+  { to: "/strategy", icon: FlaskConical, label: "Strategy" },
   { to: "/admin", icon: Settings, label: "Admin / Ops", end: true },
   { to: "/admin/auth-audit", icon: ShieldCheck, label: "Auth Audit" },
 ];

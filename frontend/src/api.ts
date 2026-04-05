@@ -781,6 +781,132 @@ export async function fetchModelPnlAttribution(modelName?: string): Promise<Mode
   return safeJson<ModelPnlAttributionResponse>(r);
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio management endpoints
+// ---------------------------------------------------------------------------
+
+export type PortfolioStatus = {
+  date: string;
+  equity: number;
+  month_start_equity: number;
+  drawdown_pct: number;
+  lots_per_trade: number;
+  trades_today: number;
+  max_trades_per_day: number;
+  max_trades_per_run: number;
+  monthly_stop_active: boolean;
+  daily_pnl: number;
+  event_signals: string[];
+  portfolio_enabled: boolean;
+};
+
+export type PortfolioHistoryDay = {
+  date: string;
+  equity_start: number | null;
+  equity_end: number | null;
+  trades_placed: number;
+  lots_per_trade: number;
+  daily_pnl: number | null;
+  monthly_stop_active: boolean;
+  event_signals: string[] | null;
+};
+
+export type PortfolioTrade = {
+  id: number;
+  trade_id: number;
+  date: string;
+  trade_source: string;
+  event_signal: string | null;
+  lots: number;
+  margin_committed: number | null;
+  realized_pnl: number | null;
+  equity_before: number | null;
+  equity_after: number | null;
+  created_at: string | null;
+  strategy_type: string | null;
+  entry_credit: number | null;
+  trade_status: string | null;
+  target_dte: number | null;
+  expiration: string | null;
+};
+
+export type PortfolioConfig = {
+  portfolio: {
+    enabled: boolean;
+    starting_capital: number;
+    max_trades_per_day: number;
+    max_trades_per_run: number;
+    monthly_drawdown_limit: number;
+    lot_per_equity: number;
+    max_equity_risk_pct: number;
+    max_margin_pct: number;
+    calls_only: boolean;
+  };
+  event: {
+    enabled: boolean;
+    budget_mode: string;
+    max_trades: number;
+    spx_drop_threshold: number;
+    spx_drop_2d_threshold: number;
+    vix_spike_threshold: number;
+    vix_elevated_threshold: number;
+    term_inversion_threshold: number;
+    side_preference: string;
+    min_dte: number;
+    max_dte: number;
+    min_delta: number;
+    max_delta: number;
+    rally_avoidance: boolean;
+    rally_threshold: number;
+  };
+  decision: {
+    entry_times: string;
+    dte_targets: string;
+    delta_targets: string;
+    spread_width_points: number;
+  };
+};
+
+/**
+ * Fetch current portfolio status (equity, lots, budget, signals).
+ */
+export async function fetchPortfolioStatus(): Promise<PortfolioStatus> {
+  const r = await fetchWithAuth(apiUrl("/api/portfolio/status"));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<PortfolioStatus>(r);
+}
+
+/**
+ * Fetch daily portfolio state history for equity charting.
+ */
+export async function fetchPortfolioHistory(days = 90): Promise<PortfolioHistoryDay[]> {
+  const r = await fetchWithAuth(apiUrl(`/api/portfolio/history?days=${days}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = await safeJson<{ items: PortfolioHistoryDay[] }>(r);
+  return data.items;
+}
+
+/**
+ * Fetch portfolio trades with source/signal enrichment.
+ */
+export async function fetchPortfolioTrades(limit = 100, source?: string): Promise<PortfolioTrade[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (source) params.set("source", source);
+  const r = await fetchWithAuth(apiUrl(`/api/portfolio/trades?${params.toString()}`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = await safeJson<{ items: PortfolioTrade[] }>(r);
+  return data.items;
+}
+
+/**
+ * Fetch current portfolio and event configuration.
+ */
+export async function fetchPortfolioConfig(): Promise<PortfolioConfig> {
+  const r = await fetchWithAuth(apiUrl("/api/portfolio/config"));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<PortfolioConfig>(r);
+}
+
 export type BacktestStrategyResult = {
   name: string;
   total_trades: number;
