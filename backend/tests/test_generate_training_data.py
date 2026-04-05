@@ -24,7 +24,7 @@ from generate_training_data import (  # noqa: E402
     TAKE_PROFIT_PCT,
     _downsample_marks,
     _evaluate_outcome,
-    _load_offline_gex,
+    _load_gex_csv,
     _mid,
     _time_to_expiry_years,
     bs_delta_vec,
@@ -1155,8 +1155,8 @@ class TestLoadEconomicCalendar:
 # ===================================================================
 
 
-class TestLoadOfflineGex:
-    """_load_offline_gex should read the GEX cache CSV."""
+class TestLoadGexCsv:
+    """_load_gex_csv should read the GEX cache CSV."""
 
     def test_basic_load(self, tmp_path: Path) -> None:
         csv = tmp_path / "gex.csv"
@@ -1164,12 +1164,12 @@ class TestLoadOfflineGex:
             "ts,gex_net,zero_gamma_level\n"
             "2026-01-02T15:05:00+00:00,1e9,5800.0\n"
         )
-        df = _load_offline_gex(csv)
+        df = _load_gex_csv(csv)
         assert len(df) == 1
         assert df.iloc[0]["gex_net"] == 1e9
 
     def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
-        df = _load_offline_gex(tmp_path / "nonexistent.csv")
+        df = _load_gex_csv(tmp_path / "nonexistent.csv")
         assert df.empty
         assert list(df.columns) == ["ts", "gex_net", "zero_gamma_level"]
 
