@@ -1176,6 +1176,7 @@ def run_analysis(results_csv: Path) -> pd.DataFrame:
     # A2: Pareto frontier
     pareto = extract_pareto_frontier(dedup)
     _print_pareto(pareto)
+    PARETO_CSV.parent.mkdir(parents=True, exist_ok=True)
     pareto.to_csv(PARETO_CSV, index=False)
     print(f"\n  Pareto frontier exported to {PARETO_CSV}")
 
