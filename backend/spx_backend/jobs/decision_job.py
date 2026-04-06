@@ -189,7 +189,8 @@ class DecisionJob:
                     )
                     await pm.record_trade(trade_id, c["credit"], lots,
                                           source="event",
-                                          event_signal=",".join(drop_signals))
+                                          event_signal=",".join(drop_signals),
+                                          session=session)
                     decisions_created.append({
                         "decision_id": int(decision_id), "trade_id": int(trade_id),
                         "target_dte": c["target_dte"], "delta_target": c["delta_target"],
@@ -229,7 +230,8 @@ class DecisionJob:
                         now_et=now_et, chosen=c, candidate_ref={},
                         contracts_override=lots,
                     )
-                    await pm.record_trade(trade_id, c["credit"], lots, source="scheduled")
+                    await pm.record_trade(trade_id, c["credit"], lots, source="scheduled",
+                                          session=session)
                     decisions_created.append({
                         "decision_id": int(decision_id), "trade_id": int(trade_id),
                         "target_dte": c["target_dte"], "delta_target": c["delta_target"],

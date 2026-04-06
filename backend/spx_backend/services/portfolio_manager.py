@@ -11,6 +11,7 @@ from typing import Any
 
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
 from spx_backend.database.connection import engine
@@ -139,6 +140,7 @@ class PortfolioManager:
         lots: int,
         source: str = "scheduled",
         event_signal: str | None = None,
+        session: AsyncSession | None = None,
     ) -> float:
         """Apply a settled trade and persist to database.
 
@@ -149,6 +151,10 @@ class PortfolioManager:
         lots : Number of lots filled.
         source : ``'scheduled'`` or ``'event'``.
         event_signal : Name of the triggering event signal (if source is 'event').
+        session : If provided, execute SQL within this existing transaction
+            instead of opening a new connection.  Required when the caller has
+            an uncommitted ``trades`` row in the same session (avoids cross-txn
+            FK violations under READ COMMITTED isolation).
 
         Returns
         -------
@@ -160,6 +166,7 @@ class PortfolioManager:
         self._trades_today += 1
 
         await self._insert_portfolio_trade(
+            session=session,
             trade_id=trade_id,
             source=source,
             event_signal=event_signal,
@@ -169,7 +176,9 @@ class PortfolioManager:
             equity_before=equity_before,
             equity_after=self.equity,
         )
-        await self._update_day_state(equity_end=self.equity, trades=self._trades_today)
+        await self._update_day_state(
+            equity_end=self.equity, trades=self._trades_today, session=session,
+        )
 
         logger.info(
             "portfolio_trade source={} pnl={:.0f} lots={} equity={:.0f}->={:.0f}",
@@ -225,38 +234,66 @@ class PortfolioManager:
         equity_end: float,
         trades: int,
         event_signals: list[str] | None = None,
+        session: AsyncSession | None = None,
     ) -> None:
-        """Update today's portfolio_state with end-of-day values."""
-        async with engine.begin() as conn:
-            await conn.execute(text(
-                "UPDATE portfolio_state SET "
-                "  equity_end = :ee, trades_placed = :tp, daily_pnl = :dpnl, "
-                "  monthly_stop_active = :ms, lots_per_trade = :lpt, "
-                "  event_signals = :ev "
-                "WHERE id = :sid"
-            ), {
-                "ee": equity_end,
-                "tp": trades,
-                "dpnl": equity_end - (self.month_start_equity if self._trades_today == trades else self.equity),
-                "ms": self._month_stopped,
-                "lpt": self._lots_today or 1,
-                "ev": json.dumps(event_signals) if event_signals else None,
-                "sid": self._state_id,
-            })
+        """Update today's portfolio_state with end-of-day values.
 
-    async def _insert_portfolio_trade(self, **kw: Any) -> None:
-        """Insert a row into ``portfolio_trades``."""
-        async with engine.begin() as conn:
-            await conn.execute(text(
-                "INSERT INTO portfolio_trades "
-                "(trade_id, portfolio_state_id, trade_source, event_signal, "
-                " lots, margin_committed, realized_pnl, equity_before, equity_after) "
-                "VALUES (:trade_id, :sid, :source, :event_signal, "
-                " :lots, :margin, :pnl, :equity_before, :equity_after)"
-            ), {
-                "trade_id": kw["trade_id"], "sid": self._state_id,
-                "source": kw["source"], "event_signal": kw.get("event_signal"),
-                "lots": kw["lots"], "margin": kw["margin"],
-                "pnl": kw["pnl"], "equity_before": kw["equity_before"],
-                "equity_after": kw["equity_after"],
-            })
+        Parameters
+        ----------
+        session : Optional existing session; when provided the UPDATE runs
+            inside that transaction instead of opening a standalone one.
+        """
+        params = {
+            "ee": equity_end,
+            "tp": trades,
+            "dpnl": equity_end - (self.month_start_equity if self._trades_today == trades else self.equity),
+            "ms": self._month_stopped,
+            "lpt": self._lots_today or 1,
+            "ev": json.dumps(event_signals) if event_signals else None,
+            "sid": self._state_id,
+        }
+        stmt = text(
+            "UPDATE portfolio_state SET "
+            "  equity_end = :ee, trades_placed = :tp, daily_pnl = :dpnl, "
+            "  monthly_stop_active = :ms, lots_per_trade = :lpt, "
+            "  event_signals = :ev "
+            "WHERE id = :sid"
+        )
+        if session is not None:
+            await session.execute(stmt, params)
+        else:
+            async with engine.begin() as conn:
+                await conn.execute(stmt, params)
+
+    async def _insert_portfolio_trade(
+        self,
+        session: AsyncSession | None = None,
+        **kw: Any,
+    ) -> None:
+        """Insert a row into ``portfolio_trades``.
+
+        Parameters
+        ----------
+        session : Optional existing session; when provided the INSERT runs
+            inside that transaction so an uncommitted ``trades`` row from the
+            same session is visible to the FK check.
+        """
+        params = {
+            "trade_id": kw["trade_id"], "sid": self._state_id,
+            "source": kw["source"], "event_signal": kw.get("event_signal"),
+            "lots": kw["lots"], "margin": kw["margin"],
+            "pnl": kw["pnl"], "equity_before": kw["equity_before"],
+            "equity_after": kw["equity_after"],
+        }
+        stmt = text(
+            "INSERT INTO portfolio_trades "
+            "(trade_id, portfolio_state_id, trade_source, event_signal, "
+            " lots, margin_committed, realized_pnl, equity_before, equity_after) "
+            "VALUES (:trade_id, :sid, :source, :event_signal, "
+            " :lots, :margin, :pnl, :equity_before, :equity_after)"
+        )
+        if session is not None:
+            await session.execute(stmt, params)
+        else:
+            async with engine.begin() as conn:
+                await conn.execute(stmt, params)

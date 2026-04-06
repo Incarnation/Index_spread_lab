@@ -231,6 +231,78 @@ class TestPerRunStagger:
         assert trades_today == 2
 
 
+# ── Session pass-through (FK fix) ─────────────────────────────────
+
+
+class TestRecordTradeSessionPassthrough:
+    """Verify record_trade routes SQL through a caller-supplied session.
+
+    When the decision_job inserts a ``trades`` row and then calls
+    ``pm.record_trade(session=session)``, the portfolio_trades INSERT and
+    portfolio_state UPDATE must run on the *same* session so the uncommitted
+    ``trades`` row is visible to the FK check (READ COMMITTED isolation).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_engine(self):
+        with patch("spx_backend.services.portfolio_manager.engine") as mock_eng:
+            self.mock_engine = mock_eng
+
+            mock_conn_ctx = AsyncMock()
+            mock_conn = AsyncMock()
+            mock_conn.execute = AsyncMock()
+            mock_conn_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_conn_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_begin_ctx = AsyncMock()
+            mock_begin_conn = AsyncMock()
+            mock_begin_conn.execute = AsyncMock()
+            mock_begin_ctx.__aenter__ = AsyncMock(return_value=mock_begin_conn)
+            mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_eng.connect.return_value = mock_conn_ctx
+            mock_eng.begin.return_value = mock_begin_ctx
+
+            self.mock_conn = mock_conn
+            self.mock_begin_conn = mock_begin_conn
+            yield
+
+    def _setup_pm(self) -> PortfolioManager:
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        pm._today = date(2026, 4, 7)
+        pm._state_id = 1
+        pm._trades_today = 0
+        pm._lots_today = 2
+        pm.equity = 20_000
+        pm.month_start_equity = 20_000
+        return pm
+
+    def test_session_receives_both_inserts(self):
+        """When session is provided, both portfolio_trades INSERT and
+        portfolio_state UPDATE run on that session -- not engine.begin()."""
+        mock_session = AsyncMock()
+        pm = self._setup_pm()
+
+        run(pm.record_trade(trade_id=42, pnl_per_lot=3.5, lots=2,
+                            source="event", event_signal="term_inversion",
+                            session=mock_session))
+
+        assert mock_session.execute.await_count == 2
+        self.mock_engine.begin.assert_not_called()
+
+        calls = [str(c.args[0]) for c in mock_session.execute.await_args_list]
+        assert any("portfolio_trades" in c for c in calls)
+        assert any("portfolio_state" in c for c in calls)
+
+    def test_no_session_uses_engine(self):
+        """Without a session, record_trade falls back to engine.begin()."""
+        pm = self._setup_pm()
+
+        run(pm.record_trade(trade_id=42, pnl_per_lot=3.5, lots=2))
+
+        assert self.mock_engine.begin.call_count == 2
+
+
 # ── Config field existence ───────────────────────────────────────
 
 

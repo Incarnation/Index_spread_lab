@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from spx_backend.config import settings
-from spx_backend.database import SessionLocal, init_db
+from spx_backend.database import init_db
 from spx_backend.ingestion.tradier_client import get_tradier_client
 from spx_backend.jobs.cboe_gex_job import build_cboe_gex_job
 from spx_backend.jobs.decision_job import DecisionJob
@@ -340,95 +340,6 @@ def _schedule_rth_window_job(
     )
 
 
-async def _maybe_decision_catchup(
-    *,
-    clock_cache: MarketClockCache,
-    feature_builder_job: Any,
-    decision_job: Any,
-) -> None:
-    """Fire the decision pipeline once if the service started after all cron entry times.
-
-    When Railway deploys mid-RTH past the last configured decision_entry_time,
-    APScheduler silently misfires every cron trigger and the decision_job won't
-    run until the next business day.  This helper detects that scenario and
-    performs a single catch-up run so the trading day is not lost.
-
-    Guards against double-trading by checking the trade_decisions table first.
-
-    Parameters
-    ----------
-    clock_cache:
-        Shared market clock cache for RTH status.
-    feature_builder_job:
-        Feature builder job instance (runs before the decision job).
-    decision_job:
-        Decision job instance to fire catch-up on.
-    """
-    if not settings.decision_startup_catchup_enabled:
-        logger.info("startup_catchup: disabled via DECISION_STARTUP_CATCHUP_ENABLED=false")
-        return
-
-    tz = ZoneInfo(settings.tz)
-    now_et = datetime.now(tz=tz)
-
-    is_open = await clock_cache.is_open(now_et)
-    if not is_open:
-        logger.info("startup_catchup: market not open, skipping (now_et={})", now_et.isoformat())
-        return
-
-    entry_times = settings.decision_entry_times_list()
-    if not entry_times:
-        logger.info("startup_catchup: no entry times configured, skipping")
-        return
-
-    current_minutes = now_et.hour * 60 + now_et.minute
-    latest_entry_minutes = max(h * 60 + m for h, m in entry_times)
-    if current_minutes <= latest_entry_minutes:
-        logger.info(
-            "startup_catchup: future trigger still pending (now_et={}, latest_entry={:02d}:{:02d}), skipping",
-            now_et.isoformat(),
-            latest_entry_minutes // 60,
-            latest_entry_minutes % 60,
-        )
-        return
-
-    from sqlalchemy import text as sa_text
-
-    today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    try:
-        async with SessionLocal() as session:
-            row = await session.execute(
-                sa_text("SELECT COUNT(*) AS cnt FROM trade_decisions WHERE ts >= :start"),
-                {"start": today_start},
-            )
-            count = row.scalar() or 0
-    except Exception as exc:
-        logger.exception("startup_catchup: DB check failed, skipping catch-up error={}", exc)
-        return
-
-    if count > 0:
-        logger.info(
-            "startup_catchup: {} trade_decisions already exist today, skipping catch-up",
-            count,
-        )
-        return
-
-    logger.info("startup_catchup: all entry times passed with 0 trades today, firing catch-up run")
-
-    if settings.feature_builder_enabled:
-        try:
-            await feature_builder_job.run_once(force=True)
-            logger.info("startup_catchup: feature_builder_job completed")
-        except Exception as exc:
-            logger.exception("startup_catchup: feature_builder_job failed error={}", exc)
-
-    try:
-        result = await decision_job.run_once(force=True)
-        logger.info("startup_catchup: decision_job completed result={}", result)
-    except Exception as exc:
-        logger.exception("startup_catchup: decision_job failed error={}", exc)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize DB, scheduler, and background jobs.
@@ -748,12 +659,6 @@ async def lifespan(app: FastAPI):
                 logger.exception("startup_warmup: job_id={} status=failed error={}", job_name, exc)
     else:
         logger.info("startup_warmup: skipped (SKIP_STARTUP_WARMUP=true)")
-
-    await _maybe_decision_catchup(
-        clock_cache=clock_cache,
-        feature_builder_job=feature_builder_job,
-        decision_job=decision_job,
-    )
 
     yield
 

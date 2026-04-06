@@ -94,10 +94,6 @@ class Settings(BaseSettings):
     decision_max_open_trades_per_side: int = 10
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
-    decision_startup_catchup_enabled: bool = True
-    """Fire the decision pipeline once on boot when the service starts after
-    all configured entry times have already passed for the current trading day.
-    Prevents a full missed-day when Railway deploys mid-RTH."""
 
     # ML feature/candidate generation (step 1)
     feature_builder_enabled: bool = True
