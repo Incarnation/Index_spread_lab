@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     cboe_gex_interval_minutes: int = 5
     cboe_gex_allow_outside_rth: bool = False
 
-    decision_entry_times: str = "10:02,11:02,12:02"
+    decision_entry_times: str = "10:01,11:01,12:01"
     decision_dte_targets: str = "3,5,7,10"
     decision_dte_tolerance_days: int = 0
     decision_delta_targets: str = "0.10,0.20"
