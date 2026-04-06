@@ -55,12 +55,13 @@ export function OverviewPage() {
     Promise.all([
       fetchTrades(100).then(setTrades),
       fetchPerformanceAnalytics(90, "realized").then(setPerf),
-      fetchAdminPreflight().then(setPreflight).catch(() => {}),
       fetchPortfolioStatus().then(setPortfolio).catch(() => {}),
       fetchPortfolioHistory(90).then(setEquityHistory).catch(() => {}),
     ])
       .catch((e) => setError(e.message ?? "Failed to load data"))
       .finally(() => setLoading(false));
+
+    fetchAdminPreflight().then(setPreflight).catch(() => {});
   }, [tick]);
 
   const openTrades = trades.filter((t) => t.status === "OPEN");
