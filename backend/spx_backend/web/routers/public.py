@@ -4,13 +4,13 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
-from spx_backend.database import get_db_session
+from spx_backend.database import SessionLocal, get_db_session
 from spx_backend.jobs.modeling import compute_margin_usage_dollars, compute_max_drawdown, summarize_strategy_quality
 from spx_backend.web.routers.auth import UserOut, get_current_user
 
@@ -87,9 +87,109 @@ def _summarize_mode_rows(rows: list[Any]) -> dict[str, float | int | None]:
 
 
 @router.get("/health")
-async def health() -> dict[str, str]:
-    """Simple health check."""
-    return {"status": "ok"}
+async def health(request: Request) -> dict:
+    """Deep health check -- DB connectivity, scheduler state, pipeline freshness.
+
+    Returns ``status`` of ``healthy``, ``degraded``, or ``unhealthy`` along
+    with per-check detail so load balancers and operators can assess system
+    readiness at a glance.  No authentication required.
+    """
+    checks: dict[str, dict] = {}
+
+    # -- DB connectivity --
+    try:
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["database"] = {"ok": True}
+    except Exception as exc:
+        checks["database"] = {"ok": False, "error": str(exc)[:200]}
+
+    # -- Scheduler heartbeat --
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        running = getattr(scheduler, "running", False)
+        checks["scheduler"] = {"ok": bool(running)}
+    else:
+        checks["scheduler"] = {"ok": False, "error": "scheduler not found"}
+
+    # -- Pipeline freshness (only when DB is up) --
+    if checks["database"]["ok"]:
+        freshness_checks = [
+            ("underlying_quotes", "ts", settings.staleness_quotes_max_minutes),
+            ("chain_snapshots", "ts", settings.staleness_snapshots_max_minutes),
+            ("trade_decisions", "ts", settings.staleness_decisions_max_minutes),
+        ]
+        try:
+            async with SessionLocal() as session:
+                for table, col, threshold in freshness_checks:
+                    row = await session.execute(
+                        text(f"SELECT MAX({col}) AS latest FROM {table}")
+                    )
+                    latest = row.scalar()
+                    if latest is None:
+                        checks[table] = {"ok": True, "age_minutes": None, "note": "empty"}
+                        continue
+                    latest_utc = latest if latest.tzinfo else latest.replace(tzinfo=ZoneInfo("UTC"))
+                    age = (datetime.now(ZoneInfo("UTC")) - latest_utc).total_seconds() / 60.0
+                    checks[table] = {
+                        "ok": age <= threshold,
+                        "age_minutes": round(age, 1),
+                        "threshold_minutes": threshold,
+                    }
+        except Exception as exc:
+            checks["freshness"] = {"ok": False, "error": str(exc)[:200]}
+
+    any_unhealthy = not checks["database"]["ok"]
+    any_degraded = any(not c["ok"] for c in checks.values() if c is not checks.get("database"))
+    status = "unhealthy" if any_unhealthy else ("degraded" if any_degraded else "healthy")
+
+    return {"status": status, "checks": checks}
+
+
+@router.get("/api/pipeline-status")
+async def pipeline_status(
+    current_user: UserOut = Depends(get_current_user),
+) -> dict:
+    """Sanitized pipeline freshness for all authenticated users.
+
+    Returns per-source age and a warnings list so the Overview page can
+    show green/amber/red indicators without requiring admin privileges.
+    Unlike ``/api/admin/preflight``, this omits row counts and admin-only
+    detail.
+    """
+    sources = [
+        ("underlying_quotes", "ts", settings.staleness_quotes_max_minutes),
+        ("chain_snapshots", "ts", settings.staleness_snapshots_max_minutes),
+        ("gex_snapshots", "ts", settings.staleness_gex_max_minutes),
+        ("trade_decisions", "ts", settings.staleness_decisions_max_minutes),
+    ]
+    freshness: dict[str, dict] = {}
+    warnings: list[str] = []
+    try:
+        async with SessionLocal() as session:
+            now_utc = datetime.now(ZoneInfo("UTC"))
+            for table, col, threshold in sources:
+                row = await session.execute(
+                    text(f"SELECT MAX({col}) AS latest FROM {table}")
+                )
+                latest = row.scalar()
+                if latest is None:
+                    freshness[table] = {"age_minutes": None, "stale": False}
+                    continue
+                latest_utc = latest if latest.tzinfo else latest.replace(tzinfo=ZoneInfo("UTC"))
+                age = (now_utc - latest_utc).total_seconds() / 60.0
+                stale = age > threshold
+                freshness[table] = {
+                    "age_minutes": round(age, 1),
+                    "threshold_minutes": threshold,
+                    "stale": stale,
+                }
+                if stale:
+                    warnings.append(f"{table} stale ({round(age)}m > {threshold}m)")
+    except Exception as exc:
+        warnings.append(f"freshness check error: {str(exc)[:100]}")
+
+    return {"freshness": freshness, "warnings": warnings}
 
 
 @router.get("/api/chain-snapshots")

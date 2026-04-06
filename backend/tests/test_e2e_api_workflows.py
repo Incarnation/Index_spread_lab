@@ -26,6 +26,17 @@ class _FakeExecResult:
     def fetchone(self) -> SimpleNamespace | None:
         return self._rows[0] if self._rows else None
 
+    def scalar(self) -> Any:
+        """Return the first scalar value (used by health/pipeline-status endpoints)."""
+        if not self._rows:
+            return None
+        first = self._rows[0]
+        if isinstance(first, (int, float, str, bool, datetime)):
+            return first
+        if hasattr(first, "latest"):
+            return getattr(first, "latest")
+        return first
+
     def scalar_one(self) -> Any:
         """Return one scalar-like value from the first stored row."""
         if not self._rows:
@@ -47,10 +58,23 @@ class _RouterAwareSession:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.commits = 0
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
     async def execute(self, stmt, params=None):  # noqa: ANN001 - SQLAlchemy text object
         sql = str(stmt)
         query_params = params or {}
         self.calls.append((sql, query_params))
+
+        if "SELECT 1" == sql.strip():
+            return _FakeExecResult([1])
+
+        if sql.strip().startswith("SELECT MAX(") and "AS latest FROM" in sql:
+            fresh_ts = datetime.now(tz=timezone.utc)
+            return _FakeExecResult([fresh_ts])
 
         # Auth: login and get_current_user lookups (e2e uses testuser / testpass123).
         if "FROM users" in sql:
@@ -439,6 +463,11 @@ class _FakeTradier:
         return {"expirations": {"date": ["2026-02-05", "2026-02-07"]}}
 
 
+class _FakeScheduler:
+    """Scheduler stub with a ``running`` attribute for the health endpoint."""
+    running = True
+
+
 def _build_test_client(monkeypatch):
     monkeypatch.setattr(settings, "jwt_secret", "e2e-test-secret")
     monkeypatch.setattr(settings, "auth_register_enabled", True)
@@ -456,14 +485,20 @@ def _build_test_client(monkeypatch):
     test_app.dependency_overrides[public.get_db_session] = _override_db
     test_app.dependency_overrides[admin.get_db_session] = _override_db
 
+    # SessionLocal is used directly by /health and /api/pipeline-status
+    monkeypatch.setattr(public, "SessionLocal", lambda: fake_session)
+
     # Wire all admin-triggered jobs into app.state.
+    test_app.state.scheduler = _FakeScheduler()
     test_app.state.snapshot_job = _FakeJob("snapshot")
     test_app.state.quote_job = _FakeJob("quotes")
     test_app.state.gex_job = _FakeJob("gex")
+    test_app.state.cboe_gex_job = _FakeJob("cboe_gex")
     test_app.state.decision_job = _FakeJob("decision")
     test_app.state.feature_builder_job = _FakeJob("feature_builder")
     test_app.state.labeler_job = _FakeJob("labeler")
     test_app.state.trade_pnl_job = _FakeJob("trade_pnl")
+    test_app.state.performance_analytics_job = _FakeJob("performance_analytics")
     test_app.state.trainer_job = _FakeJob("trainer")
     test_app.state.shadow_inference_job = _FakeJob("shadow_inference")
     test_app.state.promotion_gate_job = _FakeJob("promotion_gate")
@@ -484,7 +519,10 @@ def test_e2e_public_api_surface(monkeypatch) -> None:
     """Exercise core public API endpoints over HTTP with deterministic fixtures."""
     client, _ = _build_test_client(monkeypatch)
 
-    assert client.get("/health").status_code == 200
+    health_resp = client.get("/health")
+    assert health_resp.status_code == 200
+    assert health_resp.json()["status"] in ("healthy", "degraded")
+    assert health_resp.json()["checks"]["database"]["ok"] is True
 
     headers = _e2e_auth_headers(client)
     snapshots = client.get("/api/chain-snapshots?limit=2", headers=headers)
@@ -546,10 +584,12 @@ def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
         "/api/admin/run-snapshot",
         "/api/admin/run-quotes",
         "/api/admin/run-gex",
+        "/api/admin/run-cboe-gex",
         "/api/admin/run-decision",
         "/api/admin/run-feature-builder",
         "/api/admin/run-labeler",
         "/api/admin/run-trade-pnl",
+        "/api/admin/run-performance-analytics",
         "/api/admin/run-trainer",
         "/api/admin/run-shadow-inference",
         "/api/admin/run-promotion-gates",

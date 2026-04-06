@@ -231,6 +231,28 @@ export async function runPromotionGatesNow(): Promise<GenericAdminRunResult> {
   return safeJson<GenericAdminRunResult>(r);
 }
 
+/**
+ * Trigger a manual performance-analytics refresh.
+ */
+export async function runPerformanceAnalyticsNow(): Promise<GenericAdminRunResult> {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-performance-analytics`), {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<GenericAdminRunResult>(r);
+}
+
+/**
+ * Trigger a manual CBOE GEX run.
+ */
+export async function runCboeGexNow(): Promise<GenericAdminRunResult> {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/run-cboe-gex`), {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<GenericAdminRunResult>(r);
+}
+
 export type GexSnapshot = {
   snapshot_id: number;
   ts: string;
@@ -610,6 +632,28 @@ export async function fetchAdminPreflight(): Promise<AdminPreflightResponse> {
   const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`));
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<AdminPreflightResponse>(r);
+}
+
+/** Per-source freshness entry from the pipeline-status endpoint. */
+export type PipelineFreshness = {
+  age_minutes: number | null;
+  threshold_minutes?: number;
+  stale: boolean;
+};
+
+/** Response from GET /api/pipeline-status (available to all authenticated users). */
+export type PipelineStatusResponse = {
+  freshness: Record<string, PipelineFreshness>;
+  warnings: string[];
+};
+
+/**
+ * Fetch pipeline freshness for all authenticated users (no admin required).
+ */
+export async function fetchPipelineStatus(): Promise<PipelineStatusResponse> {
+  const r = await fetchWithAuth(apiUrl(`/api/pipeline-status`));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson<PipelineStatusResponse>(r);
 }
 
 

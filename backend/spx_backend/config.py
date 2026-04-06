@@ -196,6 +196,8 @@ class Settings(BaseSettings):
     staleness_gex_max_minutes: int = 120
     staleness_decisions_max_minutes: int = 480
     staleness_cooldown_minutes: int = 360
+    job_failure_alert_enabled: bool = True
+    job_failure_alert_cooldown_minutes: int = 30
     sendgrid_api_key: str = ""
     email_alert_recipient: str = ""
     email_alert_sender: str = "alerts@indexspreadlab.app"

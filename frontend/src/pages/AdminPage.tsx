@@ -17,6 +17,8 @@ import {
   runTrainerNow,
   runShadowInferenceNow,
   runPromotionGatesNow,
+  runPerformanceAnalyticsNow,
+  runCboeGexNow,
 } from "@/api";
 import { Activity, Database, AlertTriangle, Play } from "lucide-react";
 
@@ -24,8 +26,10 @@ const JOBS = [
   { label: "Quotes", fn: runQuotesNow },
   { label: "Snapshot", fn: runSnapshotNow },
   { label: "GEX", fn: runGexNow },
+  { label: "CBOE GEX", fn: runCboeGexNow },
   { label: "Decision", fn: runDecisionNow },
   { label: "Trade PnL", fn: runTradePnlNow },
+  { label: "Perf Analytics", fn: runPerformanceAnalyticsNow },
   { label: "Feature Builder", fn: runFeatureBuilderNow },
   { label: "Labeler", fn: runLabelerNow },
   { label: "Trainer", fn: runTrainerNow },

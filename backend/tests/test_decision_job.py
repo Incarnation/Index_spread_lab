@@ -59,7 +59,13 @@ class _SessionFactory:
 
 
 def _set_default_decision_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch common decision settings defaults used across unit tests."""
+    """Patch common decision settings defaults used across unit tests.
+
+    Pins ``portfolio_enabled=False`` so tests that target the legacy
+    (non-portfolio) ``run_once`` path are not routed into
+    ``_run_portfolio_managed`` when the env has PORTFOLIO_ENABLED=true.
+    """
+    monkeypatch.setattr(settings, "portfolio_enabled", False)
     monkeypatch.setattr(settings, "snapshot_underlying", "SPX")
     monkeypatch.setattr(settings, "decision_contracts", 1)
     monkeypatch.setattr(settings, "decision_snapshot_max_age_minutes", 15)

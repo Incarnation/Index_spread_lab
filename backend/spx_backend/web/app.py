@@ -41,8 +41,57 @@ from spx_backend.web.routers.public import (
 )
 
 
+_job_failure_last_alert: dict[str, datetime] = {}
+
+
+def _send_job_failure_email(*, job_id: str, kind: str, detail: str) -> None:
+    """Send a job failure/misfire alert via SendGrid with per-job cooldown.
+
+    Reuses the same SendGrid credentials as the staleness monitor.  Skips
+    silently when disabled, unconfigured, or within cooldown.
+    """
+    if not settings.job_failure_alert_enabled:
+        return
+    if not settings.sendgrid_api_key or not settings.email_alert_recipient:
+        return
+
+    now = datetime.now(tz=ZoneInfo("UTC"))
+    last = _job_failure_last_alert.get(job_id)
+    if last is not None:
+        elapsed = (now - last).total_seconds() / 60.0
+        if elapsed < settings.job_failure_alert_cooldown_minutes:
+            logger.debug("scheduler_alert: cooldown active for job_id={}", job_id)
+            return
+
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+    except ImportError:
+        logger.error("scheduler_alert: sendgrid package not installed")
+        return
+
+    subject = f"[IndexSpreadLab] Job {kind}: {job_id}"
+    body = f"Job: {job_id}\nEvent: {kind}\n\n{detail}"
+    message = Mail(
+        from_email=settings.email_alert_sender,
+        to_emails=settings.email_alert_recipient,
+        subject=subject,
+        plain_text_content=body,
+    )
+    try:
+        sg = SendGridAPIClient(settings.sendgrid_api_key)
+        response = sg.send(message)
+        if response.status_code in (200, 201, 202):
+            _job_failure_last_alert[job_id] = now
+            logger.info("scheduler_alert: email sent for job_id={} kind={}", job_id, kind)
+        else:
+            logger.warning("scheduler_alert: unexpected status={}", response.status_code)
+    except Exception as exc:
+        logger.error("scheduler_alert: email send failed error={}", exc)
+
+
 def _scheduler_event_listener(event: Any) -> None:
-    """Log APScheduler job errors/misfires with consistent context.
+    """Log APScheduler job errors/misfires and send email alerts.
 
     Parameters
     ----------
@@ -54,14 +103,21 @@ def _scheduler_event_listener(event: Any) -> None:
     --------
     - Logs job exceptions with traceback when available.
     - Logs missed executions as warnings so ingestion gaps are visible.
+    - Sends email alert via SendGrid (with per-job cooldown) for both
+      failures and misfires.
     """
     job_id = getattr(event, "job_id", "unknown_job")
     exception = getattr(event, "exception", None)
     traceback_value = getattr(event, "traceback", None)
     if exception is not None:
         logger.error("scheduler: job_id={} failed error={} traceback={}", job_id, exception, traceback_value)
+        _send_job_failure_email(
+            job_id=job_id, kind="FAILURE",
+            detail=f"Error: {exception}\n\nTraceback:\n{traceback_value or 'N/A'}",
+        )
         return
     logger.warning("scheduler: job_id={} missed scheduled run", job_id)
+    _send_job_failure_email(job_id=job_id, kind="MISFIRE", detail="Job missed its scheduled execution window.")
 
 
 def _normalized_rth_interval_minutes(interval_minutes: int, *, job_id: str) -> int:

@@ -7,12 +7,12 @@ import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import {
   fetchTrades,
   fetchPerformanceAnalytics,
-  fetchAdminPreflight,
+  fetchPipelineStatus,
   fetchPortfolioStatus,
   fetchPortfolioHistory,
   type TradeRow,
   type PerformanceAnalyticsResponse,
-  type AdminPreflightResponse,
+  type PipelineStatusResponse,
   type PortfolioStatus,
   type PortfolioHistoryDay,
 } from "@/api";
@@ -43,7 +43,7 @@ export function OverviewPage() {
   const { tick } = useAutoRefresh(30_000);
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [perf, setPerf] = useState<PerformanceAnalyticsResponse | null>(null);
-  const [preflight, setPreflight] = useState<AdminPreflightResponse | null>(null);
+  const [pipelineStatus, setPipelineStatus] = useState<PipelineStatusResponse | null>(null);
   const [portfolio, setPortfolio] = useState<PortfolioStatus | null>(null);
   const [equityHistory, setEquityHistory] = useState<PortfolioHistoryDay[]>([]);
   const [loading, setLoading] = useState(true);
@@ -61,7 +61,7 @@ export function OverviewPage() {
       .catch((e) => setError(e.message ?? "Failed to load data"))
       .finally(() => setLoading(false));
 
-    fetchAdminPreflight().then(setPreflight).catch(() => {});
+    fetchPipelineStatus().then(setPipelineStatus).catch(() => {});
   }, [tick]);
 
   const openTrades = trades.filter((t) => t.status === "OPEN");
@@ -308,11 +308,11 @@ export function OverviewPage() {
       </div>
 
       {/* Pipeline status */}
-      {preflight && preflight.warnings.length > 0 && (
+      {pipelineStatus && pipelineStatus.warnings.length > 0 && (
         <div className="rounded-lg border border-warning/30 bg-warning-bg p-3">
           <h4 className="text-xs font-medium text-warning mb-1">Pipeline Warnings</h4>
           <ul className="space-y-0.5">
-            {preflight.warnings.map((w, i) => (
+            {pipelineStatus.warnings.map((w, i) => (
               <li key={i} className="text-xs text-warning/80">{w}</li>
             ))}
           </ul>
