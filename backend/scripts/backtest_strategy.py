@@ -30,20 +30,25 @@ occur that the backtest did not predict.
 
 **Monthly** -- After accumulating a full calendar month of live data:
 
-1. Download latest Databento data and regenerate ``training_candidates.csv``::
+1. Export latest production data (chains, underlying quotes, calendar)::
 
-       python scripts/download_databento.py --phase full
+       python scripts/export_production_data.py --tables all
+
+2. Regenerate training candidates.  The pipeline auto-merges Databento
+   files (historical) with production exports (recent), so no separate
+   download step is needed for dates covered by the production DB::
+
        python scripts/generate_training_data.py --workers 4
 
-2. Re-run the optimizer with the expanded dataset::
+3. Re-run the optimizer with the expanded dataset::
 
        python scripts/backtest_strategy.py --optimize
 
-3. Run walk-forward validation to check for drift::
+4. Run walk-forward validation with auto-generated windows::
 
-       python scripts/backtest_strategy.py --walkforward
+       python scripts/backtest_strategy.py --walkforward --wf-auto
 
-4. If the current config's out-of-sample Sharpe drops >30% vs the
+5. If the current config's out-of-sample Sharpe drops >30% vs the
    original walkforward result for 2+ consecutive months, re-select
    the best config from the updated Pareto frontier and update
    ``.env`` PORTFOLIO_*/EVENT_* values accordingly.
@@ -52,6 +57,14 @@ occur that the backtest did not predict.
 regenerate the full training set and re-run ``--optimize --walkforward``
 to validate the strategy on the longer history.  Larger datasets
 reduce overfitting risk and increase confidence in parameter choices.
+
+**Production DB as sole data source** -- Once the production system has
+accumulated enough data, Databento/FRD downloads are no longer needed.
+The ``export_production_data.py`` script exports ``chain_snapshots``,
+``option_chain_rows``, and ``underlying_quotes`` as per-day Parquet files
+that the training pipeline consumes transparently via auto-fallback
+loaders.  Run ``--wf-auto`` to auto-size walk-forward windows to the
+available data range.
 """
 from __future__ import annotations
 
@@ -60,6 +73,7 @@ import itertools
 import sys
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1206,6 +1220,81 @@ WALKFORWARD_WINDOWS = [
 ]
 
 
+def generate_auto_windows(
+    min_day: str,
+    max_day: str,
+    *,
+    train_months: int = 6,
+    test_months: int = 3,
+    step_months: int = 3,
+) -> list[dict[str, str]]:
+    """Auto-generate rolling walk-forward windows from a data date range.
+
+    Produces non-overlapping test windows, each preceded by a contiguous
+    training window.  Windows that would extend beyond the data range are
+    truncated.  Windows with less than one month of training or test data
+    are dropped.
+
+    Parameters
+    ----------
+    min_day : str
+        Earliest date in the dataset (ISO format ``YYYY-MM-DD``).
+    max_day : str
+        Latest date in the dataset (ISO format ``YYYY-MM-DD``).
+    train_months : int
+        Length of each training window in months.
+    test_months : int
+        Length of each test window in months.
+    step_months : int
+        Stride between successive windows in months.
+
+    Returns
+    -------
+    list[dict[str, str]]
+        List of window dicts with keys ``name``, ``train_start``,
+        ``train_end``, ``test_start``, ``test_end``.
+    """
+    from dateutil.relativedelta import relativedelta
+
+    start = pd.Timestamp(min_day).date()
+    end = pd.Timestamp(max_day).date()
+
+    windows: list[dict[str, str]] = []
+    cursor = start
+    idx = 1
+
+    while True:
+        train_start = cursor
+        train_end_raw = cursor + relativedelta(months=train_months) - timedelta(days=1)
+        test_start = train_end_raw + timedelta(days=1)
+        test_end_raw = test_start + relativedelta(months=test_months) - timedelta(days=1)
+
+        # Truncate to data range
+        train_end = min(train_end_raw, end)
+        test_end = min(test_end_raw, end)
+
+        # Need at least 30 days of train and 15 days of test
+        if (train_end - train_start).days < 30:
+            break
+        if test_start > end or (test_end - test_start).days < 15:
+            break
+
+        windows.append({
+            "name": f"Auto-W{idx}",
+            "train_start": str(train_start),
+            "train_end": str(train_end),
+            "test_start": str(test_start),
+            "test_end": str(test_end),
+        })
+        idx += 1
+        cursor += relativedelta(months=step_months)
+
+        if cursor >= end:
+            break
+
+    return windows
+
+
 def walkforward_split(
     df: pd.DataFrame,
     train_start: str,
@@ -1296,6 +1385,8 @@ def run_walkforward(
     df: pd.DataFrame,
     output_csv: Path = WALKFORWARD_CSV,
     top_n: int = 10,
+    *,
+    windows: list[dict[str, str]] | None = None,
 ) -> pd.DataFrame:
     """Run rolling walk-forward validation across all windows.
 
@@ -1307,15 +1398,19 @@ def run_walkforward(
     df : Full training candidates DataFrame.
     output_csv : Path to export detailed results.
     top_n : Number of top configs per window.
+    windows : Optional custom window list.  When ``None`` the hard-coded
+        ``WALKFORWARD_WINDOWS`` are used.  Pass the output of
+        ``generate_auto_windows()`` for data-driven window placement.
 
     Returns
     -------
     DataFrame with per-window, per-config train vs test comparison.
     """
+    effective_windows = windows if windows is not None else WALKFORWARD_WINDOWS
     all_rows: list[dict[str, Any]] = []
     config_appearances: dict[tuple, list[str]] = {}
 
-    for window in WALKFORWARD_WINDOWS:
+    for window in effective_windows:
         wname = window["name"]
         print(f"\n{'=' * 100}")
         print(f"  WALK-FORWARD {wname}: "
@@ -1471,6 +1566,9 @@ def main() -> None:
                         help="Deep-dive optimizer results (param importance, Pareto, robustness)")
     parser.add_argument("--walkforward", action="store_true", default=False,
                         help="Rolling walk-forward validation (train/test splits)")
+    parser.add_argument("--wf-auto", action="store_true", default=False,
+                        help="Auto-generate walk-forward windows from data date range "
+                             "(6-month train, 3-month test, rolling at 3-month steps)")
     parser.add_argument("--output-csv", type=str, default=str(RESULTS_CSV),
                         help="CSV output path for optimizer results")
 
@@ -1510,7 +1608,17 @@ def main() -> None:
     daily_signals = precompute_daily_signals(df)
 
     if args.walkforward:
-        run_walkforward(df, output_csv=Path(args.output_csv.replace("backtest_results", "walkforward_results")))
+        wf_windows = None
+        if args.wf_auto:
+            min_day = df["day"].min()
+            max_day = df["day"].max()
+            wf_windows = generate_auto_windows(min_day, max_day)
+            print(f"Auto-generated {len(wf_windows)} walk-forward windows from {min_day} to {max_day}")
+        run_walkforward(
+            df,
+            output_csv=Path(args.output_csv.replace("backtest_results", "walkforward_results")),
+            windows=wf_windows,
+        )
 
     elif args.optimize:
         results_df = run_optimizer(df, daily_signals, Path(args.output_csv))

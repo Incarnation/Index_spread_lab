@@ -1,12 +1,15 @@
-"""Export production DB tables to CSV for offline training pipeline.
+"""Export production DB tables to CSV/Parquet for offline training pipeline.
 
 Connects to the production PostgreSQL database using DATABASE_URL from
 the .env file, exports ``underlying_quotes``, ``context_snapshots``,
-``economic_events``, and ``trade_candidates`` to CSV files that the
-offline training pipeline can load.
+``economic_events``, ``trade_candidates``, ``chains`` (option chain
+snapshots), and ``underlying_parquet`` (per-symbol parquet) to files
+that the offline training pipeline can load.
 
 Usage:
     python scripts/export_production_data.py [--start DATE] [--end DATE]
+    python scripts/export_production_data.py --tables chains
+    python scripts/export_production_data.py --tables underlying_parquet
 
 Defaults to exporting all available data when --start/--end are omitted.
 """
@@ -32,6 +35,9 @@ UNDERLYING_QUOTES_CSV = DATA_DIR / "underlying_quotes_export.csv"
 CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 ECONOMIC_EVENTS_CSV = DATA_DIR / "economic_events_export.csv"
 TRADE_CANDIDATES_CSV = DATA_DIR / "trade_candidates_export.csv"
+PRODUCTION_CHAINS_DIR = DATA_DIR / "production_exports" / "chains"
+PRODUCTION_UNDERLYING_DIR = DATA_DIR / "production_exports" / "underlying"
+ECONOMIC_CALENDAR_CSV = DATA_DIR / "economic_calendar.csv"
 
 
 def _sync_url(async_url: str) -> str:
@@ -329,10 +335,192 @@ def export_trade_candidates(
     return len(df)
 
 
+def export_chain_data(
+    engine,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    output_dir: Path = PRODUCTION_CHAINS_DIR,
+) -> tuple[int, int]:
+    """Export chain_snapshots + option_chain_rows as per-day Parquet files.
+
+    Joins the two tables and writes one Parquet file per trading day to
+    ``output_dir/{YYYYMMDD}.parquet``.  Each file contains the columns
+    needed by the offline training pipeline's production adapters.
+
+    Parameters
+    ----------
+    engine:
+        SQLAlchemy synchronous engine.
+    start:
+        ISO date string for lower bound (inclusive).  None = no lower bound.
+    end:
+        ISO date string for upper bound (exclusive).  None = no upper bound.
+    output_dir:
+        Destination directory for per-day Parquet files.
+
+    Returns
+    -------
+    tuple[int, int]
+        (number of days exported, total rows across all days).
+    """
+    clauses = ["cs.underlying = 'SPX'"]
+    params: dict = {}
+    if start:
+        clauses.append("cs.ts >= :start")
+        params["start"] = start
+    if end:
+        clauses.append("cs.ts < :end")
+        params["end"] = end
+
+    where = " AND ".join(clauses)
+    query = text(
+        f"SELECT cs.ts, ocr.option_symbol, ocr.expiration, ocr.strike, "
+        f"ocr.option_right, ocr.bid, ocr.ask, ocr.open_interest, "
+        f"ocr.delta, ocr.gamma "
+        f"FROM chain_snapshots cs "
+        f"JOIN option_chain_rows ocr ON cs.snapshot_id = ocr.snapshot_id "
+        f"WHERE {where} "
+        f"ORDER BY cs.ts, ocr.option_symbol"
+    )
+
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn, params=params)
+
+    if df.empty:
+        return 0, 0
+
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["day"] = df["ts"].dt.strftime("%Y%m%d")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    days_exported = 0
+
+    for day_str, day_df in df.groupby("day"):
+        out_path = output_dir / f"{day_str}.parquet"
+        day_df.drop(columns=["day"]).to_parquet(out_path, index=False)
+        total_rows += len(day_df)
+        days_exported += 1
+
+    return days_exported, total_rows
+
+
+def export_underlying_parquet(
+    engine,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    output_dir: Path = PRODUCTION_UNDERLYING_DIR,
+) -> dict[str, int]:
+    """Export underlying_quotes as per-symbol Parquet files.
+
+    Writes one Parquet file per symbol to ``output_dir/{SYMBOL}_1min.parquet``
+    with columns ``[ts, close]``, matching the FRD parquet format so the
+    training pipeline's ``load_frd_quotes`` can read them directly.
+
+    Parameters
+    ----------
+    engine:
+        SQLAlchemy synchronous engine.
+    start:
+        ISO date string for lower bound (inclusive).  None = no lower bound.
+    end:
+        ISO date string for upper bound (exclusive).  None = no upper bound.
+    output_dir:
+        Destination directory for per-symbol Parquet files.
+
+    Returns
+    -------
+    dict[str, int]
+        Mapping of symbol name to number of rows exported.
+    """
+    symbols = ("SPX", "SPY", "VIX", "VIX9D", "VVIX", "SKEW")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, int] = {}
+
+    for symbol in symbols:
+        clauses = [f"symbol = '{symbol}'"]
+        params: dict = {}
+        if start:
+            clauses.append("ts >= :start")
+            params["start"] = start
+        if end:
+            clauses.append("ts < :end")
+            params["end"] = end
+
+        where = " AND ".join(clauses)
+        query = text(
+            f"SELECT ts, last AS close FROM underlying_quotes "
+            f"WHERE {where} ORDER BY ts"
+        )
+
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params=params)
+
+        if df.empty:
+            results[symbol] = 0
+            continue
+
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        out_path = output_dir / f"{symbol}_1min.parquet"
+        df.to_parquet(out_path, index=False)
+        results[symbol] = len(df)
+
+    return results
+
+
+def export_economic_calendar_merged(
+    engine,
+    *,
+    output: Path = ECONOMIC_CALENDAR_CSV,
+) -> int:
+    """Export economic_events and merge with existing economic_calendar.csv.
+
+    Reads the production ``economic_events`` table and the existing
+    ``economic_calendar.csv`` (historical events), deduplicates, and writes
+    the merged result back.  This ensures the training pipeline always has
+    a complete calendar covering both historical and production periods.
+
+    Parameters
+    ----------
+    engine:
+        SQLAlchemy synchronous engine.
+    output:
+        Destination CSV path (typically ``data/economic_calendar.csv``).
+
+    Returns
+    -------
+    int
+        Total number of rows in the merged output.
+    """
+    query = text(
+        "SELECT date, event_type, has_projections, is_triple_witching "
+        "FROM economic_events ORDER BY date"
+    )
+    with engine.connect() as conn:
+        prod_df = pd.read_sql(query, conn)
+
+    # Load existing historical calendar if present
+    if output.exists():
+        hist_df = pd.read_csv(str(output))
+    else:
+        hist_df = pd.DataFrame(columns=["date", "event_type", "has_projections", "is_triple_witching"])
+
+    merged = pd.concat([hist_df, prod_df], ignore_index=True)
+    merged["date"] = pd.to_datetime(merged["date"]).dt.strftime("%Y-%m-%d")
+    merged = merged.drop_duplicates(subset=["date", "event_type"], keep="last")
+    merged = merged.sort_values("date").reset_index(drop=True)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(output, index=False)
+    return len(merged)
+
+
 def main() -> None:
     """CLI entry point for production data export."""
     parser = argparse.ArgumentParser(
-        description="Export production DB tables to CSV for offline training."
+        description="Export production DB tables to CSV/Parquet for offline training."
     )
     parser.add_argument(
         "--start", default=None,
@@ -344,7 +532,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--tables", default="all",
-        choices=["all", "underlying_quotes", "context_snapshots", "economic_events", "trade_candidates"],
+        choices=[
+            "all", "underlying_quotes", "context_snapshots",
+            "economic_events", "trade_candidates",
+            "chains", "underlying_parquet", "calendar_merge",
+        ],
         help="Which table(s) to export (default: all)",
     )
     parser.add_argument(
@@ -402,6 +594,20 @@ def main() -> None:
     if args.tables in ("all", "trade_candidates"):
         n = export_trade_candidates(engine, start=args.start, end=args.end)
         print(f"  trade_candidates: {n} rows -> {TRADE_CANDIDATES_CSV}")
+
+    if args.tables in ("all", "chains"):
+        days, rows = export_chain_data(engine, start=args.start, end=args.end)
+        print(f"  chains: {rows} rows across {days} days -> {PRODUCTION_CHAINS_DIR}/")
+
+    if args.tables in ("all", "underlying_parquet"):
+        sym_counts = export_underlying_parquet(engine, start=args.start, end=args.end)
+        for sym, n in sym_counts.items():
+            if n > 0:
+                print(f"  underlying_parquet/{sym}: {n} rows -> {PRODUCTION_UNDERLYING_DIR}/{sym}_1min.parquet")
+
+    if args.tables in ("all", "calendar_merge"):
+        n = export_economic_calendar_merged(engine)
+        print(f"  economic_calendar (merged): {n} rows -> {ECONOMIC_CALENDAR_CSV}")
 
     print("=" * 60)
     print("Done.\n")

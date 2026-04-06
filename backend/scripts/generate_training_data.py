@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -57,6 +58,10 @@ OFFLINE_GEX_CSV = DATA_DIR / "offline_gex_cache.csv"
 CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 OUTPUT_CSV = DATA_DIR / "training_candidates.csv"
 ECONOMIC_CALENDAR_CSV = DATA_DIR / "economic_calendar.csv"
+
+# Production DB exports (from export_production_data.py)
+PRODUCTION_CHAINS_DIR = DATA_DIR / "production_exports" / "chains"
+PRODUCTION_UNDERLYING_DIR = DATA_DIR / "production_exports" / "underlying"
 
 # FirstRateData parquets (converted from raw .txt downloads)
 FRD_DIR = DATA_DIR / "firstratedata"
@@ -172,13 +177,158 @@ def implied_vol_vec(
 # ===================================================================
 
 def _available_day_files(directory: Path) -> list[str]:
-    """Return sorted YYYYMMDD strings for .dbn.zst files in *directory*."""
-    results = []
+    """Return sorted YYYYMMDD day strings from .dbn.zst files in *directory*.
+
+    Also scans ``PRODUCTION_CHAINS_DIR`` for ``.parquet`` files and merges
+    them into the result, so both Databento and production-exported days
+    appear in the unified trading-day list.
+    """
+    results: set[str] = set()
     for f in directory.glob("*.dbn.zst"):
         day_str = f.name.split(".")[0]
         if day_str.isdigit() and len(day_str) == 8:
-            results.append(day_str)
+            results.add(day_str)
+    if PRODUCTION_CHAINS_DIR.exists():
+        for f in PRODUCTION_CHAINS_DIR.glob("*.parquet"):
+            day_str = f.stem
+            if day_str.isdigit() and len(day_str) == 8:
+                results.add(day_str)
     return sorted(results)
+
+
+# ===================================================================
+# PRODUCTION DATA ADAPTERS
+# ===================================================================
+
+def _symbol_to_iid(sym: str) -> int:
+    """Derive a stable integer instrument_id from an OCC option symbol.
+
+    Uses the first 8 hex digits of an MD5 hash to produce a positive 32-bit
+    integer.  Deterministic across runs so the same symbol always maps to the
+    same ID within a pipeline execution.
+    """
+    return int(hashlib.md5(sym.encode()).hexdigest()[:8], 16)
+
+
+_production_chain_cache: dict[str, pd.DataFrame | None] = {}
+_PRODUCTION_CHAIN_CACHE_MAX = 15
+
+
+def load_production_chain(day_str: str) -> pd.DataFrame | None:
+    """Read a per-day production-exported Parquet file if it exists.
+
+    Results are cached in ``_production_chain_cache`` (max 15 entries) so
+    that ``load_definitions``, ``load_cbbo``, and ``load_statistics`` can
+    all fall back for the same day without reading the parquet file three
+    times.
+
+    Returns the raw DataFrame with columns ``ts``, ``option_symbol``,
+    ``expiration``, ``strike``, ``option_right``, ``bid``, ``ask``,
+    ``open_interest``, ``delta``, ``gamma``.  Returns ``None`` when no
+    export file exists for the requested day.
+    """
+    if day_str in _production_chain_cache:
+        return _production_chain_cache[day_str]
+
+    path = PRODUCTION_CHAINS_DIR / f"{day_str}.parquet"
+    if not path.exists():
+        _production_chain_cache[day_str] = None
+        return None
+    try:
+        df = pd.read_parquet(path)
+        if "ts" in df.columns:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    except Exception as exc:
+        print(f"  [WARN] Cannot load production chain {day_str}: {exc}")
+        df = None
+
+    _production_chain_cache[day_str] = df
+    while len(_production_chain_cache) > _PRODUCTION_CHAIN_CACHE_MAX:
+        oldest = min(_production_chain_cache)
+        del _production_chain_cache[oldest]
+    return df
+
+
+def definitions_from_production(chain_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a production chain DataFrame to Databento definitions shape.
+
+    Extracts unique option symbols and maps them to the columns that
+    ``build_instrument_map`` expects: ``instrument_id``, ``raw_symbol``,
+    ``strike_price``, ``expiration``, ``instrument_class``.
+
+    Parameters
+    ----------
+    chain_df : pd.DataFrame
+        Raw production chain data from ``load_production_chain``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Definitions-like DataFrame compatible with ``build_instrument_map``.
+    """
+    unique = chain_df.drop_duplicates("option_symbol")[
+        ["option_symbol", "strike", "expiration", "option_right"]
+    ].copy()
+    unique["instrument_id"] = unique["option_symbol"].map(_symbol_to_iid)
+    unique = unique.rename(columns={
+        "option_symbol": "raw_symbol",
+        "strike": "strike_price",
+        "option_right": "instrument_class",
+    })
+    # build_instrument_map expects a ts_recv column for dedup sorting
+    unique["ts_recv"] = pd.Timestamp.now(tz="UTC")
+    return unique
+
+
+def cbbo_from_production(chain_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a production chain DataFrame to Databento CBBO shape.
+
+    Renames columns to match the Databento cbbo-1m schema that downstream
+    functions expect: ``instrument_id``, ``ts``, ``bid_px_00``, ``ask_px_00``.
+
+    Parameters
+    ----------
+    chain_df : pd.DataFrame
+        Raw production chain data from ``load_production_chain``.
+
+    Returns
+    -------
+    pd.DataFrame
+        CBBO-like DataFrame usable by ``get_cbbo_snapshot_at``.
+    """
+    df = chain_df[["ts", "option_symbol", "bid", "ask"]].copy()
+    df["instrument_id"] = df["option_symbol"].map(_symbol_to_iid)
+    df = df.rename(columns={"bid": "bid_px_00", "ask": "ask_px_00"})
+    return df[["instrument_id", "ts", "bid_px_00", "ask_px_00"]]
+
+
+def statistics_from_production(chain_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a production chain DataFrame to Databento statistics (OI) shape.
+
+    Takes the latest open_interest per option symbol and returns a DataFrame
+    with ``instrument_id`` and ``oi`` columns matching the Databento
+    statistics loader output.
+
+    Parameters
+    ----------
+    chain_df : pd.DataFrame
+        Raw production chain data from ``load_production_chain``.
+
+    Returns
+    -------
+    pd.DataFrame | None
+        OI DataFrame, or None if no open_interest data is available.
+    """
+    if "open_interest" not in chain_df.columns:
+        return None
+    df = chain_df.dropna(subset=["open_interest"])
+    if df.empty:
+        return None
+    df = df.sort_values("ts").drop_duplicates("option_symbol", keep="last")
+    df["instrument_id"] = df["option_symbol"].map(_symbol_to_iid)
+    return df[["instrument_id", "open_interest"]].rename(
+        columns={"open_interest": "oi"},
+    )
 
 
 def _load_dbn(path: Path) -> pd.DataFrame | None:
@@ -202,6 +352,9 @@ def load_definitions(day_str: str) -> pd.DataFrame | None:
     Merges definitions from both SPXW (daily/weekly) and SPX (monthly)
     sources.  Keeps only the latest definition per instrument_id
     (handles intra-day security_update_action MODIFY records).
+
+    Falls back to production-exported Parquet when no Databento files
+    exist for the requested day.
     """
     frames: list[pd.DataFrame] = []
     for defs_dir in (SPXW_DEFS, SPX_DEFS):
@@ -211,6 +364,9 @@ def load_definitions(day_str: str) -> pd.DataFrame | None:
             if tmp is not None and not tmp.empty:
                 frames.append(tmp)
     if not frames:
+        chain_df = load_production_chain(day_str)
+        if chain_df is not None and not chain_df.empty:
+            return definitions_from_production(chain_df)
         return None
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     if "instrument_id" in df.columns:
@@ -279,6 +435,9 @@ def load_cbbo(day_str: str) -> pd.DataFrame | None:
     monthly data when available.  Uses ``ts_recv`` as the canonical
     timestamp because ``ts_event`` is mostly NaT in the Databento
     cbbo-1m schema.
+
+    Falls back to production-exported Parquet when no Databento files
+    exist for the requested day.
     """
     frames: list[pd.DataFrame] = []
     for cbbo_dir in (SPXW_CBBO, SPX_CBBO):
@@ -288,6 +447,9 @@ def load_cbbo(day_str: str) -> pd.DataFrame | None:
             if tmp is not None and not tmp.empty:
                 frames.append(tmp)
     if not frames:
+        chain_df = load_production_chain(day_str)
+        if chain_df is not None and not chain_df.empty:
+            return cbbo_from_production(chain_df)
         return None
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     if "ts_recv" in df.columns:
@@ -301,6 +463,9 @@ def load_statistics(day_str: str) -> pd.DataFrame | None:
     Filters to ``stat_type == 9`` (open interest) and returns a DataFrame
     with columns ``instrument_id`` and ``oi`` (quantity).  Returns ``None``
     when no statistics files exist for the requested day.
+
+    Falls back to production-exported Parquet when no Databento files
+    exist for the requested day.
     """
     OI_STAT_TYPE = 9
     frames: list[pd.DataFrame] = []
@@ -311,6 +476,9 @@ def load_statistics(day_str: str) -> pd.DataFrame | None:
             if tmp is not None and not tmp.empty:
                 frames.append(tmp)
     if not frames:
+        chain_df = load_production_chain(day_str)
+        if chain_df is not None and not chain_df.empty:
+            return statistics_from_production(chain_df)
         return None
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     oi_df = df[df["stat_type"] == OI_STAT_TYPE].copy()
@@ -322,14 +490,34 @@ def load_statistics(day_str: str) -> pd.DataFrame | None:
 
 
 def load_spy_equity() -> pd.DataFrame:
-    """Load SPY 1-minute equity bars (parquet from Databento ohlcv-1m).
+    """Load SPY 1-minute equity bars, merging Databento and production sources.
 
-    Returns a DataFrame with ``ts`` (tz-aware UTC) and ``close`` columns.
+    Loads from both the Databento ohlcv-1m parquet (historical) and the
+    production-exported ``SPY_1min.parquet`` (recent), deduplicates by
+    timestamp keeping Databento rows when both exist (higher 1-min
+    resolution vs 5-min production snapshots).  Returns a DataFrame with
+    ``ts`` (tz-aware UTC) and ``close`` columns.
     """
-    df = pd.read_parquet(str(SPY_EQUITY_PATH))
-    df = df.reset_index()
-    df["ts"] = pd.to_datetime(df["ts_event"], utc=True)
-    return df[["ts", "close"]].sort_values("ts").reset_index(drop=True)
+    frames: list[pd.DataFrame] = []
+
+    if SPY_EQUITY_PATH.exists():
+        df = pd.read_parquet(str(SPY_EQUITY_PATH))
+        df = df.reset_index()
+        df["ts"] = pd.to_datetime(df["ts_event"], utc=True)
+        frames.append(df[["ts", "close"]])
+
+    prod_path = PRODUCTION_UNDERLYING_DIR / "SPY_1min.parquet"
+    if prod_path.exists():
+        pdf = pd.read_parquet(prod_path)
+        pdf["ts"] = pd.to_datetime(pdf["ts"], utc=True)
+        frames.append(pdf[["ts", "close"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["ts", "close"])
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["ts"], keep="first")
+    return combined.sort_values("ts").reset_index(drop=True)
 
 
 def load_daily_parquet(parquet_path: Path) -> dict[date, float]:
@@ -437,11 +625,12 @@ def lookup_intraday_value(
 
 
 def load_frd_quotes(parquet_path: Path, symbol: str) -> pd.DataFrame:
-    """Load a FirstRateData 1-min parquet as an underlying-quotes DataFrame.
+    """Load underlying quotes from FRD parquet or production export fallback.
 
-    Converts the OHLC ``close`` column to ``last`` so the output schema
-    matches ``load_underlying_quotes`` (columns: ``ts``, ``symbol``,
-    ``last``).  This allows seamless merging with the production DB export.
+    Tries the FirstRateData parquet first, then falls back to the
+    production-exported ``{SYMBOL}_1min.parquet``.  Converts the OHLC
+    ``close`` column to ``last`` so the output schema matches
+    ``load_underlying_quotes`` (columns: ``ts``, ``symbol``, ``last``).
 
     Parameters
     ----------
@@ -454,14 +643,31 @@ def load_frd_quotes(parquet_path: Path, symbol: str) -> pd.DataFrame:
     -------
     pd.DataFrame
         DataFrame with columns ``ts`` (tz-aware UTC), ``symbol``, and
-        ``last``, sorted by timestamp.  Empty DataFrame if file missing.
+        ``last``, sorted by timestamp.  Empty DataFrame if both sources
+        are missing.
     """
-    if not parquet_path.exists():
+    frames: list[pd.DataFrame] = []
+
+    if parquet_path.exists():
+        df = pd.read_parquet(parquet_path, columns=["ts", "close"])
+        df = df.rename(columns={"close": "last"})
+        df["symbol"] = symbol
+        frames.append(df[["ts", "symbol", "last"]])
+
+    prod_path = PRODUCTION_UNDERLYING_DIR / f"{symbol}_1min.parquet"
+    if prod_path.exists():
+        pdf = pd.read_parquet(prod_path)
+        pdf["ts"] = pd.to_datetime(pdf["ts"], utc=True)
+        pdf = pdf.rename(columns={"close": "last"})
+        pdf["symbol"] = symbol
+        frames.append(pdf[["ts", "symbol", "last"]])
+
+    if not frames:
         return pd.DataFrame(columns=["ts", "symbol", "last"])
-    df = pd.read_parquet(parquet_path, columns=["ts", "close"])
-    df = df.rename(columns={"close": "last"})
-    df["symbol"] = symbol
-    return df[["ts", "symbol", "last"]].sort_values("ts").reset_index(drop=True)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["ts"], keep="first")
+    return combined.sort_values("ts").reset_index(drop=True)
 
 
 def merge_underlying_quotes(
