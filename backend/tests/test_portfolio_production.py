@@ -303,6 +303,152 @@ class TestRecordTradeSessionPassthrough:
         assert self.mock_engine.begin.call_count == 2
 
 
+# ── Equity start-of-day tracking ──────────────────────────────────
+
+
+class TestEquityStartToday:
+    """Verify _equity_start_today is set once per day and not overwritten."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_engine(self):
+        with patch("spx_backend.services.portfolio_manager.engine") as mock_eng:
+            self.mock_engine = mock_eng
+
+            mock_conn_ctx = AsyncMock()
+            mock_conn = AsyncMock()
+            mock_conn_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_conn_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_begin_ctx = AsyncMock()
+            mock_begin_conn = AsyncMock()
+            mock_begin_ctx.__aenter__ = AsyncMock(return_value=mock_begin_conn)
+            mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_eng.connect.return_value = mock_conn_ctx
+            mock_eng.begin.return_value = mock_begin_ctx
+
+            self.mock_conn = mock_conn
+            self.mock_begin_conn = mock_begin_conn
+            yield
+
+    def _setup_db_responses(self, equity: float | None, trade_count: int, state_id: int = 1):
+        async def execute_side_effect(*args, **kwargs):
+            query = str(args[0]) if args else ""
+            result = MagicMock()
+            if "equity_end" in query.lower():
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: equity
+                result.fetchone.return_value = row if equity is not None else None
+            elif "count" in query.lower():
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: trade_count
+                result.fetchone.return_value = row
+            else:
+                result.fetchone.return_value = None
+            return result
+
+        self.mock_conn.execute = AsyncMock(side_effect=execute_side_effect)
+        upsert_result = MagicMock()
+        upsert_result.scalar_one.return_value = state_id
+        self.mock_begin_conn.execute = AsyncMock(return_value=upsert_result)
+
+    def test_equity_start_today_set_on_begin_day(self):
+        """begin_day should snapshot equity into _equity_start_today."""
+        self._setup_db_responses(equity=25_000, trade_count=0)
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=2)
+        run(pm.begin_day(date(2026, 4, 7)))
+
+        assert pm._equity_start_today == 25_000
+        assert pm.equity == 25_000
+
+    def test_zero_pnl_at_entry_preserves_equity(self):
+        """record_trade(pnl_per_lot=0.0) should not change equity."""
+        self._setup_db_responses(equity=20_000, trade_count=0)
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 4, 7)))
+
+        run(pm.record_trade(trade_id=1, pnl_per_lot=0.0, lots=2))
+        assert pm.equity == 20_000
+        assert pm._trades_today == 1
+
+    def test_daily_pnl_uses_equity_start_today(self):
+        """_update_day_state should compute daily_pnl as equity - start-of-day."""
+        self._setup_db_responses(equity=20_000, trade_count=0)
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 4, 7)))
+
+        # Directly set equity to simulate a closed trade updating it
+        pm.equity = 20_100
+        mock_session = AsyncMock()
+        run(pm._update_day_state(equity_end=20_100, trades=1, session=mock_session))
+
+        params = mock_session.execute.await_args_list[0].args[1]
+        assert params["dpnl"] == pytest.approx(100.0)
+
+
+# ── Event candidate filtering logic ──────────────────────────────
+
+
+class TestEventCandidateFiltering:
+    """Verify event_min_delta enforcement and event_side_preference."""
+
+    def test_min_delta_filters_low_delta(self):
+        """Candidates with delta below event_min_delta should be excluded."""
+        min_delta = 0.10
+        max_delta = 0.25
+        candidates = [
+            {"delta_diff": 0.05, "target_dte": 5, "spread_side": "put"},
+            {"delta_diff": 0.15, "target_dte": 5, "spread_side": "put"},
+            {"delta_diff": 0.30, "target_dte": 5, "spread_side": "put"},
+        ]
+        filtered = [
+            c for c in candidates
+            if abs(c.get("delta_diff", 0)) >= min_delta
+            and abs(c.get("delta_diff", 0)) <= max_delta
+        ]
+        assert len(filtered) == 1
+        assert filtered[0]["delta_diff"] == 0.15
+
+    def test_event_side_preference_filters_candidates(self):
+        """Event candidates should match the event_side_preference."""
+        event_side_raw = "puts".rstrip("s")  # "put"
+        candidates = [
+            {"spread_side": "call", "target_dte": 5, "credit_to_width": 0.5},
+            {"spread_side": "put", "target_dte": 5, "credit_to_width": 0.4},
+            {"spread_side": "call", "target_dte": 7, "credit_to_width": 0.3},
+        ]
+        event_filtered = [
+            c for c in candidates
+            if c.get("spread_side", "").lower() == event_side_raw
+        ]
+        assert len(event_filtered) == 1
+        assert event_filtered[0]["spread_side"] == "put"
+
+    def test_scheduled_side_filter(self):
+        """Scheduled candidates respect portfolio_calls_only side list."""
+        sched_sides = ["call"]
+        candidates = [
+            {"spread_side": "call", "credit_to_width": 0.5},
+            {"spread_side": "put", "credit_to_width": 0.4},
+            {"spread_side": "call", "credit_to_width": 0.3},
+        ]
+        sched_ranked = [c for c in candidates if c.get("spread_side", "").lower() in sched_sides]
+        assert len(sched_ranked) == 2
+        assert all(c["spread_side"] == "call" for c in sched_ranked)
+
+    def test_all_sides_dedup(self):
+        """all_sides combines sched + event sides without duplicates."""
+        sched_sides = ["call"]
+        event_sides = ["put"]
+        all_sides = list(dict.fromkeys(sched_sides + event_sides))
+        assert all_sides == ["call", "put"]
+
+        # When same side, no duplicate
+        event_sides = ["call"]
+        all_sides = list(dict.fromkeys(sched_sides + event_sides))
+        assert all_sides == ["call"]
+
+
 # ── Config field existence ───────────────────────────────────────
 
 

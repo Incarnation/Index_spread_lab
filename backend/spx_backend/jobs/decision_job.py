@@ -105,25 +105,42 @@ class DecisionJob:
         await pm.begin_day(now_et.date())
 
         if not pm.can_trade():
+            skip_reason = f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}"
+            async with SessionLocal() as session:
+                await self._insert_decision(
+                    session=session, now_et=now_et, entry_slot=entry_slot,
+                    target_dte=settings.decision_dte_targets_list()[0],
+                    delta_target=settings.decision_delta_targets_list()[0],
+                    decision="SKIP", reason=skip_reason,
+                    decision_source="portfolio_managed",
+                )
+                await session.commit()
             return self._build_run_result(
-                now_et=now_et, skipped=True,
-                reason=f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}",
+                now_et=now_et, skipped=True, reason=skip_reason,
                 selection_meta={"equity": pm.equity, "month_stopped": pm.is_month_stopped},
             )
 
         signals = await event_det.detect(now_et.date())
         skip_scheduled = settings.event_rally_avoidance and "rally" in signals
 
-        spread_sides = ["call"] if settings.portfolio_calls_only else settings.decision_spread_sides_list()
+        sched_sides = ["call"] if settings.portfolio_calls_only else settings.decision_spread_sides_list()
         decision_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
+
+        # Determine event side preference (normalize "puts"→"put", "calls"→"call")
+        drop_signals = [s for s in signals if s != "rally"]
+        event_side_raw = settings.event_side_preference.rstrip("s")
+        event_sides = [event_side_raw] if settings.event_enabled and drop_signals else []
+
+        # Build candidates for both scheduled and event sides (deduplicated)
+        all_sides = list(dict.fromkeys(sched_sides + event_sides))
 
         async with SessionLocal() as session:
             spot = await self._get_spot_price(session, now_et, settings.snapshot_underlying)
             context = await self._get_latest_context(session, now_et)
 
             candidates: list[dict] = []
-            for spread_side in spread_sides:
+            for spread_side in all_sides:
                 for target_dte in decision_dtes:
                     snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
                     if snapshot is None:
@@ -144,6 +161,14 @@ class DecisionJob:
                             candidates.append(candidate)
 
             if not candidates:
+                await self._insert_decision(
+                    session=session, now_et=now_et, entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP", reason="no_candidates",
+                    decision_source="portfolio_managed",
+                )
+                await session.commit()
                 return self._build_run_result(now_et=now_et, skipped=True, reason="no_candidates")
 
             # Rank by credit_to_width (credit / spread width)
@@ -156,7 +181,6 @@ class DecisionJob:
 
             # Event trades first on signal days
             event_trades_placed = 0
-            drop_signals = [s for s in signals if s != "rally"]
             decisions_created: list[dict] = []
             trades_created: list[int] = []
 
@@ -166,8 +190,10 @@ class DecisionJob:
                 event_cap = min(settings.event_max_trades, run_limit)
                 event_candidates = [
                     c for c in ranked
-                    if c["target_dte"] >= settings.event_min_dte
+                    if c.get("spread_side", "").lower() == event_side_raw
+                    and c["target_dte"] >= settings.event_min_dte
                     and c["target_dte"] <= settings.event_max_dte
+                    and abs(c.get("delta_diff", 0)) >= settings.event_min_delta
                     and abs(c.get("delta_diff", 0)) <= settings.event_max_delta
                 ]
                 for c in event_candidates[:event_cap]:
@@ -187,7 +213,7 @@ class DecisionJob:
                         now_et=now_et, chosen=c, candidate_ref={},
                         contracts_override=lots,
                     )
-                    await pm.record_trade(trade_id, c["credit"], lots,
+                    await pm.record_trade(trade_id, 0.0, lots,
                                           source="event",
                                           event_signal=",".join(drop_signals),
                                           session=session)
@@ -205,7 +231,8 @@ class DecisionJob:
                 sched_limit = min(run_limit, settings.portfolio_max_trades_per_day)
                 if settings.event_enabled and settings.event_budget_mode == "shared":
                     sched_limit = max(0, sched_limit - event_trades_placed)
-                sched_candidates = ranked[:sched_limit * 2]  # over-fetch for dedup
+                sched_ranked = [c for c in ranked if c.get("spread_side", "").lower() in sched_sides]
+                sched_candidates = sched_ranked[:sched_limit * 2]
                 seen_keys: set[tuple] = set()
                 placed = 0
                 for c in sched_candidates:
@@ -230,7 +257,7 @@ class DecisionJob:
                         now_et=now_et, chosen=c, candidate_ref={},
                         contracts_override=lots,
                     )
-                    await pm.record_trade(trade_id, c["credit"], lots, source="scheduled",
+                    await pm.record_trade(trade_id, 0.0, lots, source="scheduled",
                                           session=session)
                     decisions_created.append({
                         "decision_id": int(decision_id), "trade_id": int(trade_id),
@@ -240,6 +267,19 @@ class DecisionJob:
                     })
                     trades_created.append(int(trade_id))
                     placed += 1
+
+            if not trades_created:
+                await self._insert_decision(
+                    session=session, now_et=now_et, entry_slot=entry_slot,
+                    target_dte=decision_dtes[0],
+                    delta_target=delta_targets[0],
+                    decision="SKIP", reason="no_trades_after_filters",
+                    decision_source="portfolio_managed",
+                    strategy_params_json={
+                        "candidates_total": len(candidates),
+                        "event_signals": signals,
+                    },
+                )
 
             await session.commit()
 

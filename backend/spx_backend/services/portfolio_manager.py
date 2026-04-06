@@ -51,6 +51,7 @@ class PortfolioManager:
 
         self.equity: float = self.starting_capital
         self.month_start_equity: float = self.starting_capital
+        self._equity_start_today: float = self.starting_capital
         self._current_month: str | None = None
         self._month_stopped = False
         self._trades_today = 0
@@ -76,6 +77,7 @@ class PortfolioManager:
         if prev_equity is not None:
             self.equity = prev_equity
 
+        self._equity_start_today = self.equity
         self._trades_today = await self._count_trades_today(today)
 
         month_key = today.strftime("%Y-%m")
@@ -85,7 +87,7 @@ class PortfolioManager:
             self._month_stopped = False
 
         self._state_id = await self._upsert_day_state(
-            equity_start=self.equity,
+            equity_start=self._equity_start_today,
             month_start_equity=self.month_start_equity,
         )
         logger.info(
@@ -142,12 +144,16 @@ class PortfolioManager:
         event_signal: str | None = None,
         session: AsyncSession | None = None,
     ) -> float:
-        """Apply a settled trade and persist to database.
+        """Record a new trade entry and persist to database.
+
+        At entry time the caller should pass ``pnl_per_lot=0.0`` because no
+        PnL is realised until the trade closes.  Actual realised PnL is
+        tracked by ``trade_pnl_job`` on the ``trades`` table.
 
         Parameters
         ----------
         trade_id : Foreign key into the ``trades`` table.
-        pnl_per_lot : Realized PnL per lot.
+        pnl_per_lot : PnL per lot to book (normally ``0.0`` at entry).
         lots : Number of lots filled.
         source : ``'scheduled'`` or ``'event'``.
         event_signal : Name of the triggering event signal (if source is 'event').
@@ -158,7 +164,7 @@ class PortfolioManager:
 
         Returns
         -------
-        float : Total PnL for this trade.
+        float : Total PnL booked for this entry.
         """
         equity_before = self.equity
         total_pnl = pnl_per_lot * lots
@@ -219,12 +225,17 @@ class PortfolioManager:
         equity_start: float,
         month_start_equity: float,
     ) -> int:
-        """Create or update today's portfolio_state row and return its id."""
+        """Create or update today's portfolio_state row and return its id.
+
+        On INSERT (first run of the day) sets ``equity_start``; on conflict
+        (subsequent runs) only refreshes ``month_start_equity`` so the
+        original start-of-day equity is preserved.
+        """
         async with engine.begin() as conn:
             row = await conn.execute(text(
                 "INSERT INTO portfolio_state (date, equity_start, month_start_equity) "
                 "VALUES (:d, :es, :ms) "
-                "ON CONFLICT (date) DO UPDATE SET equity_start = :es, month_start_equity = :ms "
+                "ON CONFLICT (date) DO UPDATE SET month_start_equity = :ms "
                 "RETURNING id"
             ), {"d": self._today, "es": equity_start, "ms": month_start_equity})
             return row.scalar_one()
@@ -246,7 +257,7 @@ class PortfolioManager:
         params = {
             "ee": equity_end,
             "tp": trades,
-            "dpnl": equity_end - (self.month_start_equity if self._trades_today == trades else self.equity),
+            "dpnl": equity_end - self._equity_start_today,
             "ms": self._month_stopped,
             "lpt": self._lots_today or 1,
             "ev": json.dumps(event_signals) if event_signals else None,
