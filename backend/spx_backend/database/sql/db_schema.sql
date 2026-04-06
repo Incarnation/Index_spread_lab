@@ -561,3 +561,9 @@ CREATE TABLE IF NOT EXISTS economic_events (
     PRIMARY KEY (date, event_type)
 );
 
+-- Tracks which migration files have been applied so they are not replayed.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    TEXT        PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+

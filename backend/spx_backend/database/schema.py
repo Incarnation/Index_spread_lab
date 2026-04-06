@@ -41,6 +41,7 @@ ALL_APP_TABLES = [
     "economic_events",
     "portfolio_state",
     "portfolio_trades",
+    "schema_migrations",
 ]
 
 # Tables dropped by ML-only reset (db_reset_ml_tables.sql).
@@ -113,14 +114,71 @@ def _migrations_dir() -> Path:
     return _sql_dir() / "migrations"
 
 
+async def _ensure_migration_table() -> None:
+    """Create the ``schema_migrations`` tracking table if it doesn't exist.
+
+    Called before every migration run so the tracker is always available,
+    even on databases created before this feature was added.
+    """
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  version TEXT PRIMARY KEY,"
+            "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ")"
+        )
+
+
+async def _applied_versions() -> set[str]:
+    """Return the set of migration versions already recorded as applied."""
+    async with engine.connect() as conn:
+        result = await conn.exec_driver_sql(
+            "SELECT version FROM schema_migrations"
+        )
+        return {row[0] for row in result}
+
+
 async def _run_migrations() -> None:
-    """Run all migration SQL files in order (001_*.sql, 002_*.sql, ...)."""
+    """Run only *pending* migration SQL files, recording each on success.
+
+    On the very first run (empty ``schema_migrations`` table) all existing
+    migration files are seeded as already-applied.  This is safe because
+    production has already executed them, and on a fresh database the base
+    schema DDL in ``db_schema.sql`` makes the data-modifying migrations
+    no-ops (no rows to update/delete).
+    """
     mig_dir = _migrations_dir()
     if not mig_dir.exists():
         return
+
+    await _ensure_migration_table()
+    applied = await _applied_versions()
     paths = sorted(mig_dir.glob("*.sql"))
+
+    if not applied and paths:
+        async with engine.begin() as conn:
+            for p in paths:
+                await conn.exec_driver_sql(
+                    "INSERT INTO schema_migrations (version) VALUES ($1) "
+                    "ON CONFLICT DO NOTHING",
+                    (p.stem,),
+                )
+        logger.info("migration_seed count={}", len(paths))
+        return
+
     for path in paths:
+        version = path.stem
+        if version in applied:
+            logger.debug("migration_skip version={}", version)
+            continue
+        logger.info("migration_run version={}", version)
         await _execute_sql_file(path)
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES ($1)",
+                (version,),
+            )
+        logger.info("migration_done version={}", version)
 
 
 async def init_db() -> None:
