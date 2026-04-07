@@ -127,12 +127,21 @@ class DecisionJob:
         decision_dtes = settings.decision_dte_targets_list()
         delta_targets = settings.decision_delta_targets_list()
 
-        # Determine event side preference (normalize "puts"→"put", "calls"→"call")
         drop_signals = [s for s in signals if s != "rally"]
         event_side_raw = settings.event_side_preference.rstrip("s")
-        event_sides = [event_side_raw] if settings.event_enabled and drop_signals else []
+        has_drop = any(
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
+            for s in drop_signals
+        )
 
-        # Build candidates for both scheduled and event sides (deduplicated)
+        if settings.event_enabled and drop_signals:
+            if has_drop:
+                event_sides = [event_side_raw]
+            else:
+                event_sides = list(settings.decision_spread_sides_list())
+        else:
+            event_sides = []
+
         all_sides = list(dict.fromkeys(sched_sides + event_sides))
 
         async with SessionLocal() as session:
@@ -158,6 +167,7 @@ class DecisionJob:
                             spot=spot, context=context,
                         )
                         if candidate:
+                            candidate["spread_side"] = spread_side.lower()
                             candidates.append(candidate)
 
             if not candidates:
@@ -190,11 +200,11 @@ class DecisionJob:
                 event_cap = min(settings.event_max_trades, run_limit)
                 event_candidates = [
                     c for c in ranked
-                    if c.get("spread_side", "").lower() == event_side_raw
+                    if (not has_drop or c.get("spread_side", "").lower() == event_side_raw)
                     and c["target_dte"] >= settings.event_min_dte
                     and c["target_dte"] <= settings.event_max_dte
-                    and abs(c.get("delta_diff", 0)) >= settings.event_min_delta
-                    and abs(c.get("delta_diff", 0)) <= settings.event_max_delta
+                    and c["delta_target"] >= settings.event_min_delta
+                    and c["delta_target"] <= settings.event_max_delta
                 ]
                 for c in event_candidates[:event_cap]:
                     if not pm.can_trade():

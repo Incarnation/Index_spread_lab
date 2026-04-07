@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from spx_backend.jobs.trade_pnl_job import TradePnlJob, _mid, build_trade_pnl_job
+from spx_backend.services.portfolio_manager import PortfolioManager
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,7 @@ class TestRunOnce:
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
+            mock_settings.portfolio_enabled = False
             self.mock_settings = mock_settings
             yield
 
@@ -504,3 +506,256 @@ class TestFactory:
         mock_cache = MagicMock()
         job = build_trade_pnl_job(clock_cache=mock_cache)
         assert job.clock_cache is mock_cache
+
+
+# ---------------------------------------------------------------------------
+# Expiration closes outside RTH (P2)
+# ---------------------------------------------------------------------------
+
+
+class TestExpirationOutsideRTH:
+    """Verify that expired trades close even when market is closed."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self):
+        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+            mock_settings.tz = "America/New_York"
+            mock_settings.trade_pnl_enabled = True
+            mock_settings.trade_pnl_allow_outside_rth = False
+            mock_settings.trade_pnl_mark_max_age_minutes = 30
+            mock_settings.trade_pnl_take_profit_pct = 0.50
+            mock_settings.trade_pnl_stop_loss_enabled = False
+            mock_settings.trade_pnl_stop_loss_pct = 1.00
+            mock_settings.trade_pnl_contract_multiplier = 100
+            mock_settings.decision_contracts = 1
+            mock_settings.portfolio_enabled = False
+            self.mock_settings = mock_settings
+            yield
+
+    @pytest.mark.asyncio
+    async def test_expired_trade_closes_when_market_closed(self):
+        """Expired trades should close even when market is closed (weekend)."""
+        expired_trade = _make_trade(
+            trade_id=50, entry_credit=2.0,
+            expiration=date.today() - timedelta(days=2),
+            max_loss=300.0,
+        )
+        session = FakeSession()
+        open_result = MagicMock()
+        open_result.fetchall = MagicMock(return_value=[expired_trade])
+
+        async def fake_execute(stmt, params=None):
+            session.calls.append((str(stmt), params or {}))
+            return open_result
+
+        session.execute = fake_execute
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
+            patch.object(TradePnlJob, "_market_open", new_callable=AsyncMock, return_value=False),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once()
+
+        assert result["expired_closed"] == 1
+        assert result["closed"] == 1
+        close_calls = [c for c in session.calls if c[1].get("exit_reason") == "EXPIRED"]
+        assert len(close_calls) > 0
+
+    @pytest.mark.asyncio
+    async def test_active_trade_skipped_when_market_closed(self):
+        """Non-expired trades should NOT be processed when market is closed."""
+        active_trade = _make_trade(
+            trade_id=51, entry_credit=2.0,
+            expiration=date.today() + timedelta(days=5),
+        )
+        session = FakeSession()
+        open_result = MagicMock()
+        open_result.fetchall = MagicMock(return_value=[active_trade])
+
+        async def fake_execute(stmt, params=None):
+            session.calls.append((str(stmt), params or {}))
+            return open_result
+
+        session.execute = fake_execute
+
+        legs = {51: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 1, "entry_price": 3.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 1, "entry_price": 1.0},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_market_open", new_callable=AsyncMock, return_value=False),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once()
+
+        assert result["skipped"] is True
+        assert result["reason"] == "market_closed"
+        assert result["updated"] == 0
+        assert result["closed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_expired_and_active_outside_rth(self):
+        """Outside RTH: expired trades close, active trades deferred."""
+        expired_trade = _make_trade(
+            trade_id=52, entry_credit=2.0,
+            expiration=date.today() - timedelta(days=1),
+            max_loss=300.0,
+        )
+        active_trade = _make_trade(
+            trade_id=53, entry_credit=2.0,
+            expiration=date.today() + timedelta(days=5),
+        )
+        session = FakeSession()
+        open_result = MagicMock()
+        open_result.fetchall = MagicMock(return_value=[expired_trade, active_trade])
+
+        async def fake_execute(stmt, params=None):
+            session.calls.append((str(stmt), params or {}))
+            return open_result
+
+        session.execute = fake_execute
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
+            patch.object(TradePnlJob, "_market_open", new_callable=AsyncMock, return_value=False),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once()
+
+        assert result["expired_closed"] == 1
+        assert result["closed"] == 1
+        assert result["skipped"] is False
+        assert result["updated"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Portfolio closure integration (P0)
+# ---------------------------------------------------------------------------
+
+
+class TestPortfolioClosure:
+    """Verify trade closures flow PnL back to PortfolioManager."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self):
+        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+            mock_settings.tz = "America/New_York"
+            mock_settings.trade_pnl_enabled = True
+            mock_settings.trade_pnl_allow_outside_rth = True
+            mock_settings.trade_pnl_mark_max_age_minutes = 30
+            mock_settings.trade_pnl_take_profit_pct = 0.50
+            mock_settings.trade_pnl_stop_loss_enabled = False
+            mock_settings.trade_pnl_stop_loss_pct = 1.00
+            mock_settings.trade_pnl_contract_multiplier = 100
+            mock_settings.decision_contracts = 1
+            mock_settings.portfolio_enabled = True
+            self.mock_settings = mock_settings
+            yield
+
+    def _make_session_with_trades(self, trades):
+        """Create a FakeSession returning trades from SELECT, with rowcount support."""
+        session = FakeSession()
+        open_result = MagicMock()
+        open_result.fetchall = MagicMock(return_value=trades)
+        open_result.rowcount = 1
+
+        async def fake_execute(stmt, params=None):
+            session.calls.append((str(stmt), params or {}))
+            return open_result
+
+        session.execute = fake_execute
+        return session
+
+    @pytest.mark.asyncio
+    async def test_tp_close_calls_record_closure(self):
+        """Take-profit close should call PortfolioManager.record_closure."""
+        now_utc = datetime.now(tz=UTC)
+        trade = _make_trade(
+            trade_id=60, entry_credit=2.0, max_profit=200.0,
+            expiration=date.today() + timedelta(days=5),
+        )
+        fresh_mark = _make_mark(
+            short_bid=0.01, short_ask=0.03, long_bid=0.01, long_ask=0.03,
+            ts=now_utc - timedelta(minutes=1),
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {60: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 1, "entry_price": 3.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 1, "entry_price": 1.0},
+        )}
+
+        mock_pm = AsyncMock(spec=PortfolioManager)
+        mock_pm.begin_day = AsyncMock()
+        mock_pm.record_closure = AsyncMock()
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=fresh_mark),
+            patch("spx_backend.jobs.trade_pnl_job.PortfolioManager", return_value=mock_pm),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["closed"] >= 1
+        mock_pm.begin_day.assert_awaited_once()
+        mock_pm.record_closure.assert_awaited_once()
+        call_args = mock_pm.record_closure.await_args
+        assert call_args[0][0] == 60
+        assert call_args[0][1] > 0
+
+    @pytest.mark.asyncio
+    async def test_expired_close_calls_record_closure(self):
+        """Expired trade close should call PortfolioManager.record_closure."""
+        expired_trade = _make_trade(
+            trade_id=61, entry_credit=2.0,
+            expiration=date.today() - timedelta(days=1),
+            max_loss=300.0,
+        )
+        session = self._make_session_with_trades([expired_trade])
+
+        mock_pm = AsyncMock(spec=PortfolioManager)
+        mock_pm.begin_day = AsyncMock()
+        mock_pm.record_closure = AsyncMock()
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
+            patch("spx_backend.jobs.trade_pnl_job.PortfolioManager", return_value=mock_pm),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["expired_closed"] == 1
+        mock_pm.begin_day.assert_awaited_once()
+        mock_pm.record_closure.assert_awaited_once()
+        call_args = mock_pm.record_closure.await_args
+        assert call_args[0][0] == 61
+
+    @pytest.mark.asyncio
+    async def test_portfolio_disabled_skips_record_closure(self):
+        """When portfolio_enabled=False, record_closure should not be called."""
+        self.mock_settings.portfolio_enabled = False
+        expired_trade = _make_trade(
+            trade_id=62, entry_credit=2.0,
+            expiration=date.today() - timedelta(days=1),
+            max_loss=300.0,
+        )
+        session = self._make_session_with_trades([expired_trade])
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
+            patch("spx_backend.jobs.trade_pnl_job.PortfolioManager") as mock_pm_cls,
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["expired_closed"] == 1
+        mock_pm_cls.assert_not_called()

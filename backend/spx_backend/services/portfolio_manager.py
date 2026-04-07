@@ -192,6 +192,64 @@ class PortfolioManager:
         )
         return total_pnl
 
+    async def record_closure(
+        self,
+        trade_id: int,
+        realized_pnl: float,
+        session: AsyncSession | None = None,
+    ) -> None:
+        """Record a trade closure and update portfolio equity.
+
+        Called by ``trade_pnl_job`` after closing a trade via TP, SL, or
+        expiration.  Updates the ``portfolio_trades.realized_pnl`` column
+        and adjusts ``portfolio_state.equity_end`` so that lot sizing and
+        drawdown checks reflect actual realized outcomes.
+
+        If no ``portfolio_trades`` row exists for the given trade (e.g. a
+        legacy trade pre-dating the portfolio system), the equity update is
+        skipped with a warning -- the ``trades`` table closure still stands.
+
+        Parameters
+        ----------
+        trade_id : The trade that was closed.
+        realized_pnl : Realized dollar PnL from the closure.
+        session : Optional session for transactional consistency with the
+            caller's close-trade writes.
+        """
+        equity_before = self.equity
+        self.equity += realized_pnl
+
+        # Idempotency: only update rows still at entry-time PnL (0) to
+        # prevent double-counting if the job replays a closure.
+        stmt = text(
+            "UPDATE portfolio_trades SET realized_pnl = :pnl "
+            "WHERE trade_id = :tid AND (realized_pnl IS NULL OR realized_pnl = 0)"
+        )
+        params = {"pnl": realized_pnl, "tid": trade_id}
+
+        if session is not None:
+            result = await session.execute(stmt, params)
+        else:
+            async with engine.begin() as conn:
+                result = await conn.execute(stmt, params)
+
+        if result.rowcount == 0:
+            logger.warning(
+                "portfolio_closure_skip: no matching portfolio_trades row for "
+                "trade_id={} (missing or already closed)", trade_id,
+            )
+            self.equity = equity_before
+            return
+
+        await self._update_day_state(
+            equity_end=self.equity, trades=self._trades_today, session=session,
+        )
+
+        logger.info(
+            "portfolio_closure trade_id={} pnl={:.2f} equity={:.2f}->{:.2f}",
+            trade_id, realized_pnl, equity_before, self.equity,
+        )
+
     # ── DB helpers ────────────────────────────────────────────────
 
     async def _count_trades_today(self, today: date) -> int:

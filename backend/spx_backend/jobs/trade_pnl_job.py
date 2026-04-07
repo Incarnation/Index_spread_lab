@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,7 @@ from sqlalchemy import text
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services.portfolio_manager import PortfolioManager
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
@@ -19,11 +20,12 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (float(bid) + float(ask)) / 2.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class TradePnlJob:
     """Mark-to-market open trades and close by TP/SL/expiry."""
 
     clock_cache: MarketClockCache | None = None
+    _pm: PortfolioManager | None = field(default=None, init=False, repr=False)
 
     async def _market_open(self, now_et: datetime) -> bool:
         """Check market-open state from clock cache with RTH fallback."""
@@ -224,27 +226,116 @@ class TradePnlJob:
                 {"trade_id": trade_id, "option_symbol": long_leg["option_symbol"], "exit_price": long_exit_price},
             )
 
+    async def _get_portfolio_manager(self, now_et: datetime) -> PortfolioManager:
+        """Lazy-init a PortfolioManager for recording closures.
+
+        Loads current equity from DB via ``begin_day`` so that the equity
+        adjustment is based on the latest persisted state.
+        """
+        if self._pm is None:
+            self._pm = PortfolioManager()
+            await self._pm.begin_day(now_et.date())
+        return self._pm
+
+    async def _close_expired_trades(
+        self,
+        *,
+        session,
+        trades: list,
+        all_legs: dict,
+        now_et: datetime,
+        now_utc: datetime,
+    ) -> tuple[int, int]:
+        """Close all expired trades and update portfolio equity.
+
+        Returns (expired_closed, total_closed_delta).
+        """
+        expired_closed = 0
+        closed = 0
+
+        for trade in trades:
+            entry_credit = float(trade.entry_credit or 0.0)
+            contracts = int(trade.contracts or settings.decision_contracts or 1)
+            contract_multiplier = int(trade.contract_multiplier or settings.trade_pnl_contract_multiplier)
+
+            legs = all_legs.get(trade.trade_id)
+            pnl: float
+            exit_cost: float
+            short_leg_ref: dict | None = None
+            long_leg_ref: dict | None = None
+            short_exit: float | None = None
+            long_exit: float | None = None
+
+            if legs is not None:
+                short_leg_ref, long_leg_ref = legs
+                mark = await self._latest_spread_mark(
+                    session=session,
+                    short_symbol=short_leg_ref["option_symbol"],
+                    long_symbol=long_leg_ref["option_symbol"],
+                    now_utc=now_utc,
+                )
+                short_mid = _mid(mark["short_bid"], mark["short_ask"]) if mark else None
+                long_mid = _mid(mark["long_bid"], mark["long_ask"]) if mark else None
+                if short_mid is not None and long_mid is not None:
+                    exit_cost = short_mid - long_mid
+                    pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
+                    short_exit = short_mid
+                    long_exit = long_mid
+                else:
+                    pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                    exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
+            else:
+                pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
+
+            await self._close_trade(
+                session=session,
+                trade_id=trade.trade_id,
+                exit_time=now_utc,
+                pnl=pnl,
+                exit_cost=exit_cost,
+                exit_reason="EXPIRED",
+                short_leg=short_leg_ref,
+                long_leg=long_leg_ref,
+                short_exit_price=short_exit,
+                long_exit_price=long_exit,
+            )
+
+            if settings.portfolio_enabled:
+                pm = await self._get_portfolio_manager(now_et)
+                await pm.record_closure(trade.trade_id, pnl, session=session)
+
+            expired_closed += 1
+            closed += 1
+            logger.info(
+                "trade_pnl_job: trade_id={} closed=EXPIRED expiration={} pnl={:.2f}",
+                trade.trade_id, trade.expiration, pnl,
+            )
+
+        return expired_closed, closed
+
     async def run_once(self, *, force: bool = False) -> dict:
         """Run one live mark-to-market cycle for all open trades.
 
         Handles three close triggers in priority order:
-        1. **Expiration** -- checked against current wall-clock time so trades
-           past their expiration date are closed even when no fresh mark exists.
+        1. **Expiration** -- always processed regardless of RTH so that
+           trades expiring on Friday are closed over the weekend.
         2. **Take-profit** / **Stop-loss** -- evaluated against the latest
-           spread mark from chain snapshot data.
+           spread mark from chain snapshot data (RTH-only unless forced).
         3. Otherwise the trade mark is updated with the current unrealized PnL.
+
+        On each closure, ``PortfolioManager.record_closure`` is called to
+        flow realized PnL back to ``portfolio_state.equity_end``.
         """
         tz = ZoneInfo(settings.tz)
         now_et = datetime.now(tz=tz)
         now_utc = now_et.astimezone(ZoneInfo("UTC"))
         logger.info("trade_pnl_job: start force={} now_et={}", force, now_et.isoformat())
 
+        self._pm = None
+
         if not settings.trade_pnl_enabled:
             return {"skipped": True, "reason": "trade_pnl_disabled", "now_et": now_et.isoformat()}
-
-        if (not force) and (not settings.trade_pnl_allow_outside_rth):
-            if not await self._market_open(now_et):
-                return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat(), "updated": 0}
 
         updated = 0
         closed = 0
@@ -268,69 +359,55 @@ class TradePnlJob:
             )
             trades_list = open_rows.fetchall()
 
-            # Batch-load all legs in one query to avoid N+1
             trade_ids = [t.trade_id for t in trades_list]
             all_legs = await self._bulk_trade_legs(session, trade_ids)
 
-            for trade in trades_list:
+            # Phase 1: process expirations (runs even outside RTH)
+            expired_trades = [
+                t for t in trades_list
+                if t.expiration is not None and now_et.date() > t.expiration
+            ]
+            active_trades = [
+                t for t in trades_list
+                if not (t.expiration is not None and now_et.date() > t.expiration)
+            ]
+
+            if expired_trades:
+                expired_closed, closed = await self._close_expired_trades(
+                    session=session,
+                    trades=expired_trades,
+                    all_legs=all_legs,
+                    now_et=now_et,
+                    now_utc=now_utc,
+                )
+
+            # Phase 2: RTH gate for mark-to-market and TP/SL
+            if (not force) and (not settings.trade_pnl_allow_outside_rth):
+                if not await self._market_open(now_et):
+                    await session.commit()
+                    logger.info(
+                        "trade_pnl_job: market_closed expired_closed={} closed={}",
+                        expired_closed, closed,
+                    )
+                    return {
+                        "skipped": expired_closed == 0,
+                        "reason": "market_closed" if expired_closed == 0 else None,
+                        "now_et": now_et.isoformat(),
+                        "updated": 0,
+                        "closed": closed,
+                        "expired_closed": expired_closed,
+                        "marks_written": 0,
+                        "skipped_no_legs": 0,
+                        "skipped_no_mark": 0,
+                        "skipped_stale": 0,
+                    }
+
+            # Phase 3: MTM + TP/SL for non-expired trades
+            for trade in active_trades:
                 entry_credit = float(trade.entry_credit or 0.0)
                 contracts = int(trade.contracts or settings.decision_contracts or 1)
                 contract_multiplier = int(trade.contract_multiplier or settings.trade_pnl_contract_multiplier)
 
-                # --- Expiration gate: use wall-clock date, not mark date ---
-                if trade.expiration is not None and now_et.date() > trade.expiration:
-                    legs = all_legs.get(trade.trade_id)
-                    pnl: float
-                    exit_cost: float
-                    short_leg_ref: dict | None = None
-                    long_leg_ref: dict | None = None
-                    short_exit: float | None = None
-                    long_exit: float | None = None
-
-                    # Best-effort: use last available mark (ignore staleness)
-                    if legs is not None:
-                        short_leg_ref, long_leg_ref = legs
-                        mark = await self._latest_spread_mark(
-                            session=session,
-                            short_symbol=short_leg_ref["option_symbol"],
-                            long_symbol=long_leg_ref["option_symbol"],
-                            now_utc=now_utc,
-                        )
-                        short_mid = _mid(mark["short_bid"], mark["short_ask"]) if mark else None
-                        long_mid = _mid(mark["long_bid"], mark["long_ask"]) if mark else None
-                        if short_mid is not None and long_mid is not None:
-                            exit_cost = short_mid - long_mid
-                            pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
-                            short_exit = short_mid
-                            long_exit = long_mid
-                        else:
-                            pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
-                            exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
-                    else:
-                        pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
-                        exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
-
-                    await self._close_trade(
-                        session=session,
-                        trade_id=trade.trade_id,
-                        exit_time=now_utc,
-                        pnl=pnl,
-                        exit_cost=exit_cost,
-                        exit_reason="EXPIRED",
-                        short_leg=short_leg_ref,
-                        long_leg=long_leg_ref,
-                        short_exit_price=short_exit,
-                        long_exit_price=long_exit,
-                    )
-                    expired_closed += 1
-                    closed += 1
-                    logger.info(
-                        "trade_pnl_job: trade_id={} closed=EXPIRED expiration={} pnl={:.2f}",
-                        trade.trade_id, trade.expiration, pnl,
-                    )
-                    continue
-
-                # --- Normal mark-to-market flow ---
                 legs = all_legs.get(trade.trade_id)
                 if legs is None:
                     skipped_no_legs += 1
@@ -442,6 +519,11 @@ class TradePnlJob:
                         short_exit_price=short_mid,
                         long_exit_price=long_mid,
                     )
+
+                    if settings.portfolio_enabled:
+                        pm = await self._get_portfolio_manager(now_et)
+                        await pm.record_closure(trade.trade_id, pnl, session=session)
+
                     closed += 1
 
             await session.commit()

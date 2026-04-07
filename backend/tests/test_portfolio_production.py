@@ -390,24 +390,71 @@ class TestEquityStartToday:
 
 
 class TestEventCandidateFiltering:
-    """Verify event_min_delta enforcement and event_side_preference."""
+    """Verify event delta_target filtering and has_drop side logic."""
 
-    def test_min_delta_filters_low_delta(self):
-        """Candidates with delta below event_min_delta should be excluded."""
+    def test_delta_target_filters_candidates(self):
+        """Event filter should use delta_target, not delta_diff."""
         min_delta = 0.10
         max_delta = 0.25
         candidates = [
-            {"delta_diff": 0.05, "target_dte": 5, "spread_side": "put"},
-            {"delta_diff": 0.15, "target_dte": 5, "spread_side": "put"},
-            {"delta_diff": 0.30, "target_dte": 5, "spread_side": "put"},
+            {"delta_target": 0.05, "target_dte": 5, "spread_side": "put"},
+            {"delta_target": 0.10, "target_dte": 5, "spread_side": "put"},
+            {"delta_target": 0.20, "target_dte": 5, "spread_side": "put"},
+            {"delta_target": 0.30, "target_dte": 5, "spread_side": "put"},
         ]
         filtered = [
             c for c in candidates
-            if abs(c.get("delta_diff", 0)) >= min_delta
-            and abs(c.get("delta_diff", 0)) <= max_delta
+            if c["delta_target"] >= min_delta
+            and c["delta_target"] <= max_delta
+        ]
+        assert len(filtered) == 2
+        assert filtered[0]["delta_target"] == 0.10
+        assert filtered[1]["delta_target"] == 0.20
+
+    def test_has_drop_forces_side_preference(self):
+        """When drop-class signals present, event_side_preference is enforced."""
+        has_drop = True
+        event_side_raw = "put"
+        candidates = [
+            {"spread_side": "call", "target_dte": 5, "delta_target": 0.10},
+            {"spread_side": "put", "target_dte": 5, "delta_target": 0.10},
+        ]
+        filtered = [
+            c for c in candidates
+            if (not has_drop or c.get("spread_side", "").lower() == event_side_raw)
         ]
         assert len(filtered) == 1
-        assert filtered[0]["delta_diff"] == 0.15
+        assert filtered[0]["spread_side"] == "put"
+
+    def test_no_drop_allows_all_sides(self):
+        """Non-drop signals (e.g. term_inversion) allow all sides."""
+        has_drop = False
+        event_side_raw = "put"
+        candidates = [
+            {"spread_side": "call", "target_dte": 5, "delta_target": 0.10},
+            {"spread_side": "put", "target_dte": 5, "delta_target": 0.10},
+        ]
+        filtered = [
+            c for c in candidates
+            if (not has_drop or c.get("spread_side", "").lower() == event_side_raw)
+        ]
+        assert len(filtered) == 2
+
+    def test_has_drop_classification(self):
+        """Verify which signals are classified as drop-class."""
+        drop_signals_test = ["spx_drop_1d", "spx_drop_2d", "vix_spike", "vix_elevated"]
+        has_drop = any(
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
+            for s in drop_signals_test
+        )
+        assert has_drop is True
+
+        non_drop_signals = ["term_inversion"]
+        has_drop = any(
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
+            for s in non_drop_signals
+        )
+        assert has_drop is False
 
     def test_event_side_preference_filters_candidates(self):
         """Event candidates should match the event_side_preference."""
@@ -443,10 +490,127 @@ class TestEventCandidateFiltering:
         all_sides = list(dict.fromkeys(sched_sides + event_sides))
         assert all_sides == ["call", "put"]
 
-        # When same side, no duplicate
         event_sides = ["call"]
         all_sides = list(dict.fromkeys(sched_sides + event_sides))
         assert all_sides == ["call"]
+
+    def test_non_drop_event_sides_uses_all_spread_sides(self):
+        """For non-drop events, event_sides should be all spread sides."""
+        sched_sides = ["call"]
+        all_spread_sides = ["put", "call"]
+        drop_signals = ["term_inversion"]
+        has_drop = any(
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
+            for s in drop_signals
+        )
+        assert has_drop is False
+
+        event_sides = list(all_spread_sides)
+        all_sides = list(dict.fromkeys(sched_sides + event_sides))
+        assert "put" in all_sides
+        assert "call" in all_sides
+
+
+# ── PortfolioManager.record_closure ──────────────────────────────
+
+
+class TestRecordClosure:
+    """Verify record_closure updates portfolio_trades and equity."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_engine(self):
+        with patch("spx_backend.services.portfolio_manager.engine") as mock_eng:
+            self.mock_engine = mock_eng
+
+            mock_conn_ctx = AsyncMock()
+            mock_conn = AsyncMock()
+            mock_conn_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_conn_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_begin_ctx = AsyncMock()
+            mock_begin_conn = AsyncMock()
+            mock_begin_ctx.__aenter__ = AsyncMock(return_value=mock_begin_conn)
+            mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_eng.connect.return_value = mock_conn_ctx
+            mock_eng.begin.return_value = mock_begin_ctx
+
+            self.mock_conn = mock_conn
+            self.mock_begin_conn = mock_begin_conn
+            yield
+
+    def _setup_pm(self) -> PortfolioManager:
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        pm._today = date(2026, 4, 7)
+        pm._state_id = 1
+        pm._trades_today = 1
+        pm._lots_today = 2
+        pm.equity = 20_000
+        pm.month_start_equity = 20_000
+        pm._equity_start_today = 20_000
+        return pm
+
+    def test_record_closure_updates_equity(self):
+        """record_closure should adjust equity by realized_pnl."""
+        mock_session = AsyncMock()
+        result_mock = MagicMock()
+        result_mock.rowcount = 1
+        mock_session.execute = AsyncMock(return_value=result_mock)
+
+        pm = self._setup_pm()
+        run(pm.record_closure(trade_id=42, realized_pnl=150.0, session=mock_session))
+
+        assert pm.equity == pytest.approx(20_150.0)
+
+    def test_record_closure_updates_portfolio_trades(self):
+        """record_closure should UPDATE portfolio_trades.realized_pnl."""
+        mock_session = AsyncMock()
+        result_mock = MagicMock()
+        result_mock.rowcount = 1
+        mock_session.execute = AsyncMock(return_value=result_mock)
+
+        pm = self._setup_pm()
+        run(pm.record_closure(trade_id=42, realized_pnl=150.0, session=mock_session))
+
+        calls = [str(c.args[0]) for c in mock_session.execute.await_args_list]
+        assert any("portfolio_trades" in c for c in calls)
+        assert any("portfolio_state" in c for c in calls)
+
+    def test_record_closure_negative_pnl(self):
+        """record_closure with a loss should decrease equity."""
+        mock_session = AsyncMock()
+        result_mock = MagicMock()
+        result_mock.rowcount = 1
+        mock_session.execute = AsyncMock(return_value=result_mock)
+
+        pm = self._setup_pm()
+        run(pm.record_closure(trade_id=43, realized_pnl=-200.0, session=mock_session))
+
+        assert pm.equity == pytest.approx(19_800.0)
+
+    def test_record_closure_missing_row_skips(self):
+        """When no portfolio_trades row exists, equity should not change."""
+        mock_session = AsyncMock()
+        result_mock = MagicMock()
+        result_mock.rowcount = 0
+        mock_session.execute = AsyncMock(return_value=result_mock)
+
+        pm = self._setup_pm()
+        run(pm.record_closure(trade_id=99, realized_pnl=500.0, session=mock_session))
+
+        assert pm.equity == pytest.approx(20_000.0)
+        assert mock_session.execute.await_count == 1
+
+    def test_record_closure_without_session_uses_engine(self):
+        """record_closure without a session should use engine.begin()."""
+        result_mock = MagicMock()
+        result_mock.rowcount = 1
+        self.mock_begin_conn.execute = AsyncMock(return_value=result_mock)
+
+        pm = self._setup_pm()
+        run(pm.record_closure(trade_id=44, realized_pnl=100.0))
+
+        assert self.mock_engine.begin.call_count >= 1
 
 
 # ── Config field existence ───────────────────────────────────────
