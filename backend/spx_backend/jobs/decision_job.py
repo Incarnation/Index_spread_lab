@@ -1549,7 +1549,9 @@ class DecisionJob:
             text(
                 """
                 SELECT ts, spx_price, spy_price, vix, vix9d, term_structure,
-                       vvix, skew, gex_net, zero_gamma_level
+                       vvix, skew, gex_net, zero_gamma_level,
+                       gex_net_tradier, zero_gamma_level_tradier,
+                       gex_net_cboe, zero_gamma_level_cboe
                 FROM context_snapshots
                 WHERE ts <= :ts AND underlying = :underlying
                 ORDER BY ts DESC
@@ -1572,6 +1574,10 @@ class DecisionJob:
             "skew": result.skew,
             "gex_net": result.gex_net,
             "zero_gamma_level": result.zero_gamma_level,
+            "gex_net_tradier": result.gex_net_tradier,
+            "zero_gamma_level_tradier": result.zero_gamma_level_tradier,
+            "gex_net_cboe": result.gex_net_cboe,
+            "zero_gamma_level_cboe": result.zero_gamma_level_cboe,
         }
 
     def _context_score(self, context: dict | None, spread_side: str, spot: float | None) -> tuple[float, list[str]]:

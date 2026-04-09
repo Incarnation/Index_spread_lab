@@ -635,12 +635,16 @@ async def test_get_latest_context_filters_by_underlying(monkeypatch) -> None:
     ContextRow = namedtuple("ContextRow", [
         "ts", "spx_price", "spy_price", "vix", "vix9d",
         "term_structure", "vvix", "skew", "gex_net", "zero_gamma_level",
+        "gex_net_tradier", "zero_gamma_level_tradier",
+        "gex_net_cboe", "zero_gamma_level_cboe",
     ])
 
     spx_row = ContextRow(
         ts=datetime(2026, 4, 8, 14, 0, 0, tzinfo=timezone.utc),
         spx_price=5500.0, spy_price=550.0, vix=16.0, vix9d=15.0,
         term_structure=0.94, vvix=80.0, skew=130.0, gex_net=5e9, zero_gamma_level=5450.0,
+        gex_net_tradier=1e12, zero_gamma_level_tradier=5400.0,
+        gex_net_cboe=5e9, zero_gamma_level_cboe=5450.0,
     )
 
     captured_params: list[dict] = []

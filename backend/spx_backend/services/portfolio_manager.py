@@ -174,8 +174,9 @@ class PortfolioManager:
         """Record a new trade entry and persist to database.
 
         At entry time the caller should pass ``pnl_per_lot=0.0`` because no
-        PnL is realised until the trade closes.  Actual realised PnL is
-        tracked by ``trade_pnl_job`` on the ``trades`` table.
+        PnL is realised until the trade closes.  The ``portfolio_trades`` row
+        is inserted with ``realized_pnl = NULL`` so that ``record_closure``
+        can later identify it via ``WHERE realized_pnl IS NULL``.
 
         Parameters
         ----------
@@ -205,7 +206,7 @@ class PortfolioManager:
             event_signal=event_signal,
             lots=lots,
             margin=lots * _margin_per_lot(),
-            pnl=total_pnl,
+            pnl=None,
             equity_before=equity_before,
             equity_after=self.equity,
         )
@@ -345,14 +346,16 @@ class PortfolioManager:
     ) -> int:
         """Create or update today's portfolio_state row and return its id.
 
-        On INSERT (first run of the day) sets ``equity_start``; on conflict
-        (subsequent runs) only refreshes ``month_start_equity`` so the
-        original start-of-day equity is preserved.
+        On INSERT (first run of the day) sets ``equity_start`` and defaults
+        ``equity_end`` to the same value so that no-trade days don't leave
+        ``equity_end`` as NULL.  On conflict (subsequent runs) only refreshes
+        ``month_start_equity`` so the original start-of-day equity is
+        preserved.
         """
         async with engine.begin() as conn:
             row = await conn.execute(text(
-                "INSERT INTO portfolio_state (date, equity_start, month_start_equity) "
-                "VALUES (:d, :es, :ms) "
+                "INSERT INTO portfolio_state (date, equity_start, equity_end, month_start_equity) "
+                "VALUES (:d, :es, :es, :ms) "
                 "ON CONFLICT (date) DO UPDATE SET month_start_equity = :ms "
                 "RETURNING id"
             ), {"d": self._today, "es": equity_start, "ms": month_start_equity})

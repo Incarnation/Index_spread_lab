@@ -342,6 +342,10 @@ class FeatureBuilderJob:
             "gex_context": {
                 "gex_net": None if context is None else context.get("gex_net"),
                 "zero_gamma_level": None if context is None else context.get("zero_gamma_level"),
+                "gex_net_tradier": None if context is None else context.get("gex_net_tradier"),
+                "zero_gamma_level_tradier": None if context is None else context.get("zero_gamma_level_tradier"),
+                "gex_net_cboe": None if context is None else context.get("gex_net_cboe"),
+                "zero_gamma_level_cboe": None if context is None else context.get("zero_gamma_level_cboe"),
             },
             "cboe_context": cboe_context,
             "chain_quality": {

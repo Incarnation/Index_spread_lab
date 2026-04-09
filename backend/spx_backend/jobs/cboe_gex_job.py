@@ -573,11 +573,13 @@ class CboeGexJob:
                     text(
                         """
                         INSERT INTO context_snapshots
-                            (ts, underlying, gex_net, zero_gamma_level,
+                            (ts, underlying, gex_net_cboe, zero_gamma_level_cboe,
+                             gex_net, zero_gamma_level,
                              spx_price, spy_price, vix, vix9d, term_structure,
                              vvix, skew, notes_json)
                         VALUES (
                             :ts, :underlying, :gex_net, :zero_gamma_level,
+                            :gex_net, :zero_gamma_level,
                             (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                             (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                             (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
@@ -590,8 +592,10 @@ class CboeGexJob:
                             CAST(:notes AS jsonb)
                         )
                         ON CONFLICT (ts, underlying) DO UPDATE SET
-                          gex_net = EXCLUDED.gex_net,
-                          zero_gamma_level = EXCLUDED.zero_gamma_level,
+                          gex_net_cboe = EXCLUDED.gex_net_cboe,
+                          zero_gamma_level_cboe = EXCLUDED.zero_gamma_level_cboe,
+                          gex_net = EXCLUDED.gex_net_cboe,
+                          zero_gamma_level = EXCLUDED.zero_gamma_level_cboe,
                           spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
                           spy_price = COALESCE(context_snapshots.spy_price, EXCLUDED.spy_price),
                           vix = COALESCE(context_snapshots.vix, EXCLUDED.vix),

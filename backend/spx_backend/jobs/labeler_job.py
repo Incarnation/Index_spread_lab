@@ -494,6 +494,35 @@ class LabelerJob:
                         fs_resolved,
                     )
 
+            # Expire orphan feature_snapshots that have no linked candidates
+            # and are older than max_wait.  These can never be resolved by
+            # the normal cascade because the EXISTS guard above requires at
+            # least one candidate row.
+            orphan_result = await session.execute(
+                text(
+                    """
+                    UPDATE feature_snapshots fs
+                    SET label_status = 'expired',
+                        resolved_at = NOW(),
+                        label_error = 'no_candidates'
+                    WHERE fs.label_status = 'pending'
+                      AND fs.ts < :cutoff
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trade_candidates tc
+                          WHERE tc.feature_snapshot_id = fs.feature_snapshot_id
+                      )
+                    """
+                ),
+                {"cutoff": now_utc - max_wait},
+            )
+            orphan_expired = orphan_result.rowcount
+            if orphan_expired > 0:
+                await session.commit()
+                logger.info(
+                    "labeler_job: orphan feature_snapshots expired={}",
+                    orphan_expired,
+                )
+
         logger.info(
             "labeler_job: pending={} resolved={} errors={} skipped_fresh={}",
             pending_count,

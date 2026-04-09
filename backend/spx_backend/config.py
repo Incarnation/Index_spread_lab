@@ -191,6 +191,11 @@ class Settings(BaseSettings):
     performance_analytics_enabled: bool = True
     performance_analytics_interval_minutes: int = 5
 
+    # Data retention (purge old chain_snapshots + cascaded children)
+    retention_enabled: bool = False
+    retention_days: int = 60
+    retention_batch_size: int = 500
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls

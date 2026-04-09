@@ -164,6 +164,10 @@ class QuoteJob:
                           skew = EXCLUDED.skew,
                           gex_net = COALESCE(context_snapshots.gex_net, EXCLUDED.gex_net),
                           zero_gamma_level = COALESCE(context_snapshots.zero_gamma_level, EXCLUDED.zero_gamma_level),
+                          gex_net_tradier = COALESCE(context_snapshots.gex_net_tradier, EXCLUDED.gex_net_tradier),
+                          zero_gamma_level_tradier = COALESCE(context_snapshots.zero_gamma_level_tradier, EXCLUDED.zero_gamma_level_tradier),
+                          gex_net_cboe = COALESCE(context_snapshots.gex_net_cboe, EXCLUDED.gex_net_cboe),
+                          zero_gamma_level_cboe = COALESCE(context_snapshots.zero_gamma_level_cboe, EXCLUDED.zero_gamma_level_cboe),
                           notes_json = EXCLUDED.notes_json
                         """
                     ),

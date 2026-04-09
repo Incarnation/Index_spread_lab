@@ -143,6 +143,10 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
   skew DOUBLE PRECISION NULL,
   gex_net DOUBLE PRECISION NULL,
   zero_gamma_level DOUBLE PRECISION NULL,
+  gex_net_tradier DOUBLE PRECISION NULL,
+  zero_gamma_level_tradier DOUBLE PRECISION NULL,
+  gex_net_cboe DOUBLE PRECISION NULL,
+  zero_gamma_level_cboe DOUBLE PRECISION NULL,
   notes_json JSONB NULL,
   PRIMARY KEY (ts, underlying)
 );
@@ -398,7 +402,7 @@ CREATE TABLE IF NOT EXISTS trade_decisions (
   policy_version TEXT NULL,
   risk_gate_json JSONB NULL,
   experiment_tag TEXT NULL,
-  chain_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id),
+  chain_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE SET NULL,
   strategy_version_id BIGINT NULL REFERENCES strategy_versions(strategy_version_id),
   model_version_id BIGINT NULL REFERENCES model_versions(model_version_id),
   feature_snapshot_id BIGINT NULL REFERENCES feature_snapshots(feature_snapshot_id),
@@ -436,8 +440,8 @@ CREATE TABLE IF NOT EXISTS trades (
   decision_id BIGINT NULL REFERENCES trade_decisions(decision_id),
   candidate_id BIGINT NULL REFERENCES trade_candidates(candidate_id),
   feature_snapshot_id BIGINT NULL REFERENCES feature_snapshots(feature_snapshot_id),
-  entry_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id),
-  last_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id),
+  entry_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE SET NULL,
+  last_snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE SET NULL,
   backtest_run_id BIGINT NULL REFERENCES backtest_runs(run_id),
   trade_source TEXT NOT NULL DEFAULT 'live', -- live/paper/backtest
   strategy_version_id BIGINT NULL REFERENCES strategy_versions(strategy_version_id),

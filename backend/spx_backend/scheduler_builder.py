@@ -606,6 +606,20 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
             id="promotion_gate_job", replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
         )
 
+    # -- Daily retention job (3 AM ET) ------------------------------------------
+    if cfg.retention_enabled:
+        from spx_backend.jobs import retention_job
+
+        async def _retention_runner():
+            await retention_job.run_once()
+
+        scheduler.add_job(
+            _retention_runner, "cron",
+            hour=3, minute=0,
+            id="retention_job", replace_existing=True,
+            max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
+        )
+
     # -- Interval jobs (staleness monitor) -------------------------------------
     staleness_monitor_job = build_staleness_monitor_job(clock_cache=clock_cache) if cfg.staleness_alert_enabled else None
     if staleness_monitor_job is not None:
