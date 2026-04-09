@@ -151,10 +151,10 @@ class QuoteJob:
                     text(
                         """
                         INSERT INTO context_snapshots
-                          (ts, spx_price, spy_price, vix, vix9d, term_structure, vvix, skew, notes_json)
+                          (ts, underlying, spx_price, spy_price, vix, vix9d, term_structure, vvix, skew, notes_json)
                         VALUES
-                          (:ts, :spx_price, :spy_price, :vix, :vix9d, :term_structure, :vvix, :skew, CAST(:notes AS jsonb))
-                        ON CONFLICT (ts) DO UPDATE SET
+                          (:ts, :underlying, :spx_price, :spy_price, :vix, :vix9d, :term_structure, :vvix, :skew, CAST(:notes AS jsonb))
+                        ON CONFLICT (ts, underlying) DO UPDATE SET
                           spx_price = EXCLUDED.spx_price,
                           spy_price = EXCLUDED.spy_price,
                           vix = EXCLUDED.vix,
@@ -169,6 +169,7 @@ class QuoteJob:
                     ),
                     {
                         "ts": now_et.astimezone(utc),
+                        "underlying": "SPX",
                         "spx_price": spx_price,
                         "spy_price": spy_price,
                         "vix": vix,

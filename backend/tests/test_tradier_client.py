@@ -21,11 +21,17 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    """Captures HTTP calls and returns a configurable fake response."""
+    """Captures HTTP calls and returns a configurable fake response.
+
+    Supports both direct usage (shared client) and context-manager patterns
+    so the same mock works for the connection-pooled TradierClient.
+    """
 
     def __init__(self, *args, response_payload: dict[str, Any] | None = None, **kwargs):
         self.calls: list[dict[str, Any]] = []
         self._response_payload = response_payload
+        self.init_kwargs = kwargs
+        self.init_args = args
 
     async def __aenter__(self) -> "_FakeAsyncClient":
         return self
@@ -33,9 +39,13 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         return None
 
-    async def get(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> _FakeResponse:
-        self.calls.append({"url": url, "params": params, "headers": headers})
+    async def get(self, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, timeout: int | None = None) -> _FakeResponse:
+        """Record the call and return a fake response."""
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
         return _FakeResponse(self._response_payload)
+
+    async def aclose(self) -> None:
+        pass
 
 
 @pytest.mark.asyncio
@@ -54,7 +64,7 @@ async def test_get_option_expirations_requests_all_roots(monkeypatch: pytest.Mon
 
     assert payload["expirations"]["date"] == ["2026-02-13"]
     call = holder["client"].calls[0]
-    assert call["url"].endswith("/markets/options/expirations")
+    assert "/markets/options/expirations" in call["url"]
     assert call["params"]["symbol"] == "SPX"
     assert call["params"]["includeAllRoots"] == "true"
     assert call["params"]["strikes"] == "false"
@@ -78,7 +88,7 @@ async def test_get_option_chain_sends_correct_params(monkeypatch: pytest.MonkeyP
 
     assert payload == chain_payload
     call = holder["client"].calls[0]
-    assert call["url"].endswith("/markets/options/chains")
+    assert "/markets/options/chains" in call["url"]
     assert call["params"]["symbol"] == "SPX"
     assert call["params"]["expiration"] == "2026-04-17"
     assert call["params"]["greeks"] == "true"
@@ -120,7 +130,7 @@ async def test_get_quotes_joins_symbols(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert payload == quotes_payload
     call = holder["client"].calls[0]
-    assert call["url"].endswith("/markets/quotes")
+    assert "/markets/quotes" in call["url"]
     assert call["params"]["symbols"] == "SPX,VIX"
 
 
@@ -142,24 +152,24 @@ async def test_get_market_clock_sends_no_params(monkeypatch: pytest.MonkeyPatch)
 
     assert payload == clock_payload
     call = holder["client"].calls[0]
-    assert call["url"].endswith("/markets/clock")
+    assert "/markets/clock" in call["url"]
 
 
 @pytest.mark.asyncio
-async def test_auth_header_uses_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All requests include the Bearer token in the Authorization header."""
+async def test_auth_header_set_on_shared_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared client is initialized with the Bearer token in headers."""
     holder: dict[str, Any] = {}
 
     def _factory(*args, **kwargs) -> _FakeAsyncClient:
         client = _FakeAsyncClient(*args, **kwargs)
         holder["client"] = client
+        holder["init_kwargs"] = kwargs
         return client
 
     monkeypatch.setattr("spx_backend.ingestion.tradier_client.httpx.AsyncClient", _factory)
 
-    tc = TradierClient(base_url="https://api.tradier.com/v1", token="secret-token")
-    await tc.get_market_clock()
+    TradierClient(base_url="https://api.tradier.com/v1", token="secret-token")
 
-    headers = holder["client"].calls[0]["headers"]
+    headers = holder["init_kwargs"]["headers"]
     assert headers["Authorization"] == "Bearer secret-token"
     assert headers["Accept"] == "application/json"

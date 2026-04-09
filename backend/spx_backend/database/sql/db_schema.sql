@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
   source TEXT NOT NULL DEFAULT 'TRADIER',
   target_dte INTEGER NOT NULL,
   expiration DATE NOT NULL,
-  payload_json JSONB NOT NULL,
   checksum TEXT NOT NULL
 );
 
@@ -54,6 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_chain_snapshots_exp ON chain_snapshots (expiratio
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_underlying_ts ON chain_snapshots (underlying, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_source_ts ON chain_snapshots (source, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_underlying_source_ts ON chain_snapshots (underlying, source, ts DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chain_snapshots_ts_und_exp_src ON chain_snapshots (ts, underlying, expiration, source);
 
 CREATE TABLE IF NOT EXISTS option_chain_rows (
   snapshot_id BIGINT NOT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS gex_by_expiry_strike (
 CREATE INDEX IF NOT EXISTS idx_gex_by_expiry_snapshot_dte ON gex_by_expiry_strike (snapshot_id, dte_days, strike);
 
 CREATE TABLE IF NOT EXISTS context_snapshots (
-  ts TIMESTAMPTZ PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL,
+  underlying TEXT NOT NULL DEFAULT 'SPX',
   spx_price DOUBLE PRECISION NULL,
   spy_price DOUBLE PRECISION NULL,
   vix DOUBLE PRECISION NULL,
@@ -142,7 +143,8 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
   skew DOUBLE PRECISION NULL,
   gex_net DOUBLE PRECISION NULL,
   zero_gamma_level DOUBLE PRECISION NULL,
-  notes_json JSONB NULL
+  notes_json JSONB NULL,
+  PRIMARY KEY (ts, underlying)
 );
 
 CREATE TABLE IF NOT EXISTS underlying_quotes (
@@ -256,7 +258,7 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
   feature_snapshot_id BIGSERIAL PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL,
   snapshot_id BIGINT NULL REFERENCES chain_snapshots(snapshot_id) ON DELETE SET NULL,
-  context_ts TIMESTAMPTZ NULL REFERENCES context_snapshots(ts) ON DELETE SET NULL,
+  context_ts TIMESTAMPTZ NULL,
   underlying TEXT NOT NULL,
   target_dte INTEGER NULL,
   entry_slot INTEGER NULL,

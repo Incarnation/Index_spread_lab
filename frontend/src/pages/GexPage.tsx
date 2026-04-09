@@ -23,6 +23,7 @@ import { formatDateTime } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 
 const UNDERLYINGS = ["SPX", "SPY"] as const;
+const SOURCES = ["CBOE", "TRADIER", "All"] as const;
 
 /**
  * GEX / Market page -- gamma exposure visualization by strike.
@@ -30,6 +31,7 @@ const UNDERLYINGS = ["SPX", "SPY"] as const;
 export function GexPage() {
   const { tick } = useAutoRefresh(60_000);
   const [underlying, setUnderlying] = useState<string>("SPX");
+  const [source, setSource] = useState<string>("CBOE");
   const [snapshots, setSnapshots] = useState<GexSnapshot[]>([]);
   const [selectedSnap, setSelectedSnap] = useState<GexSnapshot | null>(null);
   const [dtes, setDtes] = useState<number[]>([]);
@@ -38,11 +40,12 @@ export function GexPage() {
 
   useEffect(() => {
     const ac = new AbortController();
-    fetchGexSnapshots(10, underlying, undefined, ac.signal)
+    const sourceParam = source === "All" ? undefined : source;
+    fetchGexSnapshots(10, underlying, sourceParam, ac.signal)
       .then((snaps) => {
         if (!ac.signal.aborted) {
           setSnapshots(snaps);
-          if (snaps.length > 0 && (!selectedSnap || selectedSnap.underlying !== underlying)) {
+          if (snaps.length > 0 && (!selectedSnap || selectedSnap.underlying !== underlying || selectedSnap.source !== (sourceParam ?? selectedSnap.source))) {
             setSelectedSnap(snaps[0]);
           }
         }
@@ -52,7 +55,7 @@ export function GexPage() {
         }
       });
     return () => ac.abort();
-  }, [underlying, tick]);
+  }, [underlying, source, tick]);
 
   useEffect(() => {
     if (!selectedSnap) return;
@@ -87,12 +90,21 @@ export function GexPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-foreground">GEX / Market</h2>
-        <div className="flex gap-1">
-          {UNDERLYINGS.map((u) => (
-            <Button key={u} variant={underlying === u ? "default" : "ghost"} size="sm" onClick={() => setUnderlying(u)}>
-              {u}
-            </Button>
-          ))}
+        <div className="flex items-center gap-3">
+          <div className="flex gap-1">
+            {SOURCES.map((s) => (
+              <Button key={s} variant={source === s ? "default" : "ghost"} size="sm" onClick={() => setSource(s)}>
+                {s}
+              </Button>
+            ))}
+          </div>
+          <div className="flex gap-1">
+            {UNDERLYINGS.map((u) => (
+              <Button key={u} variant={underlying === u ? "default" : "ghost"} size="sm" onClick={() => setUnderlying(u)}>
+                {u}
+              </Button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -141,7 +153,7 @@ export function GexPage() {
               <YAxis tick={{ fontSize: 10, fill: "#6b6b80" }} tickLine={false} axisLine={false} tickFormatter={(v: number) => v.toExponential(1)} />
               <Tooltip contentStyle={{ backgroundColor: "#111118", border: "1px solid #1e1e2e", borderRadius: "6px", fontSize: "12px", color: "#e4e4ef" }} />
               <Legend wrapperStyle={{ fontSize: "11px", color: "#a0a0b8" }} />
-              {selectedSnap?.zero_gamma_level && (
+              {selectedSnap?.zero_gamma_level != null && (
                 <ReferenceLine x={selectedSnap.zero_gamma_level} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: "Zero Gamma", fill: "#f59e0b", fontSize: 10 }} />
               )}
               {selectedSnap?.spot_price && (

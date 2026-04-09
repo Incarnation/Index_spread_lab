@@ -410,8 +410,8 @@ class SnapshotJob:
                         result = await session.execute(
                             text(
                                 """
-                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, '{}'::jsonb, :checksum)
+                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, :checksum)
                                 RETURNING snapshot_id
                                 """
                             ),
@@ -460,14 +460,14 @@ class SnapshotJob:
                                     """
                                     INSERT INTO option_chain_rows (
                                       snapshot_id, option_symbol, underlying, expiration, strike, option_right,
-                                      bid, ask, last, volume, open_interest,
+                                      bid, ask, last, volume, open_interest, contract_size,
                                       delta, gamma, theta, vega, rho,
                                       bid_iv, mid_iv, ask_iv, greeks_updated_at,
                                       raw_json
                                     )
                                     VALUES (
                                       :snapshot_id, :option_symbol, :underlying, :expiration, :strike, :option_right,
-                                      :bid, :ask, :last, :volume, :open_interest,
+                                      :bid, :ask, :last, :volume, :open_interest, :contract_size,
                                       :delta, :gamma, :theta, :vega, :rho,
                                       :bid_iv, :mid_iv, :ask_iv, :greeks_updated_at,
                                       CAST(:raw_json AS jsonb)

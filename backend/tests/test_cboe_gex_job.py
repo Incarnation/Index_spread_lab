@@ -272,3 +272,52 @@ async def test_cboe_gex_job_continues_when_one_symbol_fetch_fails(monkeypatch) -
     assert {item["underlying"] for item in result["skipped_underlyings"]} == {"SPY"}
     assert {row["underlying"] for row in capture_session.chain_snapshot_inserts} == {"SPX", "VIX"}
     assert any("forced_fetch_failure:SPY" in str(item.get("error", "")) for item in result["failed_items"])
+
+
+def test_zero_gamma_level_uses_gex_net_when_present() -> None:
+    """_zero_gamma_level should prefer gex_net over gex_calls+gex_puts when available.
+
+    This ensures the zero-gamma crossing is consistent with the aggregate
+    gex_net stored in context_snapshots (H3 fix).
+    """
+    job = CboeGexJob(mzdata=object(), clock_cache=None)  # type: ignore[arg-type]
+
+    # gex_net differs from gex_calls + gex_puts to prove the method uses gex_net
+    per_strike = {
+        5000.0: {"gex_calls": 100.0, "gex_puts": -50.0, "gex_net": -200.0},
+        5050.0: {"gex_calls": 80.0,  "gex_puts": -30.0, "gex_net": 150.0},
+    }
+
+    result = job._zero_gamma_level(per_strike)
+
+    # With gex_net: cumulative goes -200 -> (-200 + 150) = -50 — no crossing
+    # With gex_calls+gex_puts: cumulative goes 50 -> (50 + 50) = 100 — also no crossing
+    # Let's craft a case that actually crosses using gex_net but NOT gex_calls+gex_puts
+    per_strike_crossing = {
+        5000.0: {"gex_calls": 10.0, "gex_puts": -5.0, "gex_net": -100.0},
+        5050.0: {"gex_calls": 10.0, "gex_puts": -5.0, "gex_net": 200.0},
+    }
+    result_crossing = job._zero_gamma_level(per_strike_crossing)
+    assert result_crossing is not None
+
+    # prev_cum=-100, cum=(-100+200)=100 => weight = 100/(100+100) = 0.5
+    # expected = 5000 + (5050 - 5000) * 0.5 = 5025.0
+    assert result_crossing == 5025.0
+
+
+def test_zero_gamma_level_fallback_without_gex_net() -> None:
+    """When gex_net is absent, _zero_gamma_level falls back to gex_calls + gex_puts."""
+    job = CboeGexJob(mzdata=object(), clock_cache=None)  # type: ignore[arg-type]
+
+    per_strike = {
+        5000.0: {"gex_calls": -80.0, "gex_puts": -20.0},
+        5050.0: {"gex_calls": 120.0, "gex_puts": -10.0},
+    }
+
+    result = job._zero_gamma_level(per_strike)
+
+    # Without gex_net: cumulative goes -100 -> (-100 + 110) = 10 — crossing!
+    assert result is not None
+    # Interpolation: prev_cum=-100, cum=10 => weight = 100/110
+    expected = 5000.0 + (5050.0 - 5000.0) * (100.0 / 110.0)
+    assert abs(result - expected) < 0.1

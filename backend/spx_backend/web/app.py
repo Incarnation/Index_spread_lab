@@ -57,6 +57,17 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Close HTTP connection pools for Tradier and MZData clients.
+    for closeable in [
+        getattr(ctx.tradier, "aclose", None),
+        getattr(getattr(ctx.cboe_gex_job, "mzdata", None), "aclose", None),
+    ]:
+        if closeable is not None:
+            try:
+                await closeable()
+            except Exception:
+                pass
+
 
 app = FastAPI(title="IndexSpreadLab (Backend)", version="0.1.0", lifespan=lifespan)
 

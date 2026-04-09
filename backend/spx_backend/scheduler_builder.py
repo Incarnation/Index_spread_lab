@@ -215,6 +215,7 @@ def build_market_open_guarded_runner(
     timezone: str,
     job_id: str,
     open_trading_days: set[date],
+    allow_outside_rth: bool = False,
 ) -> Any:
     """Guard scheduled runs so holidays skip while preserving close-force behavior.
 
@@ -232,6 +233,9 @@ def build_market_open_guarded_runner(
         Mutable set shared across scheduler wrappers. A date is added when any
         guarded run observes ``is_open=True``, which allows close-force jobs to
         run at 16:00 only on real trading days.
+    allow_outside_rth:
+        When ``True``, the guard lets the job through even when the market is
+        closed.  The job's internal RTH check still applies.
 
     Returns
     -------
@@ -259,6 +263,9 @@ def build_market_open_guarded_runner(
                 )
                 return {"skipped": True, "reason": "non_trading_day", "now_et": now_et.isoformat()}
             return await run_callable(force=True)
+
+        if allow_outside_rth:
+            return await run_callable(force=False)
 
         if not is_open_now:
             logger.info(
@@ -309,6 +316,7 @@ def _schedule_rth_window_job(
     timezone: str,
     max_job_instances: int,
     misfire_grace_seconds: int,
+    allow_outside_rth: bool = False,
 ) -> None:
     """Schedule one job for RTH cadence with a guaranteed 16:00 ET run.
 
@@ -316,6 +324,9 @@ def _schedule_rth_window_job(
     configured cadence. A separate close trigger runs at 16:00 with
     ``force=True`` and is allowed only if a guarded run observed open market
     status earlier that date, which skips holiday executions.
+
+    When ``allow_outside_rth`` is ``True``, the market-open guard lets the job
+    through regardless of exchange status; the job's own RTH check still applies.
     """
     run_callable = build_market_open_guarded_runner(
         build_serialized_run_once_runner(job),
@@ -323,6 +334,7 @@ def _schedule_rth_window_job(
         timezone=timezone,
         job_id=job_id,
         open_trading_days=open_trading_days,
+        allow_outside_rth=allow_outside_rth,
     )
     scheduler.add_job(
         run_callable,
@@ -456,28 +468,56 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
         misfire_grace_seconds=misfire_grace_seconds,
     )
 
-    _schedule_rth_window_job(scheduler, job=snapshot_job, job_id="snapshot_job", interval_minutes=cfg.snapshot_interval_minutes, **rth_kwargs)
+    _schedule_rth_window_job(
+        scheduler, job=snapshot_job, job_id="snapshot_job",
+        interval_minutes=cfg.snapshot_interval_minutes,
+        allow_outside_rth=cfg.allow_snapshot_outside_rth, **rth_kwargs,
+    )
 
     if vix_snapshot_job is not None:
-        _schedule_rth_window_job(scheduler, job=vix_snapshot_job, job_id="snapshot_job_vix", interval_minutes=cfg.vix_snapshot_interval_minutes, **rth_kwargs)
+        _schedule_rth_window_job(
+            scheduler, job=vix_snapshot_job, job_id="snapshot_job_vix",
+            interval_minutes=cfg.vix_snapshot_interval_minutes,
+            allow_outside_rth=cfg.vix_allow_snapshot_outside_rth, **rth_kwargs,
+        )
 
     if spy_snapshot_job is not None:
-        _schedule_rth_window_job(scheduler, job=spy_snapshot_job, job_id="snapshot_job_spy", interval_minutes=cfg.spy_snapshot_interval_minutes, **rth_kwargs)
+        _schedule_rth_window_job(
+            scheduler, job=spy_snapshot_job, job_id="snapshot_job_spy",
+            interval_minutes=cfg.spy_snapshot_interval_minutes,
+            allow_outside_rth=cfg.spy_allow_snapshot_outside_rth, **rth_kwargs,
+        )
 
-    _schedule_rth_window_job(scheduler, job=quote_job, job_id="quote_job", interval_minutes=cfg.quote_interval_minutes, **rth_kwargs)
-    _schedule_rth_window_job(scheduler, job=gex_job, job_id="gex_job", interval_minutes=cfg.gex_interval_minutes, **rth_kwargs)
+    _schedule_rth_window_job(
+        scheduler, job=quote_job, job_id="quote_job",
+        interval_minutes=cfg.quote_interval_minutes,
+        allow_outside_rth=cfg.allow_quotes_outside_rth, **rth_kwargs,
+    )
+    _schedule_rth_window_job(
+        scheduler, job=gex_job, job_id="gex_job",
+        interval_minutes=cfg.gex_interval_minutes,
+        allow_outside_rth=cfg.gex_allow_outside_rth, **rth_kwargs,
+    )
 
     if cboe_gex_job is not None:
-        _schedule_rth_window_job(scheduler, job=cboe_gex_job, job_id="cboe_gex_job", interval_minutes=cfg.cboe_gex_interval_minutes, **rth_kwargs)
+        _schedule_rth_window_job(
+            scheduler, job=cboe_gex_job, job_id="cboe_gex_job",
+            interval_minutes=cfg.cboe_gex_interval_minutes,
+            allow_outside_rth=cfg.cboe_gex_allow_outside_rth, **rth_kwargs,
+        )
 
     # -- Entry-time jobs (feature builder + decision) --------------------------
     feature_builder_entry_runner = build_market_open_guarded_runner(
         build_serialized_run_once_runner(feature_builder_job),
-        clock_cache=clock_cache, timezone=cfg.tz, job_id="feature_builder_job", open_trading_days=open_trading_days,
+        clock_cache=clock_cache, timezone=cfg.tz, job_id="feature_builder_job",
+        open_trading_days=open_trading_days,
+        allow_outside_rth=cfg.feature_builder_allow_outside_rth,
     )
     decision_entry_runner = build_market_open_guarded_runner(
         build_serialized_run_once_runner(decision_job),
-        clock_cache=clock_cache, timezone=cfg.tz, job_id="decision_job", open_trading_days=open_trading_days,
+        clock_cache=clock_cache, timezone=cfg.tz, job_id="decision_job",
+        open_trading_days=open_trading_days,
+        allow_outside_rth=cfg.decision_allow_outside_rth,
     )
     for hour, minute in cfg.decision_entry_times_list():
         if cfg.feature_builder_enabled:

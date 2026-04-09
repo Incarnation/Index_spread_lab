@@ -623,3 +623,46 @@ def test_context_score_call_headwind_when_gex_positive() -> None:
 
     assert "gex_headwind" in flags
     assert "spot_above_zero_gamma" in flags
+
+
+@pytest.mark.asyncio
+async def test_get_latest_context_filters_by_underlying(monkeypatch) -> None:
+    """_get_latest_context should only return rows where underlying='SPX'."""
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+    from collections import namedtuple
+
+    ContextRow = namedtuple("ContextRow", [
+        "ts", "spx_price", "spy_price", "vix", "vix9d",
+        "term_structure", "vvix", "skew", "gex_net", "zero_gamma_level",
+    ])
+
+    spx_row = ContextRow(
+        ts=datetime(2026, 4, 8, 14, 0, 0, tzinfo=timezone.utc),
+        spx_price=5500.0, spy_price=550.0, vix=16.0, vix9d=15.0,
+        term_structure=0.94, vvix=80.0, skew=130.0, gex_net=5e9, zero_gamma_level=5450.0,
+    )
+
+    captured_params: list[dict] = []
+
+    class _FakeResult:
+        """Captures params and returns the SPX row."""
+        def fetchone(self):
+            return spx_row
+
+    class _FakeSession:
+        """Session that captures SQL parameters for assertion."""
+        async def execute(self, stmt, params=None):
+            captured_params.append(dict(params or {}))
+            return _FakeResult()
+
+    job = DecisionJob()
+    now_et = datetime(2026, 4, 8, 10, 30, 0, tzinfo=timezone.utc)
+    result = await job._get_latest_context(_FakeSession(), now_et)
+
+    assert result is not None
+    assert result["spx_price"] == 5500.0
+
+    # Verify the SQL was called with underlying='SPX'
+    assert len(captured_params) == 1
+    assert captured_params[0]["underlying"] == "SPX"

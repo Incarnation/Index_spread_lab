@@ -1503,19 +1503,19 @@ class DecisionJob:
         return float(last)
 
     async def _get_latest_context(self, session, now_et: datetime) -> dict | None:
-        """Fetch the latest context snapshot at or before now."""
+        """Fetch the latest context snapshot at or before now for SPX."""
         row = await session.execute(
             text(
                 """
                 SELECT ts, spx_price, spy_price, vix, vix9d, term_structure,
                        vvix, skew, gex_net, zero_gamma_level
                 FROM context_snapshots
-                WHERE ts <= :ts
+                WHERE ts <= :ts AND underlying = :underlying
                 ORDER BY ts DESC
                 LIMIT 1
                 """
             ),
-            {"ts": now_et.astimezone(ZoneInfo("UTC"))},
+            {"ts": now_et.astimezone(ZoneInfo("UTC")), "underlying": "SPX"},
         )
         result = row.fetchone()
         if not result:

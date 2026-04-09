@@ -605,3 +605,64 @@ async def test_lifespan_holiday_guard_skips_daily_after_close_jobs(monkeypatch) 
         assert shadow_result["skipped"] is True
         assert shadow_result["reason"] == "non_trading_day"
         assert shadow_job.run_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_guard_allow_outside_rth_bypasses_market_closed_check() -> None:
+    """When allow_outside_rth=True, the guard should invoke the job even if the market is closed."""
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    from spx_backend.scheduler_builder import build_market_open_guarded_runner
+
+    invocations: list[dict] = []
+
+    async def _fake_run(*, force: bool = False) -> dict:
+        invocations.append({"force": force})
+        return {"ok": True}
+
+    closed_cache = _FakeClockCache()
+    closed_cache.market_open = False
+
+    runner = build_market_open_guarded_runner(
+        _fake_run,
+        clock_cache=closed_cache,
+        timezone="America/New_York",
+        job_id="test_job",
+        open_trading_days=set(),
+        allow_outside_rth=True,
+    )
+
+    result = await runner()
+    assert result == {"ok": True}
+    assert len(invocations) == 1
+    assert invocations[0]["force"] is False
+
+
+@pytest.mark.asyncio
+async def test_guard_default_skips_when_market_closed() -> None:
+    """Default allow_outside_rth=False should skip when the market is closed."""
+    from spx_backend.scheduler_builder import build_market_open_guarded_runner
+
+    invocations: list[dict] = []
+
+    async def _fake_run(*, force: bool = False) -> dict:
+        invocations.append({"force": force})
+        return {"ok": True}
+
+    closed_cache = _FakeClockCache()
+    closed_cache.market_open = False
+
+    runner = build_market_open_guarded_runner(
+        _fake_run,
+        clock_cache=closed_cache,
+        timezone="America/New_York",
+        job_id="test_job",
+        open_trading_days=set(),
+        allow_outside_rth=False,
+    )
+
+    result = await runner()
+    assert result["skipped"] is True
+    assert result["reason"] == "market_closed_or_holiday"
+    assert len(invocations) == 0

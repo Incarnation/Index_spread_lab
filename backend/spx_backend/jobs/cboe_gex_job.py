@@ -238,7 +238,13 @@ class CboeGexJob:
         return int(result.snapshot_id)
 
     def _zero_gamma_level(self, per_strike: dict[float, dict[str, float]]) -> float | None:
-        """Estimate zero-gamma strike from cumulative net GEX crossing."""
+        """Estimate zero-gamma strike from cumulative net GEX crossing.
+
+        Uses the ``gex_net`` key (MZData precomputed net gamma) when available
+        so the crossing is consistent with the aggregate gex_net stored in
+        context_snapshots.  Falls back to ``gex_calls + gex_puts`` for Tradier
+        or any source that lacks a dedicated net field.
+        """
         if not per_strike:
             return None
         strikes = sorted(per_strike.keys())
@@ -247,7 +253,11 @@ class CboeGexJob:
         prev_strike: float | None = None
         for strike in strikes:
             prev_cumulative = cumulative
-            cumulative += float(per_strike[strike]["gex_calls"]) + float(per_strike[strike]["gex_puts"])
+            sdata = per_strike[strike]
+            if "gex_net" in sdata:
+                cumulative += float(sdata["gex_net"])
+            else:
+                cumulative += float(sdata["gex_calls"]) + float(sdata["gex_puts"])
             if prev_strike is None:
                 prev_strike = strike
                 continue
@@ -372,8 +382,8 @@ class CboeGexJob:
                         insert_result = await session.execute(
                             text(
                                 """
-                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, '{}'::jsonb, :checksum)
+                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, checksum)
+                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, :checksum)
                                 RETURNING snapshot_id
                                 """
                             ),
@@ -563,11 +573,11 @@ class CboeGexJob:
                     text(
                         """
                         INSERT INTO context_snapshots
-                            (ts, gex_net, zero_gamma_level,
+                            (ts, underlying, gex_net, zero_gamma_level,
                              spx_price, spy_price, vix, vix9d, term_structure,
                              vvix, skew, notes_json)
                         VALUES (
-                            :ts, :gex_net, :zero_gamma_level,
+                            :ts, :underlying, :gex_net, :zero_gamma_level,
                             (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                             (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                             (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
@@ -579,7 +589,7 @@ class CboeGexJob:
                             (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                             CAST(:notes AS jsonb)
                         )
-                        ON CONFLICT (ts) DO UPDATE SET
+                        ON CONFLICT (ts, underlying) DO UPDATE SET
                           gex_net = EXCLUDED.gex_net,
                           zero_gamma_level = EXCLUDED.zero_gamma_level,
                           spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
@@ -593,6 +603,7 @@ class CboeGexJob:
                     ),
                     {
                         "ts": batch_ts_utc,
+                        "underlying": underlying,
                         "gex_net": agg_gex_net,
                         "zero_gamma_level": agg_zero_gamma,
                         "notes": "{}",

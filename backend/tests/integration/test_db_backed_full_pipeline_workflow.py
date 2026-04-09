@@ -35,6 +35,8 @@ import spx_backend.jobs.shadow_inference_job as shadow_inference_module
 import spx_backend.jobs.snapshot_job as snapshot_module
 import spx_backend.jobs.trade_pnl_job as trade_pnl_module
 import spx_backend.jobs.trainer_job as trainer_module
+import spx_backend.services.portfolio_manager as portfolio_manager_module
+import spx_backend.services.event_signals as event_signals_module
 
 pytestmark = [pytest.mark.e2e, pytest.mark.integration]
 
@@ -272,7 +274,12 @@ def _configure_workflow_settings(monkeypatch) -> None:
 
 
 def _patch_job_session_locals(monkeypatch, session_factory) -> None:
-    """Patch job modules to use integration test DB session factory."""
+    """Patch job modules to use integration test DB session factory.
+
+    Also patches the global ``engine`` used by portfolio_manager and
+    event_signals so they connect to the test database instead of
+    the production DATABASE_URL (avoids event-loop mismatch errors).
+    """
     monkeypatch.setattr(quote_module, "SessionLocal", session_factory)
     monkeypatch.setattr(snapshot_module, "SessionLocal", session_factory)
     monkeypatch.setattr(gex_module, "SessionLocal", session_factory)
@@ -283,6 +290,10 @@ def _patch_job_session_locals(monkeypatch, session_factory) -> None:
     monkeypatch.setattr(shadow_inference_module, "SessionLocal", session_factory)
     monkeypatch.setattr(promotion_gate_module, "SessionLocal", session_factory)
     monkeypatch.setattr(trade_pnl_module, "SessionLocal", session_factory)
+
+    test_engine = session_factory.kw["bind"]
+    monkeypatch.setattr(portfolio_manager_module, "engine", test_engine)
+    monkeypatch.setattr(event_signals_module, "engine", test_engine)
 
 
 @asynccontextmanager
@@ -374,8 +385,8 @@ async def _seed_two_chain_snapshots_for_gex(*, session, now_utc: datetime) -> li
         snapshot_row = await session.execute(
             text(
                 """
-                INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
-                VALUES (:ts, 'SPX', 3, :expiration, '{}'::jsonb, :checksum)
+                INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, checksum)
+                VALUES (:ts, 'SPX', 3, :expiration, :checksum)
                 RETURNING snapshot_id
                 """
             ),

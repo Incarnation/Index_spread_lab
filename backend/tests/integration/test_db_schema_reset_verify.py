@@ -44,8 +44,8 @@ async def _insert_cboe_rows_for_dte_cleanup(engine) -> None:
                 await conn.execute(
                     text(
                         """
-                        INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, payload_json, checksum)
-                        VALUES (:ts, :underlying, :source, :target_dte, :expiration, CAST(:payload_json AS jsonb), :checksum)
+                        INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, checksum)
+                        VALUES (:ts, :underlying, :source, :target_dte, :expiration, :checksum)
                         RETURNING snapshot_id
                         """
                     ),
@@ -55,7 +55,6 @@ async def _insert_cboe_rows_for_dte_cleanup(engine) -> None:
                         "source": "CBOE",
                         "target_dte": 999,
                         "expiration": expiration,
-                        "payload_json": "{}",
                         "checksum": f"cboe_cleanup_seed_{idx}",
                     },
                 )

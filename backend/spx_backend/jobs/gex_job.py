@@ -14,7 +14,12 @@ from spx_backend.market_clock import MarketClockCache, is_rth
 
 @dataclass(frozen=True)
 class GexJob:
-    """Compute and persist GEX aggregates for new snapshots."""
+    """Compute and persist GEX aggregates from Tradier option chain snapshots.
+
+    Uses the standard dollar-GEX formula: 0.01 * gamma * OI * multiplier * S^2.
+    CBOE (CboeGexJob) is the primary GEX source for the decision engine;
+    Tradier GEX serves as a cross-check and backup when CBOE data is unavailable.
+    """
     clock_cache: MarketClockCache | None = None
 
     async def _market_open(self, now_et: datetime) -> bool:
@@ -157,7 +162,8 @@ class GexJob:
                             sign = 1.0
                             if settings.gex_puts_negative and (right == "P"):
                                 sign = -1.0
-                            gex_val = sign * float(gamma) * float(oi) * float(multiplier) * (float(spot) ** 2)
+                            # Standard dollar GEX: 0.01 * gamma * OI * multiplier * S^2
+                            gex_val = sign * 0.01 * float(gamma) * float(oi) * float(multiplier) * (float(spot) ** 2)
 
                             # Totals by option side
                             if right == "P":
@@ -283,11 +289,11 @@ class GexJob:
                             text(
                                 """
                                 INSERT INTO context_snapshots
-                                    (ts, gex_net, zero_gamma_level,
+                                    (ts, underlying, gex_net, zero_gamma_level,
                                      spx_price, spy_price, vix, vix9d, term_structure,
                                      vvix, skew, notes_json)
                                 VALUES (
-                                    :ts, :gex_net, :zero_gamma_level,
+                                    :ts, :underlying, :gex_net, :zero_gamma_level,
                                     (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                                     (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                                     (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
@@ -299,7 +305,7 @@ class GexJob:
                                     (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
                                     CAST(:notes AS jsonb)
                                 )
-                                ON CONFLICT (ts) DO UPDATE SET
+                                ON CONFLICT (ts, underlying) DO UPDATE SET
                                   gex_net = EXCLUDED.gex_net,
                                   zero_gamma_level = EXCLUDED.zero_gamma_level,
                                   spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
@@ -313,6 +319,7 @@ class GexJob:
                             ),
                             {
                                 "ts": ts,
+                                "underlying": underlying,
                                 "gex_net": gex_net,
                                 "zero_gamma_level": zero_gamma,
                                 "notes": "{}",
