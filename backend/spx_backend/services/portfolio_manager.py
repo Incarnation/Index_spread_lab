@@ -243,14 +243,13 @@ class PortfolioManager:
         session : Optional session for transactional consistency with the
             caller's close-trade writes.
         """
-        equity_before = self.equity
-        self.equity += realized_pnl
-
-        # Idempotency: only update rows still at entry-time PnL (0) to
-        # prevent double-counting if the job replays a closure.
+        # Idempotency: only update rows that have never been closed
+        # (realized_pnl IS NULL).  Previous version also matched
+        # ``realized_pnl = 0`` which caused replayed closures with a zero
+        # PnL to succeed again, re-running ``_update_day_state``.
         stmt = text(
             "UPDATE portfolio_trades SET realized_pnl = :pnl "
-            "WHERE trade_id = :tid AND (realized_pnl IS NULL OR realized_pnl = 0)"
+            "WHERE trade_id = :tid AND realized_pnl IS NULL"
         )
         params = {"pnl": realized_pnl, "tid": trade_id}
 
@@ -265,8 +264,10 @@ class PortfolioManager:
                 "portfolio_closure_skip: no matching portfolio_trades row for "
                 "trade_id={} (missing or already closed)", trade_id,
             )
-            self.equity = equity_before
             return
+
+        equity_before = self.equity
+        self.equity += realized_pnl
 
         await self._update_day_state(
             equity_end=self.equity, trades=self._trades_today, session=session,

@@ -20,6 +20,31 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (float(bid) + float(ask)) / 2.0
 
 
+def derive_stop_loss_target(
+    *,
+    existing_target: float | None,
+    basis: str,
+    pct: float,
+    max_profit: float | None,
+    max_loss: float | None,
+) -> float | None:
+    """Compute a stop-loss dollar threshold from trade attributes.
+
+    If *existing_target* is already set, it is returned as-is.  Otherwise
+    the threshold is derived from *max_loss* (when ``basis == "max_loss"``
+    and the value is present) or falls back to *max_profit*.
+
+    Returns ``None`` when neither *max_profit* nor *max_loss* is available.
+    """
+    if existing_target is not None:
+        return existing_target
+    if basis == "max_loss" and max_loss is not None:
+        return float(max_loss) * pct
+    if max_profit is not None:
+        return float(max_profit) * pct
+    return None
+
+
 @dataclass
 class TradePnlJob:
     """Mark-to-market open trades and close by TP/SL/expiry."""
@@ -440,15 +465,21 @@ class TradePnlJob:
             trade_ids = [t.trade_id for t in trades_list]
             all_legs = await self._bulk_trade_legs(session, trade_ids)
 
-            # Phase 1: process expirations (runs even outside RTH)
-            expired_trades = [
-                t for t in trades_list
-                if t.expiration is not None and now_et.date() > t.expiration
-            ]
-            active_trades = [
-                t for t in trades_list
-                if not (t.expiration is not None and now_et.date() > t.expiration)
-            ]
+            # Phase 1: process expirations (runs even outside RTH).
+            # Close on the expiration day itself once the market has closed
+            # (16:00 ET) rather than waiting until the next calendar day.
+            market_close_hour = 16
+            past_close_today = now_et.hour >= market_close_hour
+
+            def _is_expired(t) -> bool:
+                if t.expiration is None:
+                    return False
+                if now_et.date() > t.expiration:
+                    return True
+                return now_et.date() == t.expiration and past_close_today
+
+            expired_trades = [t for t in trades_list if _is_expired(t)]
+            active_trades = [t for t in trades_list if not _is_expired(t)]
 
             if expired_trades:
                 expired_closed, closed = await self._close_expired_trades(
@@ -522,9 +553,13 @@ class TradePnlJob:
                     take_profit_target = float(trade.max_profit) * settings.trade_pnl_take_profit_pct
                 stop_loss_target = None
                 if settings.trade_pnl_stop_loss_enabled:
-                    stop_loss_target = trade.stop_loss_target
-                    if stop_loss_target is None and trade.max_profit is not None:
-                        stop_loss_target = float(trade.max_profit) * settings.trade_pnl_stop_loss_pct
+                    stop_loss_target = derive_stop_loss_target(
+                        existing_target=trade.stop_loss_target,
+                        basis=settings.trade_pnl_stop_loss_basis,
+                        pct=settings.trade_pnl_stop_loss_pct,
+                        max_profit=trade.max_profit,
+                        max_loss=trade.max_loss,
+                    )
 
                 close_reason = None
                 if take_profit_target is not None and pnl >= float(take_profit_target):

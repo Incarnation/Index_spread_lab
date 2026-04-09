@@ -35,6 +35,9 @@ def test_evaluate_candidate_outcome_hits_take_profit_first() -> None:
     assert result["hit_tp50_before_sl_or_expiry"] is True
     assert result["hit_tp100_at_expiry"] is False
     assert result["exit_reason"] == "TAKE_PROFIT_50"
+    assert result["hit_sl_before_tp_or_expiry"] is False
+    assert result["sl_pnl"] is None
+    assert result["sl_ts"] is None
 
 
 def test_evaluate_candidate_outcome_resolves_on_last_mark_when_no_tp() -> None:
@@ -66,6 +69,9 @@ def test_evaluate_candidate_outcome_resolves_on_last_mark_when_no_tp() -> None:
     assert result["hit_tp100_at_expiry"] is False
     assert result["exit_reason"] == "EXPIRY_OR_LAST_MARK"
     assert result["realized_pnl"] < 50.0
+    assert result["hit_sl_before_tp_or_expiry"] is False
+    assert result["sl_pnl"] is None
+    assert result["sl_ts"] is None
 
 
 def test_evaluate_candidate_outcome_none_for_empty_marks() -> None:
@@ -110,3 +116,6 @@ def test_evaluate_candidate_outcome_tracks_tp100_at_expiry_even_if_tp50_hit_earl
     # Realized outcome remains TP50-first for live policy.
     assert result["exit_reason"] == "TAKE_PROFIT_50"
     assert result["realized_pnl"] < result["expiry_pnl"]
+    assert result["hit_sl_before_tp_or_expiry"] is False
+    assert result["sl_pnl"] is None
+    assert result["sl_ts"] is None

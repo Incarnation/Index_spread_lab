@@ -306,6 +306,7 @@ CREATE TABLE IF NOT EXISTS trade_candidates (
   resolved_at TIMESTAMPTZ NULL,
   realized_pnl DOUBLE PRECISION NULL,
   hit_tp50_before_sl_or_expiry BOOLEAN NULL,
+  hit_sl_before_tp_or_expiry BOOLEAN NULL,
   hit_tp100_at_expiry BOOLEAN NULL,
   label_error TEXT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()

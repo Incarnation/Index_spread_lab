@@ -106,11 +106,13 @@ class DecisionJob:
 
         if not pm.can_trade():
             skip_reason = f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}"
+            dte_list = settings.decision_dte_targets_list()
+            delta_list = settings.decision_delta_targets_list()
             async with SessionLocal() as session:
                 await self._insert_decision(
                     session=session, now_et=now_et, entry_slot=entry_slot,
-                    target_dte=settings.decision_dte_targets_list()[0],
-                    delta_target=settings.decision_delta_targets_list()[0],
+                    target_dte=dte_list[0] if dte_list else 0,
+                    delta_target=delta_list[0] if delta_list else 0.10,
                     decision="SKIP", reason=skip_reason,
                     decision_source="portfolio_managed",
                 )
@@ -125,7 +127,15 @@ class DecisionJob:
 
         sched_sides = ["call"] if settings.portfolio_calls_only else settings.decision_spread_sides_list()
         decision_dtes = settings.decision_dte_targets_list()
-        delta_targets = settings.decision_delta_targets_list()
+
+        # Mirror the rules-path gate: bail early on misconfigured targets
+        # instead of running an empty candidate loop and logging SKIP with
+        # ``target_dte=0``.
+        has_delta_targets = any(
+            settings.decision_delta_targets_for_side(s) for s in sched_sides
+        ) if sched_sides else bool(settings.decision_delta_targets_list())
+        if not decision_dtes or not has_delta_targets:
+            return self._build_run_result(now_et=now_et, skipped=True, reason="missing_targets")
 
         drop_signals = [s for s in signals if s != "rally"]
         event_side_raw = settings.event_side_preference.rstrip("s")
@@ -150,6 +160,7 @@ class DecisionJob:
 
             candidates: list[dict] = []
             for spread_side in all_sides:
+                side_delta_targets = settings.decision_delta_targets_for_side(spread_side)
                 for target_dte in decision_dtes:
                     snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
                     if snapshot is None:
@@ -157,7 +168,7 @@ class DecisionJob:
                     options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
                     if not options:
                         continue
-                    for delta_target in delta_targets:
+                    for delta_target in side_delta_targets:
                         candidate = self._build_candidate(
                             options=options, target_dte=snapshot["target_dte"],
                             delta_target=delta_target, spread_side=spread_side,
@@ -171,10 +182,11 @@ class DecisionJob:
                             candidates.append(candidate)
 
             if not candidates:
+                fallback_delta = settings.decision_delta_targets_list()
                 await self._insert_decision(
                     session=session, now_et=now_et, entry_slot=entry_slot,
-                    target_dte=decision_dtes[0],
-                    delta_target=delta_targets[0],
+                    target_dte=decision_dtes[0] if decision_dtes else 0,
+                    delta_target=fallback_delta[0] if fallback_delta else 0.10,
                     decision="SKIP", reason="no_candidates",
                     decision_source="portfolio_managed",
                 )
@@ -280,10 +292,11 @@ class DecisionJob:
                     placed += 1
 
             if not trades_created:
-                await self._insert_decision(
+                fallback_delta = settings.decision_delta_targets_list()
+                skip_decision_id = await self._insert_decision(
                     session=session, now_et=now_et, entry_slot=entry_slot,
-                    target_dte=decision_dtes[0],
-                    delta_target=delta_targets[0],
+                    target_dte=decision_dtes[0] if decision_dtes else 0,
+                    delta_target=fallback_delta[0] if fallback_delta else 0.10,
                     decision="SKIP", reason="no_trades_after_filters",
                     decision_source="portfolio_managed",
                     strategy_params_json={
@@ -291,6 +304,12 @@ class DecisionJob:
                         "event_signals": signals,
                     },
                 )
+                decisions_created.append({
+                    "decision_id": int(skip_decision_id),
+                    "decision": "SKIP",
+                    "reason": "no_trades_after_filters",
+                    "decision_source": "portfolio_managed",
+                })
 
             await session.commit()
 
@@ -340,10 +359,14 @@ class DecisionJob:
             return await self._run_portfolio_managed(now_et=now_et, force=force)
 
         decision_dtes = settings.decision_dte_targets_list()
-        delta_targets = settings.decision_delta_targets_list()
         spread_sides = settings.decision_spread_sides_list()
-        if not decision_dtes or not delta_targets:
+        has_delta_targets = any(
+            settings.decision_delta_targets_for_side(s) for s in spread_sides
+        ) if spread_sides else bool(settings.decision_delta_targets_list())
+        if not decision_dtes or not has_delta_targets:
             return self._build_run_result(now_et=now_et, skipped=True, reason="missing_targets")
+        # Representative delta list for SKIP decision log rows.
+        delta_targets = settings.decision_delta_targets_list() or [0.10]
         if not spread_sides:
             return self._build_run_result(now_et=now_et, skipped=True, reason="missing_spread_sides")
 
@@ -439,6 +462,7 @@ class DecisionJob:
 
             candidates: list[dict] = []
             for spread_side in eligible_spread_sides:
+                side_delta_targets = settings.decision_delta_targets_for_side(spread_side)
                 for target_dte in decision_dtes:
                     snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
                     if snapshot is None:
@@ -446,7 +470,7 @@ class DecisionJob:
                     options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
                     if not options:
                         continue
-                    for delta_target in delta_targets:
+                    for delta_target in side_delta_targets:
                         candidate = self._build_candidate(
                             options=options,
                             target_dte=snapshot["target_dte"],
@@ -890,6 +914,15 @@ class DecisionJob:
 
         actual_width = abs(short["strike"] - long["strike"])
 
+        width_deviation = abs(actual_width - width_points)
+        width_deviation_flag = width_deviation > 1.0
+        if width_deviation_flag:
+            logger.warning(
+                "width_deviation: requested={} actual={} deviation={:.1f} side={} short={} long={}",
+                width_points, actual_width, width_deviation, spread_side,
+                short["strike"], long["strike"],
+            )
+
         context_score, context_flags = self._context_score(context, spread_side, spot)
         diff = delta_diff(short)
         score = credit - diff + context_score
@@ -901,6 +934,7 @@ class DecisionJob:
             "spread_side": side_lower,
             "width_points": actual_width,
             "requested_width_points": width_points,
+            "width_deviation_flag": width_deviation_flag,
             "spot": spot,
             "credit": credit,
             "context": context or {},
@@ -1133,13 +1167,16 @@ class DecisionJob:
             hybrid_ranked.append(rules_entry)
         return hybrid_ranked
 
-    async def _select_candidate_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> dict[str, Any]:
+    async def _select_candidate_with_policy(self, *, session, now_et: datetime, candidates: list[dict]) -> dict[str, Any] | None:
         """Select a single best candidate (compatibility helper for tests).
 
         The production run path uses `_rank_candidates_with_policy` for top-N
         execution. This helper preserves legacy behavior by returning the first
-        ranked candidate.
+        ranked candidate.  Returns ``None`` when *candidates* is empty and no
+        ranked result can be produced.
         """
+        if not candidates:
+            return None
         ranked = await self._rank_candidates_with_policy(session=session, now_et=now_et, candidates=candidates)
         if not ranked:
             chosen_rules = sorted(candidates, key=lambda c: (-c["score"], c["delta_diff"]))[0]
@@ -1285,8 +1322,12 @@ class DecisionJob:
         max_profit = max(entry_credit, 0.0) * contracts * multiplier
         max_loss = max(width_points - entry_credit, 0.0) * contracts * multiplier
         take_profit_target = max_profit * settings.trade_pnl_take_profit_pct
+        sl_basis_value = (
+            max_loss if settings.trade_pnl_stop_loss_basis == "max_loss"
+            else max_profit
+        )
         stop_loss_target = (
-            max_profit * settings.trade_pnl_stop_loss_pct
+            sl_basis_value * settings.trade_pnl_stop_loss_pct
             if settings.trade_pnl_stop_loss_enabled
             else None
         )

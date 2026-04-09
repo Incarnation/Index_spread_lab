@@ -41,6 +41,8 @@ async def lifespan(app: FastAPI):
             "Set JWT_SECRET in environment to enable authentication."
         )
 
+    settings.validate_dte_alignment()
+
     ctx = build_scheduler()
     ctx.scheduler.start()
     ctx.attach_to_app_state(app)

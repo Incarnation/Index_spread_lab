@@ -361,7 +361,7 @@ class FeatureBuilderJob:
                 "spread_sides_enabled": settings.decision_spread_sides_list(),
                 "width_points": settings.decision_spread_width_points,
                 "contracts": settings.decision_contracts,
-                "delta_targets": settings.decision_delta_targets_list(),
+                "delta_targets": settings.decision_delta_targets_for_side(spread_side),
             },
         }
 
@@ -478,9 +478,11 @@ class FeatureBuilderJob:
                 return {"skipped": True, "reason": "market_closed", "now_et": now_et.isoformat()}
 
         target_dtes = settings.decision_dte_targets_list()
-        delta_targets = settings.decision_delta_targets_list()
         spread_sides = settings.decision_spread_sides_list()
-        if not target_dtes or not delta_targets:
+        has_delta_targets = any(
+            settings.decision_delta_targets_for_side(s) for s in spread_sides
+        ) if spread_sides else bool(settings.decision_delta_targets_list())
+        if not target_dtes or not has_delta_targets:
             return {"skipped": True, "reason": "missing_targets", "now_et": now_et.isoformat()}
         if not spread_sides:
             return {"skipped": True, "reason": "missing_spread_sides", "now_et": now_et.isoformat()}
@@ -573,7 +575,8 @@ class FeatureBuilderJob:
                     features_inserted += 1
 
                     candidates: list[dict] = []
-                    for delta_target in delta_targets:
+                    side_delta_targets = settings.decision_delta_targets_for_side(spread_side)
+                    for delta_target in side_delta_targets:
                         candidate = helper._build_candidate(
                             options=options,
                             target_dte=snapshot["target_dte"],

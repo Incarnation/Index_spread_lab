@@ -1,10 +1,9 @@
 """Comprehensive tests for TradePnlJob: mark-to-market, TP/SL, expiry, stale, no-legs."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -172,6 +171,7 @@ class TestRunOnce:
             mock_settings.trade_pnl_mark_max_age_minutes = 30
             mock_settings.trade_pnl_take_profit_pct = 0.50
             mock_settings.trade_pnl_stop_loss_enabled = True
+            mock_settings.trade_pnl_stop_loss_basis = "max_profit"
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1

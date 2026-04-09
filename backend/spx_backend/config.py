@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,7 +31,7 @@ class Settings(BaseSettings):
     snapshot_dte_targets: str = "3,5,7"
     snapshot_dte_mode: str = "range"  # "range" or "targets"
     snapshot_dte_min_days: int = 0
-    snapshot_dte_max_days: int = 10
+    snapshot_dte_max_days: int = 16
     snapshot_range_fallback_enabled: bool = False
     snapshot_range_fallback_count: int = 3
     snapshot_dte_tolerance_days: int = 1
@@ -80,8 +81,10 @@ class Settings(BaseSettings):
 
     decision_entry_times: str = "10:01,11:01,12:01"
     decision_dte_targets: str = "3,5,7,10"
-    decision_dte_tolerance_days: int = 0
+    decision_dte_tolerance_days: int = 1
     decision_delta_targets: str = "0.10,0.20"
+    decision_put_delta_targets: str = ""
+    decision_call_delta_targets: str = ""
     decision_spread_side: str = "put"
     decision_spread_sides: str = "put,call"
     decision_spread_width_points: float = 10.0
@@ -174,10 +177,13 @@ class Settings(BaseSettings):
     trade_pnl_mark_max_age_minutes: int = 30
     trade_pnl_take_profit_pct: float = 0.50
     trade_pnl_stop_loss_enabled: bool = True
-    # Multiplier applied to *max_profit* (not max_loss) to derive the dollar
-    # stop-loss threshold.  E.g. with default 2.0 and a $100 max-profit trade,
-    # the stop fires at PnL <= -$200.  Use trade_pnl_stop_loss_enabled=False
-    # to disable the stop-loss entirely.
+    # Basis for computing the dollar stop-loss threshold.
+    # "max_profit"  (default): SL = max_profit * stop_loss_pct
+    # "max_loss": SL = max_loss * stop_loss_pct (e.g. 0.80 × max_loss)
+    trade_pnl_stop_loss_basis: str = "max_profit"
+    # Multiplier applied to the chosen basis to derive the dollar stop-loss
+    # threshold.  E.g. with basis="max_profit", pct=2.0, and a $100
+    # max-profit trade the stop fires at PnL <= -$200.
     trade_pnl_stop_loss_pct: float = 2.00
     trade_pnl_contract_multiplier: int = 100
 
@@ -247,6 +253,16 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24  # 24h
     auth_register_enabled: bool = False  # only allowed (pre-created) users can log in
+
+    @field_validator("trade_pnl_stop_loss_basis")
+    @classmethod
+    def _check_stop_loss_basis(cls, v: str) -> str:
+        allowed = {"max_profit", "max_loss"}
+        if v not in allowed:
+            raise ValueError(
+                f"trade_pnl_stop_loss_basis must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
 
     def _parse_int_csv(self, value: str) -> list[int]:
         """Parse comma-separated integer values, ignoring malformed items."""
@@ -325,14 +341,116 @@ class Settings(BaseSettings):
         return out
 
     def decision_dte_targets_list(self) -> list[int]:
-        """Parse decision DTE targets from comma-separated env configuration."""
-        parts = [p.strip() for p in self.decision_dte_targets.split(",") if p.strip()]
-        return [int(p) for p in parts]
+        """Parse decision DTE targets from comma-separated env configuration.
+
+        Malformed tokens are silently skipped with a warning so that a
+        single typo does not crash the entire application at startup.
+        """
+        from loguru import logger as _logger
+
+        out: list[int] = []
+        for p in self.decision_dte_targets.split(","):
+            token = p.strip()
+            if not token:
+                continue
+            try:
+                out.append(int(token))
+            except ValueError:
+                _logger.warning("decision_dte_targets: skipping malformed token {!r}", token)
+        return out
 
     def decision_delta_targets_list(self) -> list[float]:
-        """Parse decision delta targets from comma-separated env configuration."""
-        parts = [p.strip() for p in self.decision_delta_targets.split(",") if p.strip()]
-        return [float(p) for p in parts]
+        """Parse decision delta targets from comma-separated env configuration.
+
+        Malformed tokens are silently skipped with a warning.
+        """
+        from loguru import logger as _logger
+
+        out: list[float] = []
+        for p in self.decision_delta_targets.split(","):
+            token = p.strip()
+            if not token:
+                continue
+            try:
+                out.append(float(token))
+            except ValueError:
+                _logger.warning("decision_delta_targets: skipping malformed token {!r}", token)
+        return out
+
+    @staticmethod
+    def _parse_float_csv(raw: str, field_name: str) -> list[float]:
+        """Parse a comma-separated string of floats, skipping bad tokens."""
+        from loguru import logger as _logger
+
+        out: list[float] = []
+        for p in raw.split(","):
+            token = p.strip()
+            if not token:
+                continue
+            try:
+                out.append(float(token))
+            except ValueError:
+                _logger.warning("{}: skipping malformed token {!r}", field_name, token)
+        return out
+
+    def decision_delta_targets_for_side(self, side: str) -> list[float]:
+        """Return delta targets for the given spread side.
+
+        Uses side-specific overrides (``decision_put_delta_targets`` /
+        ``decision_call_delta_targets``) when set, otherwise falls back
+        to the shared ``decision_delta_targets``.
+        """
+        side_lower = side.strip().lower()
+        if side_lower == "put" and self.decision_put_delta_targets.strip():
+            return self._parse_float_csv(self.decision_put_delta_targets, "decision_put_delta_targets")
+        if side_lower == "call" and self.decision_call_delta_targets.strip():
+            return self._parse_float_csv(self.decision_call_delta_targets, "decision_call_delta_targets")
+        return self.decision_delta_targets_list()
+
+    def validate_dte_alignment(self) -> None:
+        """Warn at startup if decision DTE targets exceed the snapshot window.
+
+        In range mode, ``snapshot_dte_max_days`` is a **trading-DTE** ceiling
+        (compared against ``trading_dte_lookup`` output in ``snapshot_job``).
+        So the check is: ``decision_dte > snapshot_dte_max_days + tolerance``.
+
+        In targets mode, the check verifies each decision DTE appears in the
+        explicit ``snapshot_dte_targets`` list (within tolerance).
+        """
+        from loguru import logger as _logger
+
+        tolerance = self.decision_dte_tolerance_days
+        decision_dtes = self.decision_dte_targets_list()
+
+        if self.snapshot_dte_mode == "range":
+            max_trading_dte = self.snapshot_dte_max_days
+            for dte in decision_dtes:
+                if dte > max_trading_dte + tolerance:
+                    _logger.warning(
+                        "dte_alignment: decision DTE {} exceeds "
+                        "SNAPSHOT_DTE_MAX_DAYS={} + tolerance={}. "
+                        "This target may silently produce no candidates.",
+                        dte, max_trading_dte, tolerance,
+                    )
+        elif self.snapshot_dte_mode == "targets":
+            snap_targets = set(self.dte_targets_list())
+            for dte in decision_dtes:
+                covered = any(
+                    abs(dte - st) <= tolerance for st in snap_targets
+                )
+                if not covered:
+                    _logger.warning(
+                        "dte_alignment: decision DTE {} not covered by "
+                        "SNAPSHOT_DTE_TARGETS={} (tolerance={}). "
+                        "This target may silently produce no candidates.",
+                        dte, sorted(snap_targets), tolerance,
+                    )
+        else:
+            _logger.warning(
+                "dte_alignment: unknown snapshot_dte_mode={!r}, "
+                "skipping DTE alignment check.",
+                self.snapshot_dte_mode,
+            )
 
     def decision_spread_sides_list(self) -> list[str]:
         """Parse allowed spread sides with fallback to single-side config."""
