@@ -4,7 +4,7 @@ IndexSpreadLab is a research and paper-execution platform for index options with
 
 The current stack is:
 - Backend: FastAPI + APScheduler + PostgreSQL
-- Frontend: React (Vite) + Mantine + Recharts
+- Frontend: React (Vite) + Radix UI + Tailwind CSS + Recharts
 - Data source: Tradier REST APIs (expirations, chain, quotes, market clock)
 
 This repository is designed so live capture, analytics (GEX), and decision logs share one consistent schema that can later feed backtesting and ML.
@@ -140,9 +140,11 @@ Why 3DTE is 2026-02-18:
   - `requirements-dev.txt`: test dependencies.
   - `tests/`: backend automated tests.
 - `frontend/`
-  - `src/DashboardApp.tsx`: top-level container.
-  - `src/components/`: UI panels, widgets, and `ErrorBoundary`.
-  - `src/hooks/`: data and action hooks.
+  - `src/main.tsx`: entry point with routing and auth provider.
+  - `src/app/`: layout shell (`AppShell`, `Sidebar`, `Navbar`).
+  - `src/pages/`: per-route page components.
+  - `src/components/`: shared UI (`ProtectedRoute`, `ErrorBoundary`, `DataTable`, `StatCard`, Radix primitives).
+  - `src/hooks/`: `useAutoRefresh` and data hooks.
   - `src/api.ts`: typed API client with `safeJson` response parsing.
   - `src/contexts/AuthContext.tsx`: JWT auth state with 401 event handling.
 - `.dockerignore`: slimmed Docker build context (excludes frontend, docs, data files).
@@ -503,7 +505,7 @@ Unexpected DTE mapping:
 
 - Split CI predeploy checks into faster parallel jobs while preserving gate quality.
 - Expand backtest orchestration and historical replay tooling.
-- Add frontend automated tests (Vitest + React Testing Library).
+- Expand frontend test coverage (more component and integration tests).
 - Add richer decision skip taxonomy views in dashboard.
 - Live broker order/fill automation beyond paper trading.
 - Periodic data retention automation (scheduled purge of old chain/GEX data).

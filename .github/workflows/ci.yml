@@ -34,7 +34,51 @@ jobs:
       - name: Run tests
         run: python -m pytest -q --tb=short
 
-  frontend-typecheck:
+  backend-integration-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: spx_test
+          POSTGRES_PASSWORD: spx_test_pw
+          POSTGRES_DB: index_spread_lab_test
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U spx_test -d index_spread_lab_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: "postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test"
+      DATABASE_URL_TEST: "postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test"
+      TRADIER_ACCESS_TOKEN: "ci-dummy-token"
+      TRADIER_ACCOUNT_ID: "CI000000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run integration tests
+        run: python -m pytest -q --tb=short -m integration
+
+  frontend:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -54,6 +98,9 @@ jobs:
 
       - name: TypeScript typecheck
         run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
 
       - name: Build
         run: npm run build

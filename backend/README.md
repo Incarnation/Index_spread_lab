@@ -56,7 +56,9 @@ Entrypoint:
 ## 3) Core Modules
 
 - `spx_backend/web/app.py`
-  - FastAPI app and scheduler wiring.
+  - FastAPI app, lifespan, and router mounting.
+- `spx_backend/scheduler_builder.py`
+  - APScheduler construction, job registration, and startup warmup.
 - `spx_backend/web/routers/`
   - `public.py`: public dashboard/data endpoints.
   - `admin.py`: admin run/delete/preflight endpoints.

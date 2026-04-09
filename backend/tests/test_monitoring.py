@@ -3,7 +3,7 @@
 Covers:
 - Deep ``/health`` endpoint (DB, scheduler, freshness)
 - ``/api/pipeline-status`` endpoint (authenticated, sanitized freshness)
-- ``_scheduler_event_listener`` and ``_send_job_failure_email`` alert logic
+- ``build_scheduler_event_listener`` and ``_send_job_failure_email`` alert logic
 """
 from __future__ import annotations
 
@@ -257,28 +257,28 @@ class TestJobFailureAlerts:
     """Test the scheduler event listener email alerts."""
 
     def setup_method(self):
-        from spx_backend.web import app as app_module
-        app_module._job_failure_last_alert.clear()
+        from spx_backend import scheduler_builder as sb_module
+        sb_module._job_failure_last_alert.clear()
 
     def test_listener_calls_email_on_failure(self, monkeypatch):
         """Exception events should log error and call _send_job_failure_email with FAILURE."""
-        from spx_backend.web import app as app_module
-        from spx_backend.web.app import _scheduler_event_listener
+        from spx_backend import scheduler_builder as sb_module
+        from spx_backend.scheduler_builder import build_scheduler_event_listener
 
         calls: list[dict] = []
-        original_send = app_module._send_job_failure_email
 
-        def _spy(*, job_id, kind, detail):
+        def _spy(*, job_id, kind, detail, cfg=None):
             calls.append({"job_id": job_id, "kind": kind, "detail": detail})
 
-        monkeypatch.setattr(app_module, "_send_job_failure_email", _spy)
+        monkeypatch.setattr(sb_module, "_send_job_failure_email", _spy)
 
+        listener = build_scheduler_event_listener()
         event = SimpleNamespace(
             job_id="test_job",
             exception=RuntimeError("boom"),
             traceback="Traceback...",
         )
-        _scheduler_event_listener(event)
+        listener(event)
 
         assert len(calls) == 1
         assert calls[0]["job_id"] == "test_job"
@@ -287,18 +287,19 @@ class TestJobFailureAlerts:
 
     def test_listener_calls_email_on_misfire(self, monkeypatch):
         """Misfire events (no exception) should log warning and call _send_job_failure_email with MISFIRE."""
-        from spx_backend.web import app as app_module
-        from spx_backend.web.app import _scheduler_event_listener
+        from spx_backend import scheduler_builder as sb_module
+        from spx_backend.scheduler_builder import build_scheduler_event_listener
 
         calls: list[dict] = []
 
-        def _spy(*, job_id, kind, detail):
+        def _spy(*, job_id, kind, detail, cfg=None):
             calls.append({"job_id": job_id, "kind": kind, "detail": detail})
 
-        monkeypatch.setattr(app_module, "_send_job_failure_email", _spy)
+        monkeypatch.setattr(sb_module, "_send_job_failure_email", _spy)
 
+        listener = build_scheduler_event_listener()
         event = SimpleNamespace(job_id="test_job", exception=None, traceback=None)
-        _scheduler_event_listener(event)
+        listener(event)
 
         assert len(calls) == 1
         assert calls[0]["job_id"] == "test_job"
@@ -306,7 +307,7 @@ class TestJobFailureAlerts:
 
     def test_email_sent_on_failure_when_configured(self, monkeypatch):
         """When SendGrid is configured, an email should be sent."""
-        from spx_backend.web.app import _send_job_failure_email
+        from spx_backend.scheduler_builder import _send_job_failure_email
 
         monkeypatch.setattr(settings, "job_failure_alert_enabled", True)
         monkeypatch.setattr(settings, "sendgrid_api_key", "SG.test")
@@ -330,7 +331,7 @@ class TestJobFailureAlerts:
 
     def test_cooldown_prevents_spam(self, monkeypatch):
         """Second alert for the same job within cooldown should be suppressed."""
-        from spx_backend.web.app import _send_job_failure_email, _job_failure_last_alert
+        from spx_backend.scheduler_builder import _send_job_failure_email, _job_failure_last_alert
 
         monkeypatch.setattr(settings, "job_failure_alert_enabled", True)
         monkeypatch.setattr(settings, "sendgrid_api_key", "SG.test")
@@ -355,7 +356,7 @@ class TestJobFailureAlerts:
 
     def test_disabled_skips_alert(self, monkeypatch):
         """When job_failure_alert_enabled is False, no email attempt."""
-        from spx_backend.web.app import _send_job_failure_email
+        from spx_backend.scheduler_builder import _send_job_failure_email
 
         monkeypatch.setattr(settings, "job_failure_alert_enabled", False)
 

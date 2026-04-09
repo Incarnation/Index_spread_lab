@@ -21,6 +21,11 @@ ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 
+def _today_et() -> date:
+    """Return today's date in ET, matching the timezone used by TradePnlJob.run_once."""
+    return datetime.now(tz=ET).date()
+
+
 def _make_trade(
     trade_id=1,
     entry_credit=2.0,
@@ -200,7 +205,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=1, entry_credit=2.0, max_profit=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         # exit_cost = 2.1 - 0.5 = 1.6, pnl = (2.0 - 1.6)*100 = 40 < TP(100)
         fresh_mark = _make_mark(
@@ -231,7 +236,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=2, entry_credit=2.0, max_profit=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         fresh_mark = _make_mark(
             short_bid=0.01, short_ask=0.03, long_bid=0.01, long_ask=0.03,
@@ -261,7 +266,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=3, entry_credit=2.0, max_profit=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         deep_loss_mark = _make_mark(
             short_bid=5.0, short_ask=5.2, long_bid=0.1, long_ask=0.3,
@@ -292,7 +297,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=30, entry_credit=2.0, max_profit=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         deep_loss_mark = _make_mark(
             short_bid=5.0, short_ask=5.2, long_bid=0.1, long_ask=0.3,
@@ -325,7 +330,7 @@ class TestRunOnce:
         trade = _make_trade(
             trade_id=31, entry_credit=2.0, max_profit=200.0,
             stop_loss_target=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         deep_loss_mark = _make_mark(
             short_bid=5.0, short_ask=5.2, long_bid=0.1, long_ask=0.3,
@@ -355,7 +360,7 @@ class TestRunOnce:
         """Trade past expiration date closes with EXPIRED, even without legs."""
         expired_trade = _make_trade(
             trade_id=4, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=2),
+            expiration=_today_et() - timedelta(days=2),
             max_loss=300.0,
         )
         session = self._make_session_with_trades([expired_trade])
@@ -378,7 +383,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         expired_trade = _make_trade(
             trade_id=5, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=1),
+            expiration=_today_et() - timedelta(days=1),
             max_loss=300.0,
         )
         old_mark = _make_mark(
@@ -412,7 +417,7 @@ class TestRunOnce:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=6, entry_credit=2.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         stale_mark = _make_mark(
             short_bid=1.0, short_ask=1.2, long_bid=0.3, long_ask=0.5,
@@ -440,7 +445,7 @@ class TestRunOnce:
         """Trades with missing legs are skipped."""
         trade = _make_trade(
             trade_id=7, entry_credit=2.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         session = self._make_session_with_trades([trade])
 
@@ -459,7 +464,7 @@ class TestRunOnce:
         """Trades where the mark query returns None are skipped."""
         trade = _make_trade(
             trade_id=8, entry_credit=2.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         session = self._make_session_with_trades([trade])
         legs = {8: (
@@ -537,7 +542,7 @@ class TestExpirationOutsideRTH:
         """Expired trades should close even when market is closed (weekend)."""
         expired_trade = _make_trade(
             trade_id=50, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=2),
+            expiration=_today_et() - timedelta(days=2),
             max_loss=300.0,
         )
         session = FakeSession()
@@ -568,7 +573,7 @@ class TestExpirationOutsideRTH:
         """Non-expired trades should NOT be processed when market is closed."""
         active_trade = _make_trade(
             trade_id=51, entry_credit=2.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         session = FakeSession()
         open_result = MagicMock()
@@ -603,12 +608,12 @@ class TestExpirationOutsideRTH:
         """Outside RTH: expired trades close, active trades deferred."""
         expired_trade = _make_trade(
             trade_id=52, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=1),
+            expiration=_today_et() - timedelta(days=1),
             max_loss=300.0,
         )
         active_trade = _make_trade(
             trade_id=53, entry_credit=2.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         session = FakeSession()
         open_result = MagicMock()
@@ -678,7 +683,7 @@ class TestPortfolioClosure:
         now_utc = datetime.now(tz=UTC)
         trade = _make_trade(
             trade_id=60, entry_credit=2.0, max_profit=200.0,
-            expiration=date.today() + timedelta(days=5),
+            expiration=_today_et() + timedelta(days=5),
         )
         fresh_mark = _make_mark(
             short_bid=0.01, short_ask=0.03, long_bid=0.01, long_ask=0.03,
@@ -715,7 +720,7 @@ class TestPortfolioClosure:
         """Expired trade close should call PortfolioManager.record_closure."""
         expired_trade = _make_trade(
             trade_id=61, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=1),
+            expiration=_today_et() - timedelta(days=1),
             max_loss=300.0,
         )
         session = self._make_session_with_trades([expired_trade])
@@ -744,7 +749,7 @@ class TestPortfolioClosure:
         self.mock_settings.portfolio_enabled = False
         expired_trade = _make_trade(
             trade_id=62, entry_credit=2.0,
-            expiration=date.today() - timedelta(days=1),
+            expiration=_today_et() - timedelta(days=1),
             max_loss=300.0,
         )
         session = self._make_session_with_trades([expired_trade])
