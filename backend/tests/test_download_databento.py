@@ -13,8 +13,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from download_databento import (  # noqa: E402
     get_existing_dates,
     get_trading_days,
+    require_databento_api_key,
     verify_dbn,
 )
+
+
+# ---------------------------------------------------------------------------
+# require_databento_api_key
+# ---------------------------------------------------------------------------
+
+
+class TestRequireDatabentoApiKey:
+    def test_exits_when_unset(self, monkeypatch):
+        """Missing DATABENTO_API_KEY should exit with a clear message."""
+        monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            require_databento_api_key()
+        assert "DATABENTO_API_KEY" in str(exc.value)
+
+    def test_exits_when_empty(self, monkeypatch):
+        """Whitespace-only env value should be treated as missing."""
+        monkeypatch.setenv("DATABENTO_API_KEY", "   ")
+        with pytest.raises(SystemExit):
+            require_databento_api_key()
+
+    def test_returns_stripped_key(self, monkeypatch):
+        """Non-empty key is returned with surrounding whitespace stripped."""
+        monkeypatch.setenv("DATABENTO_API_KEY", "  db-test-key  ")
+        assert require_databento_api_key() == "db-test-key"
 
 
 # ---------------------------------------------------------------------------

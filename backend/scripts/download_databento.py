@@ -30,9 +30,31 @@ from pathlib import Path
 
 import pandas as pd
 
-DATABENTO_API_KEY = os.getenv(
-    "DATABENTO_API_KEY", "db-7wQqjpM5bNu9crhPVL3GctAKanPPd"
-)
+
+def require_databento_api_key() -> str:
+    """Return the Databento API key from the environment.
+
+    Keys must never be hardcoded or committed. Set ``DATABENTO_API_KEY`` in
+    the environment or in a local ``.env`` file (gitignored).
+
+    Returns
+    -------
+    str
+        Non-empty API key string.
+
+    Raises
+    ------
+    SystemExit
+        If the variable is missing or empty.
+    """
+    key = (os.getenv("DATABENTO_API_KEY") or "").strip()
+    if not key:
+        raise SystemExit(
+            "DATABENTO_API_KEY is not set. Export it in your shell or add it to "
+            ".env (see .env.example). Never commit API keys to the repository."
+        )
+    return key
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data" / "databento"
@@ -642,7 +664,7 @@ def main() -> None:
 
     import databento as db  # lazy: not needed for verify/verify-dbn paths
 
-    client = db.Historical(DATABENTO_API_KEY)
+    client = db.Historical(require_databento_api_key())
     print(f"Databento client initialized. Output dir: {DATA_DIR}")
 
     if args.phase == "sample":
