@@ -58,23 +58,46 @@ export function ModelMonitorPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const ac = new AbortController();
     setError(null);
     Promise.all([
-      fetchModelOps().then(setOps),
-      fetchModelAccuracy().then(setAccuracy),
-      fetchModelCalibration().then(setCalibration),
-      fetchModelPnlAttribution().then(setAttribution),
-      fetchPortfolioConfig()
-        .then((cfg) => setPortfolioEnabled(cfg.portfolio.enabled))
-        .catch(() => {}),
-    ]).catch((e) => setError(e.message ?? "Failed to load model data"));
+      fetchModelOps(undefined, ac.signal).then((o) => {
+        if (!ac.signal.aborted) setOps(o);
+      }),
+      fetchModelAccuracy(undefined, "week", ac.signal).then((a) => {
+        if (!ac.signal.aborted) setAccuracy(a);
+      }),
+      fetchModelCalibration(undefined, 10, ac.signal).then((c) => {
+        if (!ac.signal.aborted) setCalibration(c);
+      }),
+      fetchModelPnlAttribution(undefined, ac.signal).then((p) => {
+        if (!ac.signal.aborted) setAttribution(p);
+      }),
+      fetchPortfolioConfig(ac.signal)
+        .then((cfg) => {
+          if (!ac.signal.aborted) setPortfolioEnabled(cfg.portfolio.enabled);
+        })
+        .catch(() => {
+          if (!ac.signal.aborted) {
+          }
+        }),
+    ]).catch((e) => {
+      if (!ac.signal.aborted) setError(e.message ?? "Failed to load model data");
+    });
+    return () => ac.abort();
   }, [tick]);
 
   useEffect(() => {
+    const ac = new AbortController();
     const dec = predFilter === "all" ? undefined : predFilter;
-    fetchModelPredictions(50, predPage * 50, undefined, dec)
-      .then(setPredictions)
-      .catch((e) => setError(e.message ?? "Failed to load predictions"));
+    fetchModelPredictions(50, predPage * 50, undefined, dec, undefined, undefined, ac.signal)
+      .then((p) => {
+        if (!ac.signal.aborted) setPredictions(p);
+      })
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load predictions");
+      });
+    return () => ac.abort();
   }, [predPage, predFilter, tick]);
 
   const active = ops?.active_model_version;

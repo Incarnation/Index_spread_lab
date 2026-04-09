@@ -6,7 +6,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as authStorage from "@/auth";
-import { API_BASE, UNAUTHORIZED_EVENT } from "@/api";
+import { apiUrl, UNAUTHORIZED_EVENT } from "@/api";
 
 export type AuthUser = { id: number; username: string; is_admin: boolean };
 
@@ -23,8 +23,6 @@ type AuthContextValue = AuthState & {
   logout: () => void;
   clearError: () => void;
 };
-
-const apiUrl = (path: string) => `${(API_BASE || "").replace(/\/+$/, "")}${path}`;
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
 

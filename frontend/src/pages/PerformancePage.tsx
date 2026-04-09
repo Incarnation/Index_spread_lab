@@ -33,11 +33,19 @@ export function PerformancePage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
-    fetchPerformanceAnalytics(lookback, mode)
-      .then(setData)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    fetchPerformanceAnalytics(lookback, mode, ac.signal)
+      .then((d) => {
+        if (!ac.signal.aborted) setData(d);
+      })
+      .catch(() => {
+        if (ac.signal.aborted) return;
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
   }, [lookback, mode]);
 
   const s = data?.summary;

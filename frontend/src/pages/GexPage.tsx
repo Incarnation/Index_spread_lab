@@ -37,23 +37,50 @@ export function GexPage() {
   const [curve, setCurve] = useState<GexCurvePoint[]>([]);
 
   useEffect(() => {
-    fetchGexSnapshots(10, underlying).then((snaps) => {
-      setSnapshots(snaps);
-      if (snaps.length > 0 && (!selectedSnap || selectedSnap.underlying !== underlying)) {
-        setSelectedSnap(snaps[0]);
-      }
-    }).catch(() => {});
+    const ac = new AbortController();
+    fetchGexSnapshots(10, underlying, undefined, ac.signal)
+      .then((snaps) => {
+        if (!ac.signal.aborted) {
+          setSnapshots(snaps);
+          if (snaps.length > 0 && (!selectedSnap || selectedSnap.underlying !== underlying)) {
+            setSelectedSnap(snaps[0]);
+          }
+        }
+      })
+      .catch(() => {
+        if (!ac.signal.aborted) {
+        }
+      });
+    return () => ac.abort();
   }, [underlying, tick]);
 
   useEffect(() => {
     if (!selectedSnap) return;
-    fetchGexDtes(selectedSnap.snapshot_id).then(setDtes).catch(() => {});
+    const ac = new AbortController();
     setSelectedDte(undefined);
+    fetchGexDtes(selectedSnap.snapshot_id, ac.signal)
+      .then((d) => {
+        if (!ac.signal.aborted) setDtes(d);
+      })
+      .catch(() => {
+        if (!ac.signal.aborted) {
+        }
+      });
+    return () => ac.abort();
   }, [selectedSnap]);
 
   useEffect(() => {
     if (!selectedSnap) return;
-    fetchGexCurve(selectedSnap.snapshot_id, selectedDte).then(setCurve).catch(() => {});
+    const ac = new AbortController();
+    fetchGexCurve(selectedSnap.snapshot_id, selectedDte, undefined, ac.signal)
+      .then((c) => {
+        if (!ac.signal.aborted) setCurve(c);
+      })
+      .catch(() => {
+        if (!ac.signal.aborted) {
+        }
+      });
+    return () => ac.abort();
   }, [selectedSnap, selectedDte]);
 
   return (

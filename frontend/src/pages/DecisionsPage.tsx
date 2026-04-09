@@ -30,11 +30,19 @@ export function DecisionsPage() {
   const [filter, setFilter] = useState<"all" | "TRADE" | "SKIP">("all");
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
-    fetchTradeDecisions(200)
-      .then(setDecisions)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    fetchTradeDecisions(200, ac.signal)
+      .then((data) => {
+        if (!ac.signal.aborted) setDecisions(data);
+      })
+      .catch(() => {
+        if (ac.signal.aborted) return;
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
   }, [tick]);
 
   const filtered = filter === "all" ? decisions : decisions.filter((d) => d.decision === filter);

@@ -50,18 +50,50 @@ export function OverviewPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
     setError(null);
     Promise.all([
-      fetchTrades(100).then(setTrades),
-      fetchPerformanceAnalytics(90, "realized").then(setPerf),
-      fetchPortfolioStatus().then(setPortfolio).catch(() => {}),
-      fetchPortfolioHistory(90).then(setEquityHistory).catch(() => {}),
+      fetchTrades(100, undefined, ac.signal).then((data) => {
+        if (!ac.signal.aborted) setTrades(data);
+      }),
+      fetchPerformanceAnalytics(90, "realized", ac.signal).then((data) => {
+        if (!ac.signal.aborted) setPerf(data);
+      }),
+      fetchPortfolioStatus(ac.signal)
+        .then((data) => {
+          if (!ac.signal.aborted) setPortfolio(data);
+        })
+        .catch(() => {
+          if (!ac.signal.aborted) {
+          }
+        }),
+      fetchPortfolioHistory(90, ac.signal)
+        .then((data) => {
+          if (!ac.signal.aborted) setEquityHistory(data);
+        })
+        .catch(() => {
+          if (!ac.signal.aborted) {
+          }
+        }),
     ])
-      .catch((e) => setError(e.message ?? "Failed to load data"))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load data");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
 
-    fetchPipelineStatus().then(setPipelineStatus).catch(() => {});
+    fetchPipelineStatus(ac.signal)
+      .then((data) => {
+        if (!ac.signal.aborted) setPipelineStatus(data);
+      })
+      .catch(() => {
+        if (!ac.signal.aborted) {
+        }
+      });
+
+    return () => ac.abort();
   }, [tick]);
 
   const openTrades = trades.filter((t) => t.status === "OPEN");

@@ -53,16 +53,30 @@ export function PortfolioPage() {
   const [configOpen, setConfigOpen] = useState(false);
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
     setError(null);
     Promise.all([
-      fetchPortfolioStatus().then(setStatus),
-      fetchPortfolioHistory(90).then(setHistory),
-      fetchPortfolioTrades(200).then(setTrades),
-      fetchPortfolioConfig().then(setConfig),
+      fetchPortfolioStatus(ac.signal).then((data) => {
+        if (!ac.signal.aborted) setStatus(data);
+      }),
+      fetchPortfolioHistory(90, ac.signal).then((data) => {
+        if (!ac.signal.aborted) setHistory(data);
+      }),
+      fetchPortfolioTrades(200, undefined, ac.signal).then((data) => {
+        if (!ac.signal.aborted) setTrades(data);
+      }),
+      fetchPortfolioConfig(ac.signal).then((data) => {
+        if (!ac.signal.aborted) setConfig(data);
+      }),
     ])
-      .catch((e) => setError(e.message ?? "Failed to load portfolio data"))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load portfolio data");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
   }, [tick]);
 
   const filteredTrades =

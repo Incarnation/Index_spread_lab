@@ -47,7 +47,15 @@ export function AdminPage() {
   const [result, setResult] = useState<{ job: string; data: unknown } | null>(null);
 
   useEffect(() => {
-    fetchAdminPreflight().then(setPreflight).catch(() => {});
+    const ac = new AbortController();
+    fetchAdminPreflight(ac.signal)
+      .then((data) => {
+        if (!ac.signal.aborted) setPreflight(data);
+      })
+      .catch(() => {
+        if (ac.signal.aborted) return;
+      });
+    return () => ac.abort();
   }, [tick]);
 
   const runJob = useCallback(async (label: string, fn: () => Promise<unknown>) => {

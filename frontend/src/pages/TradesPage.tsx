@@ -19,12 +19,20 @@ export function TradesPage() {
   const [sourceFilter, setSourceFilter] = useState<"all" | "scheduled" | "event">("all");
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
     setError(null);
-    fetchTrades(500)
-      .then(setTrades)
-      .catch((e) => setError(e.message ?? "Failed to load trades"))
-      .finally(() => setLoading(false));
+    fetchTrades(500, undefined, ac.signal)
+      .then((data) => {
+        if (!ac.signal.aborted) setTrades(data);
+      })
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load trades");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
   }, [tick]);
 
   const filteredBySource =

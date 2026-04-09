@@ -35,6 +35,12 @@ async def lifespan(app: FastAPI):
     else:
         await init_db()
 
+    if not settings.jwt_secret:
+        logger.warning(
+            "startup: JWT_SECRET is empty; auth endpoints will return 503. "
+            "Set JWT_SECRET in environment to enable authentication."
+        )
+
     ctx = build_scheduler()
     ctx.scheduler.start()
     ctx.attach_to_app_state(app)

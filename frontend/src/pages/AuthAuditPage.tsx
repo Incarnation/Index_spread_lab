@@ -38,25 +38,29 @@ export function AuthAuditPage() {
   const [page, setPage] = useState(0);
   const [detail, setDetail] = useState<AuthAuditEvent | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(null);
     try {
-      setData(await fetchAuthAudit(PAGE_SIZE, page * PAGE_SIZE, null, null));
+      const res = await fetchAuthAudit(PAGE_SIZE, page * PAGE_SIZE, null, null, signal);
+      if (!signal?.aborted) setData(res);
     } catch (e) {
+      if (signal?.aborted) return;
       setError(e instanceof Error ? e.message : "Failed to load audit log");
       if (e instanceof Error && (e.message.includes("403") || e.message.includes("Forbidden"))) {
         navigate("/", { replace: true });
       }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
   }, [page, navigate]);
 
   useEffect(() => {
     if (!user) return;
     if (!user.is_admin) { navigate("/", { replace: true }); return; }
-    load();
+    const ac = new AbortController();
+    load(ac.signal);
+    return () => ac.abort();
   }, [user, load, navigate]);
 
   if (!user?.is_admin) return null;

@@ -14,7 +14,7 @@ export const UNAUTHORIZED_EVENT = "app:unauthorized";
  * This keeps local/dev and deployed environments aligned without changing
  * call sites throughout the dashboard code.
  */
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
 }
 
@@ -281,7 +281,7 @@ export type GexCurvePoint = {
  * When `underlying` is provided, the backend returns only that symbol's
  * snapshots so the UI can switch between SPX/SPY/VIX cleanly.
  */
-export async function fetchGexSnapshots(limit = 20, underlying?: string, source?: string): Promise<GexSnapshot[]> {
+export async function fetchGexSnapshots(limit = 20, underlying?: string, source?: string, signal?: AbortSignal): Promise<GexSnapshot[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (underlying && underlying.trim()) {
     params.set("underlying", underlying.trim().toUpperCase());
@@ -289,7 +289,7 @@ export async function fetchGexSnapshots(limit = 20, underlying?: string, source?
   if (source && source.trim()) {
     params.set("source", source.trim().toUpperCase());
   }
-  const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/snapshots?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: GexSnapshot[] }>(r);
   return data.items;
@@ -298,8 +298,8 @@ export async function fetchGexSnapshots(limit = 20, underlying?: string, source?
 /**
  * Fetch available DTE filters for the selected GEX batch.
  */
-export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`));
+export async function fetchGexDtes(snapshotId: number, signal?: AbortSignal): Promise<number[]> {
+  const r = await fetchWithAuth(apiUrl(`/api/gex/dtes?snapshot_id=${encodeURIComponent(snapshotId)}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ dte_days: number[] }>(r);
   return data.dte_days;
@@ -313,11 +313,11 @@ export async function fetchGexDtes(snapshotId: number): Promise<number[]> {
  * - one DTE filter, or
  * - a custom expiration set.
  */
-export async function fetchGexCurve(snapshotId: number, dteDays?: number, expirations?: string[]): Promise<GexCurvePoint[]> {
+export async function fetchGexCurve(snapshotId: number, dteDays?: number, expirations?: string[], signal?: AbortSignal): Promise<GexCurvePoint[]> {
   const params = new URLSearchParams({ snapshot_id: String(snapshotId) });
   if (typeof dteDays === "number") params.set("dte_days", String(dteDays));
   if (expirations && expirations.length > 0) params.set("expirations_csv", expirations.join(","));
-  const r = await fetchWithAuth(apiUrl(`/api/gex/curve?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/gex/curve?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ points: GexCurvePoint[] }>(r);
   return data.points;
@@ -342,8 +342,8 @@ export type TradeDecision = {
 /**
  * Fetch recent trade decisions for the decision table.
  */
-export async function fetchTradeDecisions(limit = 50): Promise<TradeDecision[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`));
+export async function fetchTradeDecisions(limit = 50, signal?: AbortSignal): Promise<TradeDecision[]> {
+  const r = await fetchWithAuth(apiUrl(`/api/trade-decisions?limit=${encodeURIComponent(limit)}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: TradeDecision[] }>(r);
   return data.items;
@@ -394,10 +394,10 @@ export type TradeRow = {
 /**
  * Fetch trades with optional status filter for the live PnL table.
  */
-export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROLLED"): Promise<TradeRow[]> {
+export async function fetchTrades(limit = 100, status?: "OPEN" | "CLOSED" | "ROLLED", signal?: AbortSignal): Promise<TradeRow[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (status) params.set("status", status);
-  const r = await fetchWithAuth(apiUrl(`/api/trades?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/trades?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: TradeRow[] }>(r);
   return data.items;
@@ -476,13 +476,14 @@ export type PerformanceAnalyticsResponse = {
  */
 export async function fetchPerformanceAnalytics(
   lookbackDays = 90,
-  mode: PerformanceAnalyticsMode = "combined"
+  mode: PerformanceAnalyticsMode = "combined",
+  signal?: AbortSignal,
 ): Promise<PerformanceAnalyticsResponse> {
   const params = new URLSearchParams({
     lookback_days: String(lookbackDays),
     mode,
   });
-  const r = await fetchWithAuth(apiUrl(`/api/performance-analytics?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/performance-analytics?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<PerformanceAnalyticsResponse>(r);
 }
@@ -540,11 +541,11 @@ export type ModelOpsResponse = {
 /**
  * Fetch model-ops status for monitoring training/gates/prediction activity.
  */
-export async function fetchModelOps(modelName?: string): Promise<ModelOpsResponse> {
+export async function fetchModelOps(modelName?: string, signal?: AbortSignal): Promise<ModelOpsResponse> {
   const params = new URLSearchParams();
   if (modelName && modelName.trim()) params.set("model_name", modelName.trim());
   const query = params.toString();
-  const r = await fetchWithAuth(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<ModelOpsResponse>(r);
 }
@@ -628,8 +629,8 @@ export type AdminPreflightResponse = {
 /**
  * Fetch admin preflight diagnostics for pipeline freshness and warning state.
  */
-export async function fetchAdminPreflight(): Promise<AdminPreflightResponse> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`));
+export async function fetchAdminPreflight(signal?: AbortSignal): Promise<AdminPreflightResponse> {
+  const r = await fetchWithAuth(apiUrl(`/api/admin/preflight`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<AdminPreflightResponse>(r);
 }
@@ -650,8 +651,8 @@ export type PipelineStatusResponse = {
 /**
  * Fetch pipeline freshness for all authenticated users (no admin required).
  */
-export async function fetchPipelineStatus(): Promise<PipelineStatusResponse> {
-  const r = await fetchWithAuth(apiUrl(`/api/pipeline-status`));
+export async function fetchPipelineStatus(signal?: AbortSignal): Promise<PipelineStatusResponse> {
+  const r = await fetchWithAuth(apiUrl(`/api/pipeline-status`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<PipelineStatusResponse>(r);
 }
@@ -686,12 +687,13 @@ export async function fetchAuthAudit(
   limit = 100,
   offset = 0,
   eventType?: string | null,
-  userId?: number | null
+  userId?: number | null,
+  signal?: AbortSignal,
 ): Promise<AuthAuditResponse> {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (eventType && eventType.trim()) params.set("event_type", eventType.trim());
   if (userId != null) params.set("user_id", String(userId));
-  const r = await fetchWithAuth(apiUrl(`/api/admin/auth-audit?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/admin/auth-audit?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<AuthAuditResponse>(r);
 }
@@ -734,14 +736,15 @@ export async function fetchModelPredictions(
   modelVersionId?: number,
   decision?: string,
   dateFrom?: string,
-  dateTo?: string
+  dateTo?: string,
+  signal?: AbortSignal,
 ): Promise<ModelPredictionsResponse> {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (modelVersionId != null) params.set("model_version_id", String(modelVersionId));
   if (decision) params.set("decision", decision);
   if (dateFrom) params.set("date_from", dateFrom);
   if (dateTo) params.set("date_to", dateTo);
-  const r = await fetchWithAuth(apiUrl(`/api/model-predictions?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-predictions?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<ModelPredictionsResponse>(r);
 }
@@ -769,10 +772,10 @@ export type ModelAccuracyResponse = {
 /**
  * Fetch accuracy metrics aggregated over time windows (weekly/monthly).
  */
-export async function fetchModelAccuracy(modelName?: string, window = "week"): Promise<ModelAccuracyResponse> {
+export async function fetchModelAccuracy(modelName?: string, window = "week", signal?: AbortSignal): Promise<ModelAccuracyResponse> {
   const params = new URLSearchParams({ window });
   if (modelName) params.set("model_name", modelName);
-  const r = await fetchWithAuth(apiUrl(`/api/model-accuracy?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-accuracy?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<ModelAccuracyResponse>(r);
 }
@@ -793,10 +796,10 @@ export type ModelCalibrationResponse = {
 /**
  * Fetch calibration curve data for the model monitor.
  */
-export async function fetchModelCalibration(modelName?: string, bins = 10): Promise<ModelCalibrationResponse> {
+export async function fetchModelCalibration(modelName?: string, bins = 10, signal?: AbortSignal): Promise<ModelCalibrationResponse> {
   const params = new URLSearchParams({ bins: String(bins) });
   if (modelName) params.set("model_name", modelName);
-  const r = await fetchWithAuth(apiUrl(`/api/model-calibration?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-calibration?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<ModelCalibrationResponse>(r);
 }
@@ -816,11 +819,11 @@ export type ModelPnlAttributionResponse = {
 /**
  * Fetch PnL attribution comparing model-filtered vs baseline trades.
  */
-export async function fetchModelPnlAttribution(modelName?: string): Promise<ModelPnlAttributionResponse> {
+export async function fetchModelPnlAttribution(modelName?: string, signal?: AbortSignal): Promise<ModelPnlAttributionResponse> {
   const params = new URLSearchParams();
   if (modelName) params.set("model_name", modelName);
   const query = params.toString();
-  const r = await fetchWithAuth(apiUrl(`/api/model-pnl-attribution${query ? `?${query}` : ""}`));
+  const r = await fetchWithAuth(apiUrl(`/api/model-pnl-attribution${query ? `?${query}` : ""}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<ModelPnlAttributionResponse>(r);
 }
@@ -914,8 +917,8 @@ export type PortfolioConfig = {
 /**
  * Fetch current portfolio status (equity, lots, budget, signals).
  */
-export async function fetchPortfolioStatus(): Promise<PortfolioStatus> {
-  const r = await fetchWithAuth(apiUrl("/api/portfolio/status"));
+export async function fetchPortfolioStatus(signal?: AbortSignal): Promise<PortfolioStatus> {
+  const r = await fetchWithAuth(apiUrl("/api/portfolio/status"), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<PortfolioStatus>(r);
 }
@@ -923,8 +926,8 @@ export async function fetchPortfolioStatus(): Promise<PortfolioStatus> {
 /**
  * Fetch daily portfolio state history for equity charting.
  */
-export async function fetchPortfolioHistory(days = 90): Promise<PortfolioHistoryDay[]> {
-  const r = await fetchWithAuth(apiUrl(`/api/portfolio/history?days=${days}`));
+export async function fetchPortfolioHistory(days = 90, signal?: AbortSignal): Promise<PortfolioHistoryDay[]> {
+  const r = await fetchWithAuth(apiUrl(`/api/portfolio/history?days=${days}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: PortfolioHistoryDay[] }>(r);
   return data.items;
@@ -933,10 +936,10 @@ export async function fetchPortfolioHistory(days = 90): Promise<PortfolioHistory
 /**
  * Fetch portfolio trades with source/signal enrichment.
  */
-export async function fetchPortfolioTrades(limit = 100, source?: string): Promise<PortfolioTrade[]> {
+export async function fetchPortfolioTrades(limit = 100, source?: string, signal?: AbortSignal): Promise<PortfolioTrade[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (source) params.set("source", source);
-  const r = await fetchWithAuth(apiUrl(`/api/portfolio/trades?${params.toString()}`));
+  const r = await fetchWithAuth(apiUrl(`/api/portfolio/trades?${params.toString()}`), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = await safeJson<{ items: PortfolioTrade[] }>(r);
   return data.items;
@@ -945,38 +948,10 @@ export async function fetchPortfolioTrades(limit = 100, source?: string): Promis
 /**
  * Fetch current portfolio and event configuration.
  */
-export async function fetchPortfolioConfig(): Promise<PortfolioConfig> {
-  const r = await fetchWithAuth(apiUrl("/api/portfolio/config"));
+export async function fetchPortfolioConfig(signal?: AbortSignal): Promise<PortfolioConfig> {
+  const r = await fetchWithAuth(apiUrl("/api/portfolio/config"), { signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return safeJson<PortfolioConfig>(r);
 }
 
-export type BacktestStrategyResult = {
-  name: string;
-  total_trades: number;
-  wins: number;
-  losses: number;
-  win_rate: number;
-  total_pnl: number;
-  avg_pnl: number;
-  profit_factor: number | null;
-  sharpe: number | null;
-  max_drawdown: number;
-  equity_curve: { date: string; cumulative_pnl: number }[];
-  monthly: { month: string; pnl: number; trades: number }[];
-};
-
-export type BacktestResponse = {
-  strategies: BacktestStrategyResult[];
-  generated_at: string | null;
-};
-
-/**
- * Fetch precomputed backtest strategy comparison results.
- */
-export async function fetchBacktestResults(): Promise<BacktestResponse> {
-  const r = await fetchWithAuth(apiUrl("/api/backtest-results"));
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<BacktestResponse>(r);
-}
 

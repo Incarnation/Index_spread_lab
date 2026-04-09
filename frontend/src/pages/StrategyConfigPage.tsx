@@ -38,11 +38,19 @@ export function StrategyConfigPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
-    fetchPortfolioConfig()
-      .then(setConfig)
-      .catch((e) => setError(e.message ?? "Failed to load config"))
-      .finally(() => setLoading(false));
+    fetchPortfolioConfig(ac.signal)
+      .then((data) => {
+        if (!ac.signal.aborted) setConfig(data);
+      })
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load config");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
   }, []);
 
   if (loading) {
