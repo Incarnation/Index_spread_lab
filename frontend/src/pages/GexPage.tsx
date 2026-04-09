@@ -37,22 +37,32 @@ export function GexPage() {
   const [dtes, setDtes] = useState<number[]>([]);
   const [selectedDte, setSelectedDte] = useState<number | undefined>();
   const [curve, setCurve] = useState<GexCurvePoint[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const ac = new AbortController();
     const sourceParam = source === "All" ? undefined : source;
+    setLoading(true);
+    setError(null);
     fetchGexSnapshots(10, underlying, sourceParam, ac.signal)
       .then((snaps) => {
         if (!ac.signal.aborted) {
           setSnapshots(snaps);
-          if (snaps.length > 0 && (!selectedSnap || selectedSnap.underlying !== underlying || selectedSnap.source !== (sourceParam ?? selectedSnap.source))) {
-            setSelectedSnap(snaps[0]);
-          }
+          setSelectedSnap((prev) => {
+            if (snaps.length === 0) return null;
+            if (!prev || prev.underlying !== underlying || prev.source !== (sourceParam ?? prev.source)) {
+              return snaps[0];
+            }
+            return prev;
+          });
         }
       })
-      .catch(() => {
-        if (!ac.signal.aborted) {
-        }
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load GEX snapshots");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
       });
     return () => ac.abort();
   }, [underlying, source, tick]);
@@ -61,13 +71,13 @@ export function GexPage() {
     if (!selectedSnap) return;
     const ac = new AbortController();
     setSelectedDte(undefined);
+    setError(null);
     fetchGexDtes(selectedSnap.snapshot_id, ac.signal)
       .then((d) => {
         if (!ac.signal.aborted) setDtes(d);
       })
-      .catch(() => {
-        if (!ac.signal.aborted) {
-        }
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load DTE list");
       });
     return () => ac.abort();
   }, [selectedSnap]);
@@ -75,19 +85,23 @@ export function GexPage() {
   useEffect(() => {
     if (!selectedSnap) return;
     const ac = new AbortController();
+    setError(null);
     fetchGexCurve(selectedSnap.snapshot_id, selectedDte, undefined, ac.signal)
       .then((c) => {
         if (!ac.signal.aborted) setCurve(c);
       })
-      .catch(() => {
-        if (!ac.signal.aborted) {
-        }
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load GEX curve");
       });
     return () => ac.abort();
   }, [selectedSnap, selectedDte]);
 
   return (
     <div className="space-y-4">
+      {error && (
+        <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
+      )}
+
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-foreground">GEX / Market</h2>
         <div className="flex items-center gap-3">

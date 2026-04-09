@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { StatCard } from "@/components/shared/StatCard";
 import { Badge } from "@/components/ui/badge";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { fetchPortfolioConfig, type PortfolioConfig } from "@/api";
 import { FlaskConical, TrendingUp, Target, BarChart3, TrendingDown, ShieldCheck } from "lucide-react";
 
@@ -33,6 +34,7 @@ const WALKFORWARD_WINDOWS = [
  * backtest validation summary. Replaces the old BacktestPage.
  */
 export function StrategyConfigPage() {
+  const { tick } = useAutoRefresh(60_000);
   const [config, setConfig] = useState<PortfolioConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -40,6 +42,7 @@ export function StrategyConfigPage() {
   useEffect(() => {
     const ac = new AbortController();
     setLoading(true);
+    setError(null);
     fetchPortfolioConfig(ac.signal)
       .then((data) => {
         if (!ac.signal.aborted) setConfig(data);
@@ -51,7 +54,7 @@ export function StrategyConfigPage() {
         if (!ac.signal.aborted) setLoading(false);
       });
     return () => ac.abort();
-  }, []);
+  }, [tick]);
 
   if (loading) {
     return (

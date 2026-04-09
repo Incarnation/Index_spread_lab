@@ -3,6 +3,7 @@ import { StatCard } from "@/components/shared/StatCard";
 import { DataTable } from "@/components/shared/DataTable";
 import { Button } from "@/components/ui/button";
 import { formatCurrency, formatPercent } from "@/lib/utils";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import {
   fetchPerformanceAnalytics,
   type PerformanceAnalyticsResponse,
@@ -27,26 +28,29 @@ const LOOKBACKS = [7, 30, 90, 365] as const;
  * Performance page -- equity curve, KPIs, breakdowns, and monthly table.
  */
 export function PerformancePage() {
+  const { tick } = useAutoRefresh(60_000);
   const [lookback, setLookback] = useState<number>(90);
   const [mode, setMode] = useState<PerformanceAnalyticsMode>("realized");
   const [data, setData] = useState<PerformanceAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const ac = new AbortController();
     setLoading(true);
+    setError(null);
     fetchPerformanceAnalytics(lookback, mode, ac.signal)
       .then((d) => {
         if (!ac.signal.aborted) setData(d);
       })
-      .catch(() => {
-        if (ac.signal.aborted) return;
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load performance data");
       })
       .finally(() => {
         if (!ac.signal.aborted) setLoading(false);
       });
     return () => ac.abort();
-  }, [lookback, mode]);
+  }, [lookback, mode, tick]);
 
   const s = data?.summary;
   const curve = data?.equity_curve || [];
@@ -64,6 +68,10 @@ export function PerformancePage() {
 
   return (
     <div className="space-y-6">
+      {error && (
+        <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
+      )}
+
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-foreground">Performance</h2>
         <div className="flex gap-2">

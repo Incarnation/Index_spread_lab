@@ -45,15 +45,17 @@ export function AdminPage() {
   const [preflight, setPreflight] = useState<AdminPreflightResponse | null>(null);
   const [running, setRunning] = useState<string | null>(null);
   const [result, setResult] = useState<{ job: string; data: unknown } | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const ac = new AbortController();
+    setError(null);
     fetchAdminPreflight(ac.signal)
       .then((data) => {
         if (!ac.signal.aborted) setPreflight(data);
       })
-      .catch(() => {
-        if (ac.signal.aborted) return;
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load preflight data");
       });
     return () => ac.abort();
   }, [tick]);
@@ -77,6 +79,10 @@ export function AdminPage() {
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold text-foreground">Admin / Ops</h2>
+
+      {error && (
+        <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
+      )}
 
       {/* Warnings */}
       {preflight && preflight.warnings.length > 0 && (

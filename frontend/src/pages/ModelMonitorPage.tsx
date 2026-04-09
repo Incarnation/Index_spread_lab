@@ -77,9 +77,8 @@ export function ModelMonitorPage() {
         .then((cfg) => {
           if (!ac.signal.aborted) setPortfolioEnabled(cfg.portfolio.enabled);
         })
-        .catch(() => {
-          if (!ac.signal.aborted) {
-          }
+        .catch((e) => {
+          if (!ac.signal.aborted) setError((prev) => prev ?? `Portfolio config: ${e.message ?? "unavailable"}`);
         }),
     ]).catch((e) => {
       if (!ac.signal.aborted) setError(e.message ?? "Failed to load model data");
@@ -89,6 +88,7 @@ export function ModelMonitorPage() {
 
   useEffect(() => {
     const ac = new AbortController();
+    setError(null);
     const dec = predFilter === "all" ? undefined : predFilter;
     fetchModelPredictions(50, predPage * 50, undefined, dec, undefined, undefined, ac.signal)
       .then((p) => {

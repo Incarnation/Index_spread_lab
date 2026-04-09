@@ -48,11 +48,14 @@ export function OverviewPage() {
   const [equityHistory, setEquityHistory] = useState<PortfolioHistoryDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   useEffect(() => {
     const ac = new AbortController();
     setLoading(true);
     setError(null);
+    setWarnings([]);
+    const warn: string[] = [];
     Promise.all([
       fetchTrades(100, undefined, ac.signal).then((data) => {
         if (!ac.signal.aborted) setTrades(data);
@@ -64,33 +67,33 @@ export function OverviewPage() {
         .then((data) => {
           if (!ac.signal.aborted) setPortfolio(data);
         })
-        .catch(() => {
-          if (!ac.signal.aborted) {
-          }
+        .catch((e) => {
+          if (!ac.signal.aborted) warn.push(`Portfolio: ${e.message ?? "unavailable"}`);
         }),
       fetchPortfolioHistory(90, ac.signal)
         .then((data) => {
           if (!ac.signal.aborted) setEquityHistory(data);
         })
-        .catch(() => {
-          if (!ac.signal.aborted) {
-          }
+        .catch((e) => {
+          if (!ac.signal.aborted) warn.push(`Equity history: ${e.message ?? "unavailable"}`);
         }),
     ])
       .catch((e) => {
         if (!ac.signal.aborted) setError(e.message ?? "Failed to load data");
       })
       .finally(() => {
-        if (!ac.signal.aborted) setLoading(false);
+        if (!ac.signal.aborted) {
+          setLoading(false);
+          if (warn.length > 0) setWarnings(warn);
+        }
       });
 
     fetchPipelineStatus(ac.signal)
       .then((data) => {
         if (!ac.signal.aborted) setPipelineStatus(data);
       })
-      .catch(() => {
-        if (!ac.signal.aborted) {
-        }
+      .catch((e) => {
+        if (!ac.signal.aborted) setWarnings((prev) => [...prev, `Pipeline: ${e.message ?? "unavailable"}`]);
       });
 
     return () => ac.abort();
@@ -109,6 +112,9 @@ export function OverviewPage() {
     return todayPoint?.daily_pnl ?? null;
   })();
 
+  const unrealizedPnl = openTrades.reduce((sum, t) => sum + (t.current_pnl ?? 0), 0);
+  const hasUnrealized = openTrades.some((t) => t.current_pnl != null);
+
   const usePortfolioEquity = portfolioActive && equityHistory.length > 0;
 
   return (
@@ -119,8 +125,14 @@ export function OverviewPage() {
         <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
       )}
 
+      {warnings.length > 0 && (
+        <div className="rounded-lg border border-warning/30 bg-warning-bg p-3 text-sm text-warning">
+          {warnings.map((w, i) => <p key={i}>{w}</p>)}
+        </div>
+      )}
+
       {/* KPI stat cards */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-7">
         {portfolioActive && portfolio ? (
           <StatCard
             title="Current Equity"
@@ -141,6 +153,13 @@ export function OverviewPage() {
           value={todayPnl != null ? formatCurrency(todayPnl) : "—"}
           icon={todayPnl != null && todayPnl >= 0 ? TrendingUp : TrendingDown}
           trend={todayPnl != null ? (todayPnl >= 0 ? "up" : "down") : undefined}
+        />
+        <StatCard
+          title="Unrealized PnL"
+          value={hasUnrealized ? formatCurrency(unrealizedPnl) : "—"}
+          icon={unrealizedPnl >= 0 ? TrendingUp : TrendingDown}
+          trend={hasUnrealized ? (unrealizedPnl >= 0 ? "up" : "down") : undefined}
+          subtitle={`${openTrades.length} open`}
         />
         {portfolioActive && portfolio ? (
           <StatCard

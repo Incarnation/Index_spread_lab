@@ -26,18 +26,20 @@ export function DecisionsPage() {
   const { tick } = useAutoRefresh(30_000);
   const [decisions, setDecisions] = useState<TradeDecision[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<TradeDecision | null>(null);
   const [filter, setFilter] = useState<"all" | "TRADE" | "SKIP">("all");
 
   useEffect(() => {
     const ac = new AbortController();
     setLoading(true);
+    setError(null);
     fetchTradeDecisions(200, ac.signal)
       .then((data) => {
         if (!ac.signal.aborted) setDecisions(data);
       })
-      .catch(() => {
-        if (ac.signal.aborted) return;
+      .catch((e) => {
+        if (!ac.signal.aborted) setError(e.message ?? "Failed to load decisions");
       })
       .finally(() => {
         if (!ac.signal.aborted) setLoading(false);
@@ -52,6 +54,10 @@ export function DecisionsPage() {
 
   return (
     <div className="space-y-4">
+      {error && (
+        <div className="rounded-lg border border-loss/30 bg-loss-bg p-3 text-sm text-loss">{error}</div>
+      )}
+
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-foreground">Decisions</h2>
         <div className="flex gap-1">

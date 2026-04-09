@@ -1,22 +1,33 @@
-import React from "react";
+import React, { Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import "./index.css";
 import { AuthProvider } from "./contexts/AuthContext";
 import { AppShell } from "./app/AppShell";
 import { LoginPage } from "./pages/LoginPage";
-import { OverviewPage } from "./pages/OverviewPage";
-import { TradesPage } from "./pages/TradesPage";
-import { DecisionsPage } from "./pages/DecisionsPage";
-import { ModelMonitorPage } from "./pages/ModelMonitorPage";
-import { PerformancePage } from "./pages/PerformancePage";
-import { GexPage } from "./pages/GexPage";
-import { AdminPage } from "./pages/AdminPage";
-import { StrategyConfigPage } from "./pages/StrategyConfigPage";
-import { PortfolioPage } from "./pages/PortfolioPage";
-import { AuthAuditPage } from "./pages/AuthAuditPage";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { RefreshCw } from "lucide-react";
+
+const OverviewPage = React.lazy(() => import("./pages/OverviewPage").then((m) => ({ default: m.OverviewPage })));
+const TradesPage = React.lazy(() => import("./pages/TradesPage").then((m) => ({ default: m.TradesPage })));
+const DecisionsPage = React.lazy(() => import("./pages/DecisionsPage").then((m) => ({ default: m.DecisionsPage })));
+const ModelMonitorPage = React.lazy(() => import("./pages/ModelMonitorPage").then((m) => ({ default: m.ModelMonitorPage })));
+const PerformancePage = React.lazy(() => import("./pages/PerformancePage").then((m) => ({ default: m.PerformancePage })));
+const GexPage = React.lazy(() => import("./pages/GexPage").then((m) => ({ default: m.GexPage })));
+const AdminPage = React.lazy(() => import("./pages/AdminPage").then((m) => ({ default: m.AdminPage })));
+const StrategyConfigPage = React.lazy(() => import("./pages/StrategyConfigPage").then((m) => ({ default: m.StrategyConfigPage })));
+const PortfolioPage = React.lazy(() => import("./pages/PortfolioPage").then((m) => ({ default: m.PortfolioPage })));
+const AuthAuditPage = React.lazy(() => import("./pages/AuthAuditPage").then((m) => ({ default: m.AuthAuditPage })));
+
+function PageLoader() {
+  return (
+    <div className="flex items-center justify-center py-24 text-muted-foreground">
+      <RefreshCw className="h-5 w-5 animate-spin mr-2" />
+      <span className="text-sm">Loading...</span>
+    </div>
+  );
+}
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
@@ -32,16 +43,16 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
                 </ProtectedRoute>
               }
             >
-              <Route index element={<OverviewPage />} />
-              <Route path="portfolio" element={<PortfolioPage />} />
-              <Route path="trades" element={<TradesPage />} />
-              <Route path="decisions" element={<DecisionsPage />} />
-              <Route path="model" element={<ModelMonitorPage />} />
-              <Route path="performance" element={<PerformancePage />} />
-              <Route path="gex" element={<GexPage />} />
-              <Route path="admin" element={<AdminPage />} />
-              <Route path="admin/auth-audit" element={<AuthAuditPage />} />
-              <Route path="strategy" element={<StrategyConfigPage />} />
+              <Route index element={<Suspense fallback={<PageLoader />}><OverviewPage /></Suspense>} />
+              <Route path="portfolio" element={<Suspense fallback={<PageLoader />}><PortfolioPage /></Suspense>} />
+              <Route path="trades" element={<Suspense fallback={<PageLoader />}><TradesPage /></Suspense>} />
+              <Route path="decisions" element={<Suspense fallback={<PageLoader />}><DecisionsPage /></Suspense>} />
+              <Route path="model" element={<Suspense fallback={<PageLoader />}><ModelMonitorPage /></Suspense>} />
+              <Route path="performance" element={<Suspense fallback={<PageLoader />}><PerformancePage /></Suspense>} />
+              <Route path="gex" element={<Suspense fallback={<PageLoader />}><GexPage /></Suspense>} />
+              <Route path="admin" element={<Suspense fallback={<PageLoader />}><AdminPage /></Suspense>} />
+              <Route path="admin/auth-audit" element={<Suspense fallback={<PageLoader />}><AuthAuditPage /></Suspense>} />
+              <Route path="strategy" element={<Suspense fallback={<PageLoader />}><StrategyConfigPage /></Suspense>} />
             </Route>
           </Routes>
         </AuthProvider>
