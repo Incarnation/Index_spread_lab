@@ -78,10 +78,11 @@ ET = ZoneInfo("America/New_York")
 SPY_SPX_RATIO = 10.024
 RISK_FREE_RATE = 0.043
 DECISION_MINUTES_ET = [(9, 45), (10, 15), (10, 45), (11, 15), (11, 45), (12, 15)]
-DTE_TARGETS = [0, 1, 2, 3, 5, 7]
+DTE_TARGETS = [0, 1, 3, 5, 7, 10]
 DELTA_TARGETS = [0.05, 0.10, 0.15, 0.20, 0.25]
 SPREAD_SIDES = ["put", "call"]
-WIDTH_POINTS = 10.0
+WIDTH_TARGETS = [5.0, 10.0, 15.0, 20.0]
+WIDTH_POINTS = 10.0  # legacy default for single-width callers
 TAKE_PROFIT_PCT = 0.50
 STOP_LOSS_PCT = 2.00
 LABEL_MARK_INTERVAL_MINUTES = 5
@@ -1139,11 +1140,12 @@ def build_candidates_for_snapshot(
     expiry: date,
     delta_target: float,
     side: str,
+    width_points: float = WIDTH_POINTS,
 ) -> list[dict]:
     """Build vertical credit-spread candidates from a single CBBO snapshot.
 
     Finds the short leg with |delta| closest to *delta_target*, pairs it
-    with a long leg at short_strike ± WIDTH_POINTS, and computes entry
+    with a long leg at short_strike +/- *width_points*, and computes entry
     credit.  Returns an empty list when no valid spread can be formed.
     """
     is_call = side != "put"
@@ -1204,8 +1206,8 @@ def build_candidates_for_snapshot(
 
     # --- long leg: strike closest to desired offset ---
     desired_long = (
-        short["strike"] - WIDTH_POINTS if side == "put"
-        else short["strike"] + WIDTH_POINTS
+        short["strike"] - width_points if side == "put"
+        else short["strike"] + width_points
     )
     long_cands = opts[opts.index != short_idx].copy()
     if long_cands.empty:
@@ -1219,7 +1221,7 @@ def build_candidates_for_snapshot(
         return []
 
     actual_width = abs(float(short["strike"]) - float(lleg["strike"]))
-    if actual_width <= 0 or abs(actual_width - WIDTH_POINTS) > 0.01:
+    if actual_width <= 0 or abs(actual_width - width_points) > 0.01:
         return []
 
     return [{
@@ -1303,16 +1305,35 @@ def _downsample_marks(
     return [m for m in marks if m["ts"].minute % interval_minutes == 0]
 
 
+TP_LEVELS = [50, 60, 70, 80, 90, 100]
+
+
 def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     """Evaluate credit-spread outcome from forward marks with full trajectory.
 
     Iterates ALL marks without early-returning at stop-loss, capturing
     trajectory data that enables analysis of any SL level (1x-5x) and any
-    exit rule (TP50 vs hold-to-expiry) from a single pipeline run.
+    TP exit rule (50%-100% or hold-to-expiry) from a single pipeline run.
+
+    For each TP level in TP_LEVELS (50, 60, 70, 80, 90, 100) the function
+    records:
+      - ``first_tpXX_pnl``        PnL at first crossing of XX% of max_profit
+      - ``min_pnl_before_tpXX``   worst PnL before that crossing (for SL ordering)
+
+    Additional trajectory columns:
+      - ``max_favorable_pnl``     peak PnL reached at any point
+      - ``max_adverse_pnl``       worst PnL seen across all marks
+      - ``max_adverse_multiple``   max_adverse_pnl / max_profit
+      - ``final_pnl_at_expiry``   PnL at the very last mark
+      - ``hit_stop_loss``         True if PnL breached -2x credit at any point
+      - ``recovered_after_sl``    True if 2x SL breached, then TP50 fired later
 
     Backward-compatible fields (``hit_tp50``, ``realized_pnl``,
-    ``exit_reason``) preserve the original with-SL semantics.  New fields
-    capture the full PnL trajectory and hold-through outcomes.
+    ``exit_reason``) preserve the original with-SL semantics.
+
+    Hold-through columns (no-SL + close-at-first-TP strategy):
+      - ``hold_hit_tp50``, ``hold_realized_pnl``, ``hold_exit_reason``,
+        ``hold_hit_tp100_at_expiry``
 
     Parameters
     ----------
@@ -1324,37 +1345,22 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     Returns
     -------
     dict
-        Outcome fields including backward-compatible (with-SL) columns and
-        new trajectory / hold-through columns.
-
-        Trajectory columns
-        ------------------
-        max_adverse_pnl       : worst PnL seen across all marks.
-        max_adverse_multiple  : max_adverse_pnl / max_profit (e.g. -2.3).
-        min_pnl_before_tp50   : worst PnL before TP50 first triggered; used
-                                to determine which SL levels would fire
-                                before TP50 for the sweep analysis.
-        first_tp50_pnl        : PnL at the first TP50 trigger (None if never).
-        final_pnl_at_expiry   : PnL at the very last mark.
-        final_is_tp100        : True if last mark PnL >= full credit.
-        hit_stop_loss         : True if PnL breached -2x credit at any point.
-        recovered_after_sl    : True if 2x SL breached, then TP50 fired later.
-
-        Hold-through columns (no-SL + close-at-TP50 strategy)
-        ------------------------------------------------------
-        hold_hit_tp50            : TP50 fires at any point ignoring SL.
-        hold_realized_pnl        : PnL under hold-to-TP50 or hold-to-expiry.
-        hold_exit_reason         : exit type under hold strategy.
-        hold_hit_tp100_at_expiry : True if final PnL >= full credit.
+        Outcome fields with all multi-TP trajectory data.
     """
+    _tp_nulls: dict = {}
+    for lvl in TP_LEVELS:
+        _tp_nulls[f"first_tp{lvl}_pnl"] = None
+        _tp_nulls[f"min_pnl_before_tp{lvl}"] = None
+
     _trajectory_nulls = {
         "max_adverse_pnl": None, "max_adverse_multiple": None,
-        "min_pnl_before_tp50": None, "first_tp50_pnl": None,
+        "max_favorable_pnl": None,
         "final_pnl_at_expiry": None, "final_is_tp100": False,
         "hit_stop_loss": False, "recovered_after_sl": False,
         "hold_hit_tp50": False, "hold_realized_pnl": None,
         "hold_exit_reason": "NO_MARKS",
         "hold_hit_tp100_at_expiry": False,
+        **_tp_nulls,
     }
 
     if not marks:
@@ -1366,13 +1372,15 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         }
 
     max_profit = entry_credit * CONTRACT_MULT * CONTRACTS
-    tp_thr = max_profit * TAKE_PROFIT_PCT
     sl_thr = max_profit * STOP_LOSS_PCT
-    tp100_thr = max_profit
+
+    # Per-TP-level thresholds and tracking
+    tp_thresholds = {lvl: max_profit * (lvl / 100.0) for lvl in TP_LEVELS}
+    first_tp_pnl: dict[int, float | None] = {lvl: None for lvl in TP_LEVELS}
+    min_pnl_before_tp: dict[int, float | None] = {lvl: None for lvl in TP_LEVELS}
 
     max_adverse_pnl: float = 0.0
-    min_pnl_before_tp50: float = 0.0
-    first_tp50_pnl: float | None = None
+    max_favorable_pnl: float = 0.0
     sl_breach_pnl: float | None = None
     sl_breached_before_tp50: bool = False
     last_pnl: float | None = None
@@ -1387,17 +1395,21 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         last_pnl = pnl
 
         max_adverse_pnl = min(max_adverse_pnl, pnl)
+        max_favorable_pnl = max(max_favorable_pnl, pnl)
 
-        if first_tp50_pnl is None:
-            min_pnl_before_tp50 = min(min_pnl_before_tp50, pnl)
+        for lvl in TP_LEVELS:
+            if first_tp_pnl[lvl] is None:
+                if min_pnl_before_tp[lvl] is None:
+                    min_pnl_before_tp[lvl] = pnl
+                else:
+                    min_pnl_before_tp[lvl] = min(min_pnl_before_tp[lvl], pnl)
+                if pnl >= tp_thresholds[lvl]:
+                    first_tp_pnl[lvl] = pnl
 
         if sl_breach_pnl is None and pnl <= -sl_thr:
             sl_breach_pnl = pnl
-            if first_tp50_pnl is None:
+            if first_tp_pnl[50] is None:
                 sl_breached_before_tp50 = True
-
-        if first_tp50_pnl is None and pnl >= tp_thr:
-            first_tp50_pnl = pnl
 
     if last_pnl is None:
         _trajectory_nulls["hold_exit_reason"] = "NO_VALID_MARKS"
@@ -1411,9 +1423,9 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     max_adverse_multiple = (
         max_adverse_pnl / max_profit if max_profit > 0 else None
     )
-    final_is_tp100 = bool(last_pnl >= tp100_thr)
+    final_is_tp100 = bool(last_pnl >= max_profit)
     hit_stop_loss = sl_breach_pnl is not None
-    recovered_after_sl = sl_breached_before_tp50 and first_tp50_pnl is not None
+    recovered_after_sl = sl_breached_before_tp50 and first_tp_pnl[50] is not None
 
     # --- Original outcome (backward-compatible with-SL) ---
     if sl_breached_before_tp50:
@@ -1421,9 +1433,9 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         orig_pnl = sl_breach_pnl
         orig_tp50 = False
         orig_tp100 = False
-    elif first_tp50_pnl is not None:
+    elif first_tp_pnl[50] is not None:
         orig_exit = "TAKE_PROFIT_50"
-        orig_pnl = first_tp50_pnl
+        orig_pnl = first_tp_pnl[50]
         orig_tp50 = True
         orig_tp100 = final_is_tp100
     else:
@@ -1432,17 +1444,17 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         orig_tp50 = False
         orig_tp100 = final_is_tp100
 
-    # --- Hold-through outcome (ignore SL, still close at TP50) ---
-    if first_tp50_pnl is not None:
+    # --- Hold-through outcome (ignore SL, close at first TP50) ---
+    if first_tp_pnl[50] is not None:
         hold_exit = "TAKE_PROFIT_50"
-        hold_pnl = first_tp50_pnl
+        hold_pnl = first_tp_pnl[50]
         hold_tp50 = True
     else:
         hold_exit = "EXPIRY_OR_LAST_MARK"
         hold_pnl = last_pnl
         hold_tp50 = False
 
-    return {
+    result = {
         "resolved": True,
         "hit_tp50": orig_tp50,
         "hit_tp100_at_expiry": orig_tp100,
@@ -1450,8 +1462,7 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         "exit_reason": orig_exit,
         "max_adverse_pnl": max_adverse_pnl,
         "max_adverse_multiple": max_adverse_multiple,
-        "min_pnl_before_tp50": min_pnl_before_tp50,
-        "first_tp50_pnl": first_tp50_pnl,
+        "max_favorable_pnl": max_favorable_pnl,
         "final_pnl_at_expiry": last_pnl,
         "final_is_tp100": final_is_tp100,
         "hit_stop_loss": hit_stop_loss,
@@ -1461,6 +1472,17 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         "hold_exit_reason": hold_exit,
         "hold_hit_tp100_at_expiry": final_is_tp100,
     }
+
+    # Multi-TP trajectory columns
+    for lvl in TP_LEVELS:
+        result[f"first_tp{lvl}_pnl"] = first_tp_pnl[lvl]
+        result[f"min_pnl_before_tp{lvl}"] = min_pnl_before_tp[lvl]
+
+    # Backward-compat aliases (same values as multi-TP keyed versions)
+    result["min_pnl_before_tp50"] = min_pnl_before_tp[50]
+    result["first_tp50_pnl"] = first_tp_pnl[50]
+
+    return result
 
 
 def label_candidates(
@@ -1713,43 +1735,73 @@ def label_candidates_fast(
         flush=True,
     )
 
-    # Phase 2: extract marks per day (parallel or sequential)
-    all_marks: list[list[dict]] = [[] for _ in candidates]
-    day_args = sorted(plan.items())
+    # Phase 2 + 3: extract marks then evaluate in memory-bounded batches.
+    # Each batch accumulates marks for its slice of candidates across all
+    # forward days, evaluates outcomes, and frees memory before the next batch.
+    BATCH_SIZE = 50_000
+    n_cands = len(candidates)
+    n_batches = (n_cands + BATCH_SIZE - 1) // BATCH_SIZE
 
-    if workers > 1 and n_forward_days > 1:
-        actual_workers = min(workers, n_forward_days)
-        print(f"  Using {actual_workers} workers for mark extraction", flush=True)
-        with Pool(actual_workers) as pool:
-            for di, day_results in enumerate(
-                pool.imap_unordered(_extract_marks_for_day, day_args),
-            ):
+    print(f"  Processing in {n_batches} batch(es) of up to {BATCH_SIZE:,}", flush=True)
+
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * BATCH_SIZE
+        batch_end = min(batch_start + BATCH_SIZE, n_cands)
+        batch_cis = set(range(batch_start, batch_end))
+        batch_size_actual = batch_end - batch_start
+
+        batch_marks: list[list[dict]] = [[] for _ in range(batch_size_actual)]
+
+        batch_day_args: list[tuple[str, list[tuple]]] = []
+        for day_str, requests in plan.items():
+            filtered = [r for r in requests if r[0] in batch_cis]
+            if filtered:
+                batch_day_args.append((day_str, filtered))
+        batch_day_args.sort()
+
+        n_batch_days = len(batch_day_args)
+
+        if workers > 1 and n_batch_days > 1:
+            actual_workers = min(workers, n_batch_days)
+            with Pool(actual_workers) as pool:
+                for di, day_results in enumerate(
+                    pool.imap_unordered(_extract_marks_for_day, batch_day_args),
+                ):
+                    for ci, marks in day_results:
+                        batch_marks[ci - batch_start].extend(marks)
+                    if (di + 1) % 10 == 0 or di + 1 == n_batch_days:
+                        print(
+                            f"  Batch {batch_idx + 1}/{n_batches}: "
+                            f"extracted marks {di + 1}/{n_batch_days} forward days",
+                            flush=True,
+                        )
+        else:
+            for di, day_item in enumerate(batch_day_args):
+                day_results = _extract_marks_for_day(day_item)
                 for ci, marks in day_results:
-                    all_marks[ci].extend(marks)
-                if (di + 1) % 10 == 0 or di + 1 == n_forward_days:
+                    batch_marks[ci - batch_start].extend(marks)
+                if (di + 1) % 10 == 0 or di + 1 == n_batch_days:
                     print(
-                        f"  Extracted marks: {di + 1}/{n_forward_days} forward days",
+                        f"  Batch {batch_idx + 1}/{n_batches}: "
+                        f"extracted marks {di + 1}/{n_batch_days} forward days",
                         flush=True,
                     )
-    else:
-        for di, day_item in enumerate(day_args):
-            day_results = _extract_marks_for_day(day_item)
-            for ci, marks in day_results:
-                all_marks[ci].extend(marks)
-            if (di + 1) % 10 == 0 or di + 1 == n_forward_days:
-                print(
-                    f"  Extracted marks: {di + 1}/{n_forward_days} forward days",
-                    flush=True,
-                )
 
-    # Phase 3: sort, downsample, evaluate outcomes
-    print("  Evaluating outcomes ...", flush=True)
-    for ci, c in enumerate(candidates):
-        marks = sorted(all_marks[ci], key=lambda m: m["ts"])
-        marks = _downsample_marks(marks)
-        c.update(_evaluate_outcome(c["entry_credit"], marks))
-        if (ci + 1) % 5000 == 0:
-            print(f"  Evaluated {ci + 1}/{len(candidates)} candidates", flush=True)
+        for i in range(batch_size_actual):
+            ci = batch_start + i
+            c = candidates[ci]
+            marks = sorted(batch_marks[i], key=lambda m: m["ts"])
+            marks = _downsample_marks(marks)
+            c.update(_evaluate_outcome(c["entry_credit"], marks))
+            batch_marks[i] = []
+
+        print(
+            f"  Batch {batch_idx + 1}/{n_batches}: "
+            f"evaluated {batch_size_actual:,} candidates "
+            f"({batch_end:,}/{n_cands:,} total)",
+            flush=True,
+        )
+        del batch_marks
 
     print(f"  Labeling complete: {len(candidates)} candidates", flush=True)
     return candidates
@@ -2131,33 +2183,35 @@ def run_pipeline(
                     continue
                 for side in SPREAD_SIDES:
                     for delta_target in DELTA_TARGETS:
-                        cands = build_candidates_for_snapshot(
-                            snapshot=snapshot,
-                            inst_map=inst_map,
-                            spot=spx_spot,
-                            spy_price=spy_price,
-                            vix=vix,
-                            vix9d=vix9d,
-                            term_structure=term_structure,
-                            vvix=vvix,
-                            skew=skew,
-                            is_opex_day=is_opex,
-                            is_fomc_day=is_fomc,
-                            is_triple_witching=is_tw,
-                            is_cpi_day=is_cpi,
-                            is_nfp_day=is_nfp,
-                            decision_dt=dec_utc,
-                            day_date=day_date,
-                            dte_target=dte_target,
-                            expiry=expiry,
-                            delta_target=delta_target,
-                            side=side,
-                        )
-                        for cand in cands:
-                            cand["offline_gex_net"] = offline_gex_net
-                            cand["offline_zero_gamma"] = offline_zero_gamma
-                        all_candidates.extend(cands)
-                        day_count += len(cands)
+                        for width in WIDTH_TARGETS:
+                            cands = build_candidates_for_snapshot(
+                                snapshot=snapshot,
+                                inst_map=inst_map,
+                                spot=spx_spot,
+                                spy_price=spy_price,
+                                vix=vix,
+                                vix9d=vix9d,
+                                term_structure=term_structure,
+                                vvix=vvix,
+                                skew=skew,
+                                is_opex_day=is_opex,
+                                is_fomc_day=is_fomc,
+                                is_triple_witching=is_tw,
+                                is_cpi_day=is_cpi,
+                                is_nfp_day=is_nfp,
+                                decision_dt=dec_utc,
+                                day_date=day_date,
+                                dte_target=dte_target,
+                                expiry=expiry,
+                                delta_target=delta_target,
+                                side=side,
+                                width_points=width,
+                            )
+                            for cand in cands:
+                                cand["offline_gex_net"] = offline_gex_net
+                                cand["offline_zero_gamma"] = offline_zero_gamma
+                            all_candidates.extend(cands)
+                            day_count += len(cands)
 
         print(
             f"  [{day_str}] {day_count} candidates "
@@ -2370,11 +2424,13 @@ def precompute_offline_gex_to_csv(
 # ===================================================================
 
 TRAJECTORY_COLUMNS = [
-    "max_adverse_pnl", "max_adverse_multiple", "min_pnl_before_tp50",
-    "first_tp50_pnl", "final_pnl_at_expiry", "final_is_tp100",
+    "max_adverse_pnl", "max_adverse_multiple", "max_favorable_pnl",
+    "final_pnl_at_expiry", "final_is_tp100",
     "hit_stop_loss", "recovered_after_sl",
     "hold_hit_tp50", "hold_realized_pnl", "hold_exit_reason",
     "hold_hit_tp100_at_expiry",
+    # Multi-TP trajectory columns (one pair per TP level; includes tp50 aliases)
+    *[col for lvl in TP_LEVELS for col in (f"first_tp{lvl}_pnl", f"min_pnl_before_tp{lvl}")],
 ]
 
 
@@ -2422,8 +2478,9 @@ def relabel_from_csv(
     df.loc[non_sl, "hold_realized_pnl"] = df.loc[non_sl, "realized_pnl"]
     df.loc[non_sl, "hold_exit_reason"] = df.loc[non_sl, "exit_reason"]
     df.loc[non_sl, "hold_hit_tp100_at_expiry"] = df.loc[non_sl, "hit_tp100_at_expiry"]
-    # TP50 trades closed before expiry, so final_pnl is unknown; leave None
-    # max_adverse_pnl / min_pnl_before_tp50 also unknown without marks
+    # For non-SL trades, multi-TP columns cannot be inferred from existing
+    # data alone (only first_tp50_pnl was stored).  Leave new TP levels as
+    # None -- a full --relabel or regeneration will populate them.
 
     if sl_count == 0:
         print("[RELABEL] No SL trades to re-evaluate. Saving.", flush=True)

@@ -22,6 +22,7 @@ from generate_training_data import (  # noqa: E402
     LABEL_MARK_INTERVAL_MINUTES,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    TP_LEVELS,
     _downsample_marks,
     _evaluate_outcome,
     _load_gex_csv,
@@ -1217,8 +1218,8 @@ class TestTrajectoryLabels:
         assert out["hold_exit_reason"] == "TAKE_PROFIT_50"
         # max_adverse_pnl = 0.0 (initialized at entry; only mark is profitable)
         assert out["max_adverse_pnl"] == pytest.approx(0.0, abs=0.01)
-        # min_pnl_before_tp50 = 0.0 (TP50 fires on first mark, no pre-TP50 dip)
-        assert out["min_pnl_before_tp50"] == pytest.approx(0.0, abs=0.01)
+        # min_pnl_before_tp50: TP50 fires on first mark at $65 (the only mark seen)
+        assert out["min_pnl_before_tp50"] == pytest.approx(65.0, abs=1)
         assert out["max_adverse_multiple"] == pytest.approx(0.0, abs=0.01)
 
     def test_sl_then_recovery_to_tp50(self) -> None:
@@ -1350,3 +1351,81 @@ class TestTrajectoryLabels:
         # hit_stop_loss is True because SL WAS breached (just after TP50)
         assert out["hit_stop_loss"] is True
         assert out["recovered_after_sl"] is False
+
+
+class TestMultiTpLabeling:
+    """Multi-TP level tracking in _evaluate_outcome."""
+
+    def test_all_tp_levels_present(self) -> None:
+        """Output contains first_tpXX_pnl and min_pnl_before_tpXX for all TP_LEVELS."""
+        marks = [_mark(0.05, 0.05)]  # credit=1.0, pnl = (1-0)*100 = $100 (full profit)
+        out = _evaluate_outcome(1.0, marks)
+        for lvl in TP_LEVELS:
+            assert f"first_tp{lvl}_pnl" in out
+            assert f"min_pnl_before_tp{lvl}" in out
+
+    def test_tp60_fires_separately_from_tp50(self) -> None:
+        """TP50 and TP60 can fire at different marks."""
+        # credit=2.0, max_profit=$200
+        # TP50 = $100, TP60 = $120, TP70 = $140
+        marks = [
+            _mark(0.80, 0.05),   # pnl=(2-.75)*100 = $125 -> TP50=$100 fires, TP60=$120 fires
+            _mark(0.50, 0.05),   # pnl=(2-.45)*100 = $155 -> TP70=$140 fires
+        ]
+        out = _evaluate_outcome(2.0, marks)
+        assert out["first_tp50_pnl"] is not None
+        assert out["first_tp60_pnl"] is not None
+        assert out["first_tp70_pnl"] is not None
+        assert out["first_tp50_pnl"] == pytest.approx(125.0, abs=1)
+        assert out["first_tp60_pnl"] == pytest.approx(125.0, abs=1)
+        assert out["first_tp70_pnl"] == pytest.approx(155.0, abs=1)
+
+    def test_tp90_none_when_not_reached(self) -> None:
+        """Higher TP levels are None when not reached."""
+        # credit=2.0, max_profit=$200, TP90=$180
+        marks = [
+            _mark(0.90, 0.05),   # pnl=(2-.85)*100 = $115 -> TP50 fires, but not TP90
+        ]
+        out = _evaluate_outcome(2.0, marks)
+        assert out["first_tp50_pnl"] is not None
+        assert out["first_tp90_pnl"] is None
+
+    def test_min_pnl_before_tp70(self) -> None:
+        """min_pnl_before_tp70 tracks worst PnL before TP70 fires."""
+        # credit=1.0, max_profit=$100, TP70=$70
+        marks = [
+            _mark(1.80, 0.05),   # pnl=(1-1.75)*100 = -$75 (adverse)
+            _mark(0.10, 0.05),   # pnl=(1-.05)*100 = $95 -> TP70 fires
+        ]
+        out = _evaluate_outcome(1.0, marks)
+        assert out["min_pnl_before_tp70"] == pytest.approx(-75.0, abs=1)
+        assert out["first_tp70_pnl"] == pytest.approx(95.0, abs=1)
+
+    def test_max_favorable_pnl(self) -> None:
+        """max_favorable_pnl tracks peak PnL across all marks."""
+        # credit=1.0, max_profit=$100
+        # exit_cost = short_mid - long_mid; pnl = (credit - exit_cost) * 100
+        marks = [
+            _mark(0.05, 0.05),   # exit_cost=0, pnl=$100
+            _mark(0.02, 0.05),   # exit_cost=-0.03, pnl=$103 (peak)
+            _mark(0.50, 0.05),   # exit_cost=0.45, pnl=$55
+        ]
+        out = _evaluate_outcome(1.0, marks)
+        assert out["max_favorable_pnl"] == pytest.approx(103.0, abs=1)
+
+    def test_empty_marks_all_tp_none(self) -> None:
+        """Empty marks produce None for all TP levels."""
+        out = _evaluate_outcome(1.0, [])
+        for lvl in TP_LEVELS:
+            assert out[f"first_tp{lvl}_pnl"] is None
+            assert out[f"min_pnl_before_tp{lvl}"] is None
+        assert out["max_favorable_pnl"] is None
+
+    def test_backward_compat_aliases(self) -> None:
+        """Backward-compat aliases match their multi-TP keyed counterparts."""
+        # credit=1.0, max_profit=$100, TP50=$50
+        # _mark(0.30, 0.05): exit_cost=0.25, pnl=(1-0.25)*100=$75 -> TP50 fires
+        marks = [_mark(0.30, 0.05)]
+        out = _evaluate_outcome(1.0, marks)
+        assert out["first_tp50_pnl"] == pytest.approx(75.0, abs=1)
+        assert out["min_pnl_before_tp50"] == pytest.approx(75.0, abs=1)

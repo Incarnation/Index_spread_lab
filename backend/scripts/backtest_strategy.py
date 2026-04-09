@@ -85,7 +85,26 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 RESULTS_CSV = DATA_DIR / "backtest_results.csv"
 
-MARGIN_PER_LOT = 1000  # 10-pt wide SPX spread, $100/pt multiplier
+MARGIN_PER_LOT = 1000  # 10-pt wide SPX spread, $100/pt multiplier (default)
+CONTRACT_MULT = 100
+CONTRACTS = 1
+
+
+def _opt_val(v):
+    """Return *v* unchanged if it is not NaN/None, else None."""
+    return v if pd.notna(v) else None
+
+
+def _opt_str(v, default: str = "") -> str:
+    """Convert *v* to str, returning *default* when v is NaN or missing."""
+    return str(v) if pd.notna(v) else default
+
+
+def _safe_bool(v, default: bool = False) -> bool:
+    """Convert *v* to bool, returning *default* when v is NaN or missing."""
+    if pd.isna(v):
+        return default
+    return bool(v)
 
 
 # ===================================================================
@@ -118,9 +137,22 @@ class EventConfig:
 
     When ``enabled`` is False the event layer is skipped entirely
     and all other fields are ignored by the optimizer.
+
+    ``signal_mode`` controls how multiple signals combine:
+      - ``"any"``  (default) -- fire if ANY signal is active (OR logic)
+      - ``"all"``  -- fire only if ALL configured signals are active (AND)
+      - ``"spx_and_vix"`` -- require at least one SPX drop signal AND
+        at least one VIX signal (spike or elevated)
+
+    ``spx_drop_min`` / ``spx_drop_max`` (optional) restrict the event
+    trigger to SPX drops within a specific magnitude range, e.g.
+    ``spx_drop_min=-0.02, spx_drop_max=-0.005`` fires only on 0.5%-2% drops.
     """
 
     enabled: bool = False
+
+    # Signal combination logic
+    signal_mode: str = "any"           # "any", "all", or "spx_and_vix"
 
     # Budget allocation
     budget_mode: str = "shared"        # "shared" or "separate"
@@ -129,6 +161,8 @@ class EventConfig:
     # SPX drop triggers (previous-day return)
     spx_drop_threshold: float = -0.01  # e.g. -0.01 = drop > 1%
     spx_drop_2d_threshold: float = -0.02
+    spx_drop_min: float | None = None  # floor of SPX drop range (e.g. -0.02)
+    spx_drop_max: float | None = None  # ceiling of SPX drop range (e.g. -0.005)
 
     # VIX triggers
     vix_spike_threshold: float = 0.15  # VIX % change > 15%
@@ -150,20 +184,206 @@ class EventConfig:
 
 
 @dataclass
+class TradingConfig:
+    """Trade-level exit rules and regime filters.
+
+    These parameters control *how* individual trades are managed
+    (TP/SL exit logic) and *when* the strategy trades (regime filters),
+    independently of portfolio sizing and event signal detection.
+    """
+
+    tp_pct: float = 0.50
+    """Take-profit as fraction of max profit (0.50 = 50%). Use 1.01 for hold-to-expiry."""
+
+    sl_mult: float | None = None
+    """Stop-loss as multiple of credit (e.g. 2.0 = close at -200% of credit). None = no SL."""
+
+    max_vix: float | None = None
+    """Skip trading on days where VIX exceeds this level. None = no filter."""
+
+    max_term_structure: float | None = None
+    """Skip trading on days where VIX9D/VIX exceeds this (heavily inverted). None = no filter."""
+
+    avoid_opex: bool = False
+    """Skip trading on OPEX / options-expiration days."""
+
+    prefer_event_days: bool = False
+    """Only trade on FOMC or NFP days (aggressive filter for high-IV environments)."""
+
+    width_filter: float | None = None
+    """Only use candidates with this spread width (points). None = use all widths."""
+
+    entry_count: int | None = None
+    """Limit to the last N entry times per day. None = use all available entry times."""
+
+
+@dataclass
 class FullConfig:
-    """Combines portfolio and event configs into a single searchable unit."""
+    """Combines portfolio, trading, and event configs into a single searchable unit."""
 
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    trading: TradingConfig = field(default_factory=TradingConfig)
     event: EventConfig = field(default_factory=EventConfig)
 
     def flat_dict(self) -> dict[str, Any]:
-        """Flatten both configs into a single dict for CSV export."""
+        """Flatten all configs into a single dict for CSV export."""
         d: dict[str, Any] = {}
         for k, v in asdict(self.portfolio).items():
             d[f"p_{k}"] = v
+        for k, v in asdict(self.trading).items():
+            d[f"t_{k}"] = v
         for k, v in asdict(self.event).items():
             d[f"e_{k}"] = v
         return d
+
+
+# ===================================================================
+# Effective PnL computation
+# ===================================================================
+
+
+def pnl_column_name(tp_pct: float, sl_mult: float | None) -> str:
+    """Deterministic column name for a (tp_pct, sl_mult) combo."""
+    sl_tag = "none" if sl_mult is None else f"{sl_mult:.1f}"
+    return f"pnl_tp{int(tp_pct * 100)}_{sl_tag}"
+
+
+def compute_effective_pnl(
+    row: pd.Series,
+    tp_pct: float,
+    sl_mult: float | None,
+) -> float | None:
+    """Derive per-trade PnL from trajectory columns under a given exit policy.
+
+    Uses the multi-TP columns (first_tpXX_pnl, min_pnl_before_tpXX) to
+    determine whether SL fires before TP, whether TP fires at all, and
+    falls back to final_pnl_at_expiry otherwise.
+
+    Parameters
+    ----------
+    row : One row from the training CSV with trajectory columns.
+    tp_pct : Take-profit fraction (0.50-1.00). Values > 1.0 mean hold-to-expiry.
+    sl_mult : Stop-loss multiple of credit. None means no stop-loss.
+
+    Returns
+    -------
+    float | None
+        Trade PnL in dollars, or None if unresolved.
+    """
+    if not row.get("resolved", False):
+        return None
+
+    entry_credit = row.get("entry_credit")
+    if entry_credit is None or entry_credit <= 0:
+        return None
+
+    max_profit = entry_credit * CONTRACT_MULT * CONTRACTS
+    sl_thr = max_profit * sl_mult if sl_mult is not None else float("inf")
+
+    # Hold-to-expiry path (tp_pct > 1.0)
+    if tp_pct > 1.0:
+        max_adverse = row.get("max_adverse_pnl")
+        if sl_mult is not None and max_adverse is not None and max_adverse <= -sl_thr:
+            return -sl_thr
+        final = row.get("final_pnl_at_expiry")
+        return final if final is not None and not _isnan(final) else row.get("realized_pnl")
+
+    tp_key = int(tp_pct * 100)
+    first_tp = row.get(f"first_tp{tp_key}_pnl")
+    min_before = row.get(f"min_pnl_before_tp{tp_key}")
+
+    has_tp_data = first_tp is not None and not _isnan(first_tp)
+    has_min_data = min_before is not None and not _isnan(min_before)
+
+    # SL fires before TP?
+    if sl_mult is not None and has_min_data and min_before <= -sl_thr:
+        return -sl_thr
+
+    # TP fires
+    if has_tp_data:
+        return first_tp
+
+    # Neither TP nor SL hit before expiry -- check SL during hold
+    max_adverse = row.get("max_adverse_pnl")
+    if sl_mult is not None and max_adverse is not None and not _isnan(max_adverse):
+        if max_adverse <= -sl_thr:
+            return -sl_thr
+
+    final = row.get("final_pnl_at_expiry")
+    if final is not None and not _isnan(final):
+        return final
+    return row.get("realized_pnl")
+
+
+def _isnan(val) -> bool:
+    """Check if a value is NaN (safe for non-float types)."""
+    try:
+        return pd.isna(val)
+    except (TypeError, ValueError):
+        return False
+
+
+def precompute_pnl_columns(
+    df: pd.DataFrame,
+    tp_values: list[float],
+    sl_values: list[float | None],
+) -> list[str]:
+    """Add pre-computed PnL columns to df for each (tp, sl) combo.
+
+    Uses vectorized numpy operations for performance. Modifies df in place.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame (must have trajectory columns).
+    tp_values : List of TP fractions to pre-compute.
+    sl_values : List of SL multiples to pre-compute (None = no SL).
+
+    Returns
+    -------
+    List of column names that were added.
+    """
+    combos = list(itertools.product(tp_values, sl_values))
+    print(f"Pre-computing {len(combos)} PnL columns ...", end=" ", flush=True)
+    t0 = time.time()
+
+    max_profit = df["entry_credit"] * CONTRACT_MULT * CONTRACTS
+    fallback = df["final_pnl_at_expiry"].fillna(df["realized_pnl"])
+    resolved = df.get("resolved", pd.Series(True, index=df.index))
+    valid_entry = df["entry_credit"].notna() & (df["entry_credit"] > 0) & resolved.astype(bool)
+    max_adverse = df.get("max_adverse_pnl", pd.Series(np.nan, index=df.index))
+
+    col_names: list[str] = []
+    for tp, sl in combos:
+        col = pnl_column_name(tp, sl)
+        col_names.append(col)
+
+        sl_thr = max_profit * sl if sl is not None else pd.Series(np.inf, index=df.index)
+
+        if tp > 1.0:
+            # Hold-to-expiry: only SL via max_adverse
+            adverse_sl = (sl is not None) & max_adverse.notna() & (max_adverse <= -sl_thr)
+            result = np.where(adverse_sl, -sl_thr, fallback)
+        else:
+            tp_key = int(tp * 100)
+            tp_col = f"first_tp{tp_key}_pnl"
+            min_col = f"min_pnl_before_tp{tp_key}"
+            tp_vals = df.get(tp_col, pd.Series(np.nan, index=df.index))
+            min_vals = df.get(min_col, pd.Series(np.nan, index=df.index))
+
+            has_tp = tp_vals.notna()
+            sl_before_tp = (sl is not None) & min_vals.notna() & (min_vals <= -sl_thr)
+            adverse_sl = (sl is not None) & max_adverse.notna() & (max_adverse <= -sl_thr)
+
+            result = np.where(
+                sl_before_tp, -sl_thr,
+                np.where(has_tp, tp_vals,
+                    np.where(adverse_sl, -sl_thr, fallback)))
+
+        df[col] = np.where(valid_entry, result, np.nan)
+
+    elapsed = time.time() - t0
+    print(f"done in {elapsed:.1f}s", flush=True)
+    return col_names
 
 
 # ===================================================================
@@ -191,10 +411,15 @@ class PortfolioManager:
     Parameters
     ----------
     config : PortfolioConfig with all strategy parameters.
+    margin_per_lot : Override for margin requirement per lot.
+        Defaults to ``MARGIN_PER_LOT`` (1000, i.e. 10-pt × $100/pt).
+        When ``TradingConfig.width_filter`` is set, pass
+        ``width_filter * 100`` to scale margin to the actual spread width.
     """
 
-    def __init__(self, config: PortfolioConfig) -> None:
+    def __init__(self, config: PortfolioConfig, margin_per_lot: float = MARGIN_PER_LOT) -> None:
         self.cfg = config
+        self.margin_per_lot = margin_per_lot
         self.equity = config.starting_capital
         self.month_start_equity = config.starting_capital
         self._current_month: str | None = None
@@ -216,7 +441,7 @@ class PortfolioManager:
         """Return True if a new trade is allowed right now."""
         if self._month_stopped:
             return False
-        if self.equity < MARGIN_PER_LOT:
+        if self.equity < self.margin_per_lot:
             return False
         limit = self.cfg.monthly_drawdown_limit
         if limit is not None and self.equity < self.month_start_equity * (1 - limit):
@@ -236,7 +461,7 @@ class PortfolioManager:
             return self._lots_today
 
         raw = max(1, int(self.equity / self.cfg.lot_per_equity))
-        max_by_risk = max(1, int(self.equity * self.cfg.max_equity_risk_pct / MARGIN_PER_LOT))
+        max_by_risk = max(1, int(self.equity * self.cfg.max_equity_risk_pct / self.margin_per_lot))
         self._lots_today = min(raw, max_by_risk)
         return self._lots_today
 
@@ -250,7 +475,7 @@ class PortfolioManager:
     def status_label(self) -> str:
         if self._month_stopped:
             return "monthly_stop"
-        if self.equity < MARGIN_PER_LOT:
+        if self.equity < self.margin_per_lot:
             return "insufficient_capital"
         if self._trades_today >= self.cfg.max_trades_per_day:
             return "daily_limit"
@@ -290,7 +515,17 @@ class EventSignalDetector:
         ts = day_row.get("term_structure")
 
         if prev_ret is not None and prev_ret < self.cfg.spx_drop_threshold:
-            signals.append("spx_drop_1d")
+            # Optional magnitude-range gate
+            dmin = self.cfg.spx_drop_min
+            dmax = self.cfg.spx_drop_max
+            in_range = True
+            if dmin is not None and prev_ret < dmin:
+                in_range = False
+            if dmax is not None and prev_ret > dmax:
+                in_range = False
+            if in_range:
+                signals.append("spx_drop_1d")
+
         if prev_ret_2d is not None and prev_ret_2d < self.cfg.spx_drop_2d_threshold:
             signals.append("spx_drop_2d")
         if prev_vix_chg is not None and prev_vix_chg > self.cfg.vix_spike_threshold:
@@ -302,7 +537,28 @@ class EventSignalDetector:
         if self.cfg.rally_avoidance and prev_ret is not None and prev_ret > self.cfg.rally_threshold:
             signals.append("rally")
 
-        return signals
+        # Apply signal_mode filtering (rally is always kept separately)
+        mode = self.cfg.signal_mode
+        non_rally = [s for s in signals if s != "rally"]
+        has_rally = "rally" in signals
+
+        if mode == "all":
+            # Require all three categories: SPX drop, VIX, and term structure
+            spx_ok = any(s.startswith("spx_drop") for s in non_rally)
+            vix_ok = any(s in ("vix_spike", "vix_elevated") for s in non_rally)
+            ts_ok = "term_inversion" in non_rally
+            if not (spx_ok and vix_ok and ts_ok):
+                non_rally = []
+        elif mode == "spx_and_vix":
+            spx_signals = [s for s in non_rally if s.startswith("spx_drop")]
+            vix_signals = [s for s in non_rally if s in ("vix_spike", "vix_elevated")]
+            if not spx_signals or not vix_signals:
+                non_rally = []
+
+        result = non_rally
+        if has_rally:
+            result.append("rally")
+        return result
 
 
 class ScheduledSelector:
@@ -400,18 +656,31 @@ class EventSelector:
 def precompute_daily_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Build a per-day DataFrame with lagged market features for event detection.
 
+    Includes calendar flags (is_opex_day, is_fomc_day, is_nfp_day) needed
+    by TradingConfig regime filters.
+
     Parameters
     ----------
     df : Full training_candidates DataFrame.
 
     Returns
     -------
-    DataFrame indexed by ``day`` with columns used by EventSignalDetector.
+    DataFrame indexed by ``day`` with columns used by EventSignalDetector
+    and TradingConfig day-level filters.
     """
+    agg_dict: dict[str, tuple] = {
+        "spot": ("spot", "first"),
+        "vix": ("vix", "first"),
+        "vix9d": ("vix9d", "first"),
+        "term_structure": ("term_structure", "first"),
+    }
+    for cal_col in ("is_opex_day", "is_fomc_day", "is_nfp_day", "is_cpi_day", "is_triple_witching"):
+        if cal_col in df.columns:
+            agg_dict[cal_col] = (cal_col, "first")
+
     daily = (
         df.groupby("day")
-        .agg(spot=("spot", "first"), vix=("vix", "first"),
-             vix9d=("vix9d", "first"), term_structure=("term_structure", "first"))
+        .agg(**agg_dict)
         .reset_index()
         .sort_values("day")
         .reset_index(drop=True)
@@ -452,15 +721,34 @@ class BacktestResult:
     monthly: pd.DataFrame
 
 
-def _precompute_day_selections(df: pd.DataFrame) -> dict[str, dict]:
+def _precompute_day_selections(
+    df: pd.DataFrame,
+    width_filter: float | None = None,
+    entry_count: int | None = None,
+) -> dict[str, dict]:
     """Pre-group candidates by day and pre-sort by credit_to_width.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame.
+    width_filter : If set, only keep candidates with this spread width.
+    entry_count : If set, restrict to the last N entry times per day.
 
     Returns a dict keyed by day with pre-filtered views for fast selection.
     """
-    df_sorted = df.sort_values("credit_to_width", ascending=False)
+    filtered = df
+    if width_filter is not None and "width_points" in df.columns:
+        filtered = filtered[filtered["width_points"] == width_filter]
+
+    df_sorted = filtered.sort_values("credit_to_width", ascending=False)
     result: dict[str, dict] = {}
 
     for day, grp in df_sorted.groupby("day"):
+        if entry_count is not None and "entry_dt" in grp.columns:
+            unique_times = sorted(grp["entry_dt"].unique())
+            keep_times = unique_times[-entry_count:]
+            grp = grp[grp["entry_dt"].isin(keep_times)]
+
         calls = grp[grp["spread_side"] == "call"]
         puts = grp[grp["spread_side"] == "put"]
 
@@ -513,6 +801,45 @@ def _fast_event_select(precomp: dict, ec: EventConfig, signals: list[str], max_n
     return filtered.groupby("entry_dt").head(1).head(max_n)
 
 
+def _should_skip_day(
+    tc: TradingConfig,
+    day: str,
+    daily_signals: pd.DataFrame,
+) -> str | None:
+    """Check TradingConfig day-level regime filters.
+
+    Returns a skip reason string, or None if the day should be traded.
+    """
+    if day not in daily_signals.index:
+        return None
+
+    day_row = daily_signals.loc[day]
+
+    if tc.max_vix is not None:
+        vix = day_row.get("vix")
+        if vix is not None and not pd.isna(vix) and vix > tc.max_vix:
+            return "vix_filter"
+
+    if tc.max_term_structure is not None:
+        ts = day_row.get("term_structure")
+        if ts is not None and not pd.isna(ts) and ts > tc.max_term_structure:
+            return "ts_filter"
+
+    def _flag(col: str) -> bool:
+        v = day_row.get(col, False)
+        return bool(v) if pd.notna(v) else False
+
+    if tc.avoid_opex:
+        if _flag("is_opex_day"):
+            return "opex_filter"
+
+    if tc.prefer_event_days:
+        if not _flag("is_fomc_day") and not _flag("is_nfp_day"):
+            return "non_event_day"
+
+    return None
+
+
 def run_backtest(
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
@@ -526,27 +853,36 @@ def run_backtest(
     ----------
     df : Full training_candidates DataFrame.
     daily_signals : Precomputed daily signal features (from ``precompute_daily_signals``).
-    config : Combined portfolio + event configuration.
+    config : Combined portfolio + trading + event configuration.
     label : Human-readable name for this run.
     day_precomp : Optional pre-computed per-day candidate selections
         (from ``_precompute_day_selections``). Avoids repeated sorting.
+        Must be built with matching width_filter / entry_count.
 
     Returns
     -------
     BacktestResult with equity curve, metrics, and monthly breakdown.
     """
     pc = config.portfolio
+    tc = config.trading
     ec = config.event
     effective_pc = pc
     if ec.enabled and ec.budget_mode == "separate":
         effective_pc = PortfolioConfig(**{**vars(pc),
             "max_trades_per_day": pc.max_trades_per_day + ec.max_event_trades})
 
-    pm = PortfolioManager(effective_pc)
+    margin = tc.width_filter * CONTRACT_MULT if tc.width_filter else MARGIN_PER_LOT
+    pm = PortfolioManager(effective_pc, margin_per_lot=margin)
     event_det = EventSignalDetector(ec)
 
+    # Determine PnL column: use pre-computed column if it exists, else fallback
+    pnl_col = pnl_column_name(tc.tp_pct, tc.sl_mult)
+    use_precomputed = pnl_col in df.columns
+
     if day_precomp is None:
-        day_precomp = _precompute_day_selections(df)
+        day_precomp = _precompute_day_selections(
+            df, width_filter=tc.width_filter, entry_count=tc.entry_count,
+        )
 
     days = sorted(day_precomp.keys())
     curve: list[DayRecord] = []
@@ -558,6 +894,16 @@ def run_backtest(
             curve.append(DayRecord(
                 day=day, equity=pm.equity, daily_pnl=0, n_trades=0,
                 lots=0, status=pm.status_label(),
+                month_start_equity=pm.month_start_equity,
+            ))
+            continue
+
+        # --- TradingConfig day-level regime filters ---
+        skip_reason = _should_skip_day(tc, day, daily_signals)
+        if skip_reason:
+            curve.append(DayRecord(
+                day=day, equity=pm.equity, daily_pnl=0, n_trades=0,
+                lots=0, status=skip_reason,
                 month_start_equity=pm.month_start_equity,
             ))
             continue
@@ -575,6 +921,9 @@ def run_backtest(
         daily_pnl = 0.0
         trades_placed = 0
 
+        # Resolve which PnL column to read from candidates
+        effective_pnl_col = pnl_col if use_precomputed else "realized_pnl"
+
         # --- Event trades first ---
         drop_signals = [s for s in signals if s != "rally"]
         event_trades_placed = 0
@@ -582,7 +931,9 @@ def run_backtest(
             evt_max = ec.max_event_trades
             event_candidates = _fast_event_select(precomp, ec, drop_signals, evt_max)
 
-            for pnl_val in event_candidates["realized_pnl"].values:
+            for pnl_val in event_candidates[effective_pnl_col].values:
+                if pd.isna(pnl_val):
+                    continue
                 if not pm.can_trade() or event_trades_placed >= evt_max:
                     break
                 trade_pnl = pm.record_trade(float(pnl_val), lots)
@@ -597,7 +948,9 @@ def run_backtest(
             else:
                 sched_limit = pc.max_trades_per_day
             sched_candidates = _fast_sched_select(precomp, pc, sched_limit)
-            for pnl_val in sched_candidates["realized_pnl"].values:
+            for pnl_val in sched_candidates[effective_pnl_col].values:
+                if pd.isna(pnl_val):
+                    continue
                 if not pm.can_trade():
                     break
                 trade_pnl = pm.record_trade(float(pnl_val), lots)
@@ -758,34 +1111,173 @@ def _build_optimizer_grid() -> list[FullConfig]:
     return configs
 
 
-def run_optimizer(
+# TP / SL / regime values for the staged optimizer
+OPTIMIZER_TP_VALUES = [0.50, 0.60, 0.70, 0.80, 0.90, 1.01]
+OPTIMIZER_SL_VALUES: list[float | None] = [None, 1.5, 2.0, 3.0]
+
+
+def _build_staged_grid_stage1() -> list[FullConfig]:
+    """Stage 1: Sweep trading params with fixed portfolio baseline.
+
+    Fixes portfolio to current best (2/day, 15% DD, gradual sizing, calls-only)
+    and sweeps all TradingConfig dimensions.
+    """
+    configs: list[FullConfig] = []
+    pc = PortfolioConfig(
+        starting_capital=20_000, max_trades_per_day=2,
+        monthly_drawdown_limit=0.15, lot_per_equity=10_000,
+        calls_only=True,
+    )
+
+    trading_grid = itertools.product(
+        OPTIMIZER_TP_VALUES,                # tp_pct
+        OPTIMIZER_SL_VALUES,                # sl_mult
+        [None, 30.0, 35.0],                # max_vix
+        [None, 1.05, 1.10],                # max_term_structure
+        [True, False],                      # avoid_opex
+        [None, 10.0],                       # width_filter (None=all, 10=original)
+        [None, 1, 2],                       # entry_count
+        [None, 3, 5],                       # min_dte (via PortfolioConfig)
+        [None, 0.20],                       # max_delta (via PortfolioConfig)
+    )
+
+    for (tp, sl, mvix, mts, aopex, wf, ec_n, mdte, mdelta) in trading_grid:
+        tc = TradingConfig(
+            tp_pct=tp, sl_mult=sl, max_vix=mvix,
+            max_term_structure=mts, avoid_opex=aopex,
+            width_filter=wf, entry_count=ec_n,
+        )
+        pc_with_dte = PortfolioConfig(
+            starting_capital=20_000, max_trades_per_day=2,
+            monthly_drawdown_limit=0.15, lot_per_equity=10_000,
+            calls_only=True, min_dte=mdte, max_delta=mdelta,
+        )
+        configs.append(FullConfig(portfolio=pc_with_dte, trading=tc,
+                                  event=EventConfig(enabled=False)))
+
+    return configs
+
+
+_StagedTradingWinner = tuple[TradingConfig, int | None, float | None]
+"""(TradingConfig, best_min_dte, best_max_delta) from stage 1."""
+
+
+def _build_staged_grid_stage2(
+    top_trading_configs: list[_StagedTradingWinner],
+) -> list[FullConfig]:
+    """Stage 2: Sweep portfolio params using top trading configs from Stage 1.
+
+    Each winner carries the best (min_dte, max_delta) from stage 1 so
+    portfolio sweeping preserves DTE/delta filtering.
+    """
+    configs: list[FullConfig] = []
+
+    portfolio_grid = itertools.product(
+        [20_000],                          # starting_capital
+        [1, 2, 3],                         # max_trades_per_day
+        [0.10, 0.15, 0.20, None],         # monthly_drawdown_limit
+        [10_000, 20_000, 999_999],         # lot_per_equity
+        [True, False],                     # calls_only
+    )
+
+    for (cap, trades, mstop, lpe, co) in portfolio_grid:
+        for tc, mdte, mdelta in top_trading_configs:
+            pc = PortfolioConfig(
+                starting_capital=cap, max_trades_per_day=trades,
+                monthly_drawdown_limit=mstop, lot_per_equity=lpe,
+                calls_only=co, min_dte=mdte, max_delta=mdelta,
+            )
+            configs.append(FullConfig(portfolio=pc, trading=tc,
+                                      event=EventConfig(enabled=False)))
+
+    return configs
+
+
+def _build_staged_grid_stage3(
+    top_combined: list[tuple[PortfolioConfig, TradingConfig]],
+) -> list[FullConfig]:
+    """Stage 3: Sweep event params using top portfolio+trading combos.
+
+    Includes broader threshold sweeps for vix_spike_threshold,
+    vix_elevated_threshold, spx_drop_2d_threshold, and signal_mode.
+    """
+    configs: list[FullConfig] = []
+
+    event_grid = itertools.product(
+        ["any", "spx_and_vix"],            # signal_mode
+        ["shared", "separate"],            # budget_mode
+        [1, 2],                            # max_event_trades
+        [-0.005, -0.01, -0.015],           # spx_drop_threshold
+        [-0.01, -0.03],                    # spx_drop_2d_threshold
+        [0.10, 0.20],                      # vix_spike_threshold
+        [20.0, 30.0],                      # vix_elevated_threshold
+        ["puts", "best"],                  # side_preference
+        [3, 5],                            # event min_dte
+        [5, 7, 10],                        # event max_dte
+        [0.10, 0.15],                      # event min_delta
+        [0.20, 0.25],                      # event max_delta
+        [True, False],                     # rally_avoidance
+    )
+
+    event_combos = list(event_grid)
+
+    for (pc, tc) in top_combined:
+        for (sig_mode, bmode, evt_max, drop_thr, drop_2d_thr,
+             vix_spike_thr, vix_elev_thr,
+             side, emin_dte, emax_dte,
+             emin_d, emax_d, rally) in event_combos:
+
+            if emin_dte > emax_dte:
+                continue
+            if emin_d > emax_d:
+                continue
+            if bmode == "shared" and evt_max > 1:
+                continue
+
+            evc = EventConfig(
+                enabled=True,
+                signal_mode=sig_mode,
+                budget_mode=bmode,
+                max_event_trades=evt_max,
+                spx_drop_threshold=drop_thr,
+                spx_drop_2d_threshold=drop_2d_thr,
+                vix_spike_threshold=vix_spike_thr,
+                vix_elevated_threshold=vix_elev_thr,
+                side_preference=side,
+                min_dte=emin_dte, max_dte=emax_dte,
+                min_delta=emin_d, max_delta=emax_d,
+                rally_avoidance=rally,
+            )
+            configs.append(FullConfig(portfolio=pc, trading=tc, event=evc))
+
+    return configs
+
+
+def _run_grid(
+    configs: list[FullConfig],
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
-    output_csv: Path = RESULTS_CSV,
+    stage_name: str,
 ) -> pd.DataFrame:
-    """Run exhaustive grid search and export results.
-
-    Parameters
-    ----------
-    df : Training candidates DataFrame.
-    daily_signals : Precomputed daily signal features.
-    output_csv : Path to write the full results CSV.
-
-    Returns
-    -------
-    DataFrame with one row per config, sorted by Sharpe descending.
-    """
-    configs = _build_optimizer_grid()
-    print(f"\nOptimizer: {len(configs):,} configurations to evaluate")
-
-    print("Pre-computing per-day candidate selections ...")
-    day_precomp = _precompute_day_selections(df)
-
+    """Execute a list of configs and return results DataFrame."""
+    print(f"\n[{stage_name}] {len(configs):,} configurations to evaluate")
     rows: list[dict[str, Any]] = []
     t0 = time.time()
 
+    # Pre-compute day selections per unique (width_filter, entry_count)
+    precomp_cache: dict[tuple, dict] = {}
+
     for i, cfg in enumerate(configs):
-        result = run_backtest(df, daily_signals, cfg, day_precomp=day_precomp)
+        tc = cfg.trading
+        cache_key = (tc.width_filter, tc.entry_count)
+        if cache_key not in precomp_cache:
+            precomp_cache[cache_key] = _precompute_day_selections(
+                df, width_filter=tc.width_filter, entry_count=tc.entry_count,
+            )
+
+        result = run_backtest(
+            df, daily_signals, cfg, day_precomp=precomp_cache[cache_key],
+        )
         row = cfg.flat_dict()
         row.update({
             "final_equity": result.final_equity,
@@ -802,7 +1294,7 @@ def run_optimizer(
         })
         rows.append(row)
 
-        if (i + 1) % 200 == 0:
+        if (i + 1) % 500 == 0:
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed
             remaining = (len(configs) - i - 1) / rate
@@ -810,14 +1302,148 @@ def run_optimizer(
                   f"({rate:.0f}/sec, ~{remaining:.0f}s remaining)")
 
     elapsed = time.time() - t0
-    print(f"  Completed {len(configs):,} configs in {elapsed:.1f}s "
-          f"({len(configs)/elapsed:.0f}/sec)")
+    print(f"  [{stage_name}] Completed {len(configs):,} configs in {elapsed:.1f}s "
+          f"({len(configs)/max(elapsed, 0.01):.0f}/sec)")
 
-    results_df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def run_optimizer(
+    df: pd.DataFrame,
+    daily_signals: pd.DataFrame,
+    output_csv: Path = RESULTS_CSV,
+) -> pd.DataFrame:
+    """Run exhaustive grid search (original mode) and export results.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame.
+    daily_signals : Precomputed daily signal features.
+    output_csv : Path to write the full results CSV.
+
+    Returns
+    -------
+    DataFrame with one row per config, sorted by Sharpe descending.
+    """
+    configs = _build_optimizer_grid()
+    results_df = _run_grid(configs, df, daily_signals, "Optimizer")
     results_df.to_csv(output_csv, index=False)
     print(f"\n  Full results exported to {output_csv}")
-
     return results_df.sort_values("sharpe", ascending=False).reset_index(drop=True)
+
+
+def run_staged_optimizer(
+    df: pd.DataFrame,
+    daily_signals: pd.DataFrame,
+    output_csv: Path = RESULTS_CSV,
+    top_n_trading: int = 5,
+    top_n_combined: int = 3,
+) -> pd.DataFrame:
+    """Run 3-stage optimizer: trading params -> portfolio params -> event params.
+
+    Stage 1 sweeps all TradingConfig dimensions with fixed portfolio baseline.
+    Stage 2 takes the top trading configs and sweeps portfolio params.
+    Stage 3 takes the top combined configs and sweeps event params.
+
+    Parameters
+    ----------
+    df : Training candidates DataFrame (must have multi-TP trajectory columns).
+    daily_signals : Precomputed daily signal features.
+    output_csv : Path to write combined results CSV.
+    top_n_trading : Number of top trading configs to carry into Stage 2.
+    top_n_combined : Number of top combined configs to carry into Stage 3.
+
+    Returns
+    -------
+    Combined DataFrame with all stage results, sorted by Sharpe descending.
+    """
+    # Pre-compute PnL columns for all (tp, sl) combos
+    precompute_pnl_columns(df, OPTIMIZER_TP_VALUES, OPTIMIZER_SL_VALUES)
+
+    # --- Stage 1: Trading param sweep ---
+    s1_configs = _build_staged_grid_stage1()
+    s1_results = _run_grid(s1_configs, df, daily_signals, "Stage-1 Trading")
+    s1_sorted = s1_results.sort_values("sharpe", ascending=False)
+
+    # Extract top trading configs (carrying min_dte / max_delta from stage 1)
+    top_trading: list[_StagedTradingWinner] = []
+    seen: set[str] = set()
+    for _, row in s1_sorted.iterrows():
+        key = (f"{row.get('t_tp_pct')}_{row.get('t_sl_mult')}_{row.get('t_max_vix')}_"
+               f"{row.get('t_max_term_structure')}_{row.get('t_avoid_opex')}_"
+               f"{row.get('t_width_filter')}_{row.get('t_entry_count')}_"
+               f"{row.get('p_min_dte')}_{row.get('p_max_delta')}")
+        if key in seen:
+            continue
+        seen.add(key)
+
+        top_trading.append((
+            TradingConfig(
+                tp_pct=float(row.get("t_tp_pct", 0.50)),
+                sl_mult=_opt_val(row.get("t_sl_mult")),
+                max_vix=_opt_val(row.get("t_max_vix")),
+                max_term_structure=_opt_val(row.get("t_max_term_structure")),
+                avoid_opex=_safe_bool(row.get("t_avoid_opex")),
+                width_filter=_opt_val(row.get("t_width_filter")),
+                entry_count=int(row.get("t_entry_count")) if pd.notna(row.get("t_entry_count")) else None,
+            ),
+            int(row.get("p_min_dte")) if pd.notna(row.get("p_min_dte")) else None,
+            float(row.get("p_max_delta")) if pd.notna(row.get("p_max_delta")) else None,
+        ))
+        if len(top_trading) >= top_n_trading:
+            break
+
+    print(f"\n  Top {len(top_trading)} trading configs selected for Stage 2")
+
+    # --- Stage 2: Portfolio param sweep ---
+    s2_configs = _build_staged_grid_stage2(top_trading)
+    s2_results = _run_grid(s2_configs, df, daily_signals, "Stage-2 Portfolio")
+    s2_sorted = s2_results.sort_values("sharpe", ascending=False)
+
+    top_combined: list[tuple[PortfolioConfig, TradingConfig]] = []
+    seen_combined: set[str] = set()
+    _s2_key_cols = [c for c in s2_sorted.columns if c.startswith(("p_", "t_"))]
+    for _, row in s2_sorted.iterrows():
+        key = "|".join(str(row.get(c)) for c in _s2_key_cols)
+        if key in seen_combined:
+            continue
+        seen_combined.add(key)
+
+        dd_limit = _opt_val(row.get("p_monthly_drawdown_limit"))
+        pc = PortfolioConfig(
+            starting_capital=float(row.get("p_starting_capital", 20_000)),
+            max_trades_per_day=int(row.get("p_max_trades_per_day", 2)),
+            monthly_drawdown_limit=dd_limit,
+            lot_per_equity=float(row.get("p_lot_per_equity", 10_000)),
+            calls_only=_safe_bool(row.get("p_calls_only"), True),
+            min_dte=int(row.get("p_min_dte")) if pd.notna(row.get("p_min_dte")) else None,
+            max_delta=float(row.get("p_max_delta")) if pd.notna(row.get("p_max_delta")) else None,
+        )
+        tc = TradingConfig(
+            tp_pct=float(row.get("t_tp_pct", 0.50)),
+            sl_mult=_opt_val(row.get("t_sl_mult")),
+            max_vix=_opt_val(row.get("t_max_vix")),
+            max_term_structure=_opt_val(row.get("t_max_term_structure")),
+            avoid_opex=_safe_bool(row.get("t_avoid_opex")),
+            width_filter=_opt_val(row.get("t_width_filter")),
+            entry_count=int(row.get("t_entry_count")) if pd.notna(row.get("t_entry_count")) else None,
+        )
+        top_combined.append((pc, tc))
+        if len(top_combined) >= top_n_combined:
+            break
+
+    print(f"\n  Top {len(top_combined)} combined configs selected for Stage 3")
+
+    # --- Stage 3: Event param sweep ---
+    s3_configs = _build_staged_grid_stage3(top_combined)
+    s3_results = _run_grid(s3_configs, df, daily_signals, "Stage-3 Event")
+
+    # Combine all stages
+    all_results = pd.concat([s1_results, s2_results, s3_results], ignore_index=True)
+    all_results.to_csv(output_csv, index=False)
+    print(f"\n  Combined results ({len(all_results):,} rows) exported to {output_csv}")
+
+    return all_results.sort_values("sharpe", ascending=False).reset_index(drop=True)
 
 
 # ===================================================================
@@ -943,7 +1569,9 @@ def print_optimizer_top(results_df: pd.DataFrame, metric: str, n: int = 10) -> N
     print(f"  TOP {n} BY {metric.upper()}")
     print(f"{'=' * 115}")
     cols = ["p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
-            "p_calls_only", "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
+            "p_calls_only", "t_tp_pct", "t_sl_mult", "t_max_vix",
+            "t_avoid_opex", "t_width_filter", "t_entry_count",
+            "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
             "e_rally_avoidance", "final_equity", "return_pct", "max_dd_pct",
             "sharpe", "total_trades", "days_stopped"]
     display_cols = [c for c in cols if c in top.columns]
@@ -964,9 +1592,23 @@ ANALYSIS_PARAMS = [
     "p_monthly_drawdown_limit",
     "p_lot_per_equity",
     "p_calls_only",
+    "p_min_dte",
+    "p_max_delta",
+    "t_tp_pct",
+    "t_sl_mult",
+    "t_max_vix",
+    "t_max_term_structure",
+    "t_avoid_opex",
+    "t_prefer_event_days",
+    "t_width_filter",
+    "t_entry_count",
     "e_enabled",
+    "e_signal_mode",
     "e_budget_mode",
     "e_spx_drop_threshold",
+    "e_spx_drop_2d_threshold",
+    "e_vix_spike_threshold",
+    "e_vix_elevated_threshold",
     "e_rally_avoidance",
     "e_side_preference",
 ]
@@ -1067,7 +1709,9 @@ def _print_pareto(pareto: pd.DataFrame) -> None:
     print(f"  PARETO FRONTIER (Sharpe vs Max DD) -- {len(pareto)} optimal configs")
     print(f"{'=' * 130}")
     cols = ["p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
-            "p_calls_only", "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
+            "p_calls_only", "t_tp_pct", "t_sl_mult", "t_max_vix",
+            "t_avoid_opex", "t_width_filter",
+            "e_enabled", "e_budget_mode", "e_spx_drop_threshold",
             "e_rally_avoidance", "final_equity", "return_pct", "max_dd_pct",
             "sharpe", "win_rate"]
     display_cols = [c for c in cols if c in pareto.columns]
@@ -1136,33 +1780,79 @@ def _row_to_config(row: pd.Series) -> FullConfig:
 
     Returns
     -------
-    FullConfig with portfolio and event settings from the row.
+    FullConfig with portfolio, trading, and event settings from the row.
     """
     dd_limit = row.get("p_monthly_drawdown_limit")
     if pd.isna(dd_limit):
         dd_limit = None
+
+    min_dte = row.get("p_min_dte")
+    if pd.notna(min_dte):
+        min_dte = int(min_dte)
+    else:
+        min_dte = None
+
+    max_delta = row.get("p_max_delta")
+    if pd.notna(max_delta):
+        max_delta = float(max_delta)
+    else:
+        max_delta = None
+
+    def _opt_float(key, default=None):
+        v = row.get(key)
+        return float(v) if pd.notna(v) else default
+
+    def _opt_int(key, default=None):
+        v = row.get(key)
+        return int(v) if pd.notna(v) else default
+
+    def _opt_bool(key, default=False):
+        v = row.get(key, default)
+        if pd.isna(v):
+            return default
+        return bool(v)
 
     pc = PortfolioConfig(
         starting_capital=float(row.get("p_starting_capital", 20_000)),
         max_trades_per_day=int(row.get("p_max_trades_per_day", 2)),
         monthly_drawdown_limit=dd_limit,
         lot_per_equity=float(row.get("p_lot_per_equity", 10_000)),
-        calls_only=bool(row.get("p_calls_only", True)),
+        calls_only=_opt_bool("p_calls_only", True),
+        min_dte=min_dte,
+        max_delta=max_delta,
     )
+
+    tc = TradingConfig(
+        tp_pct=float(row.get("t_tp_pct", 0.50)),
+        sl_mult=_opt_float("t_sl_mult"),
+        max_vix=_opt_float("t_max_vix"),
+        max_term_structure=_opt_float("t_max_term_structure"),
+        avoid_opex=_opt_bool("t_avoid_opex"),
+        prefer_event_days=_opt_bool("t_prefer_event_days"),
+        width_filter=_opt_float("t_width_filter"),
+        entry_count=_opt_int("t_entry_count"),
+    )
+
     ec = EventConfig(
-        enabled=bool(row.get("e_enabled", False)),
-        budget_mode=str(row.get("e_budget_mode", "shared")),
+        enabled=_opt_bool("e_enabled"),
+        signal_mode=_opt_str(row.get("e_signal_mode"), "any"),
+        budget_mode=_opt_str(row.get("e_budget_mode"), "shared"),
         max_event_trades=int(row.get("e_max_event_trades", 1)),
         spx_drop_threshold=float(row.get("e_spx_drop_threshold", -0.01)),
-        side_preference=str(row.get("e_side_preference", "puts")),
+        spx_drop_2d_threshold=float(row.get("e_spx_drop_2d_threshold", -0.02)),
+        spx_drop_min=_opt_float("e_spx_drop_min"),
+        spx_drop_max=_opt_float("e_spx_drop_max"),
+        vix_spike_threshold=float(row.get("e_vix_spike_threshold", 0.15)),
+        vix_elevated_threshold=float(row.get("e_vix_elevated_threshold", 25.0)),
+        side_preference=_opt_str(row.get("e_side_preference"), "puts"),
         min_dte=int(row.get("e_min_dte", 5)),
         max_dte=int(row.get("e_max_dte", 7)),
         min_delta=float(row.get("e_min_delta", 0.15)),
         max_delta=float(row.get("e_max_delta", 0.25)),
-        rally_avoidance=bool(row.get("e_rally_avoidance", False)),
+        rally_avoidance=_opt_bool("e_rally_avoidance"),
         rally_threshold=float(row.get("e_rally_threshold", 0.01)),
     )
-    return FullConfig(portfolio=pc, event=ec)
+    return FullConfig(portfolio=pc, trading=tc, event=ec)
 
 
 def run_analysis(results_csv: Path) -> pd.DataFrame:
@@ -1370,13 +2060,24 @@ def _config_signature(row: pd.Series) -> str:
 
 
 def _config_key(row: pd.Series) -> tuple:
-    """Build a hashable key from the config columns of a results row."""
+    """Build a hashable key from the config columns of a results row.
+
+    NaN values are normalized to None so that two otherwise-identical
+    configs always produce equal keys (``NaN != NaN`` in Python).
+    """
     return tuple(
-        row.get(c) for c in [
+        _opt_val(row.get(c)) for c in [
             "p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
-            "p_calls_only", "e_enabled", "e_budget_mode", "e_max_event_trades",
-            "e_spx_drop_threshold", "e_side_preference", "e_min_dte", "e_max_dte",
-            "e_min_delta", "e_max_delta", "e_rally_avoidance",
+            "p_calls_only", "p_min_dte", "p_max_delta",
+            "t_tp_pct", "t_sl_mult", "t_max_vix", "t_max_term_structure",
+            "t_avoid_opex", "t_prefer_event_days", "t_width_filter", "t_entry_count",
+            "e_enabled", "e_signal_mode", "e_budget_mode", "e_max_event_trades",
+            "e_spx_drop_threshold", "e_spx_drop_2d_threshold",
+            "e_spx_drop_min", "e_spx_drop_max",
+            "e_vix_spike_threshold", "e_vix_elevated_threshold",
+            "e_term_inversion_threshold",
+            "e_side_preference", "e_min_dte", "e_max_dte",
+            "e_min_delta", "e_max_delta", "e_rally_avoidance", "e_rally_threshold",
         ]
     )
 
@@ -1561,7 +2262,10 @@ def main() -> None:
     parser.add_argument("--compare", action="store_true", default=False,
                         help="Run preset comparison configs")
     parser.add_argument("--optimize", action="store_true", default=False,
-                        help="Run exhaustive grid-search optimizer")
+                        help="Run exhaustive grid-search optimizer (original mode)")
+    parser.add_argument("--optimize-staged", action="store_true", default=False,
+                        help="Run 3-stage optimizer: trading -> portfolio -> event "
+                             "(requires multi-TP trajectory columns)")
     parser.add_argument("--analyze", action="store_true", default=False,
                         help="Deep-dive optimizer results (param importance, Pareto, robustness)")
     parser.add_argument("--walkforward", action="store_true", default=False,
@@ -1619,6 +2323,11 @@ def main() -> None:
             output_csv=Path(args.output_csv.replace("backtest_results", "walkforward_results")),
             windows=wf_windows,
         )
+
+    elif args.optimize_staged:
+        results_df = run_staged_optimizer(df, daily_signals, Path(args.output_csv))
+        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
+            print_optimizer_top(results_df, metric)
 
     elif args.optimize:
         results_df = run_optimizer(df, daily_signals, Path(args.output_csv))

@@ -5,6 +5,7 @@ EventSelector, precompute_daily_signals, and run_backtest.
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -23,8 +24,13 @@ from backtest_strategy import (
     PortfolioConfig,
     PortfolioManager,
     ScheduledSelector,
+    TradingConfig,
     precompute_daily_signals,
     run_backtest,
+    compute_effective_pnl,
+    pnl_column_name,
+    precompute_pnl_columns,
+    _should_skip_day,
     MARGIN_PER_LOT,
     _precompute_day_selections,
     _fast_sched_select,
@@ -618,3 +624,787 @@ class TestAnalysisSmoke:
         pareto = run_analysis(csv_path)
         assert isinstance(pareto, pd.DataFrame)
         assert len(pareto) >= 1
+
+
+# ── TradingConfig ────────────────────────────────────────────────
+
+
+class TestTradingConfig:
+    def test_defaults(self):
+        """Default TradingConfig has expected values."""
+        tc = TradingConfig()
+        assert tc.tp_pct == 0.50
+        assert tc.sl_mult is None
+        assert tc.max_vix is None
+        assert tc.avoid_opex is False
+        assert tc.width_filter is None
+        assert tc.entry_count is None
+
+    def test_flat_dict_includes_trading(self):
+        """FullConfig.flat_dict includes t_ prefixed trading params."""
+        cfg = FullConfig(trading=TradingConfig(tp_pct=0.70, sl_mult=2.0, max_vix=30.0))
+        d = cfg.flat_dict()
+        assert "t_tp_pct" in d
+        assert d["t_tp_pct"] == 0.70
+        assert d["t_sl_mult"] == 2.0
+        assert d["t_max_vix"] == 30.0
+
+
+# ── compute_effective_pnl ────────────────────────────────────────
+
+
+class TestComputeEffectivePnl:
+    @pytest.fixture
+    def base_row(self) -> pd.Series:
+        """A fully resolved candidate with multi-TP trajectory data."""
+        return pd.Series({
+            "resolved": True,
+            "entry_credit": 1.0,
+            "width_points": 10.0,
+            "realized_pnl": 50.0,
+            "max_adverse_pnl": -30.0,
+            "final_pnl_at_expiry": 80.0,
+            "first_tp50_pnl": 55.0,
+            "min_pnl_before_tp50": -10.0,
+            "first_tp60_pnl": 65.0,
+            "min_pnl_before_tp60": -10.0,
+            "first_tp70_pnl": 75.0,
+            "min_pnl_before_tp70": -20.0,
+            "first_tp80_pnl": None,
+            "min_pnl_before_tp80": -30.0,
+            "first_tp90_pnl": None,
+            "min_pnl_before_tp90": -30.0,
+            "first_tp100_pnl": None,
+            "min_pnl_before_tp100": -30.0,
+        })
+
+    def test_tp50_no_sl(self, base_row):
+        """TP50 exit with no stop-loss returns first_tp50_pnl."""
+        result = compute_effective_pnl(base_row, tp_pct=0.50, sl_mult=None)
+        assert result == pytest.approx(55.0)
+
+    def test_tp70_no_sl(self, base_row):
+        """TP70 exit returns first_tp70_pnl."""
+        result = compute_effective_pnl(base_row, tp_pct=0.70, sl_mult=None)
+        assert result == pytest.approx(75.0)
+
+    def test_tp80_not_reached_falls_to_expiry(self, base_row):
+        """When TP80 never fires, falls back to final_pnl_at_expiry."""
+        result = compute_effective_pnl(base_row, tp_pct=0.80, sl_mult=None)
+        assert result == pytest.approx(80.0)
+
+    def test_sl_fires_before_tp(self, base_row):
+        """SL fires when min_pnl_before_tp breaches threshold."""
+        # SL mult=0.2 → threshold = 100*0.2 = $20. min_before_tp70=-20 → triggers
+        result = compute_effective_pnl(base_row, tp_pct=0.70, sl_mult=0.2)
+        assert result == pytest.approx(-20.0)
+
+    def test_sl_doesnt_fire_before_tp(self, base_row):
+        """SL doesn't fire when min_pnl_before is above threshold."""
+        # SL mult=0.5 → threshold = $50. min_before_tp50=-10 → no SL
+        result = compute_effective_pnl(base_row, tp_pct=0.50, sl_mult=0.5)
+        assert result == pytest.approx(55.0)
+
+    def test_hold_to_expiry(self, base_row):
+        """tp_pct > 1.0 means hold to expiry."""
+        result = compute_effective_pnl(base_row, tp_pct=1.01, sl_mult=None)
+        assert result == pytest.approx(80.0)
+
+    def test_hold_to_expiry_with_sl(self, base_row):
+        """Hold-to-expiry with SL fires SL if max_adverse breaches."""
+        # SL mult=0.2 → threshold = $20. max_adverse=-30 → SL fires
+        result = compute_effective_pnl(base_row, tp_pct=1.01, sl_mult=0.2)
+        assert result == pytest.approx(-20.0)
+
+    def test_unresolved_row(self):
+        """Unresolved rows return None."""
+        row = pd.Series({"resolved": False, "entry_credit": 1.0})
+        assert compute_effective_pnl(row, 0.50, None) is None
+
+    def test_pnl_column_name(self):
+        """pnl_column_name generates deterministic names."""
+        assert pnl_column_name(0.50, None) == "pnl_tp50_none"
+        assert pnl_column_name(0.70, 2.0) == "pnl_tp70_2.0"
+        assert pnl_column_name(1.01, 1.5) == "pnl_tp101_1.5"
+
+
+# ── Day-level filters ────────────────────────────────────────────
+
+
+class TestDayLevelFilters:
+    @pytest.fixture
+    def daily_signals(self) -> pd.DataFrame:
+        """Minimal daily signals DataFrame with regime data."""
+        return pd.DataFrame([
+            {"day": "2025-06-01", "vix": 15.0, "term_structure": 0.95,
+             "is_opex_day": False, "is_fomc_day": False, "is_nfp_day": False},
+            {"day": "2025-06-02", "vix": 35.0, "term_structure": 1.12,
+             "is_opex_day": True, "is_fomc_day": False, "is_nfp_day": False},
+            {"day": "2025-06-03", "vix": 20.0, "term_structure": 0.90,
+             "is_opex_day": False, "is_fomc_day": True, "is_nfp_day": True},
+        ]).set_index("day")
+
+    def test_no_filters_no_skip(self, daily_signals):
+        """Default TradingConfig skips nothing."""
+        tc = TradingConfig()
+        assert _should_skip_day(tc, "2025-06-01", daily_signals) is None
+        assert _should_skip_day(tc, "2025-06-02", daily_signals) is None
+
+    def test_vix_filter(self, daily_signals):
+        """max_vix=30 skips day with VIX=35."""
+        tc = TradingConfig(max_vix=30.0)
+        assert _should_skip_day(tc, "2025-06-01", daily_signals) is None
+        assert _should_skip_day(tc, "2025-06-02", daily_signals) == "vix_filter"
+
+    def test_term_structure_filter(self, daily_signals):
+        """max_term_structure=1.10 skips day with ts=1.12."""
+        tc = TradingConfig(max_term_structure=1.10)
+        assert _should_skip_day(tc, "2025-06-01", daily_signals) is None
+        assert _should_skip_day(tc, "2025-06-02", daily_signals) == "ts_filter"
+
+    def test_opex_filter(self, daily_signals):
+        """avoid_opex=True skips OPEX day."""
+        tc = TradingConfig(avoid_opex=True)
+        assert _should_skip_day(tc, "2025-06-01", daily_signals) is None
+        assert _should_skip_day(tc, "2025-06-02", daily_signals) == "opex_filter"
+
+    def test_prefer_event_days(self, daily_signals):
+        """prefer_event_days=True skips non-FOMC/NFP days."""
+        tc = TradingConfig(prefer_event_days=True)
+        assert _should_skip_day(tc, "2025-06-01", daily_signals) == "non_event_day"
+        assert _should_skip_day(tc, "2025-06-03", daily_signals) is None
+
+    def test_missing_day_no_skip(self, daily_signals):
+        """Day not in daily_signals is not skipped."""
+        tc = TradingConfig(max_vix=10.0)
+        assert _should_skip_day(tc, "2025-12-31", daily_signals) is None
+
+
+# ── Width filter and entry count in precompute ───────────────────
+
+
+class TestPrecomputeFilters:
+    @pytest.fixture
+    def multi_width_df(self) -> pd.DataFrame:
+        """DataFrame with multiple widths and entry times."""
+        rows = []
+        for day in ["2025-06-01", "2025-06-02"]:
+            for dt in ["09:45", "10:15", "10:45"]:
+                for width in [5.0, 10.0, 15.0]:
+                    rows.append({
+                        "day": day, "entry_dt": dt,
+                        "spread_side": "call", "dte_target": 3,
+                        "delta_target": 0.10, "credit_to_width": 0.30,
+                        "realized_pnl": 100, "width_points": width,
+                        "spot": 5500, "vix": 15, "vix9d": 14,
+                        "term_structure": 1.0,
+                    })
+        return pd.DataFrame(rows)
+
+    def test_width_filter(self, multi_width_df):
+        """width_filter restricts candidates to a single width."""
+        precomp = _precompute_day_selections(multi_width_df, width_filter=10.0)
+        for day, data in precomp.items():
+            assert all(data["all"]["width_points"] == 10.0)
+
+    def test_entry_count(self, multi_width_df):
+        """entry_count=1 keeps only the last entry time per day."""
+        precomp = _precompute_day_selections(multi_width_df, entry_count=1)
+        for day, data in precomp.items():
+            assert data["all"]["entry_dt"].nunique() == 1
+            assert data["all"]["entry_dt"].iloc[0] == "10:45"
+
+    def test_entry_count_2(self, multi_width_df):
+        """entry_count=2 keeps the last 2 entry times per day."""
+        precomp = _precompute_day_selections(multi_width_df, entry_count=2)
+        for day, data in precomp.items():
+            assert data["all"]["entry_dt"].nunique() == 2
+
+    def test_no_filters(self, multi_width_df):
+        """No filters keeps all candidates."""
+        precomp = _precompute_day_selections(multi_width_df)
+        for day, data in precomp.items():
+            assert len(data["all"]) == 9  # 3 widths * 3 entry times
+
+
+# ── run_backtest with TradingConfig ──────────────────────────────
+
+
+class TestRunBacktestWithTrading:
+    def test_vix_filter_reduces_trading(self, multi_day_df):
+        """VIX filter skips days, reducing total trades."""
+        signals = precompute_daily_signals(multi_day_df)
+        config_no_filter = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2, calls_only=True),
+            trading=TradingConfig(),
+            event=EventConfig(enabled=False),
+        )
+        config_with_filter = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2, calls_only=True),
+            trading=TradingConfig(max_vix=10.0),
+            event=EventConfig(enabled=False),
+        )
+        r_no = run_backtest(multi_day_df, signals, config_no_filter)
+        r_with = run_backtest(multi_day_df, signals, config_with_filter)
+        assert r_with.total_trades <= r_no.total_trades
+
+
+# ── compute_effective_pnl edge cases ─────────────────────────────
+
+
+class TestComputeEffectivePnlEdgeCases:
+    def test_nan_trajectory_fields(self):
+        """NaN in trajectory columns falls back gracefully."""
+        row = pd.Series({
+            "resolved": True, "entry_credit": 1.0, "width_points": 10.0,
+            "realized_pnl": 42.0,
+            "max_adverse_pnl": np.nan,
+            "final_pnl_at_expiry": np.nan,
+            "first_tp50_pnl": np.nan,
+            "min_pnl_before_tp50": np.nan,
+        })
+        result = compute_effective_pnl(row, tp_pct=0.50, sl_mult=None)
+        assert result == pytest.approx(42.0)
+
+    def test_zero_entry_credit(self):
+        """entry_credit of 0 returns None."""
+        row = pd.Series({"resolved": True, "entry_credit": 0.0})
+        assert compute_effective_pnl(row, 0.50, None) is None
+
+    def test_negative_entry_credit(self):
+        """Negative entry_credit returns None."""
+        row = pd.Series({"resolved": True, "entry_credit": -0.5})
+        assert compute_effective_pnl(row, 0.50, None) is None
+
+    def test_missing_entry_credit(self):
+        """Missing entry_credit returns None."""
+        row = pd.Series({"resolved": True})
+        assert compute_effective_pnl(row, 0.50, None) is None
+
+
+# ── precompute_pnl_columns ───────────────────────────────────────
+
+
+class TestPrecomputePnlColumns:
+    @pytest.fixture
+    def trajectory_df(self) -> pd.DataFrame:
+        """Small DataFrame with trajectory columns for vectorized precompute."""
+        return pd.DataFrame([
+            {
+                "resolved": True, "entry_credit": 1.0, "width_points": 10.0,
+                "realized_pnl": 50.0, "final_pnl_at_expiry": 80.0,
+                "max_adverse_pnl": -30.0,
+                "first_tp50_pnl": 55.0, "min_pnl_before_tp50": -10.0,
+                "first_tp70_pnl": 75.0, "min_pnl_before_tp70": -20.0,
+                "first_tp100_pnl": None, "min_pnl_before_tp100": -30.0,
+            },
+            {
+                "resolved": True, "entry_credit": 2.0, "width_points": 10.0,
+                "realized_pnl": -100.0, "final_pnl_at_expiry": -100.0,
+                "max_adverse_pnl": -200.0,
+                "first_tp50_pnl": None, "min_pnl_before_tp50": -200.0,
+                "first_tp70_pnl": None, "min_pnl_before_tp70": -200.0,
+                "first_tp100_pnl": None, "min_pnl_before_tp100": -200.0,
+            },
+        ])
+
+    def test_columns_created(self, trajectory_df):
+        """Precompute adds named columns to the DataFrame."""
+        cols = precompute_pnl_columns(trajectory_df, [0.50], [None])
+        assert "pnl_tp50_none" in trajectory_df.columns
+        assert "pnl_tp50_none" in cols
+
+    def test_values_match_scalar(self, trajectory_df):
+        """Vectorized results match row-by-row compute_effective_pnl."""
+        precompute_pnl_columns(trajectory_df, [0.50, 0.70], [None, 2.0])
+        for idx, row in trajectory_df.iterrows():
+            for tp in [0.50, 0.70]:
+                for sl in [None, 2.0]:
+                    col = pnl_column_name(tp, sl)
+                    expected = compute_effective_pnl(row, tp, sl)
+                    actual = trajectory_df.at[idx, col]
+                    if expected is None or (isinstance(expected, float) and np.isnan(expected)):
+                        assert pd.isna(actual)
+                    else:
+                        assert actual == pytest.approx(expected, abs=0.01)
+
+    def test_unresolved_row_nan(self, trajectory_df):
+        """Unresolved rows get NaN in precomputed columns."""
+        trajectory_df.at[1, "resolved"] = False
+        precompute_pnl_columns(trajectory_df, [0.50], [None])
+        assert pd.isna(trajectory_df.at[1, "pnl_tp50_none"])
+
+
+# ── run_backtest with precomputed PnL column ─────────────────────
+
+
+class TestRunBacktestPrecomputedPnl:
+    def test_uses_precomputed_column(self):
+        """run_backtest uses the precomputed PnL column when it exists."""
+        rows = []
+        for day in ["2025-06-01", "2025-06-02", "2025-06-03"]:
+            rows.append({
+                "day": day, "entry_dt": "09:45", "spread_side": "call",
+                "dte_target": 3, "delta_target": 0.10,
+                "credit_to_width": 0.30,
+                "realized_pnl": 100,
+                "pnl_tp70_none": -50,  # opposite direction from realized_pnl
+                "spot": 5500, "vix": 15, "vix9d": 14, "term_structure": 1.0,
+                "width_points": 10.0,
+            })
+        df = pd.DataFrame(rows)
+        signals = precompute_daily_signals(df)
+
+        config_default = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=1, calls_only=True),
+            trading=TradingConfig(tp_pct=0.50, sl_mult=None),
+            event=EventConfig(enabled=False),
+        )
+        config_tp70 = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=1, calls_only=True),
+            trading=TradingConfig(tp_pct=0.70, sl_mult=None),
+            event=EventConfig(enabled=False),
+        )
+
+        r_default = run_backtest(df, signals, config_default)
+        r_tp70 = run_backtest(df, signals, config_tp70)
+
+        # Default (realized_pnl=100) should profit; TP70 (pnl_tp70_none=-50) should lose
+        assert r_default.final_equity > 20_000
+        assert r_tp70.final_equity < 20_000
+
+
+# ── Enriched fixtures ────────────────────────────────────────────
+
+
+class TestEnrichedFixtures:
+    @pytest.fixture
+    def enriched_df(self) -> pd.DataFrame:
+        """DataFrame with width_points, calendar flags, and trajectory columns."""
+        rows = []
+        for day_idx, day in enumerate(["2025-06-01", "2025-06-02", "2025-06-03"]):
+            for dt in ["09:45", "10:02"]:
+                rows.append({
+                    "day": day, "entry_dt": dt, "spread_side": "call",
+                    "dte_target": 3, "delta_target": 0.10,
+                    "credit_to_width": 0.30, "realized_pnl": 100,
+                    "entry_credit": 1.0, "width_points": 10.0,
+                    "spot": 5500, "vix": 15 + day_idx * 10, "vix9d": 14,
+                    "term_structure": 0.95 + day_idx * 0.10,
+                    "is_opex_day": day_idx == 1,
+                    "is_fomc_day": day_idx == 2,
+                    "is_nfp_day": False,
+                })
+        return pd.DataFrame(rows)
+
+    def test_precompute_signals_includes_calendar(self, enriched_df):
+        """precompute_daily_signals picks up calendar columns from DataFrame."""
+        signals = precompute_daily_signals(enriched_df)
+        assert "is_opex_day" in signals.columns
+        assert "is_fomc_day" in signals.columns
+
+    def test_opex_filter_end_to_end(self, enriched_df):
+        """avoid_opex=True skips OPEX day through full run_backtest."""
+        signals = precompute_daily_signals(enriched_df)
+        config = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2, calls_only=True),
+            trading=TradingConfig(avoid_opex=True),
+            event=EventConfig(enabled=False),
+        )
+        result = run_backtest(enriched_df, signals, config)
+        opex_recs = [r for r in result.curve if r.status == "opex_filter"]
+        assert len(opex_recs) == 1  # day_idx==1 is OPEX
+
+
+# ── FullConfig / RowToConfig with TradingConfig ──────────────────
+
+
+class TestFullConfigWithTrading:
+    def test_flat_dict_has_t_prefix(self):
+        """flat_dict includes t_ prefixed trading params."""
+        cfg = FullConfig(
+            trading=TradingConfig(tp_pct=0.70, sl_mult=2.0, max_vix=30.0,
+                                  avoid_opex=True, width_filter=15.0, entry_count=2),
+        )
+        d = cfg.flat_dict()
+        assert d["t_tp_pct"] == 0.70
+        assert d["t_sl_mult"] == 2.0
+        assert d["t_max_vix"] == 30.0
+        assert d["t_avoid_opex"] is True
+        assert d["t_width_filter"] == 15.0
+        assert d["t_entry_count"] == 2
+
+    def test_roundtrip_with_trading(self):
+        """Config -> flat_dict -> row -> config preserves TradingConfig."""
+        original = FullConfig(
+            portfolio=PortfolioConfig(starting_capital=20_000, max_trades_per_day=2,
+                                      monthly_drawdown_limit=0.15, lot_per_equity=10_000,
+                                      calls_only=True, min_dte=3, max_delta=0.20),
+            trading=TradingConfig(tp_pct=0.70, sl_mult=1.5, max_vix=30.0,
+                                  avoid_opex=True, width_filter=15.0, entry_count=2),
+            event=EventConfig(enabled=True, budget_mode="shared", spx_drop_threshold=-0.01,
+                              side_preference="puts", min_dte=5, max_dte=7),
+        )
+        row = pd.Series(original.flat_dict())
+        reconstructed = _row_to_config(row)
+        assert reconstructed.trading.tp_pct == 0.70
+        assert reconstructed.trading.sl_mult == 1.5
+        assert reconstructed.trading.max_vix == 30.0
+        assert reconstructed.trading.avoid_opex is True
+        assert reconstructed.trading.width_filter == 15.0
+        assert reconstructed.trading.entry_count == 2
+        assert reconstructed.portfolio.min_dte == 3
+        assert reconstructed.portfolio.max_delta == 0.20
+
+    def test_roundtrip_none_optionals(self):
+        """None optionals survive the flat_dict -> row -> config roundtrip."""
+        original = FullConfig(
+            trading=TradingConfig(tp_pct=0.50, sl_mult=None, max_vix=None,
+                                  width_filter=None, entry_count=None),
+        )
+        row = pd.Series(original.flat_dict())
+        reconstructed = _row_to_config(row)
+        assert reconstructed.trading.sl_mult is None
+        assert reconstructed.trading.max_vix is None
+        assert reconstructed.trading.width_filter is None
+        assert reconstructed.trading.entry_count is None
+
+    def test_nan_bool_reconstructed_correctly(self):
+        """NaN boolean fields default to False, not True."""
+        row = pd.Series({
+            "p_starting_capital": 20_000, "p_max_trades_per_day": 2,
+            "p_monthly_drawdown_limit": float("nan"), "p_lot_per_equity": 10_000,
+            "p_calls_only": float("nan"), "p_min_dte": float("nan"),
+            "p_max_delta": float("nan"),
+            "t_tp_pct": 0.50, "t_sl_mult": float("nan"),
+            "t_max_vix": float("nan"), "t_max_term_structure": float("nan"),
+            "t_avoid_opex": float("nan"), "t_prefer_event_days": float("nan"),
+            "t_width_filter": float("nan"), "t_entry_count": float("nan"),
+            "e_enabled": float("nan"), "e_budget_mode": "shared",
+            "e_max_event_trades": 1, "e_spx_drop_threshold": -0.01,
+            "e_side_preference": "puts", "e_min_dte": 5, "e_max_dte": 7,
+            "e_min_delta": 0.15, "e_max_delta": 0.25,
+            "e_rally_avoidance": float("nan"), "e_rally_threshold": 0.01,
+        })
+        cfg = _row_to_config(row)
+        assert cfg.portfolio.calls_only is True  # default
+        assert cfg.trading.avoid_opex is False
+        assert cfg.trading.prefer_event_days is False
+        assert cfg.event.enabled is False
+        assert cfg.event.rally_avoidance is False
+
+
+# ── PortfolioManager margin_per_lot ──────────────────────────────
+
+
+class TestPortfolioManagerMargin:
+    def test_default_margin(self):
+        """Default margin is MARGIN_PER_LOT (1000)."""
+        pm = PortfolioManager(PortfolioConfig(starting_capital=20_000))
+        assert pm.margin_per_lot == MARGIN_PER_LOT
+
+    def test_custom_margin(self):
+        """Custom margin_per_lot affects lot computation and min equity."""
+        pm = PortfolioManager(PortfolioConfig(starting_capital=2000), margin_per_lot=500)
+        pm.begin_day("2025-06-01")
+        assert pm.can_trade()
+
+        pm2 = PortfolioManager(PortfolioConfig(starting_capital=400), margin_per_lot=500)
+        pm2.begin_day("2025-06-01")
+        assert not pm2.can_trade()
+
+
+# ── EventConfig signal_mode ─────────────────────────────────────
+
+
+class TestSignalMode:
+    """Tests for signal_mode (any / all / spx_and_vix) in EventSignalDetector."""
+
+    def _crash_row(self) -> pd.Series:
+        """Row where all thresholds fire (SPX drop, VIX spike, elevated, etc.)."""
+        return pd.Series({
+            "prev_spx_return": -0.03,
+            "prev_spx_return_2d": -0.04,
+            "prev_vix_pct_change": 0.30,
+            "vix": 35,
+            "term_structure": 1.2,
+        })
+
+    def _spx_only_row(self) -> pd.Series:
+        """Row where only SPX drop fires, VIX is calm."""
+        return pd.Series({
+            "prev_spx_return": -0.015,
+            "prev_spx_return_2d": -0.025,
+            "prev_vix_pct_change": 0.02,
+            "vix": 15,
+            "term_structure": 0.90,
+        })
+
+    def _vix_only_row(self) -> pd.Series:
+        """Row where only VIX fires, SPX is flat."""
+        return pd.Series({
+            "prev_spx_return": 0.001,
+            "prev_spx_return_2d": 0.003,
+            "prev_vix_pct_change": 0.30,
+            "vix": 35,
+            "term_structure": 0.90,
+        })
+
+    def test_any_mode_fires_on_single_signal(self):
+        """'any' mode fires when just one signal triggers."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="any", spx_drop_threshold=-0.01,
+        ))
+        signals = det.detect(self._spx_only_row())
+        assert len(signals) > 0
+        assert "spx_drop_1d" in signals
+
+    def test_all_mode_requires_every_signal(self):
+        """'all' mode only fires when ALL configured thresholds trigger."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="all",
+            spx_drop_threshold=-0.01, spx_drop_2d_threshold=-0.02,
+            vix_spike_threshold=0.10, vix_elevated_threshold=25,
+            term_inversion_threshold=1.0,
+        ))
+        assert len(det.detect(self._crash_row())) > 0
+        assert len(det.detect(self._spx_only_row())) == 0
+
+    def test_spx_and_vix_mode_requires_both(self):
+        """'spx_and_vix' requires at least one SPX AND one VIX signal."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="spx_and_vix",
+            spx_drop_threshold=-0.01,
+            vix_spike_threshold=0.10, vix_elevated_threshold=25,
+        ))
+        assert len(det.detect(self._crash_row())) > 0
+        assert len(det.detect(self._spx_only_row())) == 0
+        assert len(det.detect(self._vix_only_row())) == 0
+
+    def test_spx_and_vix_with_crash(self):
+        """Crash row triggers both SPX and VIX, so spx_and_vix should fire."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="spx_and_vix",
+            spx_drop_threshold=-0.01,
+            vix_spike_threshold=0.10,
+        ))
+        signals = det.detect(self._crash_row())
+        assert "spx_drop_1d" in signals
+        assert "vix_spike" in signals
+
+    def test_rally_preserved_regardless_of_mode(self):
+        """Rally signal is kept even when other signals are filtered out."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="all",
+            rally_avoidance=True, rally_threshold=0.005,
+        ))
+        row = pd.Series({
+            "prev_spx_return": 0.02,
+            "prev_spx_return_2d": 0.03,
+            "prev_vix_pct_change": 0.01,
+            "vix": 15,
+            "term_structure": 0.90,
+        })
+        signals = det.detect(row)
+        assert "rally" in signals
+
+    def test_all_mode_category_based(self):
+        """'all' fires when all 3 categories have at least one signal, even
+        if not all 5 individual signals fire."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="all",
+            spx_drop_threshold=-0.01, spx_drop_2d_threshold=-0.99,
+            vix_spike_threshold=0.10, vix_elevated_threshold=999,
+            term_inversion_threshold=1.0,
+        ))
+        # spx_drop_1d fires, spx_drop_2d does NOT (threshold too extreme)
+        # vix_spike fires, vix_elevated does NOT (threshold too extreme)
+        # term_inversion fires
+        row = pd.Series({
+            "prev_spx_return": -0.03,
+            "prev_spx_return_2d": -0.04,
+            "prev_vix_pct_change": 0.30,
+            "vix": 35,
+            "term_structure": 1.2,
+        })
+        signals = det.detect(row)
+        assert "spx_drop_1d" in signals
+        assert "vix_spike" in signals
+        assert "term_inversion" in signals
+
+    def test_all_mode_missing_ts_category(self):
+        """'all' does NOT fire when term structure category is missing."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, signal_mode="all",
+            spx_drop_threshold=-0.01,
+            vix_spike_threshold=0.10,
+            term_inversion_threshold=1.0,
+        ))
+        row = pd.Series({
+            "prev_spx_return": -0.03,
+            "prev_spx_return_2d": -0.04,
+            "prev_vix_pct_change": 0.30,
+            "vix": 35,
+            "term_structure": 0.90,  # normal, no inversion
+        })
+        signals = det.detect(row)
+        # Has SPX + VIX but no TS -> should be empty (+ no rally)
+        assert len(signals) == 0
+
+
+# ── SPX drop range gate ─────────────────────────────────────────
+
+
+class TestSpxDropRange:
+    """Tests for spx_drop_min / spx_drop_max magnitude bucketing."""
+
+    def test_within_range_fires(self):
+        """SPX drop within [min, max] range triggers the signal."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, spx_drop_threshold=-0.005,
+            spx_drop_min=-0.02, spx_drop_max=-0.005,
+        ))
+        row = pd.Series({
+            "prev_spx_return": -0.015,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        assert "spx_drop_1d" in det.detect(row)
+
+    def test_below_min_suppressed(self):
+        """SPX drop more severe than spx_drop_min is outside the range."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, spx_drop_threshold=-0.005,
+            spx_drop_min=-0.02, spx_drop_max=-0.005,
+        ))
+        row = pd.Series({
+            "prev_spx_return": -0.03,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        assert "spx_drop_1d" not in det.detect(row)
+
+    def test_above_max_suppressed(self):
+        """SPX drop not severe enough (above max) does not fire."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, spx_drop_threshold=-0.005,
+            spx_drop_min=-0.02, spx_drop_max=-0.01,
+        ))
+        row = pd.Series({
+            "prev_spx_return": -0.007,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        assert "spx_drop_1d" not in det.detect(row)
+
+    def test_no_range_constraints_passes_through(self):
+        """Without range constraints, any drop below threshold fires."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, spx_drop_threshold=-0.01,
+        ))
+        row = pd.Series({
+            "prev_spx_return": -0.05,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        assert "spx_drop_1d" in det.detect(row)
+
+    def test_only_min_set(self):
+        """Only spx_drop_min set: suppresses drops more severe than min."""
+        det = EventSignalDetector(EventConfig(
+            enabled=True, spx_drop_threshold=-0.005,
+            spx_drop_min=-0.02,
+        ))
+        mild = pd.Series({
+            "prev_spx_return": -0.015,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        severe = pd.Series({
+            "prev_spx_return": -0.03,
+            "prev_spx_return_2d": 0, "prev_vix_pct_change": 0,
+            "vix": 15, "term_structure": 0.90,
+        })
+        assert "spx_drop_1d" in det.detect(mild)
+        assert "spx_drop_1d" not in det.detect(severe)
+
+
+# ── EventConfig roundtrip with new fields ────────────────────────
+
+
+class TestEventConfigRoundtrip:
+    """Verify new EventConfig fields survive flat_dict -> _row_to_config."""
+
+    def test_signal_mode_roundtrip(self):
+        """signal_mode survives roundtrip."""
+        cfg = FullConfig(
+            portfolio=PortfolioConfig(),
+            trading=TradingConfig(),
+            event=EventConfig(enabled=True, signal_mode="spx_and_vix"),
+        )
+        flat = cfg.flat_dict()
+        assert flat["e_signal_mode"] == "spx_and_vix"
+        restored = _row_to_config(pd.Series(flat))
+        assert restored.event.signal_mode == "spx_and_vix"
+
+    def test_spx_drop_range_roundtrip(self):
+        """spx_drop_min and spx_drop_max survive roundtrip."""
+        cfg = FullConfig(
+            portfolio=PortfolioConfig(),
+            trading=TradingConfig(),
+            event=EventConfig(
+                enabled=True,
+                spx_drop_min=-0.02, spx_drop_max=-0.005,
+            ),
+        )
+        flat = cfg.flat_dict()
+        assert flat["e_spx_drop_min"] == -0.02
+        assert flat["e_spx_drop_max"] == -0.005
+        restored = _row_to_config(pd.Series(flat))
+        assert restored.event.spx_drop_min == pytest.approx(-0.02)
+        assert restored.event.spx_drop_max == pytest.approx(-0.005)
+
+    def test_threshold_fields_roundtrip(self):
+        """New threshold sweep fields survive roundtrip."""
+        cfg = FullConfig(
+            portfolio=PortfolioConfig(),
+            trading=TradingConfig(),
+            event=EventConfig(
+                enabled=True,
+                vix_spike_threshold=0.20,
+                vix_elevated_threshold=30.0,
+                spx_drop_2d_threshold=-0.03,
+            ),
+        )
+        flat = cfg.flat_dict()
+        restored = _row_to_config(pd.Series(flat))
+        assert restored.event.vix_spike_threshold == pytest.approx(0.20)
+        assert restored.event.vix_elevated_threshold == pytest.approx(30.0)
+        assert restored.event.spx_drop_2d_threshold == pytest.approx(-0.03)
+
+    def test_none_range_roundtrip(self):
+        """None spx_drop_min/max stay None after roundtrip."""
+        cfg = FullConfig(
+            portfolio=PortfolioConfig(),
+            trading=TradingConfig(),
+            event=EventConfig(enabled=True),
+        )
+        flat = cfg.flat_dict()
+        restored = _row_to_config(pd.Series(flat))
+        assert restored.event.spx_drop_min is None
+        assert restored.event.spx_drop_max is None
+
+    def test_nan_string_fields_get_defaults(self):
+        """NaN in string EventConfig fields falls back to defaults, not 'nan'."""
+        flat = FullConfig(
+            portfolio=PortfolioConfig(),
+            trading=TradingConfig(),
+            event=EventConfig(enabled=True, signal_mode="spx_and_vix"),
+        ).flat_dict()
+        flat["e_signal_mode"] = float("nan")
+        flat["e_budget_mode"] = float("nan")
+        flat["e_side_preference"] = float("nan")
+        restored = _row_to_config(pd.Series(flat))
+        assert restored.event.signal_mode == "any"
+        assert restored.event.budget_mode == "shared"
+        assert restored.event.side_preference == "puts"
