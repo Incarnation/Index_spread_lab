@@ -80,6 +80,12 @@ class PortfolioManager:
         and restores the trade count for *today* so the daily limit is
         enforced correctly across multiple decision runs.
 
+        Preserves the original start-of-day equity and month-start equity
+        across multiple ``begin_day`` calls within the same day (e.g. after
+        ``trade_pnl_job`` closes a trade between decision runs) by reading
+        the stored values from the DB rather than recomputing them from the
+        latest (potentially updated) equity.
+
         Parameters
         ----------
         today : The current trading date.
@@ -91,13 +97,20 @@ class PortfolioManager:
         if prev_equity is not None:
             self.equity = prev_equity
 
-        self._equity_start_today = self.equity
+        # Use the DB's equity_start if today's row already exists so that
+        # intra-day closures don't reset the daily PnL baseline.
+        db_start = await self._load_today_equity_start(today)
+        self._equity_start_today = db_start if db_start is not None else self.equity
+
         self._trades_today = await self._count_trades_today(today)
 
         month_key = today.strftime("%Y-%m")
         if month_key != self._current_month:
             self._current_month = month_key
-            self.month_start_equity = self.equity
+            # Recover month-start from the DB so a process restart mid-month
+            # doesn't reset the drawdown baseline to the current equity.
+            db_month = await self._load_month_start_equity(month_key)
+            self.month_start_equity = db_month if db_month is not None else self.equity
             self._month_stopped = False
 
         self._state_id = await self._upsert_day_state(
@@ -289,6 +302,38 @@ class PortfolioManager:
                 "WHERE equity_end IS NOT NULL "
                 "ORDER BY date DESC LIMIT 1"
             ))
+            result = row.fetchone()
+            return float(result[0]) if result else None
+
+    async def _load_today_equity_start(self, today: date) -> float | None:
+        """Read today's equity_start from ``portfolio_state`` if the row exists.
+
+        Returns the stored value so that multiple ``begin_day`` calls in the
+        same day preserve the original start-of-day baseline even when
+        ``equity_end`` has been updated by trade closures in between.
+        """
+        async with engine.connect() as conn:
+            row = await conn.execute(text(
+                "SELECT equity_start FROM portfolio_state WHERE date = :d"
+            ), {"d": today})
+            result = row.fetchone()
+            return float(result[0]) if result else None
+
+    async def _load_month_start_equity(self, month_key: str) -> float | None:
+        """Read month_start_equity from the earliest row in the given month.
+
+        On a process restart ``_current_month`` is ``None``, so ``begin_day``
+        always enters the month-change branch.  Without this DB lookup it
+        would overwrite ``month_start_equity`` with the latest equity,
+        breaking the monthly drawdown baseline.
+        """
+        async with engine.connect() as conn:
+            row = await conn.execute(text(
+                "SELECT month_start_equity FROM portfolio_state "
+                "WHERE to_char(date, 'YYYY-MM') = :mk "
+                "AND month_start_equity IS NOT NULL "
+                "ORDER BY date ASC LIMIT 1"
+            ), {"mk": month_key})
             result = row.fetchone()
             return float(result[0]) if result else None
 

@@ -386,6 +386,159 @@ class TestEquityStartToday:
         assert params["dpnl"] == pytest.approx(100.0)
 
 
+# ── begin_day state preservation across re-runs ──────────────────
+
+
+class TestBeginDayStatePreservation:
+    """Verify begin_day preserves equity_start and month_start from the DB
+    across multiple calls within the same day / same month, even after
+    trade closures update equity_end in between.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_engine(self):
+        with patch("spx_backend.services.portfolio_manager.engine") as mock_eng:
+            self.mock_engine = mock_eng
+
+            mock_conn_ctx = AsyncMock()
+            mock_conn = AsyncMock()
+            mock_conn_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_conn_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_begin_ctx = AsyncMock()
+            mock_begin_conn = AsyncMock()
+            mock_begin_ctx.__aenter__ = AsyncMock(return_value=mock_begin_conn)
+            mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+
+            mock_eng.connect.return_value = mock_conn_ctx
+            mock_eng.begin.return_value = mock_begin_ctx
+
+            self.mock_conn = mock_conn
+            self.mock_begin_conn = mock_begin_conn
+            yield
+
+    def _setup_db_responses(
+        self,
+        equity: float | None,
+        trade_count: int,
+        state_id: int = 1,
+        today_equity_start: float | None = None,
+        month_start_eq: float | None = None,
+    ):
+        """Configure mock DB responses including the new helper queries.
+
+        Parameters
+        ----------
+        equity : Latest equity_end value (None = no prior state).
+        trade_count : Number of trades today.
+        today_equity_start : Existing equity_start for today's row.
+        month_start_eq : Existing month_start_equity for current month.
+        """
+        async def execute_side_effect(*args, **kwargs):
+            query = str(args[0]) if args else ""
+            ql = query.lower()
+            result = MagicMock()
+
+            if "equity_end" in ql:
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: equity
+                result.fetchone.return_value = row if equity is not None else None
+            elif "equity_start" in ql and "portfolio_state" in ql and "date" in ql:
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: today_equity_start
+                result.fetchone.return_value = row if today_equity_start is not None else None
+            elif "month_start_equity" in ql and "to_char" in ql:
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: month_start_eq
+                result.fetchone.return_value = row if month_start_eq is not None else None
+            elif "count" in ql:
+                row = MagicMock()
+                row.__getitem__ = lambda self, i: trade_count
+                result.fetchone.return_value = row
+            else:
+                result.fetchone.return_value = None
+            return result
+
+        self.mock_conn.execute = AsyncMock(side_effect=execute_side_effect)
+        upsert_result = MagicMock()
+        upsert_result.scalar_one.return_value = state_id
+        self.mock_begin_conn.execute = AsyncMock(return_value=upsert_result)
+
+    def test_begin_day_preserves_equity_start_across_reruns(self):
+        """When today's row already exists, begin_day should use the DB's
+        equity_start rather than the (potentially updated) current equity."""
+        self._setup_db_responses(
+            equity=20_660,           # equity_end updated by a closure
+            trade_count=1,
+            today_equity_start=20_240,  # original start-of-day value
+        )
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 4, 8)))
+
+        assert pm.equity == 20_660
+        assert pm._equity_start_today == 20_240
+
+    def test_first_begin_day_uses_current_equity(self):
+        """On the very first call of the day (no DB row yet), equity_start
+        should fall back to the current equity."""
+        self._setup_db_responses(
+            equity=20_000,
+            trade_count=0,
+            today_equity_start=None,  # no row yet
+        )
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 4, 7)))
+
+        assert pm._equity_start_today == 20_000
+
+    def test_month_start_from_db_on_restart(self):
+        """On process restart (_current_month is None), begin_day should
+        load month_start_equity from the DB instead of using current equity."""
+        self._setup_db_responses(
+            equity=20_660,
+            trade_count=2,
+            month_start_eq=20_000,  # true start-of-month equity
+        )
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        assert pm._current_month is None
+
+        run(pm.begin_day(date(2026, 4, 8)))
+
+        assert pm.month_start_equity == 20_000  # from DB, not 20_660
+
+    def test_month_start_falls_back_to_equity_for_new_month(self):
+        """When no DB rows exist for the current month, month_start should
+        use the current equity (genuinely new month)."""
+        self._setup_db_responses(
+            equity=21_000,
+            trade_count=0,
+            month_start_eq=None,  # no rows for this month yet
+        )
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 5, 1)))
+
+        assert pm.month_start_equity == 21_000
+
+    def test_daily_pnl_correct_after_closure_and_rerun(self):
+        """After a trade closure updates equity between begin_day calls,
+        daily_pnl should still reflect the difference from the original
+        equity_start, not zero."""
+        self._setup_db_responses(
+            equity=20_660,           # equity_end after closure
+            trade_count=1,
+            today_equity_start=20_240,  # preserved from first begin_day
+        )
+        pm = PortfolioManager(starting_capital=20_000, max_trades_per_day=3)
+        run(pm.begin_day(date(2026, 4, 8)))
+
+        mock_session = AsyncMock()
+        run(pm._update_day_state(equity_end=20_660, trades=1, session=mock_session))
+
+        params = mock_session.execute.await_args_list[0].args[1]
+        # daily_pnl = equity_end(20660) - equity_start_today(20240) = 420
+        assert params["dpnl"] == pytest.approx(420.0)
+
+
 # ── Event candidate filtering logic ──────────────────────────────
 
 
