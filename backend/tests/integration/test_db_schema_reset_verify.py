@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+pytestmark = pytest.mark.integration
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 

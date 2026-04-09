@@ -391,11 +391,8 @@ class TestLoadSpyEquityFallback:
 
 # ── Export function tests ────────────────────────────────────────
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-
 from export_production_data import (
     export_chain_data,
-    export_underlying_parquet,
     export_economic_calendar_merged,
 )
 

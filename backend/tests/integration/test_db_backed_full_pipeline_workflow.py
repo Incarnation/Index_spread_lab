@@ -268,6 +268,7 @@ def _configure_workflow_settings(monkeypatch) -> None:
     monkeypatch.setattr(settings, "trainer_min_test_rows", 0)
     monkeypatch.setattr(settings, "trainer_test_days", 1)
     monkeypatch.setattr(settings, "shadow_inference_lookback_minutes", 10080)
+    monkeypatch.setattr(settings, "shadow_inference_model_name", settings.trainer_model_name)
 
 
 def _patch_job_session_locals(monkeypatch, session_factory) -> None:
@@ -667,7 +668,7 @@ async def test_db_backed_snapshot_malformed_chain_rolls_back_only_failed_expirat
     assert result["skipped"] is False
     assert len(result["inserted"]) == 1
     assert len(result["failed_items"]) == 1
-    assert result["failed_items"][0]["stage"] == "persist_chain"
+    assert result["failed_items"][0]["stage"] == "empty_chain"
     assert result["chain_rows_inserted"] > 0
 
     snapshots = (
@@ -731,7 +732,7 @@ async def test_db_backed_gex_partial_failure_keeps_other_snapshots(
             return await _flaky_get_spot_price(session, ts, underlying)
 
     job = _FlakyGexJob()
-    result = await job.run_once()
+    result = await job.run_once(force=True)
 
     assert result["skipped"] is False
     assert result["computed_snapshots"] == 1

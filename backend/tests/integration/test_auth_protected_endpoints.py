@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.integration
 from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
 from passlib.context import CryptContext

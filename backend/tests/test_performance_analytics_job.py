@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from spx_backend.config import settings
 from spx_backend.jobs.performance_analytics_job import (
+    PerformanceAnalyticsJob,
     TradeAnalyticsRow,
     _bucket_delta,
     _bucket_dte,
@@ -93,3 +96,69 @@ def test_dimension_values_cover_side_dte_delta_weekday_hour_source() -> None:
     assert dims["weekday"] == "Tue"
     assert dims["hour"] == "15"
     assert dims["source"] == "live"
+
+
+# ── run_once skip-path tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_disabled(monkeypatch) -> None:
+    """run_once returns skipped when analytics is disabled and force is False."""
+    monkeypatch.setattr(settings, "performance_analytics_enabled", False)
+    job = PerformanceAnalyticsJob()
+    result = await job.run_once(force=False)
+    assert result["skipped"] is True
+    assert result["reason"] == "performance_analytics_disabled"
+
+
+@pytest.mark.asyncio
+async def test_run_once_force_bypasses_disabled_gate(monkeypatch) -> None:
+    """force=True runs the job even when the config flag is disabled."""
+    monkeypatch.setattr(settings, "performance_analytics_enabled", False)
+
+    fake_rows = []
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(side_effect=_build_perf_session_router(fake_rows))
+    mock_session.commit = AsyncMock()
+
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "spx_backend.jobs.performance_analytics_job.SessionLocal",
+        MagicMock(return_value=ctx),
+    )
+
+    job = PerformanceAnalyticsJob()
+    result = await job.run_once(force=True)
+    assert result["skipped"] is False
+    assert result["source_trade_count"] == 0
+
+
+def _build_perf_session_router(trade_rows):
+    """Return an async side_effect dispatcher for PerformanceAnalyticsJob SQL queries."""
+    call_count = {"n": 0}
+
+    async def _router(sql_or_text, params=None):
+        call_count["n"] += 1
+        sql_str = str(sql_or_text) if not isinstance(sql_or_text, str) else sql_or_text
+
+        if "FROM trades" in sql_str:
+            result = MagicMock()
+            result.fetchall = MagicMock(return_value=trade_rows)
+            return result
+        if "DELETE FROM trade_performance_snapshots" in sql_str:
+            return MagicMock()
+        if "INSERT INTO trade_performance_snapshots" in sql_str:
+            row = MagicMock()
+            row.analytics_snapshot_id = 1
+            result = MagicMock()
+            result.fetchone = MagicMock(return_value=row)
+            return result
+        if "INSERT INTO trade_performance_breakdowns" in sql_str:
+            return MagicMock()
+        if "INSERT INTO trade_performance_equity_curve" in sql_str:
+            return MagicMock()
+        return MagicMock()
+
+    return _router

@@ -20,7 +20,6 @@ from regime_analysis import (
     build_vix_spike_buckets,
     build_dte_buckets,
     build_side_buckets,
-    build_delta_buckets,
     build_width_buckets,
     build_calendar_buckets,
     build_term_structure_buckets,

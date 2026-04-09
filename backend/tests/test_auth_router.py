@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

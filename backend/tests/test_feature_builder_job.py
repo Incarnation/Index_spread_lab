@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from spx_backend.jobs.feature_builder_job import FeatureBuilderJob
-from spx_backend.jobs.feature_builder_job import build_candidate_hash
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from spx_backend.config import settings
+from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_candidate_hash
 
 
 def _candidate_json(short_symbol: str = "P_SHORT") -> dict:
@@ -70,3 +75,61 @@ def test_build_candidate_json_includes_cboe_context() -> None:
     payload = job._build_candidate_json(candidate, cboe_context=cboe_context)
 
     assert payload["cboe_context"] == cboe_context
+
+
+# ── run_once skip-path tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_disabled(monkeypatch) -> None:
+    """run_once returns skipped when feature_builder_enabled is False."""
+    monkeypatch.setattr(settings, "feature_builder_enabled", False)
+    job = FeatureBuilderJob()
+    result = await job.run_once()
+    assert result["skipped"] is True
+    assert result["reason"] == "feature_builder_disabled"
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_not_entry_time(monkeypatch) -> None:
+    """run_once returns skipped outside configured entry times."""
+    monkeypatch.setattr(settings, "feature_builder_enabled", True)
+    monkeypatch.setattr(settings, "decision_entry_times", "09:31,10:01")
+
+    # Freeze time to 03:00 ET — not an entry time
+    fixed = datetime(2026, 4, 9, 3, 0, tzinfo=ZoneInfo("America/New_York"))
+    import spx_backend.jobs.feature_builder_job as fb_mod
+    monkeypatch.setattr(fb_mod, "datetime", type("_DT", (), {"now": staticmethod(lambda tz=None: fixed)}))
+
+    job = FeatureBuilderJob()
+    result = await job.run_once()
+    assert result["skipped"] is True
+    assert result["reason"] == "not_entry_time"
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_missing_targets(monkeypatch) -> None:
+    """run_once returns skipped when DTE or delta targets are empty."""
+    monkeypatch.setattr(settings, "feature_builder_enabled", True)
+    monkeypatch.setattr(settings, "decision_dte_targets", "")
+    monkeypatch.setattr(settings, "decision_delta_targets", "0.20")
+
+    job = FeatureBuilderJob()
+    result = await job.run_once(force=True)
+    assert result["skipped"] is True
+    assert result["reason"] == "missing_targets"
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_missing_spread_sides(monkeypatch) -> None:
+    """run_once returns skipped when no spread sides are configured."""
+    monkeypatch.setattr(settings, "feature_builder_enabled", True)
+    monkeypatch.setattr(settings, "decision_dte_targets", "3")
+    monkeypatch.setattr(settings, "decision_delta_targets", "0.20")
+    monkeypatch.setattr(settings, "decision_spread_sides", "")
+    monkeypatch.setattr(settings, "decision_spread_side", "")
+
+    job = FeatureBuilderJob()
+    result = await job.run_once(force=True)
+    assert result["skipped"] is True
+    assert result["reason"] == "missing_spread_sides"

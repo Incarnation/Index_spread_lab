@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from spx_backend.config import settings
 from spx_backend.jobs.shadow_inference_job import (
-    ShadowInferenceJob,
     classify_prediction,
     classify_uncertainty_level,
     compute_uncertainty_penalty,

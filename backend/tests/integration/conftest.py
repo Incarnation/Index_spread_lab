@@ -4,13 +4,8 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-from httpx import ASGITransport, AsyncClient
 import pytest
-from fastapi import FastAPI
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from spx_backend.web.routers import admin, auth, public
 
 
 def _ensure_safe_test_database_url(url: str) -> None:
@@ -72,92 +67,3 @@ async def integration_db_session(database_url_test: str) -> AsyncSession:
 def admin_headers() -> dict[str, str]:
     """Return optional admin header used by integration request helpers."""
     return {"X-API-Key": "test-key"}
-
-
-@pytest.fixture
-async def integration_client(integration_db_session: AsyncSession):
-    """Build FastAPI test client with DB dependency overrides."""
-    app = FastAPI()
-    app.include_router(public.router)
-    app.include_router(admin.router)
-
-    async def _override_db():
-        yield integration_db_session
-
-    async def _override_current_user():
-        return auth.UserOut(id=1, username="test", is_admin=True)
-
-    app.dependency_overrides[public.get_db_session] = _override_db
-    app.dependency_overrides[admin.get_db_session] = _override_db
-    app.dependency_overrides[auth.get_current_user] = _override_current_user
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        yield client
-
-
-async def seed_core_records(session: AsyncSession) -> dict[str, int]:
-    """Insert minimum viable rows for DB-backed API smoke tests."""
-    snapshot_row = await session.execute(
-        text(
-            """
-            INSERT INTO chain_snapshots (ts, underlying, target_dte, expiration, payload_json, checksum)
-            VALUES (now(), 'SPX', 3, CURRENT_DATE + INTERVAL '3 day', '{}'::jsonb, 'seed_chk')
-            RETURNING snapshot_id
-            """
-        )
-    )
-    snapshot_id = int(snapshot_row.scalar_one())
-
-    await session.execute(
-        text(
-            """
-            INSERT INTO option_chain_rows (
-              snapshot_id, option_symbol, underlying, expiration, strike, option_right,
-              bid, ask, last, volume, open_interest, delta, raw_json
-            )
-            VALUES (
-              :snapshot_id, 'SPX_SEED_OPT', 'SPX', CURRENT_DATE + INTERVAL '3 day', 6000.0, 'P',
-              1.0, 1.2, 1.1, 10, 100, -0.2, '{}'::jsonb
-            )
-            """
-        ),
-        {"snapshot_id": snapshot_id},
-    )
-
-    await session.execute(
-        text(
-            """
-            INSERT INTO gex_snapshots (
-              snapshot_id, ts, underlying, spot_price, gex_net, gex_calls, gex_puts, gex_abs, zero_gamma_level, method
-            )
-            VALUES (:snapshot_id, now(), 'SPX', 6000.0, 100.0, 150.0, -50.0, 200.0, 5980.0, 'oi_gamma_spot')
-            """
-        ),
-        {"snapshot_id": snapshot_id},
-    )
-
-    decision_row = await session.execute(
-        text(
-            """
-            INSERT INTO trade_decisions (
-              ts, target_dte, entry_slot, delta_target, decision, reason, score, chain_snapshot_id,
-              ruleset_version, decision_source, chosen_legs_json, strategy_params_json
-            )
-            VALUES (
-              now(), 3, 10, 0.2, 'TRADE', NULL, 1.0, :snapshot_id,
-              'rules_v1', 'rules', '{}'::jsonb, '{}'::jsonb
-            )
-            RETURNING decision_id
-            """
-        ),
-        {"snapshot_id": snapshot_id},
-    )
-    decision_id = int(decision_row.scalar_one())
-    await session.commit()
-    return {"snapshot_id": snapshot_id, "decision_id": decision_id}
-
-
-@pytest.fixture
-def seed_core_records_fn():
-    """Expose async seeding helper to integration tests."""
-    return seed_core_records
