@@ -1,726 +1,341 @@
-# IndexSpreadLab Backend
+# IndexSpreadLab -- Backend
 
-This backend is a FastAPI service that captures options market data, computes context/GEX, and runs a rules-first plus model-assisted paper execution pipeline.
-
-It is built for observability and reproducibility:
-- every chain snapshot is stored with metadata and checksum (raw payload cleared to save storage)
-- market clock states are audited
-- decision runs are persisted (TRADE and SKIP) with reasons
-- preflight endpoint provides one-call pipeline health
-- staleness monitoring with email alerting during RTH
+FastAPI + APScheduler service that captures SPX/SPY/VIX option data, computes GEX, generates trade candidates, runs ML pipelines, and manages paper-trade execution with portfolio budgeting.
 
 ---
 
-## 1) Service Responsibilities
+## Module Map
 
-The backend performs twelve continuous tasks:
-- Quote ingestion (`underlying_quotes`, `context_snapshots`)
-- Option chain snapshots (`chain_snapshots`, `option_chain_rows`)
-- GEX computation (`gex_snapshots`, strike/expiry detail tables)
-- Feature generation (`feature_snapshots`, `trade_candidates`)
-- Decision generation (`trade_decisions`, rules/hybrid policy)
-- Trade mark-to-market and exits (`trades`, `trade_legs`, `trade_marks`)
-- Label resolution (`trade_candidates.label_*`, `realized_pnl`)
-- Weekly training with sparse CV fallback (`training_runs`, `model_versions`)
-- Shadow inference (`model_predictions`)
-- Promotion gate evaluation (model rollout status updates)
-- Performance analytics aggregation (win rates, expectancy, drawdown, margin usage)
-- Staleness monitoring with SendGrid email alerting (RTH-only, cooldown-gated)
+```
+spx_backend/
+  config.py             Pydantic Settings (env-backed, single source of truth)
+  main.py               Uvicorn entrypoint (PORT-aware for Railway)
+  dte.py                Trading-day DTE helper (skips weekends + holidays)
+  market_clock.py       Tradier clock cache with DB audit and RTH fallback
+  scheduler_builder.py  APScheduler construction and all job registration
 
-And exposes APIs for:
-- dashboard data reads
-- admin run controls
-- quick health and diagnostics
+  web/
+    app.py              FastAPI app, lifespan, middleware, CORS
+    routers/
+      public.py         Read-only data endpoints (chains, GEX, trades, analytics)
+      admin.py          Manual-trigger and ops endpoints
+      auth.py           JWT login/register/logout + audit log
+      portfolio.py      Portfolio status, history, trades, config
 
----
+  ingestion/
+    tradier_client.py   Tradier REST wrapper (expirations, chains, quotes, clock)
 
-## 2) Runtime Lifecycle
+  jobs/
+    quote_job.py        Pulls quotes for configured symbols
+    snapshot_job.py     SPX/SPY/VIX chain capture with DTE policy
+    gex_job.py          Tradier-computed GEX aggregation
+    cboe_gex_job.py     CBOE precomputed GEX fetch
+    feature_builder_job.py  Feature snapshots + ranked candidate generation
+    decision_job.py     Execution policy (rules + optional hybrid ML ranking)
+    labeler_job.py      Outcome labeling + orphan cascade
+    trade_pnl_job.py    Mark-to-market + TP/SL/expiry close
+    trainer_job.py      Walk-forward XGBoost trainer (sparse CV fallback)
+    shadow_inference_job.py  Shadow model scoring
+    promotion_gate_job.py    Quality/risk gate evaluation
+    performance_analytics_job.py  Win rate, expectancy, drawdown aggregation
+    staleness_monitor_job.py     Pipeline freshness alerting (SendGrid)
+    eod_events_job.py   End-of-day signal capture + economic calendar
+    retention_job.py    Batch purge of old chain/GEX data
+    modeling.py         XGBoost model utilities (train, predict, feature importance)
 
-Startup flow:
-1) Load settings from env (`spx_backend/config.py`).
-2) Initialize database schema from `spx_backend/database/sql/db_schema.sql`.
-3) Run SQL migrations from `spx_backend/database/sql/migrations/` (idempotent, runs every startup).
-4) Build Tradier client + market clock cache.
-5) Start APScheduler jobs for quote/SPX snapshot/(enabled-by-default) SPY snapshot/(optional) VIX snapshot/gex/feature-builder/decision/trade-pnl/labeler/trainer/shadow-inference/promotion-gates/staleness-monitor/performance-analytics.
-6) Optionally run immediate first cycles to warm data.
+  services/
+    portfolio_manager.py  Capital budgeting, lot scaling, drawdown stops
+    event_signals.py      Event-driven signal detection (VIX spikes, SPX drops, term inversion)
 
-Shutdown flow:
-- Scheduler stops with FastAPI lifespan shutdown.
+  database/
+    connection.py       Async engine + session factory
+    schema.py           Startup schema bootstrap + migration runner
+    sql/
+      db_schema.sql     Base table definitions
+      migrations/       Numbered idempotent SQL migrations (run on startup)
+      db_reset_all_tables.sql   Full destructive reset
+      db_reset_ml_tables.sql    ML-only destructive reset
 
-Entrypoint:
-- `python -m spx_backend.main`
-- Honors Railway `PORT` automatically.
+  backtest/
+    strategy.py         Local backtest engine
+    sample_data/        Documentation for sample data formats
 
----
+scripts/
+  data_retention.py     CLI to export and purge old chain/GEX data
 
-## 3) Core Modules
-
-- `spx_backend/web/app.py`
-  - FastAPI app, lifespan, and router mounting.
-- `spx_backend/scheduler_builder.py`
-  - APScheduler construction, job registration, and startup warmup.
-- `spx_backend/web/routers/`
-  - `public.py`: public dashboard/data endpoints.
-  - `admin.py`: admin run/delete/preflight endpoints.
-- `spx_backend/database/`
-  - `connection.py`: async engine/session dependency.
-  - `schema.py`: schema init/reset helpers.
-  - `sql/`: schema and reset SQL files.
-  - `reset_ml_schema.py`, `reset_all_schema.py`: DB reset CLIs.
-- `spx_backend/jobs/snapshot_job.py`
-  - Pulls expirations/chains, applies DTE policy, stores snapshots + rows.
-- `spx_backend/jobs/quote_job.py`
-  - Pulls quote symbols and updates context snapshot.
-- `spx_backend/jobs/gex_job.py`
-  - Computes GEX summary and curves.
-- `spx_backend/jobs/decision_job.py`
-  - Builds/scoring candidate spreads and writes TRADE/SKIP rows.
-- `spx_backend/jobs/staleness_monitor_job.py`
-  - RTH-gated pipeline freshness checker with SendGrid alerting and cooldown.
-- `spx_backend/jobs/performance_analytics_job.py`
-  - Aggregate trade win rates, expectancy, drawdown, and margin usage.
-- `spx_backend/market_clock.py`
-  - Tradier clock cache with DB audit rows and RTH fallback behavior.
-- `spx_backend/backtest/`
-  - Local backtest engine code (`engine.py`, `run_backtest.py`) and `data/samples/`.
-  - Parquet path sanitization to prevent SQL injection via f-string view creation.
-- `spx_backend/dte.py`
-  - Trading-session DTE lookup and expiration chooser helpers.
-- `spx_backend/database/sql/db_schema.sql`
-  - Complete schema bootstrap for ingestion, decision, ML scaffolding.
-- `spx_backend/database/sql/migrations/`
-  - Idempotent SQL migrations run on every startup (index cleanup, payload_json clearing).
-- `scripts/data_retention.py`
-  - CLI to export old chain/GEX data to gzipped CSV and purge from the database.
+tests/                  45 test files (unit, integration, E2E)
+```
 
 ---
 
-## 4) Data Flow In Detail
+## Data Flow
 
-### 4.1 Quote Job
-
-Input:
-- Tradier quotes for `QUOTE_SYMBOLS` (default `SPX,VIX,VIX9D,SPY`).
-
-Output:
-- One row per symbol in `underlying_quotes`.
-- One upserted row in `context_snapshots` at current timestamp:
-  - `spx_price`, `spy_price`, `vix`, `vix9d`
-  - `term_structure = vix9d / vix` when available
-  - `notes_json` with source metadata
-
-RTH behavior:
-- If outside regular hours and `ALLOW_QUOTES_OUTSIDE_RTH=false`, job skips unless forced.
-- Market-open checks prefer cached Tradier clock; fallback to simple weekday/time logic.
-
-### 4.2 Snapshot Job
-
-Input:
-- Tradier expirations + option chain payloads.
-
-Selection:
-- DTE mode:
-  - `range`: capture expirations between min/max DTE.
-  - `targets`: capture nearest expirations for specific targets.
-- DTE semantics are trading-session based, not calendar difference.
-- Strikes are trimmed around spot (`SNAPSHOT_STRIKES_EACH_SIDE`).
-
-Output:
-- `chain_snapshots` metadata with checksum (raw `payload_json` cleared to `{}` to save storage).
-- `option_chain_rows` normalized rows (bid/ask/greeks/open interest/etc).
-
-Dual-stream behavior:
-- SPX snapshot stream remains the trading/decision source.
-- SPY snapshot stream (enabled by default) writes the same tables with `underlying='SPY'` for future SPY model fitting.
-- Optional VIX snapshot stream writes the same tables with `underlying='VIX'` for model features/training context.
-- Decision execution continues to use SPX snapshots only.
-
-Fallback mode:
-- Optional `SNAPSHOT_RANGE_FALLBACK_ENABLED=true` can capture nearest expirations if strict range has none (useful in sandbox; usually off in production).
-
-### 4.3 GEX Job
-
-Input:
-- Recent chain snapshots + option rows + recent spot quote.
-
-Formula (per option row):
-- `gex = sign * gamma * open_interest * contract_multiplier * spot^2`
-- sign is negative for puts when `GEX_PUTS_NEGATIVE=true`.
-
-Output tables:
-- `gex_snapshots`: aggregate totals and `zero_gamma_level`.
-- `gex_by_strike`: net/call/put GEX by strike.
-- `gex_by_expiry_strike`: same by expiration+strike with `dte_days`.
-
-Consistency behavior:
-- `gex_by_expiry_strike` upserts update values on conflict, so recalculations self-heal stale DTE labels.
-
-### 4.4 Decision Job
-
-Input:
-- Latest snapshots filtered by target DTE and freshness.
-- Latest context fields (VIX/GEX/zero-gamma when available).
-
-Core process:
-1) For each target DTE, choose freshest eligible snapshot.
-2) Build candidate vertical spread(s) for each enabled side (`put`/`call`) using delta and configured width.
-3) Compute candidate credit and validate viability.
-4) Apply context score adjustments.
-5) Enforce guardrails (`DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`, per-side daily/open caps).
-6) Apply execution policy:
-   - default: rules-ranked selection (`decision_source='rules'`)
-   - optional hybrid: model-ranked selection after rules safety checks (`decision_source='hybrid_model'`)
-7) Insert one `trade_decisions` row with final action and create paper trade rows for TRADE decisions.
-
-Why SKIP rows are stored:
-- They provide full auditability for why no trade occurred.
-- They are required to evaluate decision quality over time.
-
-### 4.5 Feature Builder Job
-
-Input:
-- Same live decision-time context (fresh snapshot + option rows + spot + context).
-
-Output:
-- One `feature_snapshots` row per target DTE.
-- Ranked candidate rows in `trade_candidates` with deterministic `candidate_hash`.
-
-### 4.6 Labeler Job
-
-Input:
-- Pending candidates from `trade_candidates`.
-- Forward option marks from later snapshots for the same expiration.
-
-Output:
-- Resolved labels in `trade_candidates.label_json`.
-- Status updates in `label_status`.
-- Scalar outcomes in `realized_pnl`, `hit_tp50_before_sl_or_expiry`, and `hit_tp100_at_expiry`.
-- Separate expiry counterfactual fields in label payload (`expiry_pnl`, `expiry_exit_cost`, `expiry_ts_utc`).
-
-### 4.7 Trade PnL Job
-
-Input:
-- Open rows in `trades` and `trade_legs`.
-- Latest chain marks for both legs from `option_chain_rows`.
-
-Output:
-- Rolling mark-to-market updates in `trades.current_pnl` every interval.
-- Mark history in `trade_marks`.
-- Auto-close updates (`status`, `exit_time`, `realized_pnl`, `exit_reason`) when TP/SL/expiry rules are met.
-
-### 4.8 Trainer Job
-
-Input:
-- Resolved `trade_candidates` over configured lookback/test windows.
-
-Output:
-- `training_runs` lifecycle rows (RUNNING/COMPLETED/FAILED).
-- `model_versions` rows with serialized model payload and walk-forward metrics.
-
-### 4.9 Shadow Inference Job
-
-Input:
-- Most recent eligible model (`shadow`/`canary`/`active`) and recent candidates without predictions.
-
-Output:
-- `model_predictions` inserts/updates with `probability_win`, `expected_value`, and utility metadata.
-
-### 4.10 Promotion Gate Job
-
-Input:
-- Most recent completed training run for configured model name.
-
-Output:
-- Gate pass/fail evaluation persisted into run/model metrics JSON.
-- `model_versions.rollout_status` updates (`shadow`/`canary`) and optional activation behavior.
-
-### 4.11 Performance Analytics Job
-
-Input:
-- Closed trades and their realized PnL, side, margin usage.
-
-Output:
-- Aggregate metrics: win rates (TP50, TP100), expectancy, max drawdown, tail loss proxy, average margin usage, per-side breakdown.
-
-### 4.12 Staleness Monitor Job
-
-Input:
-- Latest timestamps from `underlying_quotes`, `chain_snapshots`, `gex_snapshots`, `trade_decisions`.
-
-Behavior:
-- Runs only during RTH (skips evenings, weekends, exchange holidays via `MarketClockCache`).
-- Compares data age against configurable thresholds per source.
-- Sends email alert via SendGrid when any source exceeds its threshold.
-- Cooldown period (default 6 hours) prevents duplicate alerts.
+```
+Tradier API                  CBOE Vendor API
+    |                              |
+    v                              v
+quote_job -----> underlying_quotes
+    |                              |
+    +-----> context_snapshots <----+
+    |                              |
+snapshot_job -> chain_snapshots    |
+    |           option_chain_rows  |
+    v                              v
+gex_job ------> gex_snapshots     cboe_gex_job --> gex_snapshots
+                gex_by_strike                      gex_by_strike
+                gex_by_expiry_strike               gex_by_expiry_strike
+                    |
+                    v
+feature_builder_job --> feature_snapshots
+                        trade_candidates
+                            |
+                            v
+decision_job ---------> trade_decisions
+    |                   trades / trade_legs
+    |                       |
+    v                       v
+portfolio_manager       trade_pnl_job --> trade_marks
+    |                       |
+    v                       v
+portfolio_state         labeler_job --> labels on feature_snapshots
+portfolio_trades            |
+                            v
+                    trainer_job --> training_runs / model_versions
+                        |
+                        v
+                    shadow_inference_job --> model_predictions
+                        |
+                        v
+                    promotion_gate_job --> model_versions (rollout status)
+                        |
+                        v
+                    performance_analytics_job --> trade_performance_*
+```
 
 ---
 
-## 5) Trading-Day DTE Semantics
+## Scheduler Architecture
 
-The backend maps DTE using trading sessions from available expirations, not raw date subtraction.
+All jobs are registered in `scheduler_builder.py`. The scheduler uses these patterns:
 
-Implications:
-- Holidays/weekends do not count as trading days.
-- A calendar +3 day expiration can still be 2DTE or 3DTE depending on closures.
-- Snapshot selection and decision selection both use this logic.
+**RTH-window jobs** (snapshot, quote, GEX, CBOE GEX, performance analytics):
+- Fire every N minutes from 09:31-15:55 ET on weekdays.
+- A separate 16:00 ET `force=True` trigger runs the final capture.
+- Market-open guard skips holidays by checking Tradier clock state; a date is only marked as a trading day when an earlier guarded run observes `is_open=True`.
 
-Helpers:
-- `trading_dte_lookup(...)`
-- `choose_expiration_for_trading_dte(...)`
-- `closest_expiration_for_trading_dte(...)`
+**Entry-time jobs** (feature builder, decision):
+- Fire at configured `DECISION_ENTRY_TIMES` (e.g., `10:00,11:00,13:00`).
+- Market-open guarded.
 
----
+**After-close jobs** (labeler at 16:15, shadow inference at 16:20, EOD events at configurable time):
+- Guarded so they only run on dates that had an observed open market earlier.
 
-## 6) API Reference
+**Weekly jobs** (trainer on configured weekday, promotion gate 60 min after trainer):
+- Standard cron triggers.
 
-### Public Endpoints
+**Interval jobs** (trade PnL, staleness monitor):
+- Simple interval triggers (not RTH-gated for trade PnL so marks update continuously).
 
-- `GET /health`
-  - liveness probe
-- `GET /api/chain-snapshots?limit=...`
-  - recent chain snapshot metadata
-- `GET /api/trade-decisions?limit=...`
-  - recent decisions (TRADE/SKIP)
-- `GET /api/gex/snapshots?limit=...`
-  - recent GEX snapshot batches
-- `GET /api/gex/dtes?snapshot_id=...`
-  - available DTE options for selected GEX capture batch
-- `GET /api/gex/expirations?snapshot_id=...`
-  - available expiration dates for selected capture batch
-- `GET /api/gex/curve?snapshot_id=...&dte_days=...`
-- `GET /api/gex/curve?snapshot_id=...&expirations_csv=YYYY-MM-DD,YYYY-MM-DD`
-  - strike curve for all, one DTE, or custom expiration set
-- `GET /api/trades?status=...&limit=...`
-  - recent/open/closed paper trade rows with legs and PnL fields
-- `GET /api/label-metrics?lookback_days=...`
-  - TP50/TP100 and realized PnL summary from resolved labels
-- `GET /api/strategy-metrics?lookback_days=...`
-  - strategy quality/risk metrics (win rates, expectancy, drawdown, tail-loss proxy, margin usage, side breakdown)
-- `GET /api/model-ops`
-  - model/training/prediction operational summary
+**Daily jobs** (retention at 03:00 ET):
+- Standard cron trigger.
 
-Batch-scoped GEX note:
-- DTE/expiration/curve endpoints use all snapshots in the same capture batch (`same ts + underlying + source`), not only one row.
+**Job failure alerting**:
+- APScheduler `EVENT_JOB_ERROR` and `EVENT_JOB_MISSED` events trigger email alerts via SendGrid.
+- Per-job cooldown prevents alert storms.
 
-### Admin Endpoints
-
-All admin endpoints require a valid authenticated user token.
-
-Routes:
-- `POST /api/admin/run-snapshot`
-- `POST /api/admin/run-quotes`
-- `POST /api/admin/run-gex`
-- `POST /api/admin/run-cboe-gex`
-- `POST /api/admin/run-decision`
-- `POST /api/admin/run-feature-builder`
-- `POST /api/admin/run-labeler`
-- `POST /api/admin/run-trade-pnl`
-- `POST /api/admin/run-trainer`
-- `POST /api/admin/run-shadow-inference`
-- `POST /api/admin/run-promotion-gates`
-- `DELETE /api/admin/trade-decisions/{decision_id}`
-- `GET /api/admin/expirations?symbol=SPX`
-- `GET /api/admin/preflight`
-
-Preflight includes:
-- counts of key tables
-- latest timestamps for quote/snapshot/gex/decision/clock
-- latest detail object for snapshot/gex/decision
-- latest quote by symbol
-- warning tags (for missing data domains)
+**Startup warmup**:
+- On boot, quote -> snapshot -> SPY snapshot -> VIX snapshot -> GEX -> CBOE GEX -> performance analytics run once sequentially to populate fresh data.
 
 ---
 
-## 7) Configuration Reference
+## Key Design Decisions
 
-Read from `.env` in repo root.
+**DTE semantics**: Trading-session based, not calendar-day. Weekends and exchange holidays are skipped. See `dte.py` and the root README for examples.
 
-Required:
-- `DATABASE_URL` (`postgresql+asyncpg://...`)
-- `TRADIER_ACCESS_TOKEN`
-- `TRADIER_ACCOUNT_ID`
+**GEX dual-source**: Both Tradier-computed and CBOE precomputed GEX are stored with `source` discrimination. CBOE is preferred for canonical `gex_net`; Tradier is the fallback. `context_snapshots` has separate `gex_net_tradier` / `gex_net_cboe` columns to avoid overwrite races.
 
-High-impact settings:
-- Snapshot:
-  - `SNAPSHOT_INTERVAL_MINUTES`
-  - `SNAPSHOT_UNDERLYING`
-  - `SNAPSHOT_DTE_MODE`
-  - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
-  - `SNAPSHOT_DTE_TARGETS`, `SNAPSHOT_DTE_TOLERANCE_DAYS`
-  - `SNAPSHOT_STRIKES_EACH_SIDE`
-  - `ALLOW_SNAPSHOT_OUTSIDE_RTH`
-  - Optional SPY snapshot stream (enabled by default):
-    - `SPY_SNAPSHOT_ENABLED`
-    - `SPY_SNAPSHOT_INTERVAL_MINUTES`
-    - `SPY_SNAPSHOT_UNDERLYING` (default `SPY`)
-    - `SPY_SNAPSHOT_DTE_MODE`
-    - `SPY_SNAPSHOT_DTE_MIN_DAYS`, `SPY_SNAPSHOT_DTE_MAX_DAYS`
-    - `SPY_SNAPSHOT_DTE_TARGETS`, `SPY_SNAPSHOT_DTE_TOLERANCE_DAYS`
-    - `SPY_SNAPSHOT_STRIKES_EACH_SIDE`
-    - `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH`
-  - Optional VIX snapshot stream:
-    - `VIX_SNAPSHOT_ENABLED`
-    - `VIX_SNAPSHOT_INTERVAL_MINUTES`
-    - `VIX_SNAPSHOT_UNDERLYING` (default `VIX`)
-    - `VIX_SNAPSHOT_DTE_MODE`
-    - `VIX_SNAPSHOT_DTE_MIN_DAYS`, `VIX_SNAPSHOT_DTE_MAX_DAYS`
-    - `VIX_SNAPSHOT_DTE_TARGETS`, `VIX_SNAPSHOT_DTE_TOLERANCE_DAYS`
-    - `VIX_SNAPSHOT_STRIKES_EACH_SIDE`
-    - `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH`
-- Decision:
-  - `DECISION_ENTRY_TIMES`
-  - `DECISION_DTE_TARGETS`, `DECISION_DTE_TOLERANCE_DAYS`
-  - `DECISION_DELTA_TARGETS`
-  - `DECISION_SPREAD_SIDE`, `DECISION_SPREAD_SIDES`, `DECISION_SPREAD_WIDTH_POINTS`
-  - `DECISION_SNAPSHOT_MAX_AGE_MINUTES`
-  - `DECISION_MAX_TRADES_PER_DAY`, `DECISION_MAX_OPEN_TRADES`
-  - `DECISION_MAX_TRADES_PER_SIDE_PER_DAY`, `DECISION_MAX_OPEN_TRADES_PER_SIDE`
-- Hybrid execution policy:
-  - `DECISION_HYBRID_ENABLED`
-  - `DECISION_HYBRID_MODEL_NAME`
-  - `DECISION_HYBRID_MIN_PROBABILITY`
-  - `DECISION_HYBRID_MIN_EXPECTED_PNL`
-  - `DECISION_HYBRID_REQUIRE_ACTIVE_MODEL`
-- Feature Builder:
-  - `FEATURE_BUILDER_ENABLED`
-  - `FEATURE_BUILDER_ALLOW_OUTSIDE_RTH`
-  - `FEATURE_SCHEMA_VERSION`
-  - `CANDIDATE_SCHEMA_VERSION`
-- Labeler:
-  - `LABELER_ENABLED`
-  - `LABELER_BATCH_LIMIT`
-  - `LABELER_MIN_AGE_MINUTES`
-  - `LABELER_MAX_WAIT_HOURS`
-  - `LABELER_TAKE_PROFIT_PCT`
-  - `LABEL_SCHEMA_VERSION`
-  - `LABEL_CONTRACT_MULTIPLIER`
-  - Schedule: daily after close (Mon-Fri) at 16:15 ET
-- Weekly trainer:
-  - `TRAINER_ENABLED`
-  - `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`
-  - `TRAINER_MODEL_NAME`
-  - `TRAINER_LOOKBACK_DAYS`, `TRAINER_TEST_DAYS`
-  - `TRAINER_MIN_ROWS`, `TRAINER_MIN_TRAIN_ROWS`, `TRAINER_MIN_TEST_ROWS`
-- Shadow inference:
-  - `SHADOW_INFERENCE_ENABLED`
-  - `SHADOW_INFERENCE_BATCH_LIMIT`
-  - `SHADOW_INFERENCE_LOOKBACK_MINUTES`
-  - `SHADOW_INFERENCE_MODEL_NAME`
-  - Schedule: daily after close (Mon-Fri) at 16:20 ET
-- Promotion gates:
-  - `PROMOTION_GATE_ENABLED`
-  - `PROMOTION_GATE_MODEL_NAME`
-  - `PROMOTION_GATE_MIN_RESOLVED`
-  - `PROMOTION_GATE_MIN_TP50_RATE`
-  - `PROMOTION_GATE_MIN_EXPECTANCY`
-  - `PROMOTION_GATE_MAX_DRAWDOWN`
-  - `PROMOTION_GATE_MIN_TAIL_LOSS_PROXY`
-  - `PROMOTION_GATE_MAX_AVG_MARGIN_USAGE`
-  - `PROMOTION_GATE_AUTO_ACTIVATE`
-  - Schedule: weekly after trainer (trainer cron + 60 minutes)
-- Trade PnL:
-  - `TRADE_PNL_ENABLED`
-  - `TRADE_PNL_INTERVAL_MINUTES`
-  - `TRADE_PNL_ALLOW_OUTSIDE_RTH`
-  - `TRADE_PNL_MARK_MAX_AGE_MINUTES`
-  - `TRADE_PNL_TAKE_PROFIT_PCT`
-  - `TRADE_PNL_STOP_LOSS_PCT`
-  - `TRADE_PNL_CONTRACT_MULTIPLIER`
-- Performance analytics:
-  - `PERFORMANCE_ANALYTICS_ENABLED`
-  - `PERFORMANCE_ANALYTICS_INTERVAL_MINUTES`
-- GEX:
-  - `GEX_ENABLED`, `GEX_INTERVAL_MINUTES`
-  - `GEX_SNAPSHOT_BATCH_LIMIT` (default `20`)
-  - `GEX_STRIKE_LIMIT` (default `150`)
-  - `GEX_MAX_DTE_DAYS` (default `10`)
-  - `GEX_SPOT_MAX_AGE_SECONDS`
-- CBOE precomputed GEX (parallel stream):
-  - `MZDATA_BASE_URL`
-  - `CBOE_GEX_ENABLED`
-  - `CBOE_GEX_UNDERLYINGS` (default `SPX,SPY,VIX`)
-  - `CBOE_GEX_UNDERLYING` (legacy fallback during migration)
-  - `CBOE_GEX_INTERVAL_MINUTES` (default `5`)
-  - `CBOE_GEX_ALLOW_OUTSIDE_RTH` (default `false`)
-- Staleness alerting:
-  - `STALENESS_ALERT_ENABLED` (default `false`)
-  - `STALENESS_ALERT_INTERVAL_MINUTES` (default `30`)
-  - `STALENESS_QUOTES_MAX_MINUTES`, `STALENESS_SNAPSHOTS_MAX_MINUTES`, `STALENESS_GEX_MAX_MINUTES` (default `120`)
-  - `STALENESS_DECISIONS_MAX_MINUTES` (default `480`)
-  - `STALENESS_COOLDOWN_MINUTES` (default `360`)
-  - `SENDGRID_API_KEY`, `EMAIL_ALERT_RECIPIENT`, `EMAIL_ALERT_SENDER`
-- Ops/Safety:
-  - `ALLOW_QUOTES_OUTSIDE_RTH`
-  - `MARKET_CLOCK_CACHE_SECONDS`
-  - `CORS_ORIGINS`
-  - `TZ`
+**Decision policy**: Hard risk guardrails run first (day caps, open-trade caps, per-side caps). If all pass, rules-based scoring selects the best candidate. When hybrid mode is enabled and eligible model predictions exist, model ranking is applied subject to minimum probability and expected PnL thresholds.
 
-Recommended SPY model-fitting profile:
-- `SPY_SNAPSHOT_ENABLED=true`
-- `SPY_SNAPSHOT_INTERVAL_MINUTES=5`
-- `SPY_SNAPSHOT_DTE_MODE=range`
-- `SPY_SNAPSHOT_DTE_MIN_DAYS=0`
-- `SPY_SNAPSHOT_DTE_MAX_DAYS=10`
-- `SPY_SNAPSHOT_STRIKES_EACH_SIDE=75`
-- Keep `SPY_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` in production.
+**Portfolio management**: When `PORTFOLIO_ENABLED=true`, the decision job delegates to `PortfolioManager` for capital budgeting. Lot sizing scales with equity (`PORTFOLIO_LOT_PER_EQUITY`). Monthly drawdown stops halt new trades when cumulative monthly loss exceeds `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`. Event-driven trades (VIX spikes, SPX drops) share or have separate budget depending on `EVENT_BUDGET_MODE`.
 
-Recommended VIX model-fitting profile:
-- `VIX_SNAPSHOT_ENABLED=true`
-- `VIX_SNAPSHOT_INTERVAL_MINUTES=5`
-- `VIX_SNAPSHOT_DTE_MODE=range`
-- `VIX_SNAPSHOT_DTE_MIN_DAYS=7`
-- `VIX_SNAPSHOT_DTE_MAX_DAYS=45`
-- `VIX_SNAPSHOT_STRIKES_EACH_SIDE=50`
-- Keep `VIX_ALLOW_SNAPSHOT_OUTSIDE_RTH=false` unless running controlled backfill/sandbox cycles.
+**Labeler orphan cascade**: Feature snapshots with no linked candidates after a configurable grace period are automatically expired to prevent unbounded growth.
+
+**Trainer sparse fallback**: When walk-forward split has insufficient rows for time-series CV, the trainer falls back to sparse cross-validation to still produce a model version.
+
+**Schema migrations**: Numbered SQL files in `database/sql/migrations/` run automatically on startup. Each migration is idempotent (uses `IF NOT EXISTS`, `IF NOT EXISTS ADD COLUMN`, etc). The `schema_migrations` table tracks which have been applied.
+
+**Retention safety**: The retention job excludes chain snapshots referenced by open trades to prevent data loss during active positions.
 
 ---
 
-## 8) Database Schema Guide
+## Database Tables
 
-Schema file:
-- `spx_backend/database/sql/db_schema.sql`
+Auth:
+- `users`, `auth_audit_log`
 
-Logical groups:
+Core ingestion:
+- `chain_snapshots`, `option_chain_rows`, `option_instruments`
+- `underlying_quotes`, `context_snapshots`, `market_clock_audit`
 
-Ingestion:
-- `option_instruments`
-- `chain_snapshots`
-- `option_chain_rows`
-- `underlying_quotes`
-- `context_snapshots`
-- `market_clock_audit`
+GEX:
+- `gex_snapshots`, `gex_by_strike`, `gex_by_expiry_strike`
 
-GEX analytics:
-- `gex_snapshots`
-- `gex_by_strike`
-- `gex_by_expiry_strike`
+Decisions/trading:
+- `trade_decisions`, `orders`, `fills`, `trades`, `trade_legs`, `trade_marks`
 
-Decision/trading:
-- `trade_decisions`
-- `orders`, `fills`
-- `trades`, `trade_legs`
+Portfolio:
+- `portfolio_state`, `portfolio_trades`
 
-ML/backtest scaffolding:
-- `strategy_versions`
-- `model_versions`
-- `training_runs`
-- `feature_snapshots`
-- `trade_candidates`
-- `model_predictions`
-- `backtest_runs`
-- `strategy_recommendations`
+Performance:
+- `trade_performance_snapshots`, `trade_performance_breakdowns`, `trade_performance_equity_curve`
 
-Initialization behavior:
-- schema is idempotent (`IF NOT EXISTS`)
-- executed statement-by-statement for asyncpg compatibility
-- ML tables now include explicit schema-version and labeling fields to support feature/candidate/prediction lineage.
+ML/backtest:
+- `strategy_versions`, `model_versions`, `training_runs`
+- `feature_snapshots`, `trade_candidates`, `model_predictions`
+- `backtest_runs`, `strategy_recommendations` (deprecated)
 
-Destructive ML reset:
-- reset SQL: `spx_backend/database/sql/db_reset_ml_tables.sql`
-- CLI: `python -m spx_backend.database.reset_ml_schema`
-- This drops and recreates ML/decision/trade tables only (market-data ingestion tables are preserved).
-
-Destructive full reset:
-- reset SQL: `spx_backend/database/sql/db_reset_all_tables.sql`
-- CLI: `python -m spx_backend.database.reset_all_schema`
-- This drops and recreates all app tables, including market-data ingestion history.
+Other:
+- `economic_events`, `schema_migrations`
 
 ---
 
-## 9) Local Run Instructions
+## API Reference
 
-From repository root:
+### Public endpoints (authenticated)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Liveness probe (unauthenticated) |
+| GET | `/api/pipeline-status` | Pipeline freshness and warnings |
+| GET | `/api/chain-snapshots` | Recent chain snapshot metadata |
+| GET | `/api/trade-decisions` | Recent TRADE/SKIP decisions |
+| GET | `/api/trades` | Paper trades with legs and PnL |
+| GET | `/api/label-metrics` | TP50/TP100 and realized PnL summary |
+| GET | `/api/strategy-metrics` | Strategy quality/risk metrics |
+| GET | `/api/performance-analytics` | Performance with breakdowns |
+| GET | `/api/model-ops` | Model/training/prediction ops summary |
+| GET | `/api/model-predictions` | Paginated prediction browser |
+| GET | `/api/model-accuracy` | Accuracy/precision/recall over windows |
+| GET | `/api/model-calibration` | Calibration curve bins |
+| GET | `/api/model-pnl-attribution` | Model PnL attribution vs baseline |
+| GET | `/api/gex/snapshots` | Recent GEX snapshot batches |
+| GET | `/api/gex/dtes` | Available DTEs for a GEX batch |
+| GET | `/api/gex/expirations` | Available expirations for a GEX batch |
+| GET | `/api/gex/curve` | Strike curve (all, one DTE, or custom expirations) |
+| GET | `/api/backtest-results` | Backtest run results |
+
+### Portfolio endpoints (prefix `/api/portfolio`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/portfolio/status` | Current equity, lots, drawdown state |
+| GET | `/api/portfolio/history` | Daily equity history |
+| GET | `/api/portfolio/trades` | Portfolio trade log with source tracking |
+| GET | `/api/portfolio/config` | Active portfolio + event + decision config |
+
+### Admin endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/admin/run-snapshot` | Trigger snapshot job |
+| POST | `/api/admin/run-quotes` | Trigger quote job |
+| POST | `/api/admin/run-gex` | Trigger GEX job |
+| POST | `/api/admin/run-cboe-gex` | Trigger CBOE GEX job |
+| POST | `/api/admin/run-decision` | Trigger decision job |
+| POST | `/api/admin/run-feature-builder` | Trigger feature builder |
+| POST | `/api/admin/run-labeler` | Trigger labeler |
+| POST | `/api/admin/run-trade-pnl` | Trigger trade PnL job |
+| POST | `/api/admin/run-performance-analytics` | Trigger performance analytics |
+| POST | `/api/admin/run-trainer` | Trigger trainer |
+| POST | `/api/admin/run-shadow-inference` | Trigger shadow inference |
+| POST | `/api/admin/run-promotion-gates` | Trigger promotion gates |
+| DELETE | `/api/admin/trade-decisions/{id}` | Delete a decision |
+| GET | `/api/admin/expirations` | Fetch expirations from Tradier |
+| GET | `/api/admin/auth-audit` | Authentication audit log |
+| GET | `/api/admin/preflight` | One-call pipeline health check |
+
+### Auth endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/login` | Login, returns JWT |
+| POST | `/api/auth/register` | Create user account |
+| GET | `/api/auth/me` | Current user info |
+| POST | `/api/auth/logout` | Logout |
+
+---
+
+## Configuration
+
+All settings live in `config.py` as a Pydantic `Settings` class backed by environment variables. See the root README for the full configuration reference.
+
+Key backend-specific settings:
+
+- `DATABASE_URL`: PostgreSQL connection string (asyncpg).
+- `TRADIER_ACCESS_TOKEN`, `TRADIER_ACCOUNT_ID`: Tradier API credentials.
+- `SNAPSHOT_INTERVAL_MINUTES`, `QUOTE_INTERVAL_MINUTES`, `GEX_INTERVAL_MINUTES`: RTH cadences.
+- `DECISION_ENTRY_TIMES`: comma-separated `HH:MM` times for candidate generation and execution.
+- `TRADE_PNL_TAKE_PROFIT_PCT`, `TRADE_PNL_STOP_LOSS_PCT`: exit thresholds.
+- `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`: weekly trainer schedule.
+- `SENDGRID_API_KEY`, `EMAIL_ALERT_RECIPIENT`: alerting credentials.
+
+---
+
+## Running Locally
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -r backend/requirements.txt
-cd backend
+pip install -r requirements.txt
 python -m spx_backend.main
 ```
 
-Reset ML schema (destructive; keeps snapshots/quotes/GEX tables):
-
-```bash
-cd backend
-python -m spx_backend.database.reset_ml_schema
-```
-
-Reset all schema (destructive; drops all app tables):
-
-```bash
-cd backend
-python -m spx_backend.database.reset_all_schema
-```
-
-Smoke test:
-
-```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/api/admin/preflight
-```
-
-Manual pipeline test:
-
-```bash
-curl -X POST http://localhost:8000/api/admin/run-quotes
-curl -X POST http://localhost:8000/api/admin/run-snapshot
-curl -X POST http://localhost:8000/api/admin/run-gex
-curl -X POST http://localhost:8000/api/admin/run-feature-builder
-curl -X POST http://localhost:8000/api/admin/run-labeler
-curl -X POST http://localhost:8000/api/admin/run-decision
-curl -X POST http://localhost:8000/api/admin/run-trade-pnl
-curl http://localhost:8000/api/admin/preflight
-```
+Default: `http://localhost:8000`
 
 ---
 
-## 10) Testing
+## Testing
 
-Install test dependencies:
+Install dev dependencies:
 
 ```bash
-cd backend
-python -m pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt
 ```
 
-Run:
+Run all unit tests:
 
 ```bash
 python -m pytest -q
 ```
 
-DB-backed integration tests (safe mode):
-
-1) Start dedicated local Postgres test DB:
+Run DB-backed integration tests (requires local test Postgres):
 
 ```bash
-cd ..
-docker compose -f docker-compose.test.yml up -d
-```
-
-2) Set `DATABASE_URL_TEST` (example in `backend/.env.test.example`):
-
-```bash
+docker compose -f ../docker-compose.test.yml up -d
 export DATABASE_URL_TEST="postgresql+asyncpg://spx_test:spx_test_pw@localhost:5434/index_spread_lab_test"
-```
-
-3) Run only integration tests:
-
-```bash
-cd backend
 python -m pytest -q -m integration
 ```
 
-Convenience Make targets (run from repo root):
+Safety behavior:
+- Integration tests skip if `DATABASE_URL_TEST` is not set.
+- They fail fast if DB host is not local or DB name does not include `test`.
+
+Convenience targets (from repo root):
 
 ```bash
-make test-e2e-up
-make test-e2e-mocked
-make test-e2e-db
-make test-e2e
-make test-e2e-regression
-make test-predeploy
-make test-e2e-down
-```
-
-If your default `python` is not your backend runtime, override interpreter:
-
-```bash
-make PYTHON_BIN=python3.11 test-e2e
-make PYTHON_BIN=python3.11 test-predeploy
-```
-
-Safety guard behavior:
-- Integration tests skip entirely when `DATABASE_URL_TEST` is unset.
-- Integration tests fail fast if `DATABASE_URL_TEST` host is not `localhost`/`127.0.0.1` or DB name does not include `test`.
-- `make test-e2e-regression` runs only failure/edge regression checks (`-m "integration and regression"`).
-
-Current coverage domains:
-- DTE helper behavior
-- Tradier expiration request params
-- Snapshot strike-selection helper
-- Decision candidate/scoring/freshness logic
-- GEX zero-gamma helper
-- GEX API output behavior (including custom expiration filter and fallback)
-- Trade PnL: mark-to-market, TP/SL/expiry close, bulk leg loading, expired trade handling
-- Staleness monitor: freshness detection, cooldown, SendGrid alerting, RTH guard
-- Market clock: `is_rth` boundary cases, `MarketClockCache` with mock Tradier and fallback
-- Quote job: market gate, symbol parsing, fetch failure, successful insertion
-- Trainer: walk-forward windows, sparse CV folds, walk-forward-to-sparse-CV fallback
-- Config parsing: list fields, dedup, bad symbols, delta targets
-- Backtest engine: parquet path sanitization (traversal, semicolons, SQL keywords)
-- HTTP-level mocked E2E router workflows
-- DB-backed integration smoke tests (`-m integration`)
-- DB-backed regression failure pack (quote fetch fail, no expirations, no shadow model, promotion gate fail/pass)
-- DB-backed trainer/shadow run-once integration coverage
-
----
-
-## 11) Railway Deployment Notes
-
-Required:
-- valid `DATABASE_URL`
-- `CORS_ORIGINS` includes deployed frontend
-
-Tradier mode:
-- sandbox: `TRADIER_BASE_URL=https://sandbox.tradier.com/v1`
-- live: `TRADIER_BASE_URL=https://api.tradier.com/v1`
-
-Recommended production behavior:
-- `SNAPSHOT_RANGE_FALLBACK_ENABLED=false` (strict)
-- keep snapshot/quote outside-RTH flags disabled unless intentionally testing
-
----
-
-## 12) Operational Debugging Queries
-
-Use API first:
-- `GET /api/admin/preflight` for fast status.
-
-Useful SQL checks:
-
-```sql
--- latest snapshots
-SELECT snapshot_id, ts, target_dte, expiration
-FROM chain_snapshots
-ORDER BY ts DESC
-LIMIT 20;
-
--- latest decisions
-SELECT decision_id, ts, decision, reason, target_dte, delta_target, score
-FROM trade_decisions
-ORDER BY ts DESC
-LIMIT 20;
-
--- latest gex summary
-SELECT snapshot_id, ts, gex_net, zero_gamma_level
-FROM gex_snapshots
-ORDER BY ts DESC
-LIMIT 20;
+make test-e2e-up        # Start test DB
+make test-e2e-mocked    # Run mocked tests
+make test-e2e-db        # Run DB integration tests
+make test-e2e           # Run all tests
+make test-predeploy     # Full predeploy gate
+make test-e2e-down      # Stop test DB
 ```
 
 ---
 
-## 13) Data Retention
+## Known Limitations
 
-A CLI script is provided for manual data lifecycle management:
-
-```bash
-python backend/scripts/data_retention.py --days 90 --export-dir ./exports
-python backend/scripts/data_retention.py --days 90 --export-dir ./exports --dry-run
-```
-
-The script exports old `chain_snapshots` and cascade-dependent rows (`option_chain_rows`, `gex_by_strike`, `gex_by_expiry_strike`, `gex_snapshots`, `trade_marks`) to gzipped CSV files, then purges them from the database.
-
-Requirements: `psycopg2-binary`, `pandas`.
-
----
-
-## 14) Known Limitations
-
-- Hybrid decision path is implemented, but defaults to rules-first with model ranking gated by config/promotions.
-- Order placement/fill lifecycle tables exist but workflow remains staged.
-- Frontend test coverage has not yet been added.
-- Full historical replay/backtest orchestration is still pending.
-- Data retention is manual (CLI script); scheduled purge automation is a future improvement.
+- Live broker order/fill automation is scaffolded (`orders`, `fills` tables) but not wired to a real broker yet.
+- Backtest orchestration and historical backfill tooling are still evolving.
+- The trainer requires a minimum number of resolved labels before producing a first model version. After a fresh DB reset, `no_model_versions` and `no_model_predictions` warnings are expected initially.
+- CBOE GEX data availability depends on the vendor API; outages are logged but do not block other pipeline stages.
