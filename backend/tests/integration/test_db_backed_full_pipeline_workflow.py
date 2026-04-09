@@ -305,7 +305,7 @@ async def _build_workflow_client(*, integration_db_session, monkeypatch, tradier
         yield integration_db_session
 
     async def _override_current_user():
-        return auth.UserOut(id=1, username="test")
+        return auth.UserOut(id=1, username="test", is_admin=True)
 
     app.dependency_overrides[public.get_db_session] = _override_db
     app.dependency_overrides[admin.get_db_session] = _override_db

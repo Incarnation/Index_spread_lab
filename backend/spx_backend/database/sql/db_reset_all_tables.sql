@@ -5,6 +5,8 @@ DROP TABLE IF EXISTS trade_marks;
 DROP TABLE IF EXISTS trade_performance_equity_curve;
 DROP TABLE IF EXISTS trade_performance_breakdowns;
 DROP TABLE IF EXISTS trade_performance_snapshots;
+DROP TABLE IF EXISTS portfolio_trades;
+DROP TABLE IF EXISTS portfolio_state;
 DROP TABLE IF EXISTS trade_legs;
 DROP TABLE IF EXISTS fills;
 DROP TABLE IF EXISTS orders;
