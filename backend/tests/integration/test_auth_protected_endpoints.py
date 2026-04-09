@@ -244,8 +244,8 @@ async def test_admin_run_snapshot_returns_403_for_non_admin(integration_client_w
 
 
 @pytest.mark.asyncio
-async def test_admin_preflight_returns_200_for_non_admin(integration_client_with_auth: AsyncClient) -> None:
-    """GET /api/admin/preflight should stay available to authenticated non-admin users."""
+async def test_admin_preflight_returns_403_for_non_admin(integration_client_with_auth: AsyncClient) -> None:
+    """GET /api/admin/preflight requires admin; non-admin users get 403."""
     login_r = await integration_client_with_auth.post(
         "/api/auth/login",
         json={"username": "otheruser", "password": "otherpass123"},
@@ -256,7 +256,7 @@ async def test_admin_preflight_returns_200_for_non_admin(integration_client_with
         "/api/admin/preflight",
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert r.status_code == 200
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio

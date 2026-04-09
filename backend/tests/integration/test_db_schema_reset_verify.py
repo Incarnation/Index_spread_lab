@@ -112,13 +112,17 @@ async def _insert_cboe_rows_for_dte_cleanup(engine) -> None:
 
 @pytest.fixture
 async def fresh_test_engine(database_url_test: str):  # noqa: ANN201
-    """Create engine for test DB and apply full reset + schema so all tables exist and are empty."""
+    """Create engine for test DB and apply full reset + schema + migrations so all tables exist."""
     engine = create_async_engine(
         database_url_test, pool_pre_ping=True, pool_size=2, max_overflow=2
     )
     sql_dir = Path(schema.__file__).resolve().parent / "sql"
     await _execute_sql_file(engine, sql_dir / "db_reset_all_tables.sql")
     await _execute_sql_file(engine, sql_dir / "db_schema.sql")
+    mig_dir = sql_dir / "migrations"
+    if mig_dir.exists():
+        for path in sorted(mig_dir.glob("*.sql")):
+            await _execute_sql_file(engine, path)
     try:
         yield engine
     finally:
