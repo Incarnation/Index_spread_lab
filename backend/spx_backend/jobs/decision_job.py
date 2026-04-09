@@ -181,10 +181,11 @@ class DecisionJob:
                 await session.commit()
                 return self._build_run_result(now_et=now_et, skipped=True, reason="no_candidates")
 
-            # Rank by credit_to_width (credit / spread width)
-            width = settings.decision_spread_width_points
+            # Rank by credit_to_width using actual strike spacing from each candidate
             for c in candidates:
-                c["credit_to_width"] = c["credit"] / width if width > 0 else 0
+                legs = c.get("chosen_legs_json") or {}
+                w = float(legs.get("width_points") or settings.decision_spread_width_points)
+                c["credit_to_width"] = c["credit"] / w if w > 0 else 0
 
             ranked = sorted(candidates, key=lambda c: -c["credit_to_width"])
             lots = pm.compute_lots()
@@ -870,6 +871,14 @@ class DecisionJob:
             return None
         long = long_candidates[0]
 
+        # Vertical integrity: put spreads must have short above long;
+        # call spreads must have short below long.
+        side_lower = spread_side.lower()
+        if side_lower == "put" and long["strike"] >= short["strike"]:
+            return None
+        if side_lower == "call" and long["strike"] <= short["strike"]:
+            return None
+
         short_mid = _mid(short["bid"], short["ask"])
         long_mid = _mid(long["bid"], long["ask"])
         if short_mid is None or long_mid is None:
@@ -879,6 +888,8 @@ class DecisionJob:
         if credit <= 0:
             return None
 
+        actual_width = abs(short["strike"] - long["strike"])
+
         context_score, context_flags = self._context_score(context, spread_side, spot)
         diff = delta_diff(short)
         score = credit - diff + context_score
@@ -887,8 +898,9 @@ class DecisionJob:
             "expiration": str(expiration),
             "target_dte": target_dte,
             "delta_target": delta_target,
-            "spread_side": spread_side.lower(),
-            "width_points": width_points,
+            "spread_side": side_lower,
+            "width_points": actual_width,
+            "requested_width_points": width_points,
             "spot": spot,
             "credit": credit,
             "context": context or {},
@@ -919,8 +931,9 @@ class DecisionJob:
             },
         }
         strategy_params_json = {
-            "spread_side": spread_side.lower(),
-            "width_points": width_points,
+            "spread_side": side_lower,
+            "width_points": actual_width,
+            "requested_width_points": width_points,
             "delta_target": delta_target,
             "contracts": settings.decision_contracts,
         }

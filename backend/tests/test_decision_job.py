@@ -485,3 +485,141 @@ async def test_run_once_clips_by_day_cap(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result["trades_created_count"] == 1
     assert result["decisions_created_count"] == 1
     assert result["selection_meta"]["clipped_by"] == "day_cap"
+
+
+# ---------------------------------------------------------------------------
+# Call-spread construction and vertical integrity
+# ---------------------------------------------------------------------------
+
+
+def test_build_candidate_call_credit_spread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_build_candidate selects correct short (lower) and long (higher) strikes for calls."""
+    _set_default_decision_settings(monkeypatch)
+    job = DecisionJob()
+    options = [
+        {"symbol": "C1", "strike": 6850.0, "bid": 16.0, "ask": 16.4, "delta": 0.30},
+        {"symbol": "C2", "strike": 6875.0, "bid": 12.5, "ask": 13.0, "delta": 0.22},
+        {"symbol": "C3", "strike": 6900.0, "bid": 9.5, "ask": 10.0, "delta": 0.15},
+    ]
+
+    candidate = job._build_candidate(
+        options=options,
+        target_dte=3,
+        delta_target=0.30,
+        spread_side="call",
+        width_points=25.0,
+        snapshot_id=200,
+        expiration=date(2026, 5, 15),
+        spot=6830.0,
+        context=None,
+    )
+
+    assert candidate is not None
+    legs = candidate["chosen_legs_json"]
+    assert legs["short"]["symbol"] == "C1"
+    assert legs["long"]["symbol"] == "C2"
+    assert legs["short"]["strike"] < legs["long"]["strike"], "Call short must be lower strike"
+    assert candidate["credit"] > 0
+    actual_width = abs(legs["short"]["strike"] - legs["long"]["strike"])
+    assert legs["width_points"] == actual_width
+
+
+def test_build_candidate_stores_actual_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """width_points in chosen_legs_json reflects actual strike distance, not config."""
+    _set_default_decision_settings(monkeypatch)
+    job = DecisionJob()
+    options = [
+        {"symbol": "P1", "strike": 6820.0, "bid": 18.0, "ask": 18.4, "delta": -0.20},
+        {"symbol": "P2", "strike": 6800.0, "bid": 14.8, "ask": 15.2, "delta": -0.16},
+    ]
+
+    candidate = job._build_candidate(
+        options=options,
+        target_dte=3,
+        delta_target=0.20,
+        spread_side="put",
+        width_points=25.0,
+        snapshot_id=123,
+        expiration=date(2026, 2, 18),
+        spot=6830.0,
+        context=None,
+    )
+
+    assert candidate is not None
+    assert candidate["chosen_legs_json"]["width_points"] == 20.0
+    assert candidate["chosen_legs_json"]["requested_width_points"] == 25.0
+
+
+def test_build_candidate_rejects_inverted_put_spread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A put spread where long strike >= short strike is rejected by integrity check."""
+    _set_default_decision_settings(monkeypatch)
+    job = DecisionJob()
+    options = [
+        {"symbol": "P1", "strike": 6800.0, "bid": 15.0, "ask": 15.4, "delta": -0.20},
+        {"symbol": "P2", "strike": 6825.0, "bid": 14.0, "ask": 14.4, "delta": -0.25},
+    ]
+
+    candidate = job._build_candidate(
+        options=options,
+        target_dte=3,
+        delta_target=0.20,
+        spread_side="put",
+        width_points=25.0,
+        snapshot_id=123,
+        expiration=date(2026, 2, 18),
+        spot=6830.0,
+        context=None,
+    )
+
+    assert candidate is None, "Should reject: long strike (6825) >= short strike (6800) for put"
+
+
+def test_build_candidate_rejects_inverted_call_spread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call spread where long strike <= short strike is rejected by integrity check."""
+    _set_default_decision_settings(monkeypatch)
+    job = DecisionJob()
+    options = [
+        {"symbol": "C1", "strike": 6850.0, "bid": 12.0, "ask": 12.4, "delta": 0.25},
+        {"symbol": "C2", "strike": 6825.0, "bid": 11.0, "ask": 11.4, "delta": 0.30},
+    ]
+
+    candidate = job._build_candidate(
+        options=options,
+        target_dte=3,
+        delta_target=0.25,
+        spread_side="call",
+        width_points=25.0,
+        snapshot_id=200,
+        expiration=date(2026, 5, 15),
+        spot=6830.0,
+        context=None,
+    )
+
+    assert candidate is None, "Should reject: long strike (6825) <= short strike (6850) for call"
+
+
+def test_context_score_supports_call_spreads() -> None:
+    """Call spreads get positive GEX score when gex_net <= 0 and spot below zero gamma."""
+    job = DecisionJob()
+    score, flags = job._context_score(
+        context={"gex_net": -500.0, "zero_gamma_level": 6850.0, "vix": 18.0, "term_structure": 0.95},
+        spread_side="call",
+        spot=6830.0,
+    )
+
+    assert score > 0
+    assert "gex_support" in flags
+    assert "spot_below_zero_gamma" in flags
+
+
+def test_context_score_call_headwind_when_gex_positive() -> None:
+    """Call spreads penalized when gex_net > 0 (dealer long gamma = headwind for calls)."""
+    job = DecisionJob()
+    score, flags = job._context_score(
+        context={"gex_net": 1000.0, "zero_gamma_level": 6800.0, "vix": 18.0, "term_structure": 0.95},
+        spread_side="call",
+        spot=6830.0,
+    )
+
+    assert "gex_headwind" in flags
+    assert "spot_above_zero_gamma" in flags

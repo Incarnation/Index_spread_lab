@@ -174,6 +174,10 @@ class Settings(BaseSettings):
     trade_pnl_mark_max_age_minutes: int = 30
     trade_pnl_take_profit_pct: float = 0.50
     trade_pnl_stop_loss_enabled: bool = True
+    # Multiplier applied to *max_profit* (not max_loss) to derive the dollar
+    # stop-loss threshold.  E.g. with default 2.0 and a $100 max-profit trade,
+    # the stop fires at PnL <= -$200.  Use trade_pnl_stop_loss_enabled=False
+    # to disable the stop-loss entirely.
     trade_pnl_stop_loss_pct: float = 2.00
     trade_pnl_contract_multiplier: int = 100
 

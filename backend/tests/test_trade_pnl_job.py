@@ -36,6 +36,7 @@ def _make_trade(
     stop_loss_target=None,
     max_profit=None,
     max_loss=None,
+    strategy_type="credit_vertical_put",
 ):
     """Create a fake trade row matching the column names from the SQL SELECT."""
     return SimpleNamespace(
@@ -48,6 +49,7 @@ def _make_trade(
         stop_loss_target=stop_loss_target,
         max_profit=max_profit,
         max_loss=max_loss,
+        strategy_type=strategy_type,
     )
 
 
@@ -119,10 +121,10 @@ class TestBulkTradeLegs:
     async def test_parses_legs(self):
         """Correctly separates short and long legs from bulk query results."""
         rows = [
-            SimpleNamespace(trade_id=1, leg_index=0, option_symbol="SPX230120P04000", side="STO", qty=1, entry_price=3.0),
-            SimpleNamespace(trade_id=1, leg_index=1, option_symbol="SPX230120P03950", side="BTO", qty=1, entry_price=1.0),
-            SimpleNamespace(trade_id=2, leg_index=0, option_symbol="SPX230120C04100", side="STO", qty=1, entry_price=2.0),
-            SimpleNamespace(trade_id=2, leg_index=1, option_symbol="SPX230120C04150", side="BTO", qty=1, entry_price=0.5),
+            SimpleNamespace(trade_id=1, leg_index=0, option_symbol="SPX230120P04000", side="STO", qty=1, entry_price=3.0, strike=4000.0),
+            SimpleNamespace(trade_id=1, leg_index=1, option_symbol="SPX230120P03950", side="BTO", qty=1, entry_price=1.0, strike=3950.0),
+            SimpleNamespace(trade_id=2, leg_index=0, option_symbol="SPX230120C04100", side="STO", qty=1, entry_price=2.0, strike=4100.0),
+            SimpleNamespace(trade_id=2, leg_index=1, option_symbol="SPX230120C04150", side="BTO", qty=1, entry_price=0.5, strike=4150.0),
         ]
 
         class _Sess:
@@ -141,7 +143,7 @@ class TestBulkTradeLegs:
     async def test_missing_leg_excluded(self):
         """Trades with only one leg are excluded from the result."""
         rows = [
-            SimpleNamespace(trade_id=3, leg_index=0, option_symbol="SPX230120P04000", side="STO", qty=1, entry_price=3.0),
+            SimpleNamespace(trade_id=3, leg_index=0, option_symbol="SPX230120P04000", side="STO", qty=1, entry_price=3.0, strike=4000.0),
         ]
 
         class _Sess:
@@ -764,3 +766,169 @@ class TestPortfolioClosure:
 
         assert result["expired_closed"] == 1
         mock_pm_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Multi-contract PnL scaling
+# ---------------------------------------------------------------------------
+
+
+class TestMultiContractPnl(TestRunOnce):
+    """Verify PnL scales correctly with contracts > 1 and varying multipliers."""
+
+    @pytest.mark.asyncio
+    async def test_mtm_scales_with_contracts(self):
+        """MTM PnL = (entry_credit - exit_cost) * contracts * multiplier."""
+        now_utc = datetime.now(tz=UTC)
+        trade = _make_trade(
+            trade_id=80, entry_credit=1.5, contracts=5, contract_multiplier=100,
+            expiration=_today_et() + timedelta(days=5),
+        )
+        mark = _make_mark(
+            short_bid=0.90, short_ask=1.10, long_bid=0.40, long_ask=0.60,
+            ts=now_utc - timedelta(minutes=1),
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {80: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 5, "entry_price": 2.0, "strike": 6000.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 5, "entry_price": 0.5, "strike": 5975.0},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=mark),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["updated"] >= 1
+        # exit_cost = (0.90+1.10)/2 - (0.40+0.60)/2 = 1.0 - 0.5 = 0.5
+        # pnl = (1.5 - 0.5) * 5 * 100 = 500.0
+        pnl_calls = [c for c in session.calls if "current_pnl" in str(c[1])]
+        assert len(pnl_calls) > 0
+        actual_pnl = pnl_calls[0][1]["current_pnl"]
+        assert abs(actual_pnl - 500.0) < 0.01
+
+    @pytest.mark.asyncio
+    async def test_tp_threshold_with_multi_contract(self):
+        """TP fires when dollar PnL >= take_profit_target (also in multi-contract)."""
+        now_utc = datetime.now(tz=UTC)
+        trade = _make_trade(
+            trade_id=81, entry_credit=2.0, contracts=3, contract_multiplier=100,
+            expiration=_today_et() + timedelta(days=5),
+            max_profit=600.0,
+        )
+        # Near-zero exit cost → pnl ≈ 2.0 * 3 * 100 = 600 (== max_profit)
+        mark = _make_mark(
+            short_bid=0.01, short_ask=0.03, long_bid=0.01, long_ask=0.03,
+            ts=now_utc - timedelta(minutes=1),
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {81: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 3, "entry_price": 3.0, "strike": 6000.0},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 3, "entry_price": 1.0, "strike": 5975.0},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=mark),
+        ):
+            job = TradePnlJob()
+            result = await job.run_once(force=True)
+
+        assert result["closed"] >= 1
+        tp_calls = [c for c in session.calls if "TAKE_PROFIT" in str(c[1].get("exit_reason", ""))]
+        assert len(tp_calls) > 0
+
+
+# ---------------------------------------------------------------------------
+# Intrinsic settlement for expired trades
+# ---------------------------------------------------------------------------
+
+
+class TestIntrinsicSettlement:
+    """Verify intrinsic-value settlement when marks are missing."""
+
+    def test_put_spread_expires_otm(self):
+        """Put credit spread fully OTM at expiry → exit_cost = 0."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_put",
+            short_strike=5800.0,
+            long_strike=5775.0,
+            spot=5900.0,
+        )
+        assert result == 0.0
+
+    def test_put_spread_expires_full_loss(self):
+        """Put credit spread fully ITM at expiry → exit_cost = width."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_put",
+            short_strike=5800.0,
+            long_strike=5775.0,
+            spot=5700.0,
+        )
+        assert result == 25.0
+
+    def test_put_spread_partial_intrinsic(self):
+        """Put credit spread partially ITM → short has intrinsic, long is worthless."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_put",
+            short_strike=5800.0,
+            long_strike=5775.0,
+            spot=5790.0,
+        )
+        # short intrinsic = max(5800-5790, 0) = 10, long = max(5775-5790, 0) = 0
+        assert abs(result - 10.0) < 0.01
+
+    def test_call_spread_expires_otm(self):
+        """Call credit spread fully OTM at expiry → exit_cost = 0."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_call",
+            short_strike=5900.0,
+            long_strike=5925.0,
+            spot=5800.0,
+        )
+        assert result == 0.0
+
+    def test_call_spread_expires_full_loss(self):
+        """Call credit spread fully ITM at expiry → exit_cost = width."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_call",
+            short_strike=5900.0,
+            long_strike=5925.0,
+            spot=6000.0,
+        )
+        assert result == 25.0
+
+    def test_call_spread_partial_intrinsic(self):
+        """Call credit spread partially ITM → short has intrinsic, long is worthless."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_call",
+            short_strike=5900.0,
+            long_strike=5925.0,
+            spot=5910.0,
+        )
+        # short intrinsic = max(5910-5900, 0) = 10, long = max(5910-5925, 0) = 0
+        assert abs(result - 10.0) < 0.01
+
+    def test_returns_none_when_spot_missing(self):
+        """Returns None when spot is unavailable (triggers max-loss fallback)."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="credit_vertical_put",
+            short_strike=5800.0,
+            long_strike=5775.0,
+            spot=None,
+        )
+        assert result is None
+
+    def test_returns_none_for_unknown_strategy(self):
+        """Returns None for unrecognized strategy type."""
+        result = TradePnlJob._intrinsic_exit_cost(
+            strategy_type="iron_condor",
+            short_strike=5800.0,
+            long_strike=5775.0,
+            spot=5900.0,
+        )
+        assert result is None

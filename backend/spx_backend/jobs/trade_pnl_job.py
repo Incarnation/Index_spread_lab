@@ -68,12 +68,29 @@ class TradePnlJob:
             "long_ask": result.long_ask,
         }
 
+    async def _latest_spot(self, session, *, now_utc: datetime) -> float | None:
+        """Return the latest underlying quote price for intrinsic settlement."""
+        row = await session.execute(
+            text(
+                """
+                SELECT last
+                FROM underlying_quotes
+                WHERE symbol = :symbol AND ts <= :now_ts
+                ORDER BY ts DESC
+                LIMIT 1
+                """
+            ),
+            {"symbol": settings.snapshot_underlying, "now_ts": now_utc},
+        )
+        result = row.fetchone()
+        return float(result.last) if result and result.last is not None else None
+
     async def _trade_legs(self, session, trade_id: int) -> tuple[dict, dict] | None:
         """Return short and long leg rows for a trade."""
         rows = await session.execute(
             text(
                 """
-                SELECT leg_index, option_symbol, side, qty, entry_price
+                SELECT leg_index, option_symbol, side, qty, entry_price, strike
                 FROM trade_legs
                 WHERE trade_id = :trade_id
                 ORDER BY leg_index ASC
@@ -91,6 +108,7 @@ class TradePnlJob:
                 "side": side,
                 "qty": row.qty,
                 "entry_price": row.entry_price,
+                "strike": float(row.strike) if row.strike is not None else None,
             }
             if side in {"STO", "SHORT"} and short_leg is None:
                 short_leg = leg
@@ -121,7 +139,7 @@ class TradePnlJob:
         rows = await session.execute(
             text(
                 """
-                SELECT trade_id, leg_index, option_symbol, side, qty, entry_price
+                SELECT trade_id, leg_index, option_symbol, side, qty, entry_price, strike
                 FROM trade_legs
                 WHERE trade_id = ANY(:trade_ids)
                 ORDER BY trade_id, leg_index ASC
@@ -139,6 +157,7 @@ class TradePnlJob:
                 "side": side,
                 "qty": row.qty,
                 "entry_price": row.entry_price,
+                "strike": float(row.strike) if row.strike is not None else None,
             }
             slot = legs_by_trade.setdefault(tid, {"short": None, "long": None})
             if side in {"STO", "SHORT"} and slot["short"] is None:
@@ -181,7 +200,7 @@ class TradePnlJob:
         exit_cost:
             Per-unit exit cost of the spread.
         exit_reason:
-            Machine-readable close reason (TAKE_PROFIT_50, STOP_LOSS, EXPIRED).
+            Machine-readable close reason (TAKE_PROFIT_<pct>, STOP_LOSS, EXPIRED).
         short_leg / long_leg:
             Leg dicts; when provided the corresponding exit_price is written.
         short_exit_price / long_exit_price:
@@ -237,6 +256,42 @@ class TradePnlJob:
             await self._pm.begin_day(now_et.date())
         return self._pm
 
+    @staticmethod
+    def _intrinsic_exit_cost(
+        strategy_type: str | None,
+        short_strike: float | None,
+        long_strike: float | None,
+        spot: float | None,
+    ) -> float | None:
+        """Compute intrinsic-value exit cost at expiration from spot and strikes.
+
+        For a put credit spread (short put above long put):
+          - spot >= short_strike → both expire worthless → exit_cost = 0
+          - spot <= long_strike  → max loss → exit_cost = short - long
+          - otherwise            → partial intrinsic on short, long worthless
+
+        For a call credit spread (short call below long call):
+          - spot <= short_strike → both expire worthless → exit_cost = 0
+          - spot >= long_strike  → max loss → exit_cost = -(long - short)
+          - otherwise            → partial intrinsic on short, long worthless
+
+        Returns exit_cost in points (same sign convention as mark-based:
+        exit_cost = short_value - long_value), or None if inputs are insufficient.
+        """
+        if spot is None or short_strike is None or long_strike is None:
+            return None
+        st = (strategy_type or "").lower()
+
+        if "put" in st:
+            short_intrinsic = max(short_strike - spot, 0.0)
+            long_intrinsic = max(long_strike - spot, 0.0)
+            return short_intrinsic - long_intrinsic
+        elif "call" in st:
+            short_intrinsic = max(spot - short_strike, 0.0)
+            long_intrinsic = max(spot - long_strike, 0.0)
+            return short_intrinsic - long_intrinsic
+        return None
+
     async def _close_expired_trades(
         self,
         *,
@@ -248,10 +303,18 @@ class TradePnlJob:
     ) -> tuple[int, int]:
         """Close all expired trades and update portfolio equity.
 
+        Uses three fallback tiers for exit valuation:
+        1. Last snapshot mark (mid-to-mid) if available.
+        2. Intrinsic-value settlement from latest spot price and leg strikes.
+        3. Worst-case assumption of full max loss.
+
         Returns (expired_closed, total_closed_delta).
         """
         expired_closed = 0
         closed = 0
+
+        spot: float | None = None
+        spot_loaded = False
 
         for trade in trades:
             entry_credit = float(trade.entry_credit or 0.0)
@@ -282,8 +345,22 @@ class TradePnlJob:
                     short_exit = short_mid
                     long_exit = long_mid
                 else:
-                    pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
-                    exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
+                    # Tier 2: intrinsic settlement from spot and leg strikes
+                    if not spot_loaded:
+                        spot = await self._latest_spot(session, now_utc=now_utc)
+                        spot_loaded = True
+                    intrinsic = self._intrinsic_exit_cost(
+                        strategy_type=getattr(trade, "strategy_type", None),
+                        short_strike=short_leg_ref.get("strike"),
+                        long_strike=long_leg_ref.get("strike"),
+                        spot=spot,
+                    )
+                    if intrinsic is not None:
+                        exit_cost = intrinsic
+                        pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
+                    else:
+                        pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                        exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
             else:
                 pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
                 exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
@@ -350,7 +427,8 @@ class TradePnlJob:
                 text(
                     """
                     SELECT trade_id, entry_credit, contracts, contract_multiplier, expiration,
-                           take_profit_target, stop_loss_target, max_profit, max_loss
+                           take_profit_target, stop_loss_target, max_profit, max_loss,
+                           strategy_type
                     FROM trades
                     WHERE status = 'OPEN'
                     ORDER BY entry_time ASC
@@ -450,7 +528,8 @@ class TradePnlJob:
 
                 close_reason = None
                 if take_profit_target is not None and pnl >= float(take_profit_target):
-                    close_reason = "TAKE_PROFIT_50"
+                    tp_pct = int(settings.trade_pnl_take_profit_pct * 100)
+                    close_reason = f"TAKE_PROFIT_{tp_pct}"
                 elif stop_loss_target is not None and pnl <= -abs(float(stop_loss_target)):
                     close_reason = "STOP_LOSS"
 

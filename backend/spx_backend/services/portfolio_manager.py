@@ -16,7 +16,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from spx_backend.config import settings
 from spx_backend.database.connection import engine
 
-MARGIN_PER_LOT = 1000  # 10-pt wide SPX spread, $100/pt multiplier
+MARGIN_PER_LOT = 1000  # legacy default for backward-compat imports
+
+
+def _margin_per_lot() -> float:
+    """Derive margin per lot from configured spread width and multiplier.
+
+    Returns ``spread_width_points * contract_multiplier`` (e.g. 10 * 100 = 1000).
+    Falls back to the legacy ``MARGIN_PER_LOT`` constant if either setting is
+    unavailable or yields a non-positive value.
+    """
+    try:
+        val = float(settings.decision_spread_width_points) * float(settings.trade_pnl_contract_multiplier)
+        return val if val > 0 else float(MARGIN_PER_LOT)
+    except Exception:
+        return float(MARGIN_PER_LOT)
 
 
 class PortfolioManager:
@@ -100,7 +114,7 @@ class PortfolioManager:
         """Return True if another trade is permitted right now."""
         if self._month_stopped:
             return False
-        if self.equity < MARGIN_PER_LOT:
+        if self.equity < _margin_per_lot():
             return False
         if self.monthly_dd_limit is not None:
             if self.equity < self.month_start_equity * (1 - self.monthly_dd_limit):
@@ -131,7 +145,7 @@ class PortfolioManager:
         if self._lots_today is not None:
             return self._lots_today
         raw = max(1, int(self.equity / self.lot_per_equity))
-        max_by_risk = max(1, int(self.equity * self.max_risk_pct / MARGIN_PER_LOT))
+        max_by_risk = max(1, int(self.equity * self.max_risk_pct / _margin_per_lot()))
         self._lots_today = min(raw, max_by_risk)
         return self._lots_today
 
@@ -177,7 +191,7 @@ class PortfolioManager:
             source=source,
             event_signal=event_signal,
             lots=lots,
-            margin=lots * MARGIN_PER_LOT,
+            margin=lots * _margin_per_lot(),
             pnl=total_pnl,
             equity_before=equity_before,
             equity_after=self.equity,
