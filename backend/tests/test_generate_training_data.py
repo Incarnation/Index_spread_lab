@@ -45,6 +45,7 @@ from generate_training_data import (  # noqa: E402
     lookup_gex_context,
     lookup_intraday_value,
     merge_underlying_quotes,
+    walk_forward_validate,
 )
 
 
@@ -1429,3 +1430,34 @@ class TestMultiTpLabeling:
         out = _evaluate_outcome(1.0, marks)
         assert out["first_tp50_pnl"] == pytest.approx(75.0, abs=1)
         assert out["min_pnl_before_tp50"] == pytest.approx(75.0, abs=1)
+
+
+# ── Walk-forward date-boundary split ───────────────────────────
+
+
+class TestWalkForwardDateBoundary:
+    """Verify walk_forward_validate splits on day boundaries, not row count."""
+
+    def test_no_day_straddling(self) -> None:
+        """All rows from a single day must land in either train or test, not both."""
+        rows = []
+        for day in ["2025-01-01", "2025-01-02", "2025-01-03",
+                     "2025-01-04", "2025-01-05", "2025-01-06"]:
+            for i in range(10):
+                rows.append({
+                    "day": day,
+                    "realized_pnl": 50.0,
+                    "hit_tp50": True,
+                    "features": {"dummy": 1},
+                })
+
+        result = walk_forward_validate(rows, train_ratio=0.67)
+        assert "error" not in result
+
+        train_days_str = result["train_days"]
+        test_days_str = result["test_days"]
+        train_last = train_days_str.split(" .. ")[1]
+        test_first = test_days_str.split(" .. ")[0]
+        assert train_last < test_first, (
+            f"Train ends at {train_last} but test starts at {test_first} -- overlap!"
+        )

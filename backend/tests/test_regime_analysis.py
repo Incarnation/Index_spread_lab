@@ -192,7 +192,7 @@ class TestMetrics:
         assert m["n_total"] == len(enriched_df)
         assert isinstance(m["avg_pnl"], float)
         assert 0 <= m["win_rate"] <= 1
-        assert isinstance(m["sharpe"], float)
+        assert isinstance(m["pnl_ratio"], float)
 
     def test_empty_slice(self):
         """Empty DataFrame produces zero-count metrics."""

@@ -86,9 +86,9 @@ FRD_SKEW = FRD_DIR / "skew_daily.parquet"
 ET = ZoneInfo("America/New_York")
 SPY_SPX_RATIO = 10.024
 RISK_FREE_RATE = 0.043
-DECISION_MINUTES_ET = [(9, 45), (10, 15), (10, 45), (11, 15), (11, 45), (12, 15)]
+DECISION_MINUTES_ET = [(10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (16, 0)]
 DTE_TARGETS = [0, 1, 3, 5, 7, 10]
-DELTA_TARGETS = [0.05, 0.10, 0.15, 0.20, 0.25]
+DELTA_TARGETS = [0.10, 0.15, 0.20, 0.25]
 SPREAD_SIDES = ["put", "call"]
 WIDTH_TARGETS = [5.0, 10.0, 15.0, 20.0]
 WIDTH_POINTS = 10.0  # legacy default for single-width callers
@@ -1952,15 +1952,19 @@ def build_training_rows(
 def walk_forward_validate(
     rows: list[dict], train_ratio: float = 0.67,
 ) -> dict:
-    """Walk-forward validation: train on earliest *train_ratio*, test rest.
+    """Walk-forward validation: train on earliest *train_ratio* of days, test rest.
 
-    Uses production ``train_bucket_model`` and ``predict_with_bucket_model``
-    to produce out-of-sample quality metrics via ``summarize_strategy_quality``.
+    Splits on **unique day boundaries** so no single trading day straddles
+    the train/test partition.  Uses production ``train_bucket_model`` and
+    ``predict_with_bucket_model`` to produce out-of-sample quality metrics
+    via ``summarize_strategy_quality``.
     """
     sorted_rows = sorted(rows, key=lambda r: r["day"])
-    split_idx = int(len(sorted_rows) * train_ratio)
-    train_rows = sorted_rows[:split_idx]
-    test_rows = sorted_rows[split_idx:]
+    unique_days = sorted(set(r["day"] for r in sorted_rows))
+    split_day_idx = int(len(unique_days) * train_ratio)
+    split_day = unique_days[min(split_day_idx, len(unique_days) - 1)]
+    train_rows = [r for r in sorted_rows if r["day"] < split_day]
+    test_rows = [r for r in sorted_rows if r["day"] >= split_day]
 
     if not train_rows or not test_rows:
         return {"error": "Insufficient data for walk-forward split"}
@@ -2040,6 +2044,152 @@ def deploy_model(
 
 
 # ===================================================================
+# PARALLEL CANDIDATE GENERATION
+# ===================================================================
+
+_WORKER_REF: dict[str, Any] = {}
+
+
+def _init_candidate_worker(
+    spy_df_bytes: bytes,
+    uq_df_bytes: bytes,
+    skew_daily_dict: dict,
+    cal_map_dict: dict,
+) -> None:
+    """Initializer for candidate-generation worker processes.
+
+    Deserializes shared read-only reference data into module-level storage
+    so each worker can access it without re-reading from disk.
+    """
+    import pickle
+    _WORKER_REF["spy_df"] = pickle.loads(spy_df_bytes)
+    _WORKER_REF["uq_df"] = pickle.loads(uq_df_bytes)
+    _WORKER_REF["skew_daily"] = skew_daily_dict
+    _WORKER_REF["cal_map"] = cal_map_dict
+
+
+def _generate_candidates_for_day(day_str: str) -> list[dict]:
+    """Generate all candidates for a single trading day (worker function).
+
+    Top-level function so it can be pickled by multiprocessing.Pool.
+    Reads Databento/production chain data for the day, constructs spread
+    candidates at every decision time x DTE x delta x width combination,
+    and returns the flat list of candidate dicts.
+    """
+    spy_df = _WORKER_REF["spy_df"]
+    uq_df = _WORKER_REF["uq_df"]
+    skew_daily = _WORKER_REF["skew_daily"]
+    cal_map = _WORKER_REF["cal_map"]
+
+    day_date = date(int(day_str[:4]), int(day_str[4:6]), int(day_str[6:]))
+
+    def_df = load_definitions(day_str)
+    if def_df is None:
+        return []
+    inst_map = build_instrument_map(def_df)
+    del def_df
+    if not inst_map:
+        return []
+
+    cbbo_df = load_cbbo(day_str)
+    if cbbo_df is None or cbbo_df.empty:
+        return []
+
+    oi_df = load_statistics(day_str)
+
+    all_expiries = sorted({info["expiry"] for info in inst_map.values()})
+    dte_map = build_dte_lookup(all_expiries, day_date)
+
+    candidates: list[dict] = []
+    for hour, minute in DECISION_MINUTES_ET:
+        dec_et = datetime(
+            day_date.year, day_date.month, day_date.day,
+            hour, minute, tzinfo=ET,
+        )
+        dec_utc = dec_et.astimezone(timezone.utc)
+
+        snapshot = get_cbbo_snapshot_at(cbbo_df, dec_utc)
+        if snapshot.empty:
+            continue
+
+        spx_spot_frd = lookup_intraday_value(uq_df, "SPX", dec_utc)
+        if spx_spot_frd is not None:
+            spx_spot = spx_spot_frd
+            spy_price = spx_spot / SPY_SPX_RATIO
+        else:
+            spy_mask = (
+                (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
+                & (spy_df["ts"] <= dec_utc)
+            )
+            spy_rows = spy_df[spy_mask]
+            if spy_rows.empty:
+                continue
+            spy_price = float(spy_rows.iloc[-1]["close"])
+            spx_spot = derive_spx_from_parity(
+                snapshot, inst_map, day_date, spy_price,
+            )
+
+        vix = lookup_intraday_value(uq_df, "VIX", dec_utc)
+        vix9d = lookup_intraday_value(uq_df, "VIX9D", dec_utc)
+        term_structure = (vix9d / vix) if vix and vix > 0 and vix9d else None
+        vvix = lookup_intraday_value(uq_df, "VVIX", dec_utc)
+        skew = skew_daily.get(day_date)
+
+        cal = cal_map.get(day_date, {})
+        is_opex = cal.get("is_opex", False)
+        is_fomc = cal.get("is_fomc", False)
+        is_tw = cal.get("is_triple_witching", False)
+        is_cpi = cal.get("is_cpi", False)
+        is_nfp = cal.get("is_nfp", False)
+
+        offline_gex_net: float | None = None
+        offline_zero_gamma: float | None = None
+        if oi_df is not None:
+            offline_gex_net, offline_zero_gamma = compute_offline_gex(
+                snapshot, inst_map, oi_df, spx_spot, day_date,
+            )
+
+        for dte_target in DTE_TARGETS:
+            expiry = find_expiry_for_dte(dte_map, dte_target)
+            if expiry is None:
+                continue
+            for side in SPREAD_SIDES:
+                for delta_target in DELTA_TARGETS:
+                    for width in WIDTH_TARGETS:
+                        cands = build_candidates_for_snapshot(
+                            snapshot=snapshot,
+                            inst_map=inst_map,
+                            spot=spx_spot,
+                            spy_price=spy_price,
+                            vix=vix,
+                            vix9d=vix9d,
+                            term_structure=term_structure,
+                            vvix=vvix,
+                            skew=skew,
+                            is_opex_day=is_opex,
+                            is_fomc_day=is_fomc,
+                            is_triple_witching=is_tw,
+                            is_cpi_day=is_cpi,
+                            is_nfp_day=is_nfp,
+                            decision_dt=dec_utc,
+                            day_date=day_date,
+                            dte_target=dte_target,
+                            expiry=expiry,
+                            delta_target=delta_target,
+                            side=side,
+                            width_points=width,
+                        )
+                        for cand in cands:
+                            cand["offline_gex_net"] = offline_gex_net
+                            cand["offline_zero_gamma"] = offline_zero_gamma
+                        candidates.extend(cands)
+
+    del cbbo_df, inst_map, oi_df
+    gc.collect()
+    return candidates
+
+
+# ===================================================================
 # MAIN PIPELINE ORCHESTRATION
 # ===================================================================
 
@@ -2067,6 +2217,9 @@ def run_pipeline(
     spxw_days = set(_available_day_files(SPXW_CBBO))
     spx_days = set(_available_day_files(SPX_CBBO))
     trading_days = sorted(spxw_days | spx_days)
+    if not trading_days:
+        logger.error("No trading days found in %s or %s", SPXW_CBBO, SPX_CBBO)
+        sys.exit(2)
     if max_days:
         trading_days = trading_days[:max_days]
     print(
@@ -2104,128 +2257,47 @@ def run_pipeline(
     print(f"  Calendar events  : {len(cal_map)}")
     print(f"  GEX snapshots    : {len(cs_df)} rows ({gex_count} with GEX)", flush=True)
 
-    # -- 3. Generate candidates --
-    print("[PIPELINE] Generating candidates ...", flush=True)
+    # -- 3. Generate candidates (parallel across days) --
+    candidate_workers = min(workers, len(trading_days))
+    print(
+        f"[PIPELINE] Generating candidates ({candidate_workers} workers) ...",
+        flush=True,
+    )
     all_candidates: list[dict] = []
 
-    for day_str in trading_days:
-        day_date = date(int(day_str[:4]), int(day_str[4:6]), int(day_str[6:]))
+    import pickle
+    spy_bytes = pickle.dumps(spy_df)
+    uq_bytes = pickle.dumps(uq_df)
 
-        def_df = load_definitions(day_str)
-        if def_df is None:
+    if candidate_workers > 1:
+        with Pool(
+            candidate_workers,
+            initializer=_init_candidate_worker,
+            initargs=(spy_bytes, uq_bytes, skew_daily, cal_map),
+        ) as pool:
+            for di, day_cands in enumerate(
+                pool.imap(_generate_candidates_for_day, trading_days),
+            ):
+                day_str = trading_days[di]
+                all_candidates.extend(day_cands)
+                if verbose:
+                    print(
+                        f"  [{day_str}] {len(day_cands)} candidates",
+                        flush=True,
+                    )
+    else:
+        _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map)
+        for day_str in trading_days:
+            day_cands = _generate_candidates_for_day(day_str)
+            all_candidates.extend(day_cands)
             if verbose:
-                print(f"  [{day_str}] no definitions -- skip")
-            continue
-        inst_map = build_instrument_map(def_df)
-        del def_df
-        if not inst_map:
-            continue
-
-        cbbo_df = load_cbbo(day_str)
-        if cbbo_df is None or cbbo_df.empty:
-            if verbose:
-                print(f"  [{day_str}] no cbbo data -- skip")
-            continue
-
-        oi_df = load_statistics(day_str)
-
-        all_expiries = sorted({info["expiry"] for info in inst_map.values()})
-        dte_map = build_dte_lookup(all_expiries, day_date)
-
-        day_count = 0
-        for hour, minute in DECISION_MINUTES_ET:
-            dec_et = datetime(
-                day_date.year, day_date.month, day_date.day,
-                hour, minute, tzinfo=ET,
-            )
-            dec_utc = dec_et.astimezone(timezone.utc)
-
-            snapshot = get_cbbo_snapshot_at(cbbo_df, dec_utc)
-            if snapshot.empty:
-                continue
-
-            # SPX spot: prefer FRD SPX direct price, fall back to SPY + parity
-            spx_spot_frd = lookup_intraday_value(uq_df, "SPX", dec_utc)
-            if spx_spot_frd is not None:
-                spx_spot = spx_spot_frd
-                spy_price = spx_spot / SPY_SPX_RATIO
-            else:
-                spy_mask = (
-                    (spy_df["ts"] >= dec_utc - timedelta(minutes=5))
-                    & (spy_df["ts"] <= dec_utc)
-                )
-                spy_rows = spy_df[spy_mask]
-                if spy_rows.empty:
-                    continue
-                spy_price = float(spy_rows.iloc[-1]["close"])
-                spx_spot = derive_spx_from_parity(
-                    snapshot, inst_map, day_date, spy_price,
+                print(
+                    f"  [{day_str}] {len(day_cands)} candidates",
+                    flush=True,
                 )
 
-            vix = lookup_intraday_value(uq_df, "VIX", dec_utc)
-            vix9d = lookup_intraday_value(uq_df, "VIX9D", dec_utc)
-            term_structure = (vix9d / vix) if vix and vix > 0 and vix9d else None
-            vvix = lookup_intraday_value(uq_df, "VVIX", dec_utc)
-            skew = skew_daily.get(day_date)
-
-            # Calendar event flags for this trading day
-            cal = cal_map.get(day_date, {})
-            is_opex = cal.get("is_opex", False)
-            is_fomc = cal.get("is_fomc", False)
-            is_tw = cal.get("is_triple_witching", False)
-            is_cpi = cal.get("is_cpi", False)
-            is_nfp = cal.get("is_nfp", False)
-
-            # Precompute offline GEX for this decision time
-            offline_gex_net: float | None = None
-            offline_zero_gamma: float | None = None
-            if oi_df is not None:
-                offline_gex_net, offline_zero_gamma = compute_offline_gex(
-                    snapshot, inst_map, oi_df, spx_spot, day_date,
-                )
-
-            for dte_target in DTE_TARGETS:
-                expiry = find_expiry_for_dte(dte_map, dte_target)
-                if expiry is None:
-                    continue
-                for side in SPREAD_SIDES:
-                    for delta_target in DELTA_TARGETS:
-                        for width in WIDTH_TARGETS:
-                            cands = build_candidates_for_snapshot(
-                                snapshot=snapshot,
-                                inst_map=inst_map,
-                                spot=spx_spot,
-                                spy_price=spy_price,
-                                vix=vix,
-                                vix9d=vix9d,
-                                term_structure=term_structure,
-                                vvix=vvix,
-                                skew=skew,
-                                is_opex_day=is_opex,
-                                is_fomc_day=is_fomc,
-                                is_triple_witching=is_tw,
-                                is_cpi_day=is_cpi,
-                                is_nfp_day=is_nfp,
-                                decision_dt=dec_utc,
-                                day_date=day_date,
-                                dte_target=dte_target,
-                                expiry=expiry,
-                                delta_target=delta_target,
-                                side=side,
-                                width_points=width,
-                            )
-                            for cand in cands:
-                                cand["offline_gex_net"] = offline_gex_net
-                                cand["offline_zero_gamma"] = offline_zero_gamma
-                            all_candidates.extend(cands)
-                            day_count += len(cands)
-
-        print(
-            f"  [{day_str}] {day_count} candidates "
-            f"({len(inst_map)} instruments)", flush=True,
-        )
-        del cbbo_df, inst_map, oi_df
-        gc.collect()
+    del spy_bytes, uq_bytes
+    gc.collect()
 
     print(f"[PIPELINE] Total candidates: {len(all_candidates)}", flush=True)
     if not all_candidates:
@@ -2253,6 +2325,13 @@ def run_pipeline(
     for c in resolved:
         rec = {k: v for k, v in c.items() if not isinstance(v, (dict, list))}
         flat_records.append(rec)
+    before_filter = len(flat_records)
+    flat_records = [r for r in flat_records if r.get("entry_credit", 0) >= 0.01]
+    if before_filter != len(flat_records):
+        logger.info(
+            "Filtered %d near-zero credit candidates",
+            before_filter - len(flat_records),
+        )
     pd.DataFrame(flat_records).to_csv(str(OUTPUT_CSV), index=False)
 
     # -- 7. Walk-forward validation --

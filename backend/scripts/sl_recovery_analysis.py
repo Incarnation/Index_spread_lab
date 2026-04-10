@@ -35,8 +35,6 @@ from _constants import CONTRACT_MULT, CONTRACTS
 DATA_DIR = _BACKEND.parent / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 
-TAKE_PROFIT_PCT = 0.50
-
 # Strategy sweep grid
 SL_LEVELS: list[float | None] = [
     None, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0,
@@ -81,11 +79,15 @@ def compute_trade_pnl(
     min_pnl_before_tp50 = row.get("min_pnl_before_tp50")
     first_tp50_pnl = row.get("first_tp50_pnl")
     final_pnl = row.get("final_pnl_at_expiry")
-    hold_realized = row.get("hold_realized_pnl")
 
-    # For non-SL trades that were relabeled with inferred columns,
-    # trajectory fields may be None.  Fall back to existing labels.
-    has_trajectory = min_pnl_before_tp50 is not None and not _isnan(min_pnl_before_tp50)
+    # All trajectory columns must be present for the full SL/TP path analysis.
+    # If any core field is missing/NaN, fall back to existing labels.
+    # Note: first_tp50_pnl and final_pnl may legitimately be NaN (no TP50 hit,
+    # or no expiry mark), so we only require min_pnl_before_tp50 plus the
+    # boolean/categorical columns that are always set during relabeling.
+    traj_vals = [min_pnl_before_tp50, row.get("recovered_after_sl"),
+                 row.get("hold_hit_tp50"), row.get("exit_reason")]
+    has_trajectory = all(v is not None and not _isnan(v) for v in traj_vals)
 
     if not has_trajectory:
         return _fallback_pnl(row, sl_mult, exit_rule, max_profit)
@@ -127,11 +129,13 @@ def _fallback_pnl(
         # hold-to-expiry: we don't have final_pnl for TP50 trades (closed early)
         return orig_pnl
     elif orig_exit == "STOP_LOSS":
-        # Shouldn't reach here for non-SL trades, but just in case
         if sl_mult is None:
             hold_pnl = row.get("hold_realized_pnl")
             return hold_pnl if hold_pnl is not None else orig_pnl
-        return orig_pnl
+        # Counterfactual: if an SL was applied, the trade would have been
+        # stopped at -sl_threshold (trajectory is missing so approximate).
+        sl_threshold = max_profit * sl_mult
+        return -sl_threshold
     else:
         return orig_pnl
 
@@ -340,7 +344,7 @@ def recovery_analysis(df: pd.DataFrame) -> None:
     print(f"Improvement (hold-TP50): ${hold_mean - orig_mean:>+8.0f}/trade")
 
     # By DTE
-    print(f"\n--- Recovery by DTE ---")
+    print("\n--- Recovery by DTE ---")
     for dte in sorted(sl["dte_target"].unique()):
         sub = sl[sl["dte_target"] == dte]
         rec = (sub["recovered_after_sl"] == True).mean()  # noqa: E712
@@ -352,7 +356,7 @@ def recovery_analysis(df: pd.DataFrame) -> None:
               f"(${hold-orig:>+7.0f})")
 
     # By side
-    print(f"\n--- Recovery by Side ---")
+    print("\n--- Recovery by Side ---")
     for side in sorted(sl["spread_side"].unique()):
         sub = sl[sl["spread_side"] == side]
         rec = (sub["recovered_after_sl"] == True).mean()  # noqa: E712
@@ -364,7 +368,7 @@ def recovery_analysis(df: pd.DataFrame) -> None:
 
     # By VIX bucket
     if "vix" in sl.columns:
-        print(f"\n--- Recovery by VIX ---")
+        print("\n--- Recovery by VIX ---")
         for label, mask in build_vix_buckets(sl).items():
             sub = sl[mask]
             if sub.empty:
@@ -377,7 +381,7 @@ def recovery_analysis(df: pd.DataFrame) -> None:
                   f"SL ${orig:>7.0f} → hold ${hold:>7.0f}")
 
     # By delta
-    print(f"\n--- Recovery by Delta ---")
+    print("\n--- Recovery by Delta ---")
     for delta in sorted(sl["delta_target"].unique()):
         sub = sl[sl["delta_target"] == delta]
         rec = (sub["recovered_after_sl"] == True).mean()  # noqa: E712
@@ -469,7 +473,7 @@ def main() -> None:
                 df, sl_m, er, "vix", build_vix_buckets(df),
             )
             if vix_slices:
-                print(f"\n  By VIX:")
+                print("\n  By VIX:")
                 for s in vix_slices:
                     print(f"    {str(s['slice']):>12}: "
                           f"{s['n_trades']:>5} trades, "
@@ -481,7 +485,7 @@ def main() -> None:
                 df["_entry_hour"] = extract_entry_hour(df)
                 hour_slices = slice_by_dimension(df, sl_m, er, "_entry_hour")
                 if hour_slices:
-                    print(f"\n  By entry hour (ET):")
+                    print("\n  By entry hour (ET):")
                     for s in hour_slices:
                         print(f"    {int(s['slice']):>5}:00: "
                               f"{s['n_trades']:>5} trades, "

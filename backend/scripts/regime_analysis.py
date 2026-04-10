@@ -45,8 +45,6 @@ logging.basicConfig(
 
 
 _BACKEND = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_BACKEND / "scripts"))
-
 DATA_DIR = _BACKEND.parent / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 
@@ -59,8 +57,9 @@ DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     """Merge prior-day SPX return and VIX change onto every candidate row.
 
-    Computes per-day aggregates (first observation of spot/vix), derives
-    lagged returns, and left-joins back to the candidate DataFrame.
+    Computes per-day aggregates (last observation of spot/vix sorted by
+    entry_dt for determinism), derives lagged returns, and left-joins
+    back to the candidate DataFrame.
 
     Parameters
     ----------
@@ -78,12 +77,13 @@ def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
         translating regime analysis findings into EventConfig thresholds,
         divide by 100.
     """
+    sorted_df = df.sort_values("entry_dt") if "entry_dt" in df.columns else df
     agg: dict[str, tuple] = {
-        "spot": ("spot", "first"),
-        "vix": ("vix", "first"),
+        "spot": ("spot", "last"),
+        "vix": ("vix", "last"),
     }
     daily = (
-        df.groupby("day")
+        sorted_df.groupby("day")
         .agg(**agg)
         .reset_index()
         .sort_values("day")
@@ -240,8 +240,9 @@ def compute_cell_metrics(
 
     Returns
     -------
-    Dict with n_trades, avg_pnl, total_pnl, win_rate, sharpe,
-    avg_max_adverse, avg_max_favorable, tp hit rates, tail_5pct.
+    Dict with n_trades, avg_pnl, total_pnl, win_rate, pnl_ratio
+    (per-trade mean/std, not annualized Sharpe), avg_max_adverse,
+    avg_max_favorable, tp hit rates, tail_5pct.
     """
     n_total = len(df)
     pnl = df[pnl_col].dropna()
@@ -252,6 +253,8 @@ def compute_cell_metrics(
     arr = pnl.values.astype(float)
     avg = float(np.mean(arr))
     std = float(np.std(arr)) if n > 1 else 0.0
+    # Mean of worst ~5% of trades (not the 5th-percentile quantile).
+    # For small n this may be a single trade.
     tail_count = max(1, n // 20)
     tail_5 = float(np.mean(np.sort(arr)[:tail_count]))
 
@@ -261,7 +264,7 @@ def compute_cell_metrics(
         "avg_pnl": avg,
         "total_pnl": float(np.sum(arr)),
         "win_rate": float(np.mean(arr > 0)),
-        "sharpe": avg / std if std > 0 else 0.0,
+        "pnl_ratio": avg / std if std > 0 else 0.0,
         "tail_5pct": tail_5,
     }
 
@@ -280,7 +283,8 @@ def compute_cell_metrics(
     for tp in [50, 60, 70, 80, 90, 100]:
         col = f"first_tp{tp}_pnl"
         if col in df.columns:
-            result[f"tp{tp}_hit_rate"] = float(df[col].notna().mean())
+            tp_hits = int(df[col].notna().sum())
+            result[f"tp{tp}_hit_rate"] = tp_hits / n if n > 0 else 0.0
         else:
             result[f"tp{tp}_hit_rate"] = None
 
@@ -291,7 +295,7 @@ def _empty_metrics(n_total: int = 0) -> dict[str, Any]:
     """Return a metrics dict for an empty slice."""
     m: dict[str, Any] = {
         "n_total": n_total, "n_trades": 0, "avg_pnl": None, "total_pnl": None,
-        "win_rate": None, "sharpe": None, "tail_5pct": None,
+        "win_rate": None, "pnl_ratio": None, "tail_5pct": None,
         "avg_max_adverse": None, "avg_max_favorable": None,
     }
     for tp in [50, 60, 70, 80, 90, 100]:
@@ -369,6 +373,7 @@ def apply_filters(df: pd.DataFrame, filters: list[tuple[str, str, float]]) -> pd
     mask = pd.Series(True, index=df.index)
     for col, op, val in filters:
         if col not in df.columns:
+            logger.warning("Filter column %r not found in data — skipping filter %s%s%s", col, col, op, val)
             continue
         s = df[col]
         if op == "<":
@@ -560,7 +565,7 @@ def run_regime_report(
 # ===================================================================
 
 
-_CORE_COLS = ["n_total", "n_trades", "avg_pnl", "total_pnl", "win_rate", "sharpe", "tail_5pct"]
+_CORE_COLS = ["n_total", "n_trades", "avg_pnl", "total_pnl", "win_rate", "pnl_ratio", "tail_5pct"]
 _EXTENDED_COLS = [
     "avg_max_adverse", "avg_max_favorable",
     "tp50_hit_rate", "tp60_hit_rate", "tp70_hit_rate",
@@ -616,8 +621,8 @@ def format_table(result_df: pd.DataFrame, title: str = "") -> str:
             header_parts.append(f"{'TotalPnL':>12}")
         elif col == "win_rate" or col.endswith("_hit_rate"):
             header_parts.append(f"{col:>12}")
-        elif col == "sharpe":
-            header_parts.append(f"{'Sharpe':>8}")
+        elif col == "pnl_ratio":
+            header_parts.append(f"{'PnlRatio':>10}")
         elif col == "tail_5pct":
             header_parts.append(f"{'Tail5%':>10}")
         elif col in ("avg_max_adverse", "avg_max_favorable"):
@@ -657,8 +662,8 @@ def format_table(result_df: pd.DataFrame, title: str = "") -> str:
                 parts.append(f"${val:>9,.0f}")
             elif col == "win_rate" or col.endswith("_hit_rate"):
                 parts.append(f"{val * 100:>11.1f}%")
-            elif col == "sharpe":
-                parts.append(f"{val:>8.2f}")
+            elif col == "pnl_ratio":
+                parts.append(f"{val:>10.2f}")
             elif col in ("avg_max_adverse", "avg_max_favorable"):
                 parts.append(f"${val:>15,.0f}")
             else:
@@ -791,7 +796,7 @@ def main() -> None:
         print(f"\n  OVERALL: {overall['n_trades']} trades, "
               f"avg ${overall['avg_pnl']:,.0f}, "
               f"win {overall['win_rate'] * 100:.1f}%, "
-              f"sharpe {overall['sharpe']:.2f}")
+              f"pnl_ratio {overall['pnl_ratio']:.2f}")
 
         for dim in ["spx_drop", "vix_level", "dte"]:
             result_df = run_1d_breakdown(df, dim, pnl_col, args.min_trades)

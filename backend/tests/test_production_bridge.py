@@ -512,11 +512,11 @@ class TestGenerateAutoWindows:
 
     def test_short_data_produces_few_windows(self):
         windows = generate_auto_windows("2026-01-01", "2026-06-30")
-        # ~6 months should produce at most 1 window (6m train + 3m test = 9m)
-        # but data is only 6 months, so test truncation
-        assert len(windows) <= 1
+        # 6 months with defaults (3m train / 1m test / 1m step) produces 3 windows
+        assert 1 <= len(windows) <= 4
 
     def test_very_short_data_produces_no_windows(self):
+        # 1 month of data is not enough for 3m train + 1m test
         windows = generate_auto_windows("2026-04-01", "2026-04-30")
         assert len(windows) == 0
 

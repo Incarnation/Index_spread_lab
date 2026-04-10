@@ -86,7 +86,11 @@ def export_underlying_quotes(
     end: str | None = None,
     output: Path = UNDERLYING_QUOTES_CSV,
 ) -> int:
-    """Export underlying_quotes (SPX, SPY, VIX, VIX9D) to CSV.
+    """Export underlying_quotes (SPX, SPY, VIX, VIX9D, VVIX, SKEW) to CSV.
+
+    When a date filter is applied, new rows are merged with the existing
+    CSV (if present) and deduplicated by (ts, symbol) so incremental
+    exports don't destroy previously exported data.
 
     Parameters
     ----------
@@ -102,7 +106,7 @@ def export_underlying_quotes(
     Returns
     -------
     int
-        Number of rows exported.
+        Total number of rows in the final output.
     """
     clauses = ["symbol IN ('SPX', 'SPY', 'VIX', 'VIX9D', 'VVIX', 'SKEW')"]
     params: dict = {}
@@ -122,6 +126,13 @@ def export_underlying_quotes(
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params=params)
 
+    if output.exists() and (start or end):
+        existing = pd.read_csv(str(output))
+        df = pd.concat([existing, df], ignore_index=True)
+        df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
+        df = df.drop_duplicates(subset=["ts", "symbol"], keep="last")
+        df = df.sort_values("ts").reset_index(drop=True)
+
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
     return len(df)
@@ -134,7 +145,11 @@ def export_context_snapshots(
     end: str | None = None,
     output: Path = CONTEXT_SNAPSHOTS_CSV,
 ) -> int:
-    """Export context_snapshots to CSV.
+    """Export context_snapshots to CSV, merging with any existing export.
+
+    When a date filter is applied, new rows are merged with the existing
+    CSV (if present) and deduplicated by timestamp so incremental exports
+    don't destroy previously exported data.
 
     Parameters
     ----------
@@ -150,7 +165,7 @@ def export_context_snapshots(
     Returns
     -------
     int
-        Number of rows exported.
+        Total number of rows in the final output.
     """
     clauses = ["1=1"]
     params: dict = {}
@@ -170,6 +185,13 @@ def export_context_snapshots(
 
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params=params)
+
+    if output.exists() and (start or end):
+        existing = pd.read_csv(str(output))
+        df = pd.concat([existing, df], ignore_index=True)
+        df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
+        df = df.drop_duplicates(subset=["ts"], keep="last")
+        df = df.sort_values("ts").reset_index(drop=True)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
@@ -430,6 +452,10 @@ def export_underlying_parquet(
     with columns ``[ts, close]``, matching the FRD parquet format so the
     training pipeline's ``load_frd_quotes`` can read them directly.
 
+    When a date filter is applied, new rows are merged with the existing
+    parquet (if present) and deduplicated by timestamp so incremental
+    exports don't destroy previously exported data.
+
     Parameters
     ----------
     engine:
@@ -444,7 +470,7 @@ def export_underlying_parquet(
     Returns
     -------
     dict[str, int]
-        Mapping of symbol name to number of rows exported.
+        Mapping of symbol name to total number of rows in each output file.
     """
     symbols = ("SPX", "SPY", "VIX", "VIX9D", "VVIX", "SKEW")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -474,7 +500,15 @@ def export_underlying_parquet(
             continue
 
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
         out_path = output_dir / f"{symbol}_1min.parquet"
+        if out_path.exists() and (start or end):
+            existing = pd.read_parquet(out_path)
+            existing["ts"] = pd.to_datetime(existing["ts"], utc=True)
+            df = pd.concat([existing, df], ignore_index=True)
+            df = df.drop_duplicates(subset=["ts"], keep="last")
+            df = df.sort_values("ts").reset_index(drop=True)
+
         df.to_parquet(out_path, index=False)
         results[symbol] = len(df)
 
