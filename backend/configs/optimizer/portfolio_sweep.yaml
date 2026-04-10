@@ -1,0 +1,23 @@
+name: portfolio-sweep
+description: >
+  Portfolio-only parameter sweep without events.  Covers capital allocation,
+  trade limits, drawdown stops, and lot sizing with a fixed baseline
+  trading config.  Does NOT include the event-enabled block from
+  _build_optimizer_grid(); use event_only.yaml or staged configs for that.
+
+portfolio:
+  starting_capital: [20000]
+  max_trades_per_day: [1, 2, 3]
+  monthly_drawdown_limit: [0.10, 0.15, 0.20, null]
+  lot_per_equity: [10000, 20000, 999999]
+  calls_only: [true, false]
+
+trading:
+  tp_pct: [0.50]
+  sl_mult: [null]
+
+event:
+  enabled: [false]
+
+regime:
+  enabled: [false]

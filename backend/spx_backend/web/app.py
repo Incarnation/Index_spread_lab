@@ -9,7 +9,7 @@ from loguru import logger
 from spx_backend.config import settings
 from spx_backend.database import init_db
 from spx_backend.scheduler_builder import build_scheduler
-from spx_backend.web.routers import admin, auth, portfolio, public
+from spx_backend.web.routers import admin, auth, optimizer, portfolio, public
 from spx_backend.web.routers.public import (
     get_performance_analytics,
     get_gex_curve,
@@ -85,6 +85,7 @@ app.include_router(auth.router)
 app.include_router(public.router)
 app.include_router(admin.router)
 app.include_router(portfolio.router)
+app.include_router(optimizer.router)
 
 __all__ = [
     "app",

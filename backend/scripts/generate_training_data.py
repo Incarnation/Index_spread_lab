@@ -67,6 +67,7 @@ OFFLINE_GEX_CSV = DATA_DIR / "offline_gex_cache.csv"
 CONTEXT_SNAPSHOTS_CSV = DATA_DIR / "context_snapshots_export.csv"
 OUTPUT_CSV = DATA_DIR / "training_candidates.csv"
 ECONOMIC_CALENDAR_CSV = DATA_DIR / "economic_calendar.csv"
+CANDIDATES_CACHE_DIR = DATA_DIR / "candidates_cache"
 
 # Production DB exports (from export_production_data.py)
 PRODUCTION_CHAINS_DIR = DATA_DIR / "production_exports" / "chains"
@@ -2190,6 +2191,61 @@ def _generate_candidates_for_day(day_str: str) -> list[dict]:
 
 
 # ===================================================================
+# INCREMENTAL CANDIDATE CACHING
+# ===================================================================
+
+
+def _compute_code_version() -> str:
+    """SHA-256 of this script, used to invalidate cache on code changes."""
+    src = Path(__file__).read_bytes()
+    return hashlib.sha256(src).hexdigest()[:16]
+
+
+def _load_cache_manifest(cache_dir: Path) -> dict:
+    """Load the cache manifest file, or return an empty dict."""
+    manifest_path = cache_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            return json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Corrupt cache manifest, ignoring: %s", exc)
+    return {}
+
+
+def _save_cache_manifest(cache_dir: Path, manifest: dict) -> None:
+    """Write the cache manifest file atomically."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / "manifest.json"
+    tmp = manifest_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, default=str))
+    tmp.rename(manifest_path)
+
+
+def _cache_day_candidates(
+    cache_dir: Path,
+    day_str: str,
+    candidates: list[dict],
+) -> int:
+    """Save one day's candidates as a Parquet file. Returns row count."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not candidates:
+        return 0
+    df = pd.DataFrame(candidates)
+    parquet_path = cache_dir / f"{day_str}.parquet"
+    df.to_parquet(parquet_path, index=False)
+    return len(df)
+
+
+def _load_cached_day(cache_dir: Path, day_str: str) -> list[dict]:
+    """Load cached candidates for a single day from Parquet."""
+    parquet_path = cache_dir / f"{day_str}.parquet"
+    if not parquet_path.exists():
+        return []
+    df = pd.read_parquet(parquet_path)
+    return df.to_dict("records")
+
+
+# ===================================================================
 # MAIN PIPELINE ORCHESTRATION
 # ===================================================================
 
@@ -2199,6 +2255,8 @@ def run_pipeline(
     deploy: bool = False,
     verbose: bool = True,
     workers: int = 8,
+    force_regen: bool = False,
+    cache_dir: Path = CANDIDATES_CACHE_DIR,
 ) -> None:
     """Execute the full offline training pipeline end-to-end.
 
@@ -2206,10 +2264,16 @@ def run_pipeline(
       1. Discover available trading days from Databento files.
       2. Load reference data (SPY equity bars, VIX / VIX9D CSVs).
       3. For each day × decision time × DTE × delta: construct candidates.
+         (uses incremental per-day Parquet cache to skip unchanged days)
       4. Label all candidates with forward-looking cbbo-1m marks.
       5. Build production-compatible feature vectors.
       6. Walk-forward validation and final model training.
       7. (Optional) insert model into production DB as shadow.
+
+    Parameters
+    ----------
+    force_regen : If True, ignore the candidate cache and regenerate all days.
+    cache_dir : Directory for per-day Parquet candidate cache files.
     """
     t0 = time.time()
 
@@ -2257,46 +2321,107 @@ def run_pipeline(
     print(f"  Calendar events  : {len(cal_map)}")
     print(f"  GEX snapshots    : {len(cs_df)} rows ({gex_count} with GEX)", flush=True)
 
-    # -- 3. Generate candidates (parallel across days) --
-    candidate_workers = min(workers, len(trading_days))
-    print(
-        f"[PIPELINE] Generating candidates ({candidate_workers} workers) ...",
-        flush=True,
+    # -- 3. Generate candidates (parallel across days, with incremental cache) --
+    code_version = _compute_code_version()
+    manifest = _load_cache_manifest(cache_dir)
+    decision_key = str(DECISION_MINUTES_ET)
+
+    cache_valid = (
+        not force_regen
+        and manifest.get("code_version") == code_version
+        and manifest.get("decision_minutes") == decision_key
     )
+    if force_regen:
+        print("[PIPELINE] --force-regen: ignoring candidate cache", flush=True)
+    elif not cache_valid:
+        if not manifest:
+            reason = "no cache found"
+        elif manifest.get("code_version") != code_version:
+            reason = "code changed"
+        else:
+            reason = "entry times changed"
+        print(f"[PIPELINE] Cache invalidated ({reason}), regenerating all days", flush=True)
+
+    cached_days_info = manifest.get("days", {}) if cache_valid else {}
+    days_to_generate = [d for d in trading_days if d not in cached_days_info]
+    days_from_cache = [d for d in trading_days if d in cached_days_info]
+
+    print(f"[PIPELINE] Cache: {len(days_from_cache)} days cached, "
+          f"{len(days_to_generate)} days to generate", flush=True)
+
     all_candidates: list[dict] = []
 
-    import pickle
-    spy_bytes = pickle.dumps(spy_df)
-    uq_bytes = pickle.dumps(uq_df)
+    # Load cached days
+    for day_str in days_from_cache:
+        day_cands = _load_cached_day(cache_dir, day_str)
+        all_candidates.extend(day_cands)
+        if verbose:
+            print(f"  [{day_str}] {len(day_cands)} candidates (cached)", flush=True)
 
-    if candidate_workers > 1:
-        with Pool(
-            candidate_workers,
-            initializer=_init_candidate_worker,
-            initargs=(spy_bytes, uq_bytes, skew_daily, cal_map),
-        ) as pool:
-            for di, day_cands in enumerate(
-                pool.imap(_generate_candidates_for_day, trading_days),
-            ):
-                day_str = trading_days[di]
+    # Generate new days
+    if days_to_generate:
+        candidate_workers = min(workers, len(days_to_generate))
+        print(
+            f"[PIPELINE] Generating {len(days_to_generate)} days "
+            f"({candidate_workers} workers) ...",
+            flush=True,
+        )
+
+        import pickle
+        spy_bytes = pickle.dumps(spy_df)
+        uq_bytes = pickle.dumps(uq_df)
+
+        new_manifest_days = dict(cached_days_info)
+
+        if candidate_workers > 1:
+            with Pool(
+                candidate_workers,
+                initializer=_init_candidate_worker,
+                initargs=(spy_bytes, uq_bytes, skew_daily, cal_map),
+            ) as pool:
+                for di, day_cands in enumerate(
+                    pool.imap(_generate_candidates_for_day, days_to_generate),
+                ):
+                    day_str = days_to_generate[di]
+                    all_candidates.extend(day_cands)
+                    n_cached = _cache_day_candidates(cache_dir, day_str, day_cands)
+                    new_manifest_days[day_str] = {
+                        "rows": n_cached,
+                        "file": f"{day_str}.parquet",
+                    }
+                    if verbose:
+                        print(
+                            f"  [{day_str}] {len(day_cands)} candidates (new)",
+                            flush=True,
+                        )
+        else:
+            _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map)
+            for day_str in days_to_generate:
+                day_cands = _generate_candidates_for_day(day_str)
                 all_candidates.extend(day_cands)
+                n_cached = _cache_day_candidates(cache_dir, day_str, day_cands)
+                new_manifest_days[day_str] = {
+                    "rows": n_cached,
+                    "file": f"{day_str}.parquet",
+                }
                 if verbose:
                     print(
-                        f"  [{day_str}] {len(day_cands)} candidates",
+                        f"  [{day_str}] {len(day_cands)} candidates (new)",
                         flush=True,
                     )
-    else:
-        _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map)
-        for day_str in trading_days:
-            day_cands = _generate_candidates_for_day(day_str)
-            all_candidates.extend(day_cands)
-            if verbose:
-                print(
-                    f"  [{day_str}] {len(day_cands)} candidates",
-                    flush=True,
-                )
 
-    del spy_bytes, uq_bytes
+        del spy_bytes, uq_bytes
+
+        # Update manifest
+        _save_cache_manifest(cache_dir, {
+            "code_version": code_version,
+            "decision_minutes": decision_key,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "days": new_manifest_days,
+        })
+    else:
+        print("[PIPELINE] All days loaded from cache", flush=True)
+
     gc.collect()
 
     print(f"[PIPELINE] Total candidates: {len(all_candidates)}", flush=True)
@@ -2669,6 +2794,14 @@ def main() -> None:
         help="Number of parallel workers for the labeling step "
              "(default: min(8, cpu_count))",
     )
+    parser.add_argument(
+        "--force-regen", action="store_true",
+        help="Ignore candidate cache and regenerate all days from scratch",
+    )
+    parser.add_argument(
+        "--cache-dir", type=str, default=str(CANDIDATES_CACHE_DIR),
+        help=f"Directory for per-day Parquet candidate cache (default: {CANDIDATES_CACHE_DIR})",
+    )
     args = parser.parse_args()
 
     if args.precompute_gex:
@@ -2689,6 +2822,8 @@ def main() -> None:
         deploy=args.deploy,
         verbose=not args.quiet,
         workers=args.workers,
+        force_regen=args.force_regen,
+        cache_dir=Path(args.cache_dir),
     )
 
 

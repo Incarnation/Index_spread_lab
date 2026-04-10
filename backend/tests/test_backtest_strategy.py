@@ -36,6 +36,7 @@ from backtest_strategy import (
     _fast_sched_select,
     _build_event_only_grid,
     _build_selective_grid,
+    _run_grid,
     extract_pareto_frontier,
     _deduplicate_results,
     _parameter_importance,
@@ -1517,3 +1518,50 @@ class TestSelectiveGrid:
         has_on = any(c.regime.enabled for c in configs)
         has_off = any(not c.regime.enabled for c in configs)
         assert has_on and has_off
+
+
+# ── Parallel grid ──────────────────────────────────────────────
+
+
+class TestParallelGrid:
+    """Verify _run_grid produces identical results in sequential vs parallel mode."""
+
+    def test_parallel_matches_sequential(self, multi_day_df):
+        """Sequential (workers=1) and parallel (workers=2) produce the same results."""
+        daily_signals = precompute_daily_signals(multi_day_df)
+
+        configs = [
+            FullConfig(
+                portfolio=PortfolioConfig(starting_capital=cap, calls_only=co),
+                trading=TradingConfig(tp_pct=tp),
+            )
+            for cap in [10_000, 20_000]
+            for co in [True, False]
+            for tp in [0.50, 0.70]
+        ]
+
+        seq = _run_grid(configs, multi_day_df, daily_signals,
+                        "test-seq", num_workers=1)
+        par = _run_grid(configs, multi_day_df, daily_signals,
+                        "test-par", num_workers=2)
+
+        assert len(seq) == len(par) == len(configs)
+
+        key_cols = [c for c in seq.columns if c.startswith(("p_", "t_"))]
+        seq_sorted = seq.sort_values(key_cols).reset_index(drop=True)
+        par_sorted = par.sort_values(key_cols).reset_index(drop=True)
+
+        for col in ["final_equity", "return_pct", "sharpe", "total_trades",
+                     "win_days", "win_rate"]:
+            assert list(seq_sorted[col]) == list(par_sorted[col]), (
+                f"Mismatch in column {col} between sequential and parallel"
+            )
+
+    def test_single_worker_fallback(self, multi_day_df):
+        """workers=1 uses the sequential code path and still returns results."""
+        daily_signals = precompute_daily_signals(multi_day_df)
+        configs = [FullConfig()]
+        result = _run_grid(configs, multi_day_df, daily_signals,
+                           "test-single", num_workers=1)
+        assert len(result) == 1
+        assert "final_equity" in result.columns

@@ -71,10 +71,13 @@ from __future__ import annotations
 import argparse
 import itertools
 import logging
+import os
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import timedelta
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Any
 
@@ -1348,6 +1351,7 @@ def run_event_only_optimizer(
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
     output_csv: Path = RESULTS_CSV,
+    num_workers: int = 1,
 ) -> pd.DataFrame:
     """Run a focused optimizer sweep for event-only (SPX drop) strategies.
 
@@ -1361,6 +1365,7 @@ def run_event_only_optimizer(
     df : Training candidates DataFrame.
     daily_signals : Precomputed daily signal features.
     output_csv : Path to write/append results CSV.
+    num_workers : Number of parallel backtest workers (1 = sequential).
 
     Returns
     -------
@@ -1370,7 +1375,8 @@ def run_event_only_optimizer(
 
     configs = _build_event_only_grid()
     print(f"  Event-only grid: {len(configs):,} configs", flush=True)
-    results = _run_grid(configs, df, daily_signals, "Event-Only")
+    results = _run_grid(configs, df, daily_signals, "Event-Only",
+                        num_workers=num_workers)
 
     if results.empty:
         logger.warning("Event-only optimizer produced no results")
@@ -1466,6 +1472,7 @@ def run_selective_optimizer(
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
     output_csv: Path = RESULTS_CSV,
+    num_workers: int = 1,
 ) -> pd.DataFrame:
     """Run a focused optimizer sweep targeting high win-rate selective strategies.
 
@@ -1478,6 +1485,7 @@ def run_selective_optimizer(
     df : Training candidates DataFrame.
     daily_signals : Precomputed daily signal features.
     output_csv : Path to write/append results CSV.
+    num_workers : Number of parallel backtest workers (1 = sequential).
 
     Returns
     -------
@@ -1487,7 +1495,8 @@ def run_selective_optimizer(
 
     configs = _build_selective_grid()
     print(f"  Selective grid: {len(configs):,} configs", flush=True)
-    results = _run_grid(configs, df, daily_signals, "Selective-HiWR")
+    results = _run_grid(configs, df, daily_signals, "Selective-HiWR",
+                        num_workers=num_workers)
 
     if results.empty:
         logger.warning("Selective optimizer produced no results")
@@ -1528,53 +1537,154 @@ def run_selective_optimizer(
     return results.sort_values("sharpe", ascending=False).reset_index(drop=True)
 
 
+# ===================================================================
+# Parallel backtest worker infrastructure
+# ===================================================================
+
+_BACKTEST_WORKER_REF: dict[str, Any] = {}
+
+
+def _init_backtest_worker(
+    df_bytes: bytes,
+    signals_bytes: bytes,
+    precomp_bytes: bytes,
+) -> None:
+    """Initializer for each worker process in the backtest pool.
+
+    Unpickles the shared read-only data once per worker, storing them in
+    the module-level ``_BACKTEST_WORKER_REF`` dict so ``_backtest_worker``
+    can access them without re-serializing on every task.
+    """
+    _BACKTEST_WORKER_REF["df"] = pickle.loads(df_bytes)
+    _BACKTEST_WORKER_REF["daily_signals"] = pickle.loads(signals_bytes)
+    _BACKTEST_WORKER_REF["precomp_cache"] = pickle.loads(precomp_bytes)
+
+
+def _backtest_worker(cfg: FullConfig) -> dict[str, Any]:
+    """Run a single backtest config inside a worker process.
+
+    Reads shared data from ``_BACKTEST_WORKER_REF`` (set by the pool
+    initializer) and returns the flat config + result metrics dict.
+    """
+    df = _BACKTEST_WORKER_REF["df"]
+    daily_signals = _BACKTEST_WORKER_REF["daily_signals"]
+    precomp_cache = _BACKTEST_WORKER_REF["precomp_cache"]
+
+    tc = cfg.trading
+    cache_key = (tc.width_filter, tc.entry_count)
+    day_precomp = precomp_cache[cache_key]
+
+    result = run_backtest(df, daily_signals, cfg, day_precomp=day_precomp)
+    row = cfg.flat_dict()
+    row.update({
+        "final_equity": result.final_equity,
+        "return_pct": result.total_return_pct,
+        "ann_return_pct": result.annualised_return_pct,
+        "max_dd_pct": result.max_drawdown_pct,
+        "trough": result.trough,
+        "sharpe": result.sharpe,
+        "total_trades": result.total_trades,
+        "days_traded": result.days_traded,
+        "days_stopped": result.days_stopped,
+        "win_days": result.win_days,
+        "win_rate": result.win_days / max(result.days_traded, 1),
+    })
+    return row
+
+
+def _build_precomp_cache(
+    df: pd.DataFrame,
+    configs: list[FullConfig],
+) -> dict[tuple, dict]:
+    """Pre-compute day selections for all unique (width_filter, entry_count) keys.
+
+    Building these upfront (instead of lazily) is required before forking
+    worker processes so every worker has the full cache available.
+    """
+    cache: dict[tuple, dict] = {}
+    for cfg in configs:
+        tc = cfg.trading
+        key = (tc.width_filter, tc.entry_count)
+        if key not in cache:
+            cache[key] = _precompute_day_selections(
+                df, width_filter=tc.width_filter, entry_count=tc.entry_count,
+            )
+    return cache
+
+
 def _run_grid(
     configs: list[FullConfig],
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
     stage_name: str,
+    num_workers: int = 1,
 ) -> pd.DataFrame:
-    """Execute a list of configs and return results DataFrame."""
-    print(f"\n[{stage_name}] {len(configs):,} configurations to evaluate", flush=True)
-    rows: list[dict[str, Any]] = []
+    """Execute a list of configs and return results DataFrame.
+
+    When *num_workers* > 1, distributes backtest runs across a
+    ``multiprocessing.Pool``.  Falls back to a sequential loop when
+    *num_workers* == 1 (useful for debugging).
+    """
+    print(f"\n[{stage_name}] {len(configs):,} configurations to evaluate"
+          f" (workers={num_workers})", flush=True)
     t0 = time.time()
 
-    # Pre-compute day selections per unique (width_filter, entry_count)
-    precomp_cache: dict[tuple, dict] = {}
+    precomp_cache = _build_precomp_cache(df, configs)
 
-    for i, cfg in enumerate(configs):
-        tc = cfg.trading
-        cache_key = (tc.width_filter, tc.entry_count)
-        if cache_key not in precomp_cache:
-            precomp_cache[cache_key] = _precompute_day_selections(
-                df, width_filter=tc.width_filter, entry_count=tc.entry_count,
+    if num_workers > 1:
+        df_bytes = pickle.dumps(df)
+        signals_bytes = pickle.dumps(daily_signals)
+        precomp_bytes = pickle.dumps(precomp_cache)
+
+        rows: list[dict[str, Any]] = []
+        with Pool(
+            num_workers,
+            initializer=_init_backtest_worker,
+            initargs=(df_bytes, signals_bytes, precomp_bytes),
+        ) as pool:
+            for i, row in enumerate(
+                pool.imap_unordered(_backtest_worker, configs, chunksize=64),
+            ):
+                rows.append(row)
+                if (i + 1) % 500 == 0:
+                    elapsed = time.time() - t0
+                    rate = (i + 1) / elapsed
+                    remaining = (len(configs) - i - 1) / rate
+                    print(f"  {i+1:,}/{len(configs):,} done  "
+                          f"({rate:.0f}/sec, ~{remaining:.0f}s remaining)",
+                          flush=True)
+    else:
+        rows = []
+        for i, cfg in enumerate(configs):
+            tc = cfg.trading
+            cache_key = (tc.width_filter, tc.entry_count)
+
+            result = run_backtest(
+                df, daily_signals, cfg, day_precomp=precomp_cache[cache_key],
             )
+            row = cfg.flat_dict()
+            row.update({
+                "final_equity": result.final_equity,
+                "return_pct": result.total_return_pct,
+                "ann_return_pct": result.annualised_return_pct,
+                "max_dd_pct": result.max_drawdown_pct,
+                "trough": result.trough,
+                "sharpe": result.sharpe,
+                "total_trades": result.total_trades,
+                "days_traded": result.days_traded,
+                "days_stopped": result.days_stopped,
+                "win_days": result.win_days,
+                "win_rate": result.win_days / max(result.days_traded, 1),
+            })
+            rows.append(row)
 
-        result = run_backtest(
-            df, daily_signals, cfg, day_precomp=precomp_cache[cache_key],
-        )
-        row = cfg.flat_dict()
-        row.update({
-            "final_equity": result.final_equity,
-            "return_pct": result.total_return_pct,
-            "ann_return_pct": result.annualised_return_pct,
-            "max_dd_pct": result.max_drawdown_pct,
-            "trough": result.trough,
-            "sharpe": result.sharpe,
-            "total_trades": result.total_trades,
-            "days_traded": result.days_traded,
-            "days_stopped": result.days_stopped,
-            "win_days": result.win_days,
-            "win_rate": result.win_days / max(result.days_traded, 1),
-        })
-        rows.append(row)
-
-        if (i + 1) % 500 == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            remaining = (len(configs) - i - 1) / rate
-            print(f"  {i+1:,}/{len(configs):,} done  "
-                  f"({rate:.0f}/sec, ~{remaining:.0f}s remaining)", flush=True)
+            if (i + 1) % 500 == 0:
+                elapsed = time.time() - t0
+                rate = (i + 1) / elapsed
+                remaining = (len(configs) - i - 1) / rate
+                print(f"  {i+1:,}/{len(configs):,} done  "
+                      f"({rate:.0f}/sec, ~{remaining:.0f}s remaining)",
+                      flush=True)
 
     elapsed = time.time() - t0
     print(f"  [{stage_name}] Completed {len(configs):,} configs in {elapsed:.1f}s "
@@ -1587,6 +1697,7 @@ def run_optimizer(
     df: pd.DataFrame,
     daily_signals: pd.DataFrame,
     output_csv: Path = RESULTS_CSV,
+    num_workers: int = 1,
 ) -> pd.DataFrame:
     """Run exhaustive grid search (original mode) and export results.
 
@@ -1595,13 +1706,15 @@ def run_optimizer(
     df : Training candidates DataFrame.
     daily_signals : Precomputed daily signal features.
     output_csv : Path to write the full results CSV.
+    num_workers : Number of parallel backtest workers (1 = sequential).
 
     Returns
     -------
     DataFrame with one row per config, sorted by Sharpe descending.
     """
     configs = _build_optimizer_grid()
-    results_df = _run_grid(configs, df, daily_signals, "Optimizer")
+    results_df = _run_grid(configs, df, daily_signals, "Optimizer",
+                           num_workers=num_workers)
     results_df.to_csv(output_csv, index=False)
     print(f"\n  Full results exported to {output_csv}", flush=True)
     return results_df.sort_values("sharpe", ascending=False).reset_index(drop=True)
@@ -1613,6 +1726,7 @@ def run_staged_optimizer(
     output_csv: Path = RESULTS_CSV,
     top_n_trading: int = 10,
     top_n_combined: int = 5,
+    num_workers: int = 1,
 ) -> pd.DataFrame:
     """Run 3-stage optimizer: trading params -> portfolio params -> event params.
 
@@ -1627,6 +1741,7 @@ def run_staged_optimizer(
     output_csv : Path to write combined results CSV.
     top_n_trading : Number of top trading configs to carry into Stage 2.
     top_n_combined : Number of top combined configs to carry into Stage 3.
+    num_workers : Number of parallel backtest workers (1 = sequential).
 
     Returns
     -------
@@ -1637,7 +1752,8 @@ def run_staged_optimizer(
 
     # --- Stage 1: Trading param sweep ---
     s1_configs = _build_staged_grid_stage1()
-    s1_results = _run_grid(s1_configs, df, daily_signals, "Stage-1 Trading")
+    s1_results = _run_grid(s1_configs, df, daily_signals, "Stage-1 Trading",
+                           num_workers=num_workers)
     s1_sorted = s1_results.sort_values("sharpe", ascending=False)
 
     # Extract top trading configs (carrying min_dte / max_delta from stage 1)
@@ -1672,7 +1788,8 @@ def run_staged_optimizer(
 
     # --- Stage 2: Portfolio param sweep ---
     s2_configs = _build_staged_grid_stage2(top_trading)
-    s2_results = _run_grid(s2_configs, df, daily_signals, "Stage-2 Portfolio")
+    s2_results = _run_grid(s2_configs, df, daily_signals, "Stage-2 Portfolio",
+                           num_workers=num_workers)
     s2_sorted = s2_results.sort_values("sharpe", ascending=False)
 
     top_combined: list[tuple[PortfolioConfig, TradingConfig]] = []
@@ -1711,7 +1828,8 @@ def run_staged_optimizer(
 
     # --- Stage 3: Event param sweep ---
     s3_configs = _build_staged_grid_stage3(top_combined)
-    s3_results = _run_grid(s3_configs, df, daily_signals, "Stage-3 Event")
+    s3_results = _run_grid(s3_configs, df, daily_signals, "Stage-3 Event",
+                           num_workers=num_workers)
 
     # Combine all stages
     all_results = pd.concat([s1_results, s2_results, s3_results], ignore_index=True)
@@ -2620,8 +2738,22 @@ def main() -> None:
                         help="Staged optimizer: top-N combined configs to carry into Stage 3 (default: 5)")
     parser.add_argument("--output-csv", type=str, default=str(RESULTS_CSV),
                         help="CSV output path for optimizer results")
+    parser.add_argument("--backtest-workers", type=int,
+                        default=max(1, (cpu_count() or 2) - 1),
+                        help="Number of parallel workers for optimizer grid "
+                             "(1 = sequential, default = cpu_count - 1)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to a YAML grid definition file "
+                             "(overrides the hardcoded grid for --optimize)")
+    parser.add_argument("--experiment-name", type=str, default=None,
+                        help="Name for the experiment run (enables experiment tracking)")
+    parser.add_argument("--no-track", action="store_true", default=False,
+                        help="Disable experiment tracking even when --experiment-name is set")
+    parser.add_argument("--git-tag", action="store_true", default=False,
+                        help="Create a git tag for the experiment run")
 
     args = parser.parse_args()
+    args.backtest_workers = max(1, args.backtest_workers)
 
     # --analyze only needs the results CSV, not the full training data
     if args.analyze:
@@ -2685,33 +2817,94 @@ def main() -> None:
         wf_output = Path(args.output_csv).parent / "walkforward_results.csv"
         run_walkforward(df, output_csv=wf_output, windows=wf_windows)
 
-    elif args.optimize_staged:
-        results_df = run_staged_optimizer(
-            df, daily_signals, Path(args.output_csv),
-            top_n_trading=args.top_n_trading,
-            top_n_combined=args.top_n_combined,
-        )
-        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
-            print_optimizer_top(results_df, metric)
+    elif args.optimize_staged or args.optimize_event_only or args.optimize_selective or args.optimize:
+        # Determine optimizer mode
+        if args.optimize_staged:
+            mode = "staged"
+        elif args.optimize_event_only:
+            mode = "event-only"
+        elif args.optimize_selective:
+            mode = "selective"
+        else:
+            mode = "yaml-config" if args.config else "exhaustive"
 
-    elif args.optimize_event_only:
-        results_df = run_event_only_optimizer(
-            df, daily_signals, Path(args.output_csv),
-        )
-        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
-            print_optimizer_top(results_df, metric)
+        # Set up experiment tracking
+        tracker = None
+        if args.experiment_name and not args.no_track:
+            from experiment_tracker import CsvExperimentTracker
+            tracker = CsvExperimentTracker()
+            tracker.start_run(args.experiment_name, {
+                "mode": mode,
+                "csv": args.csv,
+                "output_csv": args.output_csv,
+                "workers": args.backtest_workers,
+                "config_file": args.config,
+            })
 
-    elif args.optimize_selective:
-        results_df = run_selective_optimizer(
-            df, daily_signals, Path(args.output_csv),
-        )
-        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
-            print_optimizer_top(results_df, metric)
+        # Run the selected optimizer (with tracker cleanup on failure)
+        try:
+            if args.optimize_staged:
+                results_df = run_staged_optimizer(
+                    df, daily_signals, Path(args.output_csv),
+                    top_n_trading=args.top_n_trading,
+                    top_n_combined=args.top_n_combined,
+                    num_workers=args.backtest_workers,
+                )
+            elif args.optimize_event_only:
+                results_df = run_event_only_optimizer(
+                    df, daily_signals, Path(args.output_csv),
+                    num_workers=args.backtest_workers,
+                )
+            elif args.optimize_selective:
+                results_df = run_selective_optimizer(
+                    df, daily_signals, Path(args.output_csv),
+                    num_workers=args.backtest_workers,
+                )
+            elif args.config:
+                from configs.optimizer.schema import build_configs_from_yaml
+                configs = build_configs_from_yaml(args.config)
+                tp_vals = sorted({c.trading.tp_pct for c in configs})
+                sl_vals = sorted({c.trading.sl_mult for c in configs}, key=lambda x: x or 0)
+                precompute_pnl_columns(df, tp_vals, sl_vals)
+                results_df = _run_grid(configs, df, daily_signals, "YAML-Grid",
+                                       num_workers=args.backtest_workers)
+                results_df.sort_values("sharpe", ascending=False, ignore_index=True, inplace=True)
+                results_df.to_csv(Path(args.output_csv), index=False)
+                print(f"\n  Results exported to {args.output_csv}", flush=True)
+            else:
+                results_df = run_optimizer(df, daily_signals, Path(args.output_csv),
+                                           num_workers=args.backtest_workers)
 
-    elif args.optimize:
-        results_df = run_optimizer(df, daily_signals, Path(args.output_csv))
-        for metric in ["sharpe", "return_pct", "max_dd_pct"]:
-            print_optimizer_top(results_df, metric)
+            for metric in ["sharpe", "return_pct", "max_dd_pct"]:
+                print_optimizer_top(results_df, metric)
+
+            # Finalize experiment tracking
+            if tracker is not None:
+                tracker.log_metric("num_configs", len(results_df))
+                if not results_df.empty:
+                    tracker.log_metric("best_sharpe", float(results_df["sharpe"].max()))
+                    tracker.log_metric("best_return_pct", float(results_df["return_pct"].max()))
+                    tracker.log_metric("best_win_rate", float(results_df["win_rate"].max()))
+                output_path = Path(args.output_csv)
+                if output_path.exists():
+                    tracker.log_artifact(output_path, "results.csv")
+                if args.config:
+                    tracker.log_artifact(Path(args.config), "config.yaml")
+                top_n = results_df.nlargest(10, "sharpe")
+                tracker.log_summary({
+                    "mode": mode,
+                    "total_configs": len(results_df),
+                    "top_10_by_sharpe": top_n.to_dict("records"),
+                })
+                if args.git_tag:
+                    tracker.create_git_tag()
+                run_dir = tracker.current_run_dir
+                tracker.end_run()
+                print(f"\n  Experiment tracked: {run_dir}", flush=True)
+        except BaseException:
+            if tracker is not None:
+                tracker.end_run(status="failed")
+            raise
 
     elif args.compare:
         presets = _build_comparison_configs()

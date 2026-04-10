@@ -1,0 +1,29 @@
+name: staged-stage1
+description: >
+  Trading parameter sweep with fixed portfolio baseline.
+  Fixes portfolio to 2/day, 15% DD, gradual sizing, calls-only
+  and sweeps all TradingConfig dimensions.
+
+portfolio:
+  starting_capital: [20000]
+  max_trades_per_day: [2]
+  monthly_drawdown_limit: [0.15]
+  lot_per_equity: [10000]
+  calls_only: [true]
+  min_dte: [null, 3, 5]
+  max_delta: [null, 0.20]
+
+trading:
+  tp_pct: [0.50, 0.60, 0.70, 0.80, 0.90, 1.01]
+  sl_mult: [null, 1.5, 2.0, 3.0]
+  max_vix: [null, 30.0, 35.0]
+  max_term_structure: [null, 1.05, 1.10]
+  avoid_opex: [true, false]
+  width_filter: [null, 10.0]
+  entry_count: [null, 1, 2]
+
+event:
+  enabled: [false]
+
+regime:
+  enabled: [false]

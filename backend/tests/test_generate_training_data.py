@@ -23,10 +23,15 @@ from generate_training_data import (  # noqa: E402
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     TP_LEVELS,
+    _cache_day_candidates,
+    _compute_code_version,
     _downsample_marks,
     _evaluate_outcome,
+    _load_cache_manifest,
+    _load_cached_day,
     _load_gex_csv,
     _mid,
+    _save_cache_manifest,
     _time_to_expiry_years,
     bs_delta_vec,
     bs_price_vec,
@@ -1461,3 +1466,59 @@ class TestWalkForwardDateBoundary:
         assert train_last < test_first, (
             f"Train ends at {train_last} but test starts at {test_first} -- overlap!"
         )
+
+
+# ── Incremental candidate cache ──────────────────────────────
+
+
+class TestCandidateCache:
+    """Verify per-day Parquet candidate caching."""
+
+    def test_code_version_deterministic(self) -> None:
+        """Same script file produces the same version hash."""
+        v1 = _compute_code_version()
+        v2 = _compute_code_version()
+        assert v1 == v2
+        assert len(v1) == 16
+
+    def test_manifest_roundtrip(self, tmp_path: Path) -> None:
+        """Write then read a manifest file."""
+        manifest = {
+            "code_version": "abc123",
+            "decision_minutes": "[(10, 0)]",
+            "days": {"2025-01-02": {"rows": 10, "file": "2025-01-02.parquet"}},
+        }
+        _save_cache_manifest(tmp_path, manifest)
+        loaded = _load_cache_manifest(tmp_path)
+        assert loaded == manifest
+
+    def test_empty_manifest(self, tmp_path: Path) -> None:
+        """Loading from empty dir returns empty dict."""
+        loaded = _load_cache_manifest(tmp_path)
+        assert loaded == {}
+
+    def test_cache_day_roundtrip(self, tmp_path: Path) -> None:
+        """Cache a day's candidates then reload them."""
+        candidates = [
+            {"day": "2025-01-02", "entry_credit": 1.5, "delta_target": 0.10},
+            {"day": "2025-01-02", "entry_credit": 2.0, "delta_target": 0.15},
+        ]
+        n = _cache_day_candidates(tmp_path, "2025-01-02", candidates)
+        assert n == 2
+
+        reloaded = _load_cached_day(tmp_path, "2025-01-02")
+        assert len(reloaded) == 2
+        assert reloaded[0]["entry_credit"] == 1.5
+        assert reloaded[1]["delta_target"] == 0.15
+
+    def test_cache_empty_day(self, tmp_path: Path) -> None:
+        """Caching an empty day returns 0 rows and loading returns empty list."""
+        n = _cache_day_candidates(tmp_path, "2025-01-03", [])
+        assert n == 0
+        reloaded = _load_cached_day(tmp_path, "2025-01-03")
+        assert reloaded == []
+
+    def test_cache_miss(self, tmp_path: Path) -> None:
+        """Loading a day that was never cached returns empty list."""
+        reloaded = _load_cached_day(tmp_path, "2099-01-01")
+        assert reloaded == []

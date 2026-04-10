@@ -1,0 +1,26 @@
+name: staged-stage3
+description: >
+  Event parameter sweep using top portfolio+trading combos from Stage 2.
+  Includes broader threshold sweeps for VIX spike, VIX elevated,
+  SPX drop 2-day, and signal mode.
+
+event:
+  enabled: [true]
+  signal_mode: ["any", "spx_and_vix"]
+  budget_mode: ["shared", "separate"]
+  max_event_trades: [1, 2]
+  spx_drop_threshold: [-0.005, -0.01, -0.015, -0.02, -0.03, -0.05]
+  spx_drop_2d_threshold: [-0.01, -0.02, -0.03, -0.05]
+  vix_spike_threshold: [0.10, 0.20]
+  vix_elevated_threshold: [20.0, 30.0]
+  side_preference: ["puts", "best"]
+  min_dte: [3, 5]
+  max_dte: [5, 7, 10]
+  min_delta: [0.10, 0.15]
+  max_delta: [0.20, 0.25]
+  rally_avoidance: [true, false]
+
+filters:
+  min_dte_lt_max_dte: true
+  min_delta_lt_max_delta: true
+  shared_single_event_trade: true

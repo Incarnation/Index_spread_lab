@@ -19,6 +19,7 @@ const AdminPage = React.lazy(() => import("./pages/AdminPage").then((m) => ({ de
 const StrategyConfigPage = React.lazy(() => import("./pages/StrategyConfigPage").then((m) => ({ default: m.StrategyConfigPage })));
 const PortfolioPage = React.lazy(() => import("./pages/PortfolioPage").then((m) => ({ default: m.PortfolioPage })));
 const AuthAuditPage = React.lazy(() => import("./pages/AuthAuditPage").then((m) => ({ default: m.AuthAuditPage })));
+const OptimizerPage = React.lazy(() => import("./pages/OptimizerPage"));
 
 function PageLoader() {
   return (
@@ -53,6 +54,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               <Route path="admin" element={<Suspense fallback={<PageLoader />}><AdminPage /></Suspense>} />
               <Route path="admin/auth-audit" element={<Suspense fallback={<PageLoader />}><AuthAuditPage /></Suspense>} />
               <Route path="strategy" element={<Suspense fallback={<PageLoader />}><StrategyConfigPage /></Suspense>} />
+              <Route path="optimizer" element={<Suspense fallback={<PageLoader />}><OptimizerPage /></Suspense>} />
             </Route>
           </Routes>
         </AuthProvider>

@@ -14,6 +14,7 @@ import {
   ChevronLeft,
   ChevronRight,
   X,
+  Target,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -26,6 +27,7 @@ const NAV_ITEMS: { to: string; icon: typeof LayoutDashboard; label: string; end?
   { to: "/performance", icon: BarChart3, label: "Performance" },
   { to: "/gex", icon: Activity, label: "GEX / Market" },
   { to: "/strategy", icon: FlaskConical, label: "Strategy" },
+  { to: "/optimizer", icon: Target, label: "Optimizer" },
   { to: "/admin", icon: Settings, label: "Admin / Ops", end: true },
   { to: "/admin/auth-audit", icon: ShieldCheck, label: "Auth Audit" },
 ];

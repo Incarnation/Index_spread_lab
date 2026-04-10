@@ -41,6 +41,9 @@ ALL_APP_TABLES = [
     "economic_events",
     "portfolio_state",
     "portfolio_trades",
+    "optimizer_runs",
+    "optimizer_results",
+    "optimizer_walkforward",
     "schema_migrations",
 ]
 

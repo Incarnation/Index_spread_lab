@@ -1,0 +1,22 @@
+name: staged-stage2
+description: >
+  Portfolio parameter sweep using top trading configs from Stage 1.
+  NOTE: min_dte and max_delta are carried from Stage 1 winners at runtime;
+  the values here serve as fallback defaults only.
+
+portfolio:
+  starting_capital: [20000]
+  max_trades_per_day: [1, 2, 3]
+  monthly_drawdown_limit: [0.10, 0.15, 0.20, null]
+  lot_per_equity: [10000, 20000, 999999]
+  calls_only: [true, false]
+
+trading:
+  tp_pct: [0.50]
+  sl_mult: [null]
+
+event:
+  enabled: [false]
+
+regime:
+  enabled: [false]

@@ -1,0 +1,30 @@
+name: selective-high-wr
+description: >
+  Conservative grid targeting 90%+ win rate with selective trading.
+  Uses tight delta, long DTE, VIX filter, and conservative take-profit.
+
+portfolio:
+  starting_capital: [20000, 50000, 100000]
+  max_trades_per_day: [1, 2]
+  monthly_drawdown_limit: [0.10, 0.15, 0.20]
+  lot_per_equity: [20000, 50000, 100000]
+  calls_only: [true, false]
+  min_dte: [3, 5]
+  max_delta: [0.15, 0.20]
+
+trading:
+  tp_pct: [0.50, 0.60, 0.70]
+  sl_mult: [null, 2.0, 3.0]
+  max_vix: [25.0, 30.0]
+  avoid_opex: [true, false]
+  width_filter: [10.0]
+  entry_count: [1, 2]
+
+event:
+  enabled: [false]
+
+regime:
+  enabled: [true, false]
+
+filters:
+  lot_per_equity_eq_capital: true

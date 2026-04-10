@@ -955,3 +955,117 @@ export async function fetchPortfolioConfig(signal?: AbortSignal): Promise<Portfo
 }
 
 
+// ── Optimizer Dashboard API ────────────────────────────────────
+
+export type OptimizerRun = {
+  run_id: string;
+  run_name: string | null;
+  git_hash: string | null;
+  config_file: string | null;
+  optimizer_mode: string;
+  started_at: string | null;
+  finished_at: string | null;
+  num_configs: number | null;
+  status: string;
+  result_count: number;
+  best_sharpe: number | null;
+  best_return_pct: number | null;
+  pareto_count: number;
+};
+
+export type OptimizerResult = {
+  id: number;
+  run_id: string;
+  sharpe: number;
+  return_pct: number;
+  max_dd_pct: number;
+  win_rate: number;
+  total_trades: number;
+  final_equity: number;
+  ann_return_pct: number;
+  is_pareto: boolean;
+  [key: string]: unknown;
+};
+
+export type WalkforwardRow = {
+  id: number;
+  run_id: string;
+  config_key: string | null;
+  window_label: string | null;
+  train_sharpe: number | null;
+  test_sharpe: number | null;
+  train_return: number | null;
+  test_return: number | null;
+  decay_ratio: number | null;
+};
+
+/** List all optimizer runs with summary stats. */
+export async function fetchOptimizerRuns(
+  limit = 50,
+  offset = 0,
+  signal?: AbortSignal,
+): Promise<{ runs: OptimizerRun[]; total: number }> {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  const r = await fetchWithAuth(apiUrl(`/api/optimizer/runs?${params}`), { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson(r);
+}
+
+/** Paginated results for a run with sorting and filtering. */
+export async function fetchOptimizerResults(
+  runId: string,
+  opts: {
+    sortBy?: string;
+    sortOrder?: string;
+    minSharpe?: number;
+    minWinRate?: number;
+    minTrades?: number;
+    limit?: number;
+    offset?: number;
+  } = {},
+  signal?: AbortSignal,
+): Promise<{ results: OptimizerResult[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts.sortBy) params.set("sort_by", opts.sortBy);
+  if (opts.sortOrder) params.set("sort_order", opts.sortOrder);
+  if (opts.minSharpe !== undefined) params.set("min_sharpe", String(opts.minSharpe));
+  if (opts.minWinRate !== undefined) params.set("min_win_rate", String(opts.minWinRate));
+  if (opts.minTrades !== undefined) params.set("min_trades", String(opts.minTrades));
+  params.set("limit", String(opts.limit ?? 100));
+  params.set("offset", String(opts.offset ?? 0));
+  const r = await fetchWithAuth(apiUrl(`/api/optimizer/runs/${runId}/results?${params}`), { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson(r);
+}
+
+/** Pareto frontier configs for a run. */
+export async function fetchParetoFrontier(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ pareto: OptimizerResult[]; count: number }> {
+  const r = await fetchWithAuth(apiUrl(`/api/optimizer/runs/${runId}/pareto`), { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson(r);
+}
+
+/** Side-by-side config comparison. */
+export async function fetchConfigComparison(
+  ids: number[],
+  signal?: AbortSignal,
+): Promise<{ configs: OptimizerResult[]; differing_columns: string[] }> {
+  const r = await fetchWithAuth(apiUrl(`/api/optimizer/compare?ids=${ids.join(",")}`), { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson(r);
+}
+
+/** Walk-forward results for a run. */
+export async function fetchWalkforwardResults(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ walkforward: WalkforwardRow[]; count: number }> {
+  const r = await fetchWithAuth(apiUrl(`/api/optimizer/walkforward/${runId}`), { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return safeJson(r);
+}
+
+
