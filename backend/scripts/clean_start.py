@@ -15,17 +15,27 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 _backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_backend_dir))
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _env import load_project_env
+
+load_project_env()
 
 TABLES_TO_TRUNCATE = [
     "portfolio_trades",
@@ -117,7 +127,7 @@ async def main() -> None:
 
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        print("FATAL: DATABASE_URL not set")
+        logger.error("DATABASE_URL not set")
         sys.exit(1)
 
     engine = create_async_engine(db_url, pool_pre_ping=True, pool_size=2)
@@ -162,12 +172,12 @@ async def main() -> None:
     if all_zero:
         print("\n  [OK] All truncated tables are empty.")
     else:
-        print("\n  [WARN] Some tables still have rows -- check above.")
+        logger.warning("Some tables still have rows -- check above.")
 
     if preserved_ok:
         print("  [OK] Preserved tables are untouched.")
     else:
-        print("  [WARN] Preserved table counts changed -- investigate!")
+        logger.warning("Preserved table counts changed -- investigate!")
         if args.verbose:
             _print_counts("PRESERVED TABLES (after):", preserved_after)
 
@@ -177,4 +187,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

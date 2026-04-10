@@ -17,6 +17,7 @@ import argparse
 import gc
 import hashlib
 import json
+import logging
 import math
 import os
 import sys
@@ -32,9 +33,17 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 _BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_BACKEND))
+sys.path.insert(0, str(_BACKEND / "scripts"))
 
+from _constants import CONTRACT_MULT, CONTRACTS
 from spx_backend.jobs.modeling import (
     extract_candidate_features,
     predict_with_bucket_model,
@@ -86,8 +95,6 @@ WIDTH_POINTS = 10.0  # legacy default for single-width callers
 TAKE_PROFIT_PCT = 0.50
 STOP_LOSS_PCT = 2.00
 LABEL_MARK_INTERVAL_MINUTES = 5
-CONTRACT_MULT = 100
-CONTRACTS = 1
 MIN_MID_PRICE = 0.05
 MAX_IV = 5.0
 MIN_IV = 0.01
@@ -240,7 +247,7 @@ def load_production_chain(day_str: str) -> pd.DataFrame | None:
         if "ts" in df.columns:
             df["ts"] = pd.to_datetime(df["ts"], utc=True)
     except Exception as exc:
-        print(f"  [WARN] Cannot load production chain {day_str}: {exc}")
+        logger.warning("Cannot load production chain %s: %s", day_str, exc)
         df = None
 
     _production_chain_cache[day_str] = df
@@ -343,7 +350,7 @@ def _load_dbn(path: Path) -> pd.DataFrame | None:
         store = db.DBNStore.from_file(str(path))
         return store.to_df().reset_index()
     except Exception as exc:
-        print(f"  [WARN] Cannot load {path.name}: {exc}")
+        logger.warning("Cannot load %s: %s", path.name, exc)
         return None
 
 
@@ -2007,12 +2014,12 @@ def deploy_model(
     """
     import os
 
-    from dotenv import load_dotenv
-    load_dotenv(_BACKEND / ".env")
+    from _env import load_project_env
+    load_project_env()
 
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
-        print("[ERROR] DATABASE_URL not set; cannot deploy model.")
+        logger.error("DATABASE_URL not set; cannot deploy model.")
         return
 
     sync_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
@@ -2253,8 +2260,7 @@ def run_pipeline(
     results = walk_forward_validate(training_rows)
 
     if "error" in results:
-        print(f"  [WARN] {results['error']}")
-        print("[PIPELINE] Training on all data instead ...")
+        logger.warning("%s -- training on all data instead", results["error"])
         final_model = train_bucket_model(rows=training_rows)
     else:
         ts = results["test_summary"]
@@ -2265,6 +2271,7 @@ def run_pipeline(
         print(f"  Test  : {results['test_count']} rows ({results['test_days']})")
 
         def _fmt(label: str, key: str, fmt: str = ".1%", prefix: str = "") -> None:
+            """Print a single metric line if the key exists in the test summary."""
             val = ts.get(key)
             if val is not None:
                 print(f"  {label}: {prefix}{val:{fmt}}")
@@ -2607,4 +2614,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

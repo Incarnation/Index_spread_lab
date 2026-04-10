@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from spx_backend.config import settings
 from spx_backend.database.connection import engine
 
-MARGIN_PER_LOT = 1000  # legacy default for backward-compat imports
+MARGIN_PER_LOT = 1000  # keep in sync with scripts/_constants.py
 
 
 def _margin_per_lot() -> float:

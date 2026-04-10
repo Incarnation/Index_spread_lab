@@ -21,14 +21,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 
 def require_databento_api_key() -> str:
@@ -261,7 +269,7 @@ def _download_streaming(
     df = data.to_df()
 
     if len(df) == 0:
-        print(f"    [warn] No records returned for {job['label']} ({start} to {end})")
+        logger.warning("No records returned for %s (%s to %s)", job["label"], start, end)
         return out_path
 
     df.to_parquet(out_path, engine="pyarrow")
@@ -335,7 +343,7 @@ def _download_batch(
             if (j["id"] if isinstance(j, dict) else j.id) == job_id
         ]
         if not matched:
-            print(f"    [ERROR] Job {job_id} not found in list_jobs")
+            logger.error("Job %s not found in list_jobs", job_id)
             return out_dir
         current = matched[0]
         state = current["state"] if isinstance(current, dict) else current.state
@@ -343,7 +351,7 @@ def _download_batch(
             print(f"    Job complete. Downloading files...", flush=True)
             break
         elif state in ("expired", "error"):
-            print(f"    [ERROR] Batch job {state}")
+            logger.error("Batch job %s", state)
             return out_dir
         else:
             print(f"    Status: {state} ... waiting 30s", flush=True)
@@ -461,7 +469,7 @@ def run_sample(client: db.Historical, *, skip_groups: set[str] | None = None) ->
         try:
             _download_streaming(client, job, SAMPLE_START, SAMPLE_END)
         except Exception as e:
-            print(f"    [ERROR] {type(e).__name__}: {e}")
+            logger.error("%s: %s", type(e).__name__, e)
         print()
 
 
@@ -489,7 +497,7 @@ def run_full(client: db.Historical, start: str, end: str, *, skip_groups: set[st
             else:
                 _download_batch(client, job, start, end)
         except Exception as e:
-            print(f"    [ERROR] {type(e).__name__}: {e}")
+            logger.error("%s: %s", type(e).__name__, e)
         print(flush=True)
 
 
@@ -546,7 +554,7 @@ def verify() -> None:
 
             print()
         except Exception as e:
-            print(f"  {rel}: ERROR - {e}\n")
+            logger.error("%s: %s", rel, e)
 
 
 def verify_dbn(start: str, end: str) -> dict[str, dict]:
@@ -625,6 +633,7 @@ def verify_dbn(start: str, end: str) -> dict[str, dict]:
 
 
 def main() -> None:
+    """Parse CLI arguments and dispatch to the requested download/verify mode."""
     all_groups = sorted({j.get("group", "") for j in DOWNLOAD_JOBS if j.get("group")})
     parser = argparse.ArgumentParser(description="Download Databento historical data")
     parser.add_argument(
@@ -676,4 +685,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

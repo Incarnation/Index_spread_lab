@@ -11,12 +11,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 
 def _load_model_artifacts(model_dir: Path) -> dict[str, Any]:
@@ -154,7 +161,7 @@ async def batch_predict(
         )).fetchone()
 
         if mv_row is None:
-            print("[ERROR] No xgb_entry_v1 model_version found. Run --upload first.")
+            logger.error("No xgb_entry_v1 model_version found. Run --upload first.")
             return 0
         mvid = int(mv_row.model_version_id)
 
@@ -236,7 +243,7 @@ def main() -> None:
 
     model_dir = Path(args.model_dir)
     if not model_dir.exists():
-        print(f"[ERROR] Model directory not found: {model_dir}")
+        logger.error("Model directory not found: %s", model_dir)
         sys.exit(1)
 
     if args.batch:
@@ -251,4 +258,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

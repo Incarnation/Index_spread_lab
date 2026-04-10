@@ -17,15 +17,23 @@ Defaults to exporting all available data when --start/--end are omitted.
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import os
 import sys
 from pathlib import Path
 
-import json
-
 import pandas as pd
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _env import load_project_env
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 
 _BACKEND = Path(__file__).resolve().parent.parent
@@ -53,17 +61,20 @@ def _sync_url(async_url: str) -> str:
 def _load_env() -> str:
     """Load .env and return the DATABASE_URL.
 
-    Searches backend/.env and repo-root/.env (matching Settings lookup
-    order in config.py).
+    Delegates to the shared ``_env.load_project_env()`` helper, then
+    reads DATABASE_URL from the environment.
+
+    Returns:
+        The DATABASE_URL string.
+
+    Raises:
+        SystemExit: If DATABASE_URL is not set after loading .env.
     """
-    for candidate in [_BACKEND / ".env", _BACKEND.parent / ".env"]:
-        if candidate.exists():
-            load_dotenv(candidate)
-            break
+    load_project_env()
 
     url = os.getenv("DATABASE_URL")
     if not url:
-        print("ERROR: DATABASE_URL not found in environment or .env", file=sys.stderr)
+        logger.error("DATABASE_URL not found in environment or .env")
         sys.exit(1)
     return url
 
@@ -614,4 +625,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

@@ -12,6 +12,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -328,17 +335,16 @@ def main() -> None:
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
-        print(f"[ERROR] CSV not found: {csv_path}")
-        return
+        logger.error("CSV not found: %s", csv_path)
+        sys.exit(2)
 
     print(f"[BACKTEST] Loading {csv_path} ...")
     df = pd.read_csv(csv_path)
     print(f"[BACKTEST] {len(df)} rows, {len(df.columns)} columns")
 
-    # Ensure hold labels are present
     if "hold_realized_pnl" not in df.columns:
-        print("[ERROR] hold_realized_pnl column missing — run --relabel first")
-        return
+        logger.error("hold_realized_pnl column missing -- run --relabel first")
+        sys.exit(2)
 
     build_fn = None
     if args.v2:
@@ -359,8 +365,8 @@ def main() -> None:
     print(f"[BACKTEST] Collected {len(pool)} OOS predictions in {elapsed:.1f}s")
 
     if pool.empty:
-        print("[ERROR] No OOS predictions generated")
-        return
+        logger.error("No OOS predictions generated")
+        sys.exit(1)
 
     results = run_strategies(pool, is_v2=args.v2)
     print_results(results)
@@ -369,4 +375,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

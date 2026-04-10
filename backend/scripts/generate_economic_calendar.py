@@ -13,20 +13,28 @@ Sources
 
 Usage
 -----
-    python -m backend.scripts.generate_economic_calendar
-    # or directly:
     python backend/scripts/generate_economic_calendar.py
+    python backend/scripts/generate_economic_calendar.py --output /tmp/cal.csv
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import calendar
+import logging
+import sys
 from datetime import date
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 _ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_CSV = _ROOT / "data" / "economic_calendar.csv"
+DEFAULT_OUTPUT_CSV = _ROOT / "data" / "economic_calendar.csv"
 
 # ---------------------------------------------------------------------------
 # FOMC decision dates (announcement day = day 2 of the 2-day meeting).
@@ -176,11 +184,23 @@ def generate_rows() -> list[dict]:
 
 
 def main() -> None:
-    """Write the economic calendar CSV."""
-    rows = generate_rows()
-    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    """Parse CLI arguments and write the economic calendar CSV."""
+    parser = argparse.ArgumentParser(
+        description="Generate a unified economic-event calendar CSV.",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=Path,
+        default=DEFAULT_OUTPUT_CSV,
+        help=f"Output CSV path (default: {DEFAULT_OUTPUT_CSV}).",
+    )
+    args = parser.parse_args()
+    output_csv: Path = args.output
 
-    with open(OUTPUT_CSV, "w", newline="") as f:
+    rows = generate_rows()
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=["date", "event_type", "has_projections", "is_triple_witching"],
@@ -192,10 +212,16 @@ def main() -> None:
     for r in rows:
         event_counts[r["event_type"]] = event_counts.get(r["event_type"], 0) + 1
 
-    print(f"Wrote {len(rows)} rows to {OUTPUT_CSV}")
+    logger.info("Wrote %d rows to %s", len(rows), output_csv)
     for etype, count in sorted(event_counts.items()):
-        print(f"  {etype}: {count}")
+        logger.info("  %s: %d", etype, count)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

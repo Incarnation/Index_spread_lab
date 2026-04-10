@@ -14,22 +14,28 @@ of the top performers.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 _BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_BACKEND / "scripts"))
+
+from _constants import CONTRACT_MULT, CONTRACTS
 
 DATA_DIR = _BACKEND.parent / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 
-# Pipeline constants (must match generate_training_data.py)
 TAKE_PROFIT_PCT = 0.50
-CONTRACT_MULT = 100
-CONTRACTS = 1
 
 # Strategy sweep grid
 SL_LEVELS: list[float | None] = [
@@ -401,9 +407,11 @@ def main() -> None:
 
     has_trajectory = "hold_realized_pnl" in df.columns
     if not has_trajectory:
-        print("\nWARNING: CSV does not have trajectory columns. "
-              "Run `--relabel` first for full analysis.")
-        print("Falling back to backward-compatible columns only.\n")
+        logger.warning(
+            "CSV does not have trajectory columns. "
+            "Run `--relabel` first for full analysis. "
+            "Falling back to backward-compatible columns only."
+        )
 
     # --- Recovery analysis (SL-specific) ---
     if has_trajectory:
@@ -487,4 +495,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

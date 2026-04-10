@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 
 _BACKEND = Path(__file__).resolve().parents[1]
@@ -701,7 +708,7 @@ def main() -> None:
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
-        print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
+        logger.error("CSV not found: %s", csv_path)
         sys.exit(1)
 
     print(f"Loading {csv_path} ...")
@@ -748,7 +755,7 @@ def main() -> None:
             pnl_col = candidate_col
             print(f"  Using PnL column: {pnl_col}")
         else:
-            print(f"  WARNING: {candidate_col} not found, using realized_pnl")
+            logger.warning("%s not found, using realized_pnl", candidate_col)
 
     print(f"  Period: {df['day'].min()} to {df['day'].max()}")
 
@@ -800,4 +807,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

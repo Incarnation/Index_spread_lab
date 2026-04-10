@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import logging
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -80,14 +81,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from _constants import CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT
+
+DATA_DIR = _SCRIPTS_DIR.parents[1] / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 RESULTS_CSV = DATA_DIR / "backtest_results.csv"
-
-MARGIN_PER_LOT = 1000  # 10-pt wide SPX spread, $100/pt multiplier (default)
-CONTRACT_MULT = 100
-CONTRACTS = 1
 
 
 def _opt_val(v):
@@ -418,6 +425,7 @@ class PortfolioManager:
     """
 
     def __init__(self, config: PortfolioConfig, margin_per_lot: float = MARGIN_PER_LOT) -> None:
+        """Initialise budget tracker with starting capital from *config*."""
         self.cfg = config
         self.margin_per_lot = margin_per_lot
         self.equity = config.starting_capital
@@ -453,6 +461,7 @@ class PortfolioManager:
 
     @property
     def is_month_stopped(self) -> bool:
+        """True when the monthly drawdown stop-loss has been triggered."""
         return self._month_stopped
 
     def compute_lots(self) -> int:
@@ -473,6 +482,7 @@ class PortfolioManager:
         return total_pnl
 
     def status_label(self) -> str:
+        """Return a human-readable label describing why trading may be blocked."""
         if self._month_stopped:
             return "monthly_stop"
         if self.equity < self.margin_per_lot:
@@ -494,6 +504,7 @@ class EventSignalDetector:
     """
 
     def __init__(self, config: EventConfig) -> None:
+        """Bind the detector to the given event configuration."""
         self.cfg = config
 
     def detect(self, day_row: pd.Series) -> list[str]:
@@ -574,6 +585,7 @@ class ScheduledSelector:
     """
 
     def __init__(self, config: PortfolioConfig, max_n: int) -> None:
+        """Create a selector bounded to *max_n* candidates per day."""
         self.cfg = config
         self.max_n = max_n
 
@@ -607,6 +619,7 @@ class EventSelector:
     """
 
     def __init__(self, config: EventConfig, max_n: int) -> None:
+        """Create an event selector bounded to *max_n* candidates per signal day."""
         self.cfg = config
         self.max_n = max_n
 
@@ -826,6 +839,7 @@ def _should_skip_day(
             return "ts_filter"
 
     def _flag(col: str) -> bool:
+        """Return a boolean from *day_row[col]*, defaulting to False on NaN."""
         v = day_row.get(col, False)
         return bool(v) if pd.notna(v) else False
 
@@ -1799,14 +1813,17 @@ def _row_to_config(row: pd.Series) -> FullConfig:
         max_delta = None
 
     def _opt_float(key, default=None):
+        """Extract a float from *row[key]*, returning *default* on NaN."""
         v = row.get(key)
         return float(v) if pd.notna(v) else default
 
     def _opt_int(key, default=None):
+        """Extract an int from *row[key]*, returning *default* on NaN."""
         v = row.get(key)
         return int(v) if pd.notna(v) else default
 
     def _opt_bool(key, default=False):
+        """Extract a bool from *row[key]*, returning *default* on NaN."""
         v = row.get(key, default)
         if pd.isna(v):
             return default
@@ -2282,8 +2299,7 @@ def main() -> None:
     if args.analyze:
         results_path = Path(args.output_csv)
         if not results_path.exists():
-            print(f"ERROR: Results CSV not found: {results_path}", file=sys.stderr)
-            print("  Run --optimize first to generate it.", file=sys.stderr)
+            logger.error("Results CSV not found: %s. Run --optimize first to generate it.", results_path)
             sys.exit(1)
         pareto = run_analysis(results_path)
 
@@ -2300,7 +2316,7 @@ def main() -> None:
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
-        print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
+        logger.error("CSV not found: %s", csv_path)
         sys.exit(1)
 
     print(f"Loading {csv_path} ...")
@@ -2383,4 +2399,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

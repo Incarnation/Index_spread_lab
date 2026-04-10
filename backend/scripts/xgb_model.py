@@ -13,12 +13,20 @@ relying on hand-coded thresholds.
 from __future__ import annotations
 
 import json
+import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 from sklearn.metrics import brier_score_loss, mean_absolute_error
 from xgboost import XGBClassifier, XGBRegressor
 
@@ -846,6 +854,7 @@ def _extract_entry_rules(
     rules: list[dict[str, Any]] = []
 
     def _add(condition: str, sub: pd.DataFrame) -> None:
+        """Append a rule entry to *rules* if the subset is large enough."""
         if len(sub) < 5:
             return
         tp50_rate = float(sub[cls_col].mean())
@@ -1235,8 +1244,8 @@ def main() -> None:
 
     csv_path = Path(args.csv)
     if not csv_path.exists():
-        print(f"[ERROR] CSV not found: {csv_path}")
-        return
+        logger.error("CSV not found: %s", csv_path)
+        sys.exit(2)
 
     print(f"[XGB] Loading {csv_path} ...")
     df = pd.read_csv(csv_path)
@@ -1261,7 +1270,7 @@ def _run_tp50(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> Non
     results = walk_forward_validate_xgb(df)
 
     if "error" in results:
-        print(f"[ERROR] {results['error']}")
+        logger.error("%s", results["error"])
         return
 
     xm = results["xgb_metrics"]
@@ -1310,7 +1319,7 @@ def _run_hold_vs_close(df: pd.DataFrame) -> None:
     results = walk_forward_hold_vs_close(df)
 
     if "error" in results:
-        print(f"[ERROR] {results['error']}")
+        logger.error("%s", results["error"])
         return
 
     slr = results["sl_risk"]
@@ -1367,7 +1376,7 @@ def _run_entry(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> No
 
     results = walk_forward_rolling(df)
     if "error" in results:
-        print(f"[ERROR] {results['error']}")
+        logger.error("%s", results["error"])
         return
 
     am = results["aggregated_metrics"]
@@ -1476,7 +1485,7 @@ def _run_entry_v2(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) ->
         cls_params=v2_cls_params,
     )
     if "error" in results:
-        print(f"[ERROR] {results['error']}")
+        logger.error("%s", results["error"])
         return
 
     am = results["aggregated_metrics"]
@@ -1550,4 +1559,10 @@ def _run_entry_v2(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) ->
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

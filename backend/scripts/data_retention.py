@@ -18,39 +18,52 @@ Requirements: psycopg2-binary (or psycopg2), pandas
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 try:
     import pandas as pd
     import psycopg2
 except ImportError:
-    sys.exit(
+    print(
         "Missing dependencies.  Install with:\n"
-        "  pip install psycopg2-binary pandas"
+        "  pip install psycopg2-binary pandas",
+        file=sys.stderr,
     )
+    sys.exit(2)
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _env import load_project_env
 
 
 def _sync_dsn() -> str:
     """Resolve a synchronous psycopg2-compatible DSN from the environment.
 
-    Returns
-    -------
-    str
-        PostgreSQL connection string with asyncpg:// replaced by postgresql://.
+    Loads the project ``.env`` via the shared helper, then reads
+    DATABASE_URL and converts the asyncpg driver prefix to plain
+    ``postgresql://`` for psycopg2.
+
+    Returns:
+        PostgreSQL connection string suitable for psycopg2.
+
+    Raises:
+        SystemExit: If DATABASE_URL is not found.
     """
+    load_project_env()
     raw = os.getenv("DATABASE_URL", "")
     if not raw:
-        dotenv = Path(__file__).resolve().parents[2] / ".env"
-        if dotenv.exists():
-            for line in dotenv.read_text().splitlines():
-                if line.startswith("DATABASE_URL="):
-                    raw = line.split("=", 1)[1].strip()
-                    break
-    if not raw:
-        sys.exit("DATABASE_URL not set and no .env file found.")
+        logger.error("DATABASE_URL not set and no .env file found.")
+        sys.exit(1)
     return raw.replace("postgresql+asyncpg://", "postgresql://")
 
 
@@ -189,4 +202,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

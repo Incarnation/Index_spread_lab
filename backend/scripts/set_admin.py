@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
+"""Promote a user to admin (``is_admin = true``).
+
+Usage (from repo root)::
+
+    cd backend && PYTHONPATH=. python scripts/set_admin.py alice
 """
-Set a user as admin (is_admin = true).
-
-Usage (from repo root, backend uses .env for DATABASE_URL):
-  cd backend && PYTHONPATH=. python scripts/set_admin.py <username>
-
-Example:
-  cd backend && PYTHONPATH=. python scripts/set_admin.py eric_huang
-"""
-
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import sys
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.database.connection import SessionLocal
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 
 async def _run(username: str) -> None:
-    async with SessionLocal() as session:  # type: AsyncSession
+    """Set ``is_admin = true`` for *username*.
+
+    Args:
+        username: The user to promote.
+
+    Raises:
+        SystemExit: If no matching user is found.
+    """
+    async with SessionLocal() as session:
         result = await session.execute(
             text("UPDATE users SET is_admin = true WHERE username = :u RETURNING id"),
             {"u": username},
@@ -29,19 +40,28 @@ async def _run(username: str) -> None:
         row = result.fetchone()
         await session.commit()
         if row:
-            print(f"User {username!r} is now an admin (id={row[0]}).")
+            logger.info("User %r is now an admin (id=%s).", username, row[0])
         else:
-            print(f"No user found with username {username!r}. Nothing changed.")
+            logger.error("No user found with username %r. Nothing changed.", username)
             sys.exit(1)
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or not sys.argv[1].strip():
-        print("Usage: python scripts/set_admin.py <username>", file=sys.stderr)
-        sys.exit(2)
-    username = sys.argv[1].strip()
-    asyncio.run(_run(username))
+    """Parse CLI arguments and promote the specified user."""
+    parser = argparse.ArgumentParser(
+        description="Promote a user to admin (is_admin = true).",
+    )
+    parser.add_argument("username", help="Username to promote to admin.")
+    args = parser.parse_args()
+
+    asyncio.run(_run(args.username))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)

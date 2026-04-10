@@ -13,21 +13,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 
 # Ensure the backend package is importable when run from repo root.
 _backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_backend_dir))
 
 import httpx
-from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _env import load_project_env
+
+load_project_env()
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -35,6 +44,7 @@ WARN = "WARN"
 
 
 def _env(key: str, default: str = "") -> str:
+    """Read an environment variable with an optional default."""
     return os.getenv(key, default)
 
 
@@ -147,13 +157,14 @@ def check_skip_init_db() -> tuple[str, str]:
 
 
 async def main() -> None:
+    """Run all production health checks and print a summary table."""
     parser = argparse.ArgumentParser(description="Production health check")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
     db_url = _env("DATABASE_URL")
     if not db_url:
-        print("FAIL: DATABASE_URL not set")
+        logger.error("DATABASE_URL not set")
         sys.exit(1)
 
     engine = create_async_engine(db_url, pool_pre_ping=True, pool_size=1)
@@ -192,4 +203,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        logger.error("Fatal: %s", exc, exc_info=True)
+        sys.exit(1)
