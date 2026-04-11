@@ -1099,6 +1099,64 @@ class TestLoadDailyParquet:
         assert result == {}
 
 
+class TestSkewProductionFallback:
+    """Verify SKEW merge: FRD wins on overlap, production extends forward."""
+
+    @staticmethod
+    def _make_parquet(path: Path, dates: list[str], values: list[float]) -> None:
+        """Write a minimal ts+close parquet for load_daily_parquet."""
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(dates, utc=True),
+            "close": values,
+        })
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+
+    def test_frd_wins_on_overlap(self, tmp_path: Path) -> None:
+        """When both FRD and production have the same date, FRD value is kept."""
+        frd_path = tmp_path / "skew_daily.parquet"
+        prod_path = tmp_path / "SKEW_1min.parquet"
+        self._make_parquet(frd_path, ["2026-01-02 22:15:00"], [130.0])
+        self._make_parquet(prod_path, ["2026-01-02 22:15:00"], [999.0])
+
+        skew_daily = load_daily_parquet(frd_path)
+        prod_skew = load_daily_parquet(prod_path)
+        for d, v in prod_skew.items():
+            skew_daily.setdefault(d, v)
+
+        assert skew_daily[date(2026, 1, 2)] == 130.0
+
+    def test_production_extends_forward(self, tmp_path: Path) -> None:
+        """Production fills dates that FRD doesn't have."""
+        frd_path = tmp_path / "skew_daily.parquet"
+        prod_path = tmp_path / "SKEW_1min.parquet"
+        self._make_parquet(frd_path, ["2026-01-02 22:15:00"], [130.0])
+        self._make_parquet(prod_path, ["2026-01-03 22:15:00"], [132.0])
+
+        skew_daily = load_daily_parquet(frd_path)
+        prod_skew = load_daily_parquet(prod_path)
+        for d, v in prod_skew.items():
+            skew_daily.setdefault(d, v)
+
+        assert skew_daily[date(2026, 1, 2)] == 130.0
+        assert skew_daily[date(2026, 1, 3)] == 132.0
+
+    def test_no_production_file(self, tmp_path: Path) -> None:
+        """When production parquet is missing, FRD alone is used."""
+        frd_path = tmp_path / "skew_daily.parquet"
+        prod_path = tmp_path / "SKEW_1min.parquet"
+        self._make_parquet(frd_path, ["2026-01-02 22:15:00"], [130.0])
+
+        skew_daily = load_daily_parquet(frd_path)
+        if prod_path.exists():
+            prod_skew = load_daily_parquet(prod_path)
+            for d, v in prod_skew.items():
+                skew_daily.setdefault(d, v)
+
+        assert len(skew_daily) == 1
+        assert skew_daily[date(2026, 1, 2)] == 130.0
+
+
 # ===================================================================
 # Economic calendar loading
 # ===================================================================

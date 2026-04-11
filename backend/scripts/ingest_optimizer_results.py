@@ -40,25 +40,40 @@ DEFAULT_RESULTS_CSV = _DATA_DIR / "backtest_results.csv"
 DEFAULT_WF_CSV = _DATA_DIR / "walkforward_results.csv"
 
 
+def _to_sync_url(url: str) -> str:
+    """Convert an async DATABASE_URL to a sync one for SQLAlchemy.
+
+    Replaces ``postgresql+asyncpg://`` with ``postgresql://`` so that
+    ``create_engine`` works without greenlet/async context.
+    """
+    if "+asyncpg" in url:
+        return url.replace("+asyncpg", "")
+    return url
+
+
 def _get_database_url() -> str:
-    """Read DATABASE_URL from environment or .env file."""
+    """Read DATABASE_URL from environment or .env file.
+
+    Automatically converts async driver URLs (``postgresql+asyncpg://``)
+    to sync (``postgresql://``) so ``create_engine`` works without greenlet.
+    """
     url = os.environ.get("DATABASE_URL")
     if url:
-        return url
+        return _to_sync_url(url)
 
     env_file = _SCRIPTS_DIR.parents[1] / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
             if line.startswith("DATABASE_URL="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+                return _to_sync_url(line.split("=", 1)[1].strip().strip('"').strip("'"))
 
     backend_env = _SCRIPTS_DIR.parent / ".env"
     if backend_env.exists():
         for line in backend_env.read_text().splitlines():
             line = line.strip()
             if line.startswith("DATABASE_URL="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+                return _to_sync_url(line.split("=", 1)[1].strip().strip('"').strip("'"))
 
     raise RuntimeError(
         "DATABASE_URL not found. Set it as an environment variable "
@@ -209,16 +224,41 @@ def ingest_results(
         wf_df = pd.read_csv(walkforward_csv)
         print(f"Ingesting {len(wf_df):,} walk-forward results ...", flush=True)
         wf_df["run_id"] = run_id
+
+        # Map CSV column names to DB column names
+        wf_rename = {
+            "window": "window_label",
+            "train_return_pct": "train_return",
+            "test_return_pct": "test_return",
+        }
+        wf_df.rename(columns=wf_rename, inplace=True)
+
+        # Build a config_key from param columns to identify each config
+        param_cols = [c for c in _CONFIG_COLUMNS if c in wf_df.columns]
+        if param_cols:
+            wf_df["config_key"] = wf_df[param_cols].fillna("").astype(str).agg("|".join, axis=1).apply(
+                lambda s: hashlib.sha256(s.encode()).hexdigest()[:12]
+            )
+
+        # Compute decay_ratio = test_sharpe / train_sharpe when both are available
+        if "train_sharpe" in wf_df.columns and "test_sharpe" in wf_df.columns:
+            wf_df["decay_ratio"] = wf_df.apply(
+                lambda r: r["test_sharpe"] / r["train_sharpe"]
+                if pd.notna(r["train_sharpe"]) and r["train_sharpe"] != 0
+                else None,
+                axis=1,
+            )
+
         wf_df = wf_df.where(pd.notna(wf_df), None)
 
-        wf_cols = [c for c in wf_df.columns if c in {
+        wf_db_cols = [c for c in wf_df.columns if c in {
             "run_id", "config_key", "window_label",
             "train_start", "train_end", "test_start", "test_end",
             "train_sharpe", "test_sharpe", "train_return", "test_return",
             "train_trades", "test_trades", "decay_ratio",
         }]
-        if wf_cols:
-            wf_df[wf_cols].to_sql(
+        if wf_db_cols:
+            wf_df[wf_db_cols].to_sql(
                 "optimizer_walkforward",
                 engine,
                 if_exists="append",

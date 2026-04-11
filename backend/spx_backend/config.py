@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     vix_snapshot_dte_tolerance_days: int = 2
     vix_snapshot_strikes_each_side: int = 50
     vix_allow_snapshot_outside_rth: bool = False
-    quote_symbols: str = "SPX,VIX,VIX9D,SPY"
+    quote_symbols: str = "SPX,VIX,VIX9D,SPY,VVIX,SKEW"
     quote_interval_minutes: int = 5
     gex_enabled: bool = True
     gex_interval_minutes: int = 5
@@ -252,6 +252,14 @@ class Settings(BaseSettings):
     event_max_delta: float = 0.25
     event_rally_avoidance: bool = False
     event_rally_threshold: float = 0.01
+    event_only_mode: bool = False
+    """When True, skip all scheduled (non-event) trades.  Only event-signal
+    trades are placed.  Equivalent to the backtest ``e_event_only=True`` flag."""
+
+    # ─── Hard day-level filters ──────────────────────────────────
+    decision_avoid_opex: bool = False
+    """When True, skip all trade entries on monthly OPEX days (3rd Friday).
+    Regime analysis shows OPEX days have negative average PnL."""
 
     # Auth: JWT and user registration (multiple users, in-house auth).
     jwt_secret: str = ""  # set JWT_SECRET in env for auth; auth endpoints error if empty

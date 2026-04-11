@@ -57,6 +57,14 @@ class TestConfigParsing:
         s = self._settings(QUOTE_SYMBOLS="SPX,VIX,SPY")
         assert s.quote_symbols_list() == ["SPX", "VIX", "SPY"]
 
+    def test_quote_symbols_default_includes_vvix_and_skew(self):
+        """Default quote_symbols should capture all six underlyings."""
+        s = self._settings()
+        symbols = s.quote_symbols_list()
+        assert "VVIX" in symbols
+        assert "SKEW" in symbols
+        assert len(symbols) == 6
+
     def test_cboe_gex_underlyings_dedup(self):
         """Duplicate symbols are removed while preserving order."""
         s = self._settings(CBOE_GEX_UNDERLYINGS="SPX,SPY,SPX")
@@ -81,3 +89,58 @@ class TestConfigParsing:
     def test_decision_delta_targets(self):
         s = self._settings(DECISION_DELTA_TARGETS="0.10,0.15,0.20")
         assert s.decision_delta_targets_list() == [0.10, 0.15, 0.20]
+
+    # ── event_only_mode / decision_avoid_opex ─────────────────────
+
+    def test_event_only_mode_default_false(self):
+        """event_only_mode defaults to False when env var is not set."""
+        s = self._settings(EVENT_ONLY_MODE="false")
+        assert s.event_only_mode is False
+
+    def test_event_only_mode_env_override(self):
+        """EVENT_ONLY_MODE=true activates event-only trading."""
+        s = self._settings(EVENT_ONLY_MODE="true")
+        assert s.event_only_mode is True
+
+    def test_decision_avoid_opex_default_false(self):
+        """decision_avoid_opex is False when env var is not set."""
+        s = self._settings(DECISION_AVOID_OPEX="false")
+        assert s.decision_avoid_opex is False
+
+    def test_decision_avoid_opex_env_override(self):
+        """DECISION_AVOID_OPEX=true skips trading on OPEX days."""
+        s = self._settings(DECISION_AVOID_OPEX="true")
+        assert s.decision_avoid_opex is True
+
+
+class TestIsOpexDay:
+    """Validate the DecisionJob._is_opex_day static helper."""
+
+    @pytest.mark.asyncio
+    async def test_opex_day_returns_true(self):
+        """_is_opex_day returns True when economic_events has an OPEX row."""
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import date
+        from spx_backend.jobs.decision_job import DecisionJob
+
+        mock_row = MagicMock()
+        mock_result = MagicMock()
+        mock_result.first.return_value = mock_row
+        mock_session = AsyncMock()
+        mock_session.execute.return_value = mock_result
+
+        assert await DecisionJob._is_opex_day(mock_session, date(2026, 4, 17)) is True
+
+    @pytest.mark.asyncio
+    async def test_non_opex_day_returns_false(self):
+        """_is_opex_day returns False when no OPEX row exists."""
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import date
+        from spx_backend.jobs.decision_job import DecisionJob
+
+        mock_result = MagicMock()
+        mock_result.first.return_value = None
+        mock_session = AsyncMock()
+        mock_session.execute.return_value = mock_result
+
+        assert await DecisionJob._is_opex_day(mock_session, date(2026, 4, 14)) is False

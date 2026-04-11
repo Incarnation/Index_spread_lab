@@ -38,6 +38,20 @@ class DecisionJob:
         allowed = settings.decision_entry_times_list()
         return (now_et.hour, now_et.minute) in allowed
 
+    @staticmethod
+    async def _is_opex_day(session, today: date) -> bool:
+        """Check if *today* is a monthly OPEX day (3rd Friday) by querying economic_events.
+
+        Returns True when a row with ``event_type = 'OPEX'`` exists for the
+        given date.  The ``economic_events`` table is populated by
+        ``eod_events_job`` using ``generate_economic_calendar.generate_rows()``.
+        """
+        result = await session.execute(
+            text("SELECT 1 FROM economic_events WHERE date = :d AND event_type = 'OPEX'"),
+            {"d": today},
+        )
+        return result.first() is not None
+
     def _build_run_result(
         self,
         *,
@@ -103,6 +117,13 @@ class DecisionJob:
         event_det = ProdEventSignalDetector()
 
         await pm.begin_day(now_et.date())
+
+        # Hard day-level filter: skip all entries on OPEX days (3rd Friday).
+        if settings.decision_avoid_opex:
+            async with SessionLocal() as session:
+                if await self._is_opex_day(session, now_et.date()):
+                    logger.info("decision_job: skipping OPEX day {}", now_et.date())
+                    return self._build_run_result(now_et=now_et, skipped=True, reason="opex_day")
 
         if not pm.can_trade():
             skip_reason = f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}"
@@ -250,7 +271,7 @@ class DecisionJob:
                     event_trades_placed += 1
 
             # Scheduled trades (capped by per-run stagger limit)
-            if not skip_scheduled:
+            if not skip_scheduled and not settings.event_only_mode:
                 sched_limit = min(run_limit, settings.portfolio_max_trades_per_day)
                 if settings.event_enabled and settings.event_budget_mode == "shared":
                     sched_limit = max(0, sched_limit - event_trades_placed)

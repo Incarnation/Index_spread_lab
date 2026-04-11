@@ -2305,8 +2305,14 @@ def run_pipeline(
     uq_df = merge_underlying_quotes(empty_prod, frd_spx, frd_vix, frd_vix9d, frd_vvix)
     frd_total = len(frd_spx) + len(frd_vix) + len(frd_vix9d) + len(frd_vvix)
 
-    # Daily SKEW from parquet (one value per trading day)
+    # Daily SKEW from parquet (one value per trading day).
+    # FRD is the primary source; production DB export extends forward.
     skew_daily = load_daily_parquet(FRD_SKEW)
+    prod_skew_path = PRODUCTION_UNDERLYING_DIR / "SKEW_1min.parquet"
+    if prod_skew_path.exists():
+        prod_skew = load_daily_parquet(prod_skew_path)
+        for d, v in prod_skew.items():
+            skew_daily.setdefault(d, v)
 
     # Economic calendar (OPEX / FOMC / triple witching)
     cal_map = load_economic_calendar(ECONOMIC_CALENDAR_CSV)

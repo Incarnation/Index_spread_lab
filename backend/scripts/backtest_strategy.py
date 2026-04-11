@@ -2784,7 +2784,8 @@ def main() -> None:
 
     # Validate required and optional columns
     required_cols = {"day", "entry_credit", "realized_pnl", "spread_side",
-                     "dte_target", "delta_target", "credit_to_width", "spot", "vix"}
+                     "dte_target", "delta_target", "credit_to_width", "spot", "vix",
+                     "vix9d", "term_structure"}
     optional_cols = {"width_points", "is_opex_day", "is_fomc_day", "is_nfp_day",
                      "is_cpi_day", "hold_realized_pnl", "recovered_after_sl",
                      "hold_hit_tp50", "exit_reason", "final_pnl_at_expiry"}
