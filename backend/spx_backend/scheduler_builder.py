@@ -31,6 +31,7 @@ from spx_backend.jobs.staleness_monitor_job import build_staleness_monitor_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.market_clock import MarketClockCache
+from spx_backend.services.sms_notifier import SmsNotifier
 
 
 _job_failure_last_alert: dict[str, datetime] = {}
@@ -450,10 +451,11 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob(clock_cache=clock_cache)
     cboe_gex_job = build_cboe_gex_job(clock_cache=clock_cache) if cfg.cboe_gex_enabled else None
-    decision_job = DecisionJob(clock_cache=clock_cache)
+    sms_notifier = SmsNotifier()
+    decision_job = DecisionJob(clock_cache=clock_cache, notifier=sms_notifier)
     feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
     labeler_job = LabelerJob()
-    trade_pnl_job = TradePnlJob(clock_cache=clock_cache)
+    trade_pnl_job = TradePnlJob(clock_cache=clock_cache, notifier=sms_notifier)
     trainer_job = TrainerJob()
     shadow_inference_job = ShadowInferenceJob()
     promotion_gate_job = PromotionGateJob()

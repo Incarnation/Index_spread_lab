@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -11,6 +12,9 @@ from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
 from spx_backend.services.portfolio_manager import PortfolioManager
+
+if TYPE_CHECKING:
+    from spx_backend.services.sms_notifier import SmsNotifier
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
@@ -50,6 +54,7 @@ class TradePnlJob:
     """Mark-to-market open trades and close by TP/SL/expiry."""
 
     clock_cache: MarketClockCache | None = None
+    notifier: SmsNotifier | None = None
     _pm: PortfolioManager | None = field(default=None, init=False, repr=False)
 
     async def _market_open(self, now_et: datetime) -> bool:
@@ -325,7 +330,7 @@ class TradePnlJob:
         all_legs: dict,
         now_et: datetime,
         now_utc: datetime,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[dict[str, Any]]]:
         """Close all expired trades and update portfolio equity.
 
         Uses three fallback tiers for exit valuation:
@@ -333,10 +338,11 @@ class TradePnlJob:
         2. Intrinsic-value settlement from latest spot price and leg strikes.
         3. Worst-case assumption of full max loss.
 
-        Returns (expired_closed, total_closed_delta).
+        Returns (expired_closed, total_closed_delta, sms_close_infos).
         """
         expired_closed = 0
         closed = 0
+        sms_close_infos: list[dict[str, Any]] = []
 
         spot: float | None = None
         spot_loaded = False
@@ -409,12 +415,22 @@ class TradePnlJob:
 
             expired_closed += 1
             closed += 1
+            sms_close_infos.append({
+                "trade_id": trade.trade_id,
+                "strategy_type": getattr(trade, "strategy_type", None),
+                "exit_reason": "EXPIRED",
+                "entry_credit": entry_credit,
+                "exit_cost": exit_cost,
+                "realized_pnl": pnl,
+                "contracts": contracts,
+                "source": getattr(trade, "trade_source", ""),
+            })
             logger.info(
                 "trade_pnl_job: trade_id={} closed=EXPIRED expiration={} pnl={:.2f}",
                 trade.trade_id, trade.expiration, pnl,
             )
 
-        return expired_closed, closed
+        return expired_closed, closed, sms_close_infos
 
     async def run_once(self, *, force: bool = False) -> dict:
         """Run one live mark-to-market cycle for all open trades.
@@ -453,7 +469,7 @@ class TradePnlJob:
                     """
                     SELECT trade_id, entry_credit, contracts, contract_multiplier, expiration,
                            take_profit_target, stop_loss_target, max_profit, max_loss,
-                           strategy_type
+                           strategy_type, trade_source
                     FROM trades
                     WHERE status = 'OPEN'
                     ORDER BY entry_time ASC
@@ -481,19 +497,24 @@ class TradePnlJob:
             expired_trades = [t for t in trades_list if _is_expired(t)]
             active_trades = [t for t in trades_list if not _is_expired(t)]
 
+            sms_close_infos: list[dict[str, Any]] = []
             if expired_trades:
-                expired_closed, closed = await self._close_expired_trades(
+                expired_closed, closed, expired_sms = await self._close_expired_trades(
                     session=session,
                     trades=expired_trades,
                     all_legs=all_legs,
                     now_et=now_et,
                     now_utc=now_utc,
                 )
+                sms_close_infos.extend(expired_sms)
 
             # Phase 2: RTH gate for mark-to-market and TP/SL
             if (not force) and (not settings.trade_pnl_allow_outside_rth):
                 if not await self._market_open(now_et):
                     await session.commit()
+                    if self.notifier and sms_close_infos:
+                        for ci in sms_close_infos:
+                            await self.notifier.notify_trade_closed(ci)
                     logger.info(
                         "trade_pnl_job: market_closed expired_closed={} closed={}",
                         expired_closed, closed,
@@ -638,9 +659,23 @@ class TradePnlJob:
                         pm = await self._get_portfolio_manager(now_et)
                         await pm.record_closure(trade.trade_id, pnl, session=session)
 
+                    sms_close_infos.append({
+                        "trade_id": trade.trade_id,
+                        "strategy_type": getattr(trade, "strategy_type", None),
+                        "exit_reason": close_reason,
+                        "entry_credit": entry_credit,
+                        "exit_cost": exit_cost,
+                        "realized_pnl": pnl,
+                        "contracts": contracts,
+                        "source": getattr(trade, "trade_source", ""),
+                    })
                     closed += 1
 
             await session.commit()
+
+        if self.notifier and sms_close_infos:
+            for ci in sms_close_infos:
+                await self.notifier.notify_trade_closed(ci)
 
         logger.info(
             "trade_pnl_job: updated={} closed={} expired_closed={} marks_written={} "
@@ -662,6 +697,18 @@ class TradePnlJob:
         }
 
 
-def build_trade_pnl_job(clock_cache: MarketClockCache | None = None) -> TradePnlJob:
-    """Factory helper for TradePnlJob."""
-    return TradePnlJob(clock_cache=clock_cache)
+def build_trade_pnl_job(
+    clock_cache: MarketClockCache | None = None,
+    notifier: SmsNotifier | None = None,
+) -> TradePnlJob:
+    """Factory helper for TradePnlJob.
+
+    Parameters
+    ----------
+    clock_cache:
+        Shared market-clock cache for RTH checks.
+    notifier:
+        Optional SMS notifier; when provided, trade-closed messages are sent
+        after the DB commit for each closed trade.
+    """
+    return TradePnlJob(clock_cache=clock_cache, notifier=notifier)

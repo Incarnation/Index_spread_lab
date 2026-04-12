@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -13,6 +13,9 @@ from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
 from spx_backend.services.portfolio_manager import PortfolioManager as ProdPortfolioManager
 from spx_backend.services.event_signals import EventSignalDetector as ProdEventSignalDetector
+
+if TYPE_CHECKING:
+    from spx_backend.services.sms_notifier import SmsNotifier
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
@@ -26,6 +29,7 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
 class DecisionJob:
     """Rule-based decision runner for credit spreads."""
     clock_cache: MarketClockCache | None = None
+    notifier: SmsNotifier | None = None
 
     async def _market_open(self, now_et: datetime) -> bool:
         """Check if the market is open using cache or RTH fallback."""
@@ -37,6 +41,45 @@ class DecisionJob:
         """Return True if now matches configured entry times."""
         allowed = settings.decision_entry_times_list()
         return (now_et.hour, now_et.minute) in allowed
+
+    @staticmethod
+    def _build_sms_trade_info(chosen: dict, *, contracts: int, source: str,
+                              event_signals: Any = None) -> dict[str, Any]:
+        """Assemble the dict expected by ``SmsNotifier.notify_trade_opened``.
+
+        Pulls leg details, credit, width, and computed max-loss from the
+        candidate data that is already in scope at trade-creation time.
+        """
+        legs = chosen.get("chosen_legs_json") or {}
+        short = legs.get("short") or {}
+        long = legs.get("long") or {}
+        spread_side = str(legs.get("spread_side") or settings.decision_spread_side).lower()
+        width = float(legs.get("width_points") or settings.decision_spread_width_points)
+        credit = float(chosen.get("credit") or 0.0)
+        multiplier = int(settings.trade_pnl_contract_multiplier)
+        max_loss = max(width - credit, 0.0) * contracts * multiplier
+        return {
+            "spread_side": spread_side,
+            "target_dte": chosen.get("target_dte"),
+            "expiration": str(chosen.get("expiration", "")),
+            "short": {
+                "symbol": short.get("symbol", ""),
+                "strike": short.get("strike"),
+                "entry_price": short.get("mid"),
+                "delta": short.get("delta"),
+            },
+            "long": {
+                "symbol": long.get("symbol", ""),
+                "strike": long.get("strike"),
+                "entry_price": long.get("mid"),
+            },
+            "credit": credit,
+            "width_points": width,
+            "contracts": contracts,
+            "max_loss": max_loss,
+            "source": source,
+            "event_signals": event_signals,
+        }
 
     @staticmethod
     async def _is_opex_day(session, today: date) -> bool:
@@ -227,6 +270,7 @@ class DecisionJob:
             event_trades_placed = 0
             decisions_created: list[dict] = []
             trades_created: list[int] = []
+            sms_trade_infos: list[dict] = []
 
             run_limit = settings.portfolio_max_trades_per_run
 
@@ -268,6 +312,10 @@ class DecisionJob:
                         "score": c["credit_to_width"], "decision_source": "portfolio_event",
                     })
                     trades_created.append(int(trade_id))
+                    sms_trade_infos.append(self._build_sms_trade_info(
+                        c, contracts=lots, source="portfolio_event",
+                        event_signals=drop_signals,
+                    ))
                     event_trades_placed += 1
 
             # Scheduled trades (capped by per-run stagger limit)
@@ -310,6 +358,9 @@ class DecisionJob:
                         "score": c["credit_to_width"], "decision_source": "portfolio_scheduled",
                     })
                     trades_created.append(int(trade_id))
+                    sms_trade_infos.append(self._build_sms_trade_info(
+                        c, contracts=lots, source="portfolio_scheduled",
+                    ))
                     placed += 1
 
             if not trades_created:
@@ -333,6 +384,10 @@ class DecisionJob:
                 })
 
             await session.commit()
+
+        if self.notifier and sms_trade_infos:
+            for ti in sms_trade_infos:
+                await self.notifier.notify_trade_opened(ti)
 
         return self._build_run_result(
             now_et=now_et,
@@ -681,6 +736,7 @@ class DecisionJob:
 
             decisions_created: list[dict] = []
             trades_created: list[int] = []
+            sms_trade_infos: list[dict] = []
             for selection in selected:
                 chosen = selection["chosen"]
                 candidate_ref = selection.get("candidate_ref") or {}
@@ -732,7 +788,15 @@ class DecisionJob:
                     }
                 )
                 trades_created.append(int(trade_id))
+                sms_trade_infos.append(self._build_sms_trade_info(
+                    chosen, contracts=int(settings.decision_contracts or 1),
+                    source=decision_source,
+                ))
             await session.commit()
+
+        if self.notifier and sms_trade_infos:
+            for ti in sms_trade_infos:
+                await self.notifier.notify_trade_opened(ti)
 
         clipped_by = None
         if len(selected) < max_per_run:
@@ -1663,6 +1727,18 @@ def json_dumps(payload: dict) -> str:
     return json.dumps(payload, default=str)
 
 
-def build_decision_job(clock_cache: MarketClockCache | None = None) -> DecisionJob:
-    """Factory helper for DecisionJob."""
-    return DecisionJob(clock_cache=clock_cache)
+def build_decision_job(
+    clock_cache: MarketClockCache | None = None,
+    notifier: SmsNotifier | None = None,
+) -> DecisionJob:
+    """Factory helper for DecisionJob.
+
+    Parameters
+    ----------
+    clock_cache:
+        Shared market-clock cache for RTH checks.
+    notifier:
+        Optional SMS notifier; when provided, trade-opened messages are sent
+        after the DB commit for each placed trade.
+    """
+    return DecisionJob(clock_cache=clock_cache, notifier=notifier)

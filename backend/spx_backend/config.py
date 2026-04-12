@@ -261,11 +261,35 @@ class Settings(BaseSettings):
     """When True, skip all trade entries on monthly OPEX days (3rd Friday).
     Regime analysis shows OPEX days have negative average PnL."""
 
+    # ─── SMS trade notifications (Twilio) ──────────────────────────
+    sms_enabled: bool = False
+    """Master toggle for SMS trade notifications.  When False the notifier
+    is a no-op regardless of other Twilio settings."""
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+    """Twilio sender phone number in E.164 format (e.g. +15551234567)."""
+    twilio_to_numbers: str = ""
+    """Comma-separated recipient phone numbers in E.164 format."""
+    sms_notify_sources: str = "all"
+    """Which trade sources trigger SMS: 'all', 'event', or 'scheduled'."""
+
     # Auth: JWT and user registration (multiple users, in-house auth).
     jwt_secret: str = ""  # set JWT_SECRET in env for auth; auth endpoints error if empty
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24  # 24h
     auth_register_enabled: bool = False  # only allowed (pre-created) users can log in
+
+    @field_validator("sms_notify_sources")
+    @classmethod
+    def _check_sms_notify_sources(cls, v: str) -> str:
+        allowed = {"all", "event", "scheduled"}
+        normalized = v.strip().lower()
+        if normalized not in allowed:
+            raise ValueError(
+                f"sms_notify_sources must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return normalized
 
     @field_validator("trade_pnl_stop_loss_basis")
     @classmethod
@@ -464,6 +488,10 @@ class Settings(BaseSettings):
                 "skipping DTE alignment check.",
                 self.snapshot_dte_mode,
             )
+
+    def twilio_to_numbers_list(self) -> list[str]:
+        """Parse recipient phone numbers from comma-separated config value."""
+        return [p.strip() for p in self.twilio_to_numbers.split(",") if p.strip()]
 
     def decision_spread_sides_list(self) -> list[str]:
         """Parse allowed spread sides with fallback to single-side config."""
