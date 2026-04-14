@@ -1,125 +1,206 @@
 # IndexSpreadLab
 
-IndexSpreadLab is a research and paper-execution platform for index options with a practical focus on short-dated credit spread workflows.
+IndexSpreadLab is a research and paper-execution platform for index options with a practical focus on short-dated credit spread workflows. It combines a live pipeline (data capture, event-signal detection, portfolio-managed trade execution) with an offline optimizer for systematic strategy development.
 
 The current stack is:
 - Backend: FastAPI + APScheduler + PostgreSQL
 - Frontend: React 18 (Vite) + Radix UI + Tailwind CSS v4 + Recharts
 - Data sources: Tradier REST APIs (expirations, chain, quotes, market clock) + CBOE precomputed GEX
 - Auth: JWT-based authentication with bcrypt password hashing
+- Notifications: Twilio SMS for trade open/close alerts
 
-This repository is designed so live capture, analytics (GEX), and decision logs share one consistent schema that can later feed backtesting and ML.
+---
+
+## System Architecture
+
+```mermaid
+flowchart TB
+  subgraph external [External Data]
+    Tradier["Tradier API"]
+    CBOE["CBOE / MZData"]
+    Twilio["Twilio SMS"]
+  end
+
+  subgraph live [Live Pipeline — APScheduler]
+    QuoteJob["Quote Job"]
+    SnapshotJob["Snapshot Job"]
+    GexJob["GEX Job"]
+    CboeGexJob["CBOE GEX Job"]
+    FeatureBuilder["Feature Builder"]
+    DecisionJob["Decision Job"]
+    EventSignals["Event Signal Detector"]
+    PortfolioMgr["Portfolio Manager"]
+    TradePnl["Trade PnL Job"]
+    SmsNotifier["SMS Notifier"]
+    Labeler["Labeler"]
+    Trainer["Trainer"]
+    ShadowInference["Shadow Inference"]
+    PromotionGate["Promotion Gate"]
+    PerfAnalytics["Performance Analytics"]
+    Staleness["Staleness Monitor"]
+    Retention["Retention Job"]
+    EodEvents["EOD Events"]
+  end
+
+  subgraph offline [Offline Optimizer Pipeline]
+    GenTraining["generate_training_data.py"]
+    Backtest["backtest_strategy.py"]
+    YamlConfigs["YAML Configs"]
+    Regime["regime_analysis.py"]
+    Ingest["ingest_optimizer_results.py"]
+  end
+
+  subgraph storage [PostgreSQL]
+    DB[("Database — 30+ tables")]
+  end
+
+  subgraph frontend [React Dashboard]
+    Dashboard["12-page SPA"]
+  end
+
+  Tradier --> QuoteJob & SnapshotJob
+  CBOE --> CboeGexJob
+  QuoteJob --> DB
+  SnapshotJob --> DB
+  GexJob --> DB
+  CboeGexJob --> DB
+  FeatureBuilder --> DB
+  EventSignals --> DecisionJob
+  PortfolioMgr --> DecisionJob
+  DecisionJob --> DB
+  DecisionJob --> SmsNotifier --> Twilio
+  TradePnl --> DB
+  TradePnl --> SmsNotifier
+  Labeler --> DB
+  Trainer --> DB
+  ShadowInference --> DB
+  PromotionGate --> DB
+  PerfAnalytics --> DB
+  EodEvents --> DB
+  Staleness -.->|SendGrid| external
+
+  DB --> Dashboard
+  GenTraining --> Backtest
+  YamlConfigs --> Backtest
+  Backtest --> Regime
+  Backtest --> Ingest --> DB
+```
 
 ---
 
 ## Current Product Scope
 
 What is implemented now:
+
+**Live Data Capture**
 - Scheduled SPX option-chain snapshot capture (0-16 DTE range profile).
 - Scheduled SPY snapshot stream (enabled by default) and optional VIX snapshot stream.
 - Scheduled quote capture (SPX, VIX, VIX9D, SPY by default).
-- Dual-source GEX computation: Tradier-computed and CBOE precomputed streams with source-specific columns.
-- Feature/candidate generation for both `put` and `call` credit spreads.
-- Label resolution with both live-style TP50 outcome and expiry counterfactual outcome.
-- Weekly walk-forward trainer (with sparse CV fallback) that writes `training_runs` and `model_versions`.
-- Shadow inference writer to `model_predictions`.
-- Promotion gate evaluator for rollout safety checks.
-- Hybrid execution policy support (rules guardrails first, model ranking second) with safe default `decision_source='rules'`.
+- Dual-source GEX computation: Tradier-computed and CBOE precomputed streams.
+
+**Trade Execution**
+- Event-driven trading layer: detects VIX spikes, SPX drops (1d/2d), VIX elevated, term-structure inversion, and rally conditions. Configurable signal mode (`any` or `spx_and_vix`).
+- Event-only mode: suppresses scheduled trades entirely, only trading on event signals.
 - Portfolio management with capital budgeting, lot scaling, drawdown stops, and trade-source tracking.
-- Event-driven trading layer (VIX spikes, SPX drops, term-structure inversion) with configurable budget mode.
-- EOD events job for end-of-day signal capture and economic calendar integration.
-- Automated data retention job (configurable purge of old chain/GEX data with cascade safety).
-- Pipeline staleness monitoring with SendGrid email alerting (RTH-only, cooldown-gated).
+- Hybrid execution policy support (rules guardrails first, model ranking second).
+- SMS trade notifications via Twilio (open/close alerts with spread details).
+
+**ML Pipeline**
+- Feature/candidate generation for both `put` and `call` credit spreads.
+- Label resolution with TP50 outcome and expiry counterfactual outcome.
+- Weekly walk-forward trainer (with sparse CV fallback).
+- Shadow inference and promotion gate evaluation for rollout safety.
+
+**Optimizer / Backtest System**
+- Offline capital-budgeted backtester with parallel execution (`backtest_strategy.py`).
+- YAML-driven parameter sweeps across portfolio, trading, event, and regime dimensions.
+- Multiple optimizer modes: staged (3-phase), event-only, selective, exhaustive, YAML-config.
+- Walk-forward validation with auto-generated rolling windows.
+- Regime analysis for performance breakdown by market conditions.
+- Result ingestion into PostgreSQL for the interactive optimizer dashboard.
+
+**Operations & Monitoring**
 - Performance analytics aggregation (win rates, expectancy, drawdown, tail loss, margin usage).
+- Pipeline staleness monitoring with SendGrid email alerting (RTH-only, cooldown-gated).
+- Automated data retention job (configurable purge of old chain/GEX data).
+- EOD events job for economic calendar integration.
 - Admin APIs to manually trigger each pipeline stage.
-- JWT authentication with user registration, login, logout, and auth audit logging.
-- React dashboard with lazy-loaded pages, error boundaries, responsive mobile sidebar, and live trade PnL.
-- Data retention CLI for exporting and purging old chain/GEX data.
-- Backend unit/integration/E2E suites with a predeploy gate and CI workflow.
+
+**Dashboard**
+- React dashboard with 12 lazy-loaded pages, error boundaries, responsive mobile sidebar.
+- Pages: Overview, Portfolio, Trades, Decisions, Model Monitor, Performance, GEX, Strategy Config, Optimizer, Admin, Auth Audit.
+- Optimizer dashboard with run comparison, Pareto scatter, walk-forward charts, and paginated results.
+
+**Testing & CI**
+- Backend unit/integration/E2E suites (53 test files) with predeploy gate and CI workflow.
 - Frontend test suite (Vitest + Testing Library) with page-level tests.
 
 Still intentionally limited:
 - Live broker order/fill automation remains staged (schema and paper workflow are available).
-- Backtest runner orchestration and full historical backfill are still evolving.
 
 ---
 
 ## How The System Works
 
-The pipeline runs in this order:
+### Live Pipeline
 
-1) **Quote job**
-- Pulls latest quotes for configured symbols (`QUOTE_SYMBOLS`).
-- Stores raw quote rows in `underlying_quotes`.
-- Updates `context_snapshots` (`spx_price`, `vix`, `term_structure`, etc).
+The pipeline runs in this order during market hours:
 
-2) **Snapshot job**
-- Gets SPX expirations from Tradier (including all roots for weeklies/dailies).
-- Selects expirations by DTE policy (`range` or `targets`).
-- Pulls option chains and writes:
-  - `chain_snapshots` (metadata + checksum; raw payload cleared to save storage)
-  - `option_chain_rows` (normalized per-option rows)
-- Dedicated SPY snapshot stream (enabled by default) runs in parallel and stores `underlying='SPY'` rows for future SPY model fitting.
-- Optional VIX snapshot stream can run in parallel and writes the same tables with `underlying='VIX'` for model features/training context.
-- Decision/trade execution remains SPX-only.
+1. **Quote job** -- Pulls latest quotes for configured symbols. Stores in `underlying_quotes` and updates `context_snapshots`.
 
-3) **GEX job (Tradier)**
-- Reads option rows + latest eligible spot quote.
-- Computes gamma exposure aggregates.
-- Writes `gex_snapshots`, `gex_by_strike`, `gex_by_expiry_strike`.
-- Populates `gex_net_tradier` / `zero_gamma_level_tradier` source columns in `context_snapshots`.
+2. **Snapshot job** -- Gets SPX expirations from Tradier, selects by DTE policy, pulls option chains. Writes `chain_snapshots` and `option_chain_rows`. Parallel SPY/VIX streams optional.
 
-4) **CBOE GEX job**
-- Fetches precomputed GEX data from CBOE/MZData vendor API.
-- Writes the same GEX tables with `source='CBOE'`.
-- Populates `gex_net_cboe` / `zero_gamma_level_cboe` source columns in `context_snapshots`.
-- CBOE is the preferred source for canonical `gex_net`; Tradier is the fallback.
+3. **GEX jobs** -- Tradier GEX computes gamma exposure from chain data. CBOE GEX fetches precomputed data from vendor API. Both write to `gex_snapshots` tables with source discrimination.
 
-5) **Feature builder + candidate generation**
-- At configured entry times, builds feature snapshots and ranked candidates.
-- Generates candidates for both `put` and `call` sides.
-- Writes `feature_snapshots` and `trade_candidates` (ranked, hashed candidates).
+4. **Feature builder + candidate generation** -- At configured entry times, builds feature snapshots and ranked candidates for both put and call sides.
 
-6) **Decision + execution policy**
-- Enforces hard risk guardrails first (day/open caps and per-side caps).
-- Selects candidate by rules score by default.
-- If hybrid is enabled and eligible model predictions exist, applies model ranking subject to safety thresholds.
-- Portfolio manager handles capital budgeting, lot sizing, and drawdown stops when portfolio mode is active.
-- Writes one decision row per run (`TRADE`/`SKIP`) in `trade_decisions`, then creates/updates paper trade rows.
+5. **Decision + execution** -- Event signal detector evaluates market conditions (SPX drops, VIX spikes, term structure). Portfolio manager enforces capital budgets and drawdown stops. Decision job selects candidates by rules (optionally hybrid ML ranking). Writes `trade_decisions` and opens trades. SMS notification sent on trade open.
 
-7) **Labeler + trade PnL**
-- Trade PnL job marks open trades continuously and closes on TP/SL/expiry policy.
-- Labeler resolves candidate outcomes from forward marks and stores labels.
-- Orphan feature snapshots (no linked candidates) are automatically expired.
+6. **Trade PnL** -- Marks open trades continuously. Closes on take-profit, stop-loss, or expiry. SMS notification sent on trade close.
 
-8) **Weekly model loop**
-- Trainer runs walk-forward evaluation and writes `training_runs` + `model_versions`.
-- Falls back to sparse cross-validation when walk-forward split has insufficient rows.
-- Shadow inference scores fresh candidates and writes `model_predictions`.
-- Promotion gates evaluate quality/risk thresholds and update rollout status.
+7. **Labeler** -- Resolves candidate outcomes from forward marks and stores labels.
 
-9) **EOD events job**
-- Runs after market close to capture end-of-day signals and economic calendar events.
-- Writes to `economic_events` table for next-day decision context.
+8. **Weekly model loop** -- Trainer runs walk-forward evaluation. Shadow inference scores candidates. Promotion gates evaluate rollout thresholds.
 
-10) **Performance analytics**
-- Aggregates win rates, expectancy, drawdown, tail loss proxy, and margin usage.
-- Refreshes on a configurable interval during RTH.
+9. **EOD events** -- Captures end-of-day signals and economic calendar events.
 
-11) **Staleness monitor**
-- Periodically checks latest timestamps in key tables.
-- Runs only during RTH (skips evenings, weekends, exchange holidays).
-- Sends email alert via SendGrid when any source exceeds its configured staleness threshold.
+10. **Performance analytics** -- Aggregates win rates, expectancy, drawdown, tail loss, margin usage.
 
-12) **Retention job**
-- Runs daily at 3 AM ET when enabled.
-- Deletes old `chain_snapshots` and cascaded children in batches.
-- Excludes snapshots referenced by open trades as a safety measure.
-- Configurable retention window (default 60 days).
+11. **Staleness monitor** -- Checks pipeline freshness during RTH. Sends SendGrid alerts on stale data.
 
-Important semantics:
-- DTE handling is trading-session based (weekends and market holidays are skipped).
-- GEX API data for UI is batch-scoped (same timestamp + underlying + source), not only one snapshot row.
+12. **Retention job** -- Daily 3 AM purge of old chain/GEX data (excludes open-trade references).
+
+### Offline Optimizer Pipeline
+
+The optimizer runs outside the live system for strategy research:
+
+1. **Generate training data** -- `generate_training_data.py` exports production DB data to `training_candidates.csv` with simulated P&L trajectories.
+
+2. **Run optimizer** -- `backtest_strategy.py --optimize --config <yaml>` sweeps all parameter combinations in parallel. Precomputes P&L columns for each TP/SL pair, then runs capital-budgeted backtests.
+
+3. **Walk-forward validation** -- `--walkforward --wf-auto` tests top configs across rolling train/test windows to check for overfitting.
+
+4. **Regime analysis** -- `regime_analysis.py` breaks down performance by VIX level, term structure, calendar events, etc.
+
+5. **Ingest results** -- `ingest_optimizer_results.py` loads CSVs into `optimizer_runs/results/walkforward` tables for the dashboard.
+
+### Current Live Configuration (C3)
+
+The optimized C3 configuration deployed to production:
+
+| Parameter | Value |
+|-----------|-------|
+| Entry times | 10:01, 11:01, 12:01, 13:01, 14:01, 15:01, 16:01 (7 hourly checks) |
+| Spread width | 15 points |
+| Take profit | 50% of credit received |
+| Stop loss | Disabled |
+| Max event trades | 2 per day |
+| VIX elevated threshold | 20.0 |
+| SPX 2-day drop threshold | -1.0% |
+| Term inversion | Disabled (threshold 99.0) |
+| Event-only mode | Yes (no scheduled trades) |
+
+Backtest performance: Sharpe 10.78, return 215.8%, max drawdown 0.0%, 208 trades, 100% win rate. Walk-forward validated across 9 rolling windows (all PASS).
 
 ---
 
@@ -141,36 +222,86 @@ Why 3DTE is 2026-02-18:
 
 ## Repository Layout
 
-- `backend/`
-  - `spx_backend/config.py`: env-backed settings.
-  - `spx_backend/main.py`: app entrypoint (`PORT` aware for Railway).
-  - `spx_backend/web/app.py`: FastAPI app + scheduler wiring.
-  - `spx_backend/web/routers/`: route modules (`public.py`, `admin.py`, `auth.py`, `portfolio.py`).
-  - `spx_backend/database/`: DB package (`connection.py`, `schema.py`, reset CLIs).
-  - `spx_backend/database/sql/migrations/`: idempotent SQL migrations (run automatically on startup).
-  - `spx_backend/services/portfolio_manager.py`: capital budgeting, lot scaling, drawdown stops.
-  - `spx_backend/backtest/`: local backtest engine with path-sanitization + sample data docs.
-  - `spx_backend/jobs/`: all pipeline jobs (snapshot, quote, gex, cboe_gex, feature_builder, decision, labeler, trade_pnl, trainer, shadow_inference, promotion_gate, staleness_monitor, performance_analytics, eod_events, retention).
-  - `spx_backend/market_clock.py`: Tradier clock cache with DB audit and RTH fallback.
-  - `spx_backend/dte.py`: trading-day DTE helper logic.
-  - `spx_backend/scheduler_builder.py`: APScheduler construction and job registration.
-  - `scripts/data_retention.py`: CLI to export and purge old chain/GEX data.
-  - `requirements.txt`: runtime dependencies.
-  - `requirements-dev.txt`: test dependencies.
-  - `tests/`: backend automated tests (45 test files).
-- `frontend/`
-  - `src/main.tsx`: entry point with lazy-loaded routing and auth provider.
-  - `src/app/`: layout shell (`AppShell`, `Sidebar` with mobile drawer, `Navbar`).
-  - `src/pages/`: per-route page components (Overview, Portfolio, Trades, Decisions, ModelMonitor, Performance, GEX, Admin, AuthAudit, StrategyConfig).
-  - `src/components/`: shared UI (`ProtectedRoute`, `ErrorBoundary`, `DataTable`, `StatCard`, Radix primitives).
-  - `src/hooks/`: `useAutoRefresh` with market-hours awareness.
-  - `src/api.ts`: typed API client with `safeJson` response parsing.
-  - `src/contexts/AuthContext.tsx`: JWT auth state with 401 event handling.
-  - `src/test/`: test setup and page-level tests.
-- `Makefile`: E2E and predeploy test targets.
-- `Dockerfile`: backend Docker image.
-- `docker-compose.test.yml`: Postgres test DB for integration tests.
-- `.dockerignore`: slimmed Docker build context (excludes frontend, docs, data files).
+```
+├── backend/
+│   ├── spx_backend/
+│   │   ├── config.py              Pydantic Settings (env-backed)
+│   │   ├── main.py                Uvicorn entrypoint (PORT-aware for Railway)
+│   │   ├── dte.py                 Trading-day DTE helper
+│   │   ├── market_clock.py        Tradier clock cache with RTH fallback
+│   │   ├── scheduler_builder.py   APScheduler construction and job registration
+│   │   ├── web/
+│   │   │   ├── app.py             FastAPI app, lifespan, CORS
+│   │   │   └── routers/           public, admin, auth, portfolio, optimizer
+│   │   ├── jobs/                  15 pipeline jobs (snapshot, quote, gex, decision, etc.)
+│   │   ├── services/
+│   │   │   ├── portfolio_manager.py   Capital budgeting, lot scaling, drawdown stops
+│   │   │   ├── event_signals.py       Event-driven signal detection
+│   │   │   └── sms_notifier.py        Twilio SMS trade notifications
+│   │   ├── ingestion/
+│   │   │   └── tradier_client.py      Tradier REST wrapper
+│   │   └── database/
+│   │       ├── connection.py      Async engine + session factory
+│   │       ├── schema.py          Schema bootstrap + migration runner
+│   │       └── sql/               DDL, migrations (14 numbered files)
+│   ├── configs/optimizer/         YAML parameter sweep definitions (8 configs)
+│   ├── scripts/                   21 offline CLI tools (see below)
+│   ├── tests/                     53 test files (unit + integration)
+│   ├── requirements.txt           Runtime dependencies
+│   └── requirements-dev.txt       Test dependencies
+├── frontend/
+│   ├── src/
+│   │   ├── main.tsx               Entry point with routing and auth
+│   │   ├── app/                   Layout shell (AppShell, Sidebar, Navbar)
+│   │   ├── pages/                 12 page components
+│   │   ├── components/            Shared UI (DataTable, StatCard, Radix primitives)
+│   │   ├── hooks/                 useAutoRefresh (market-hours-aware polling)
+│   │   ├── api.ts                 Typed API client with auto-auth
+│   │   └── contexts/              AuthContext (JWT state)
+│   ├── package.json
+│   └── vite.config.ts
+├── data/                          CSV exports, training data, optimizer results (gitignored)
+├── Dockerfile                     Backend Docker image
+├── Makefile                       E2E and predeploy test targets
+├── docker-compose.test.yml        Postgres test DB for integration tests
+└── .env.example                   Full configuration reference
+```
+
+### Key Scripts (`backend/scripts/`)
+
+| Script | Purpose |
+|--------|---------|
+| `backtest_strategy.py` | Capital-budgeted backtester with optimizer modes |
+| `generate_training_data.py` | Offline training pipeline for SPX credit-spread models |
+| `ingest_optimizer_results.py` | Ingest optimizer CSVs into PostgreSQL for the dashboard |
+| `regime_analysis.py` | Regime-based performance analysis |
+| `xgb_model.py` | XGBoost training, prediction, walk-forward validation |
+| `upload_xgb_model.py` | Upload trained XGB model into `model_versions` |
+| `export_production_data.py` | Export production DB tables to CSV/Parquet |
+| `download_databento.py` | Download historical options from Databento |
+| `generate_economic_calendar.py` | Unified economic-event calendar CSV |
+| `sl_recovery_analysis.py` | Stop-loss recovery analysis and sweeps |
+| `experiment_tracker.py` | Experiment tracking for optimizer runs |
+| `backtest_entry.py` | Backtest framework for SPX credit spread entries |
+| `data_retention.py` | CLI to export and purge old chain/GEX data |
+| `clean_start.py` | One-time DB cleanup for a fresh portfolio start |
+| `health_check.py` | Production health check |
+| `create_allowed_users.py` | Insert allowed user with bcrypt hash |
+| `set_admin.py` | Promote user to admin |
+| `test_sms.py` | Twilio SMS smoke test |
+
+### Optimizer Configs (`backend/configs/optimizer/`)
+
+| Config | Purpose |
+|--------|---------|
+| `staged_stage1.yaml` | Stage 1: trading parameter sweep (TP, SL, VIX, width) |
+| `staged_stage2.yaml` | Stage 2: portfolio parameter sweep |
+| `staged_stage3.yaml` | Stage 3: event signal parameter sweep |
+| `event_only.yaml` | Event-only mode full sweep |
+| `event_only_v2.yaml` | Phase 1: term_inversion ON/OFF validation |
+| `event_only_v2_explore.yaml` | Phase 2: broad exploration (signal mode, VIX, entries, width) |
+| `selective.yaml` | Selective high-win-rate configuration sweep |
+| `portfolio_sweep.yaml` | Portfolio-only parameter sweep |
 
 ---
 
@@ -206,9 +337,21 @@ Primary knobs:
   - `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`, `PORTFOLIO_LOT_PER_EQUITY`
   - `PORTFOLIO_CALLS_ONLY`
 - Event-driven trading:
-  - `EVENT_ENABLED`, `EVENT_BUDGET_MODE`
-  - `EVENT_SPX_DROP_THRESHOLD`, `EVENT_VIX_SPIKE_THRESHOLD`
+  - `EVENT_ENABLED`, `EVENT_BUDGET_MODE`, `EVENT_SIGNAL_MODE`
+  - `EVENT_SPX_DROP_THRESHOLD`, `EVENT_SPX_DROP_2D_THRESHOLD`
+  - `EVENT_VIX_SPIKE_THRESHOLD`, `EVENT_VIX_ELEVATED_THRESHOLD`
+  - `EVENT_TERM_INVERSION_THRESHOLD`, `EVENT_SIDE_PREFERENCE`
   - `EVENT_MIN_DTE`, `EVENT_MAX_DTE`, `EVENT_MIN_DELTA`, `EVENT_MAX_DELTA`
+  - `EVENT_MAX_TRADES`, `EVENT_EVENT_ONLY`
+  - `EVENT_RALLY_AVOIDANCE`, `EVENT_RALLY_THRESHOLD`
+- Trade PnL:
+  - `TRADE_PNL_ENABLED`, `TRADE_PNL_INTERVAL_MINUTES`
+  - `TRADE_PNL_TAKE_PROFIT_PCT`, `TRADE_PNL_STOP_LOSS_ENABLED`
+  - `TRADE_PNL_STOP_LOSS_PCT`, `TRADE_PNL_STOP_LOSS_BASIS`
+- SMS notifications:
+  - `SMS_ENABLED`, `SMS_ACCOUNT_SID`, `SMS_AUTH_TOKEN`
+  - `SMS_FROM_NUMBER`, `SMS_TO_NUMBER`
+  - `SMS_NOTIFY_SOURCES` (comma-separated: `portfolio_scheduled`, `portfolio_event`)
 - ML (feature + label pipeline):
   - `FEATURE_BUILDER_ENABLED`, `LABELER_ENABLED`
   - `TRAINER_ENABLED`, `SHADOW_INFERENCE_ENABLED`
@@ -216,6 +359,8 @@ Primary knobs:
 - GEX:
   - `GEX_ENABLED`, `GEX_SNAPSHOT_BATCH_LIMIT`
   - `CBOE_GEX_ENABLED`, `CBOE_GEX_UNDERLYINGS`
+- Performance analytics:
+  - `PERFORMANCE_ANALYTICS_ENABLED`, `PERFORMANCE_ANALYTICS_INTERVAL_MINUTES`
 - Data retention:
   - `RETENTION_ENABLED` (default `false`)
   - `RETENTION_DAYS` (default `60`)
@@ -223,12 +368,6 @@ Primary knobs:
 - EOD events:
   - `EOD_EVENTS_ENABLED` (default `true`)
   - `EOD_EVENTS_HOUR`, `EOD_EVENTS_MINUTE`
-- Trade PnL:
-  - `TRADE_PNL_ENABLED`, `TRADE_PNL_INTERVAL_MINUTES`
-  - `TRADE_PNL_TAKE_PROFIT_PCT`, `TRADE_PNL_STOP_LOSS_PCT`
-  - `TRADE_PNL_STOP_LOSS_BASIS` (`max_profit` or `max_loss`)
-- Performance analytics:
-  - `PERFORMANCE_ANALYTICS_ENABLED`, `PERFORMANCE_ANALYTICS_INTERVAL_MINUTES`
 - Staleness alerting:
   - `STALENESS_ALERT_ENABLED` (default `true`)
   - `STALENESS_ALERT_INTERVAL_MINUTES`
@@ -269,6 +408,28 @@ npm run dev
 
 Frontend default URL:
 - `http://localhost:5173`
+
+### 3) Run Optimizer (offline)
+
+```bash
+cd backend
+# Generate training data from production DB
+PYTHONPATH=. python scripts/generate_training_data.py
+
+# Run YAML-driven parameter sweep
+PYTHONPATH=. python scripts/backtest_strategy.py \
+  --optimize --config configs/optimizer/event_only_v2_explore.yaml \
+  --output-csv ../data/optimizer_results.csv
+
+# Walk-forward validation
+PYTHONPATH=. python scripts/backtest_strategy.py \
+  --walkforward --wf-auto --wf-train-months 3 --wf-test-months 1
+
+# Ingest results into database for dashboard
+PYTHONPATH=. python scripts/ingest_optimizer_results.py \
+  --run-name "my-run" --mode yaml-config \
+  --results-csv ../data/optimizer_results.csv
+```
 
 ---
 
@@ -312,6 +473,17 @@ Frontend default URL:
 - `GET /api/portfolio/trades` -- portfolio trade log with source tracking
 - `GET /api/portfolio/config` -- active portfolio + event + decision config
 
+### Optimizer endpoints (authenticated, prefix `/api/optimizer`)
+
+- `GET /api/optimizer/runs` -- list all optimizer runs with summary stats
+- `GET /api/optimizer/runs/{run_id}` -- single run details
+- `GET /api/optimizer/runs/{run_id}/results` -- paginated/sorted results for a run
+- `GET /api/optimizer/runs/{run_id}/pareto` -- Pareto frontier configs
+- `GET /api/optimizer/runs/{run_id}/equity-curve` -- equity curve data for a config
+- `GET /api/optimizer/regime-breakdown` -- regime performance breakdown
+- `GET /api/optimizer/compare` -- multi-config comparison
+- `GET /api/optimizer/walkforward/{run_id}` -- walk-forward validation results
+
 ### Admin endpoints (authenticated)
 
 - `POST /api/admin/run-snapshot`
@@ -340,7 +512,7 @@ Auth:
 - `auth_audit_log`: login/logout/register events.
 
 Core ingestion:
-- `chain_snapshots`: one row per captured chain (metadata + checksum; raw payload cleared to save storage).
+- `chain_snapshots`: one row per captured chain (metadata + checksum).
 - `option_chain_rows`: normalized options from each snapshot.
 - `underlying_quotes`: raw quote history.
 - `context_snapshots`: derived market context per timestamp (includes source-specific GEX columns).
@@ -366,6 +538,11 @@ Performance:
 - `trade_performance_snapshots`: aggregated performance snapshots.
 - `trade_performance_breakdowns`: per-dimension breakdowns (side, DTE, delta, etc).
 - `trade_performance_equity_curve`: daily equity curve data.
+
+Optimizer:
+- `optimizer_runs`: optimizer run metadata (name, mode, config count, status).
+- `optimizer_results`: per-config backtest metrics with Pareto flags.
+- `optimizer_walkforward`: walk-forward validation results per window.
 
 ML/backtest scaffolding:
 - `strategy_versions`, `model_versions`, `training_runs`
@@ -394,7 +571,7 @@ python -m spx_backend.database.reset_all_schema
 
 ## Testing
 
-Backend tests (45 test files):
+Backend tests (53 test files):
 
 ```bash
 cd backend
@@ -504,7 +681,8 @@ Unexpected DTE mapping:
 
 ## Next Improvements
 
-- Split CI predeploy checks into faster parallel jobs while preserving gate quality.
-- Expand backtest orchestration and historical replay tooling.
-- Add richer decision skip taxonomy views in dashboard.
 - Live broker order/fill automation beyond paper trading.
+- Automated optimizer scheduling (run sweeps on a cron, auto-ingest results).
+- Richer regime-conditional position sizing in the live system.
+- Split CI predeploy checks into faster parallel jobs.
+- Add richer decision skip taxonomy views in dashboard.
