@@ -204,7 +204,7 @@ class DecisionJob:
         drop_signals = [s for s in signals if s != "rally"]
         event_side_raw = settings.event_side_preference.rstrip("s")
         has_drop = any(
-            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated", "term_inversion")
             for s in drop_signals
         )
 

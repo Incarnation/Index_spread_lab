@@ -113,6 +113,61 @@ class TestConfigParsing:
         assert s.decision_avoid_opex is True
 
 
+class TestEventSidePreference:
+    """Verify that all event signals respect EVENT_SIDE_PREFERENCE."""
+
+    @staticmethod
+    def _resolve_event_sides(drop_signals: list[str], side_preference: str, spread_sides: list[str]) -> list[str]:
+        """Replicate the has_drop -> event_sides logic from _run_portfolio_managed.
+
+        This mirrors lines 204-217 of decision_job.py so we can test
+        the signal-to-side mapping without spinning up the full job.
+        """
+        event_side_raw = side_preference.rstrip("s")
+        has_drop = any(
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated", "term_inversion")
+            for s in drop_signals
+        )
+        if drop_signals:
+            if has_drop:
+                return [event_side_raw]
+            else:
+                return list(spread_sides)
+        return []
+
+    def test_spx_drop_uses_side_preference(self):
+        """spx_drop_1d signal should use EVENT_SIDE_PREFERENCE (put)."""
+        sides = self._resolve_event_sides(["spx_drop_1d"], "puts", ["put", "call"])
+        assert sides == ["put"]
+
+    def test_vix_spike_uses_side_preference(self):
+        sides = self._resolve_event_sides(["vix_spike"], "puts", ["put", "call"])
+        assert sides == ["put"]
+
+    def test_vix_elevated_uses_side_preference(self):
+        sides = self._resolve_event_sides(["vix_elevated"], "puts", ["put", "call"])
+        assert sides == ["put"]
+
+    def test_term_inversion_uses_side_preference(self):
+        """term_inversion must respect EVENT_SIDE_PREFERENCE, not fall back to both sides."""
+        sides = self._resolve_event_sides(["term_inversion"], "puts", ["put", "call"])
+        assert sides == ["put"]
+
+    def test_multiple_signals_uses_side_preference(self):
+        """When multiple signals fire, side preference is still respected."""
+        sides = self._resolve_event_sides(["term_inversion", "vix_elevated"], "puts", ["put", "call"])
+        assert sides == ["put"]
+
+    def test_no_signals_returns_empty(self):
+        sides = self._resolve_event_sides([], "puts", ["put", "call"])
+        assert sides == []
+
+    def test_unknown_signal_falls_back_to_spread_sides(self):
+        """An unrecognized signal that isn't in has_drop falls back to configured spread sides."""
+        sides = self._resolve_event_sides(["some_future_signal"], "puts", ["put", "call"])
+        assert sides == ["put", "call"]
+
+
 class TestIsOpexDay:
     """Validate the DecisionJob._is_opex_day static helper."""
 
