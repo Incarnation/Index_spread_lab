@@ -1,0 +1,44 @@
+name: event-only-v2
+description: >
+  Focused backtest to validate the live config with term_inversion
+  disabled (99.0) vs enabled (1.0), and max_event_trades 1/2/3.
+  Uses the best-performing parameter values from the original
+  165,888-config optimizer run.
+
+portfolio:
+  starting_capital: [20000]
+  max_trades_per_day: [3]
+  monthly_drawdown_limit: [0.15]
+  lot_per_equity: [20000]
+  max_equity_risk_pct: [0.10]
+  max_margin_pct: [0.30]
+  calls_only: [false]
+
+trading:
+  tp_pct: [0.50, 0.60]
+  sl_mult: [null, 2.0]
+  avoid_opex: [true]
+  width_filter: [10.0]
+
+event:
+  enabled: [true]
+  event_only: [true]
+  signal_mode: ["any"]
+  budget_mode: ["shared"]
+  max_event_trades: [1, 2, 3]
+  spx_drop_threshold: [-0.005, -0.01]
+  spx_drop_2d_threshold: [-0.01, -0.02]
+  vix_spike_threshold: [0.15]
+  vix_elevated_threshold: [25.0]
+  term_inversion_threshold: [1.0, 99.0]
+  side_preference: ["puts"]
+  min_dte: [3, 5]
+  max_dte: [7, 10]
+  min_delta: [0.10]
+  max_delta: [0.20]
+  rally_avoidance: [false]
+
+filters:
+  min_dte_lt_max_dte: true
+  min_delta_lt_max_delta: true
+  shared_single_event_trade: false
