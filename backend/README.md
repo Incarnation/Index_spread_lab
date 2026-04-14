@@ -79,6 +79,8 @@ tests/                         53 test files (unit + integration + E2E)
 
 ## Data Flow
 
+For runtime order of scheduled jobs and high-level workflows, see the root [README.md](../README.md) section **System Architecture**.
+
 ```mermaid
 flowchart TD
   subgraph ingest [Data Ingestion]

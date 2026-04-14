@@ -13,78 +13,170 @@ The current stack is:
 
 ## System Architecture
 
+These diagrams split the architecture by concern: **system context** (who talks to whom), **live pipeline** (causal data and trade flow), **scheduler timing** (when jobs run), and **offline optimizer** (research loop). For table-level data flow (which jobs write which tables), see [backend/README.md](backend/README.md) (Data Flow).
+
+### System context
+
+```mermaid
+flowchart LR
+  subgraph clients [Clients]
+    browser[Browser]
+  end
+  subgraph ext [External services]
+    tradier[Tradier API]
+    cboe[CBOE MZData]
+    twilio[Twilio SMS]
+    sendgrid[SendGrid email]
+  end
+  subgraph app [IndexSpreadLab]
+    spa[React SPA]
+    api[FastAPI]
+    sched[APScheduler jobs]
+  end
+  pg[(PostgreSQL)]
+  browser -->|HTTPS| spa
+  spa -->|JWT REST| api
+  api --> pg
+  sched --> pg
+  tradier --> sched
+  cboe --> sched
+  sched --> twilio
+  sched --> sendgrid
+  pg --> api
+```
+
+### Live pipeline (causal workflow)
+
 ```mermaid
 flowchart TB
-  subgraph external [External Data]
-    Tradier["Tradier API"]
-    CBOE["CBOE / MZData"]
-    Twilio["Twilio SMS"]
+  subgraph capture [Quotes and chains]
+    quoteJob[Quote job]
+    snapJob[Snapshot job]
   end
-
-  subgraph live [Live Pipeline — APScheduler]
-    QuoteJob["Quote Job"]
-    SnapshotJob["Snapshot Job"]
-    GexJob["GEX Job"]
-    CboeGexJob["CBOE GEX Job"]
-    FeatureBuilder["Feature Builder"]
-    DecisionJob["Decision Job"]
-    EventSignals["Event Signal Detector"]
-    PortfolioMgr["Portfolio Manager"]
-    TradePnl["Trade PnL Job"]
-    SmsNotifier["SMS Notifier"]
-    Labeler["Labeler"]
-    Trainer["Trainer"]
-    ShadowInference["Shadow Inference"]
-    PromotionGate["Promotion Gate"]
-    PerfAnalytics["Performance Analytics"]
-    Staleness["Staleness Monitor"]
-    Retention["Retention Job"]
-    EodEvents["EOD Events"]
+  subgraph gamma [GEX dual source]
+    gexJob[GEX job]
+    cboeJob[CBOE GEX job]
   end
-
-  subgraph offline [Offline Optimizer Pipeline]
-    GenTraining["generate_training_data.py"]
-    Backtest["backtest_strategy.py"]
-    YamlConfigs["YAML Configs"]
-    Regime["regime_analysis.py"]
-    Ingest["ingest_optimizer_results.py"]
+  subgraph prep [Candidates]
+    featJob[Feature builder]
   end
-
-  subgraph storage [PostgreSQL]
-    DB[("Database — 30+ tables")]
+  subgraph policy [Execution]
+    eventSig[Event signals from quotes]
+    portMgr[Portfolio manager]
+    decJob[Decision job]
   end
-
-  subgraph frontend [React Dashboard]
-    Dashboard["12-page SPA"]
+  subgraph lifecycle [Marks and exits]
+    pnlJob[Trade PnL job]
   end
-
-  Tradier --> QuoteJob & SnapshotJob
-  CBOE --> CboeGexJob
-  QuoteJob --> DB
-  SnapshotJob --> DB
-  GexJob --> DB
-  CboeGexJob --> DB
-  FeatureBuilder --> DB
-  EventSignals --> DecisionJob
-  PortfolioMgr --> DecisionJob
-  DecisionJob --> DB
-  DecisionJob --> SmsNotifier --> Twilio
-  TradePnl --> DB
-  TradePnl --> SmsNotifier
-  Labeler --> DB
-  Trainer --> DB
-  ShadowInference --> DB
-  PromotionGate --> DB
-  PerfAnalytics --> DB
-  EodEvents --> DB
-  Staleness -.->|SendGrid| external
-
-  DB --> Dashboard
-  GenTraining --> Backtest
-  YamlConfigs --> Backtest
-  Backtest --> Regime
-  Backtest --> Ingest --> DB
+  subgraph mlLoop [ML loop in parallel]
+    labeler[Labeler]
+    trainer[Trainer weekly]
+    shadow[Shadow inference]
+    promo[Promotion gate]
+  end
+  subgraph ops [Operations]
+    perfJob[Performance analytics]
+    eodJob[EOD events]
+    staleJob[Staleness monitor]
+    retJob[Retention job]
+  end
+  db[(PostgreSQL)]
+  sms[Twilio SMS]
+  email[SendGrid]
+  quoteJob --> db
+  snapJob --> db
+  snapJob --> gexJob
+  db --> gexJob
+  cboeJob --> db
+  gexJob --> db
+  db --> featJob
+  featJob --> db
+  db --> eventSig
+  db --> portMgr
+  eventSig --> decJob
+  portMgr --> decJob
+  db --> decJob
+  decJob --> db
+  decJob --> sms
+  db --> pnlJob
+  pnlJob --> db
+  pnlJob --> sms
+  db --> labeler
+  labeler --> db
+  db --> trainer
+  trainer --> db
+  db --> shadow
+  shadow --> db
+  db --> promo
+  promo --> db
+  db --> perfJob
+  perfJob --> db
+  eodJob --> db
+  retJob --> db
+  staleJob --> email
 ```
+
+### Scheduler timing (when jobs run)
+
+```mermaid
+flowchart TB
+  subgraph rth [RTH interval jobs]
+    r_quote[quote_job]
+    r_snap[snapshot_job]
+    r_spy[spy_snapshot optional]
+    r_vix[vix_snapshot optional]
+    r_gex[gex_job]
+    r_cboe[cboe_gex_job]
+    r_perf[performance_analytics_job]
+  end
+  subgraph entry [Entry time jobs]
+    e_feat[feature_builder_job]
+    e_dec[decision_job]
+  end
+  subgraph afterClose [After close jobs]
+    a_lbl[labeler_job]
+    a_shd[shadow_inference_job]
+  end
+  subgraph cadence [Interval weekly daily]
+    c_pnl[trade_pnl_job interval]
+    c_stale[staleness_monitor_job interval]
+    c_train[trainer_job weekly]
+    c_promo[promotion_gate_job weekly]
+    c_eod[eod_events_job scheduled]
+    c_ret[retention_job daily 0300 ET]
+  end
+```
+
+Job registration and guards (market-open, RTH windows, cooldowns) are described in [backend/README.md](backend/README.md) under **Scheduler Architecture**.
+
+### Offline optimizer pipeline
+
+```mermaid
+flowchart LR
+  subgraph inputs [Inputs]
+    prodDb[(Production DB)]
+    yamlCfg[YAML configs]
+  end
+  gen[generate_training_data.py]
+  backtest[backtest_strategy.py]
+  wf["Walk forward optional"]
+  regime["regime_analysis optional"]
+  ingest[ingest_optimizer_results.py]
+  pg[(PostgreSQL)]
+  dash[Optimizer dashboard]
+  prodDb --> gen
+  gen --> backtest
+  yamlCfg --> backtest
+  backtest --> wf
+  backtest --> regime
+  backtest --> ingest
+  wf -.->|optional outputs| ingest
+  regime -.->|optional outputs| ingest
+  ingest --> pg
+  pg --> dash
+```
+
+Walk-forward and regime analysis are optional steps that consume optimizer outputs; result CSVs are loaded into PostgreSQL via `ingest_optimizer_results.py` for the dashboard.
 
 ---
 
