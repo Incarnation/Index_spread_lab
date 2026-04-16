@@ -25,13 +25,16 @@ from generate_training_data import (  # noqa: E402
     TP_LEVELS,
     _cache_day_candidates,
     _compute_code_version,
+    _determine_relabel_days,
     _downsample_marks,
     _evaluate_outcome,
     _load_cache_manifest,
     _load_cached_day,
     _load_gex_csv,
+    _load_labels_manifest,
     _mid,
     _save_cache_manifest,
+    _save_labels_manifest,
     _time_to_expiry_years,
     bs_delta_vec,
     bs_price_vec,
@@ -1580,3 +1583,202 @@ class TestCandidateCache:
         """Loading a day that was never cached returns empty list."""
         reloaded = _load_cached_day(tmp_path, "2099-01-01")
         assert reloaded == []
+
+
+# ===================================================================
+#  Label Cache Tests
+# ===================================================================
+
+
+class TestLabelsManifest:
+    """Tests for label manifest load/save and corruption handling."""
+
+    def test_roundtrip(self, tmp_path: Path) -> None:
+        """Save then load a manifest and confirm it matches."""
+        manifest = {
+            "code_hash": "abc123",
+            "grid_hash": "grid456",
+            "trading_days_list": ["20250102", "20250103"],
+            "days": {
+                "2025-01-02": {"rows": 5, "max_expiry": "2025-01-17"},
+            },
+        }
+        _save_labels_manifest(tmp_path, manifest)
+        loaded = _load_labels_manifest(tmp_path)
+        assert loaded == manifest
+
+    def test_empty_dir_returns_empty_dict(self, tmp_path: Path) -> None:
+        """Loading from a dir with no manifest returns {}."""
+        assert _load_labels_manifest(tmp_path) == {}
+
+    def test_corrupt_json_returns_empty_dict(self, tmp_path: Path) -> None:
+        """A malformed JSON manifest is treated as empty (not a crash)."""
+        manifest_path = tmp_path / "labels_manifest.json"
+        manifest_path.write_text("{corrupt json here!!!}")
+        loaded = _load_labels_manifest(tmp_path)
+        assert loaded == {}
+
+    def test_binary_garbage_returns_empty_dict(self, tmp_path: Path) -> None:
+        """Binary content in the manifest file is treated as empty."""
+        manifest_path = tmp_path / "labels_manifest.json"
+        manifest_path.write_bytes(b"\x00\xff\xfe\xfd")
+        loaded = _load_labels_manifest(tmp_path)
+        assert loaded == {}
+
+
+class TestDetermineRelabelDays:
+    """Tests for _determine_relabel_days logic branches."""
+
+    @staticmethod
+    def _make_candidates(days: list[str]) -> list[dict]:
+        """Helper: create minimal candidate dicts for given ISO day strings."""
+        return [{"day": d} for d in days]
+
+    @staticmethod
+    def _make_manifest(
+        code_hash: str = "hash1",
+        grid_hash: str = "grid1",
+        trading_days: list[str] | None = None,
+        days_info: dict | None = None,
+    ) -> dict:
+        """Helper: build a manifest dict with sensible defaults."""
+        return {
+            "code_hash": code_hash,
+            "grid_hash": grid_hash,
+            "trading_days_list": trading_days or [],
+            "days": days_info or {},
+        }
+
+    def test_force_regen_returns_all_days(self) -> None:
+        """force_regen=True bypasses all caching — every day is relabeled."""
+        candidates = self._make_candidates(["2025-01-02", "2025-01-03"])
+        manifest = self._make_manifest(
+            days_info={
+                "2025-01-02": {"rows": 5, "max_expiry": "2025-01-17"},
+                "2025-01-03": {"rows": 3, "max_expiry": "2025-01-17"},
+            },
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102", "20250103"],
+            code_hash="hash1", force_regen=True, grid_hash="grid1",
+        )
+        assert result == {"2025-01-02", "2025-01-03"}
+
+    def test_empty_manifest_returns_all_days(self) -> None:
+        """An empty manifest means nothing is cached — relabel everything."""
+        candidates = self._make_candidates(["2025-01-02"])
+        result = _determine_relabel_days(
+            candidates, {},
+            trading_days=["20250102"],
+            code_hash="hash1", force_regen=False, grid_hash="grid1",
+        )
+        assert result == {"2025-01-02"}
+
+    def test_code_hash_change_returns_all_days(self) -> None:
+        """A different code hash invalidates the entire label cache."""
+        candidates = self._make_candidates(["2025-01-02"])
+        manifest = self._make_manifest(
+            code_hash="old_hash",
+            days_info={"2025-01-02": {"rows": 5, "max_expiry": "2025-01-17"}},
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102"],
+            code_hash="new_hash", force_regen=False, grid_hash="grid1",
+        )
+        assert result == {"2025-01-02"}
+
+    def test_grid_hash_change_returns_all_days(self) -> None:
+        """A different grid hash invalidates the entire label cache."""
+        candidates = self._make_candidates(["2025-01-02"])
+        manifest = self._make_manifest(
+            grid_hash="old_grid",
+            days_info={"2025-01-02": {"rows": 5, "max_expiry": "2025-01-17"}},
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102"],
+            code_hash="hash1", force_regen=False, grid_hash="new_grid",
+        )
+        assert result == {"2025-01-02"}
+
+    def test_no_new_data_cached_day_skipped(self) -> None:
+        """When no new trading days exist and a day is cached, it's skipped."""
+        candidates = self._make_candidates(["2025-01-02", "2025-01-03"])
+        manifest = self._make_manifest(
+            trading_days=["20250102", "20250103"],
+            days_info={
+                "2025-01-02": {"rows": 5, "max_expiry": "2025-01-17"},
+            },
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102", "20250103"],
+            code_hash="hash1", force_regen=False, grid_hash="grid1",
+        )
+        # 2025-01-02 is cached, 2025-01-03 is not
+        assert result == {"2025-01-03"}
+
+    def test_new_data_day_triggers_relabel_for_overlapping_expiry(self) -> None:
+        """A new trading day causes cached days with overlapping expiry to relabel.
+
+        If a cached day has max_expiry >= the earliest new trading day (in ISO),
+        its labels may have been affected by the new data.
+        """
+        candidates = self._make_candidates(["2025-01-02", "2025-01-06"])
+        manifest = self._make_manifest(
+            trading_days=["20250102", "20250103"],
+            days_info={
+                # max_expiry 2025-01-10 >= new day 2025-01-06 → relabel
+                "2025-01-02": {"rows": 5, "max_expiry": "2025-01-10"},
+                "2025-01-06": {"rows": 3, "max_expiry": "2025-01-10"},
+            },
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102", "20250103", "20250106"],
+            code_hash="hash1", force_regen=False, grid_hash="grid1",
+        )
+        # 20250106 is a new data day; both cached days have expiry >= 2025-01-06
+        assert "2025-01-02" in result
+        assert "2025-01-06" in result
+
+    def test_new_data_day_no_overlap_skipped(self) -> None:
+        """A new trading day doesn't invalidate cached days whose expiry is earlier."""
+        candidates = self._make_candidates(["2025-01-02"])
+        manifest = self._make_manifest(
+            trading_days=["20250102"],
+            days_info={
+                # max_expiry 2025-01-03 < new day 2025-01-10 → safe
+                "2025-01-02": {"rows": 5, "max_expiry": "2025-01-03"},
+            },
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            trading_days=["20250102", "20250110"],
+            code_hash="hash1", force_regen=False, grid_hash="grid1",
+        )
+        assert result == set()
+
+    def test_compact_cached_expiry_normalized_to_iso(self) -> None:
+        """A legacy compact-format max_expiry (YYYYMMDD) is handled correctly.
+
+        The function normalizes compact dates to ISO before comparing
+        against the ISO-formatted min_new date.
+        """
+        candidates = self._make_candidates(["2025-01-02"])
+        manifest = self._make_manifest(
+            trading_days=["20250102"],
+            days_info={
+                # Legacy compact format — should be converted to 2025-01-17
+                "2025-01-02": {"rows": 5, "max_expiry": "20250117"},
+            },
+        )
+        result = _determine_relabel_days(
+            candidates, manifest,
+            # New day 20250110 → ISO 2025-01-10 < expiry 2025-01-17 → relabel
+            trading_days=["20250102", "20250110"],
+            code_hash="hash1", force_regen=False, grid_hash="grid1",
+        )
+        assert result == {"2025-01-02"}

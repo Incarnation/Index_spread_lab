@@ -1,0 +1,20 @@
+# Narrow training grid for quick iteration and testing.
+# Put-side only, width 15, short DTEs, afternoon entries.
+# ~60 candidate slots per day (vs 1,344 for default).
+
+name: narrow
+description: Minimal grid for rapid prototyping — put-side, width 15, 0-1 DTE, afternoon entries.
+
+decision_minutes_et:
+  - [13, 0]
+  - [14, 0]
+  - [15, 0]
+
+dte_targets: [0, 1]
+delta_targets: [0.10, 0.15, 0.20, 0.25]
+spread_sides: [put]
+width_targets: [15.0]
+
+take_profit_pct: 0.50
+stop_loss_pct: 2.00
+label_mark_interval_minutes: 5

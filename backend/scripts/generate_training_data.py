@@ -101,6 +101,16 @@ MAX_IV = 5.0
 MIN_IV = 0.01
 IV_BISECT_ITERS = 60
 
+# Active training grid config — overridden by --config at runtime
+_ACTIVE_GRID: dict[str, Any] | None = None
+
+
+def _get_grid_param(name: str) -> Any:
+    """Return a grid parameter from the active config, falling back to the module constant."""
+    if _ACTIVE_GRID is not None:
+        return _ACTIVE_GRID[name]
+    return globals()[name]
+
 
 # ===================================================================
 # BLACK-SCHOLES (vectorised with numpy / scipy)
@@ -1333,13 +1343,17 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
       - ``max_adverse_pnl``       worst PnL seen across all marks
       - ``max_adverse_multiple``   max_adverse_pnl / max_profit
       - ``final_pnl_at_expiry``   PnL at the very last mark
-      - ``hit_stop_loss``         True if PnL breached -2x credit at any point
-      - ``recovered_after_sl``    True if 2x SL breached, then TP50 fired later
+      - ``hit_stop_loss``         True if PnL breached -SL threshold at any point
+      - ``recovered_after_sl``    True if SL breached, then primary TP fired later
+
+    The primary TP level is derived from ``TAKE_PROFIT_PCT`` in ``_ACTIVE_GRID``
+    (e.g. 0.50 -> TP50, 0.60 -> TP60).  If the configured level is not in
+    ``TP_LEVELS``, a warning is logged and 50 is used as the fallback.
 
     Backward-compatible fields (``hit_tp50``, ``realized_pnl``,
-    ``exit_reason``) preserve the original with-SL semantics.
+    ``exit_reason``) reflect the *configured* primary TP level (not always 50).
 
-    Hold-through columns (no-SL + close-at-first-TP strategy):
+    Hold-through columns (no-SL + close-at-first-configured-TP strategy):
       - ``hold_hit_tp50``, ``hold_realized_pnl``, ``hold_exit_reason``,
         ``hold_hit_tp100_at_expiry``
 
@@ -1380,7 +1394,17 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         }
 
     max_profit = entry_credit * CONTRACT_MULT * CONTRACTS
-    sl_thr = max_profit * STOP_LOSS_PCT
+    sl_thr = max_profit * _get_grid_param("STOP_LOSS_PCT")
+
+    # Derive the primary TP level from YAML config (e.g. 0.50 -> 50)
+    primary_tp_lvl = round(_get_grid_param("TAKE_PROFIT_PCT") * 100)
+    if primary_tp_lvl not in TP_LEVELS:
+        logger.warning(
+            "Configured TAKE_PROFIT_PCT %.2f maps to TP level %d which is not "
+            "in TP_LEVELS %s — falling back to 50",
+            _get_grid_param("TAKE_PROFIT_PCT"), primary_tp_lvl, TP_LEVELS,
+        )
+        primary_tp_lvl = 50
 
     # Per-TP-level thresholds and tracking
     tp_thresholds = {lvl: max_profit * (lvl / 100.0) for lvl in TP_LEVELS}
@@ -1390,7 +1414,7 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     max_adverse_pnl: float = 0.0
     max_favorable_pnl: float = 0.0
     sl_breach_pnl: float | None = None
-    sl_breached_before_tp50: bool = False
+    sl_breached_before_primary_tp: bool = False
     last_pnl: float | None = None
 
     for m in marks:
@@ -1416,8 +1440,8 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
 
         if sl_breach_pnl is None and pnl <= -sl_thr:
             sl_breach_pnl = pnl
-            if first_tp_pnl[50] is None:
-                sl_breached_before_tp50 = True
+            if first_tp_pnl[primary_tp_lvl] is None:
+                sl_breached_before_primary_tp = True
 
     if last_pnl is None:
         _trajectory_nulls["hold_exit_reason"] = "NO_VALID_MARKS"
@@ -1433,17 +1457,20 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     )
     final_is_tp100 = bool(last_pnl >= max_profit)
     hit_stop_loss = sl_breach_pnl is not None
-    recovered_after_sl = sl_breached_before_tp50 and first_tp_pnl[50] is not None
+    recovered_after_sl = (
+        sl_breached_before_primary_tp
+        and first_tp_pnl[primary_tp_lvl] is not None
+    )
 
-    # --- Original outcome (backward-compatible with-SL) ---
-    if sl_breached_before_tp50:
+    # --- Original outcome (with-SL, uses configured primary TP level) ---
+    if sl_breached_before_primary_tp:
         orig_exit = "STOP_LOSS"
         orig_pnl = sl_breach_pnl
         orig_tp50 = False
         orig_tp100 = False
-    elif first_tp_pnl[50] is not None:
-        orig_exit = "TAKE_PROFIT_50"
-        orig_pnl = first_tp_pnl[50]
+    elif first_tp_pnl[primary_tp_lvl] is not None:
+        orig_exit = f"TAKE_PROFIT_{primary_tp_lvl}"
+        orig_pnl = first_tp_pnl[primary_tp_lvl]
         orig_tp50 = True
         orig_tp100 = final_is_tp100
     else:
@@ -1452,10 +1479,10 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
         orig_tp50 = False
         orig_tp100 = final_is_tp100
 
-    # --- Hold-through outcome (ignore SL, close at first TP50) ---
-    if first_tp_pnl[50] is not None:
-        hold_exit = "TAKE_PROFIT_50"
-        hold_pnl = first_tp_pnl[50]
+    # --- Hold-through outcome (ignore SL, close at first configured TP) ---
+    if first_tp_pnl[primary_tp_lvl] is not None:
+        hold_exit = f"TAKE_PROFIT_{primary_tp_lvl}"
+        hold_pnl = first_tp_pnl[primary_tp_lvl]
         hold_tp50 = True
     else:
         hold_exit = "EXPIRY_OR_LAST_MARK"
@@ -1595,7 +1622,7 @@ def label_candidates(
                 })
 
         marks.sort(key=lambda m: m["ts"])
-        marks = _downsample_marks(marks)
+        marks = _downsample_marks(marks, _get_grid_param("LABEL_MARK_INTERVAL_MINUTES"))
 
         c.update(_evaluate_outcome(c["entry_credit"], marks))
         labeled.append(c)
@@ -1799,7 +1826,7 @@ def label_candidates_fast(
             ci = batch_start + i
             c = candidates[ci]
             marks = sorted(batch_marks[i], key=lambda m: m["ts"])
-            marks = _downsample_marks(marks)
+            marks = _downsample_marks(marks, _get_grid_param("LABEL_MARK_INTERVAL_MINUTES"))
             c.update(_evaluate_outcome(c["entry_credit"], marks))
             batch_marks[i] = []
 
@@ -1813,6 +1840,146 @@ def label_candidates_fast(
 
     print(f"  Labeling complete: {len(candidates)} candidates", flush=True)
     return candidates
+
+
+# ===================================================================
+# LABEL CACHE (incremental re-labeling)
+# ===================================================================
+
+LABELS_CACHE_DIR = DATA_DIR / "labels_cache"
+
+
+def _load_labels_manifest(cache_dir: Path) -> dict:
+    """Load the label cache manifest, or empty dict if missing/corrupt."""
+    manifest_path = cache_dir / "labels_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            logger.warning("Corrupt labels manifest %s: %s — treating as empty", manifest_path, exc)
+    return {}
+
+
+def _save_labels_manifest(cache_dir: Path, manifest: dict) -> None:
+    """Atomically write the label cache manifest."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / "labels_manifest.json.tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp.rename(cache_dir / "labels_manifest.json")
+
+
+def _compute_label_code_hash() -> str:
+    """Hash of label-related code sections for cache invalidation.
+
+    Uses the full script hash (same as candidate cache) since labeling
+    logic and evaluation logic are interleaved in the same file.
+    """
+    return _compute_code_version()
+
+
+def _compute_days_hash(trading_days: list[str]) -> str:
+    """Deterministic hash of the trading days list.
+
+    Any change (new days added, days removed) invalidates entries
+    whose expiry could be affected.
+    """
+    return hashlib.sha256(",".join(trading_days).encode()).hexdigest()[:16]
+
+
+def _determine_relabel_days(
+    all_candidates: list[dict],
+    manifest: dict,
+    trading_days: list[str],
+    code_hash: str,
+    force_regen: bool,
+    grid_hash: str = "default",
+) -> set[str]:
+    """Determine which entry-days need re-labeling vs can be loaded from cache.
+
+    Parameters
+    ----------
+    all_candidates : Full list of generated (unlabeled) candidates.
+    manifest : Current labels_manifest.json contents.
+    trading_days : Sorted list of all available trading day strings (compact YYYYMMDD).
+    code_hash : Current label code hash.
+    force_regen : Skip all caching.
+    grid_hash : Hash of the training grid config. A change means different
+        candidates were generated so all labels must be regenerated.
+
+    Returns
+    -------
+    Set of entry-day strings (ISO YYYY-MM-DD) that need fresh labeling.
+    """
+    if force_regen or not manifest:
+        return {c["day"] for c in all_candidates}
+
+    if manifest.get("code_hash") != code_hash:
+        return {c["day"] for c in all_candidates}
+
+    if manifest.get("grid_hash", "default") != grid_hash:
+        return {c["day"] for c in all_candidates}
+
+    cached_days_info = manifest.get("days", {})
+    prev_trading_days = set(manifest.get("trading_days_list", []))
+    current_trading_days = set(trading_days)
+    new_data_days = current_trading_days - prev_trading_days
+
+    entry_days = sorted({c["day"] for c in all_candidates})
+    days_to_relabel: set[str] = set()
+
+    if not new_data_days:
+        for day in entry_days:
+            if day not in cached_days_info:
+                days_to_relabel.add(day)
+        return days_to_relabel
+
+    # Convert compact YYYYMMDD to ISO for comparison with max_expiry
+    min_new_compact = min(new_data_days)
+    min_new_iso = f"{min_new_compact[:4]}-{min_new_compact[4:6]}-{min_new_compact[6:]}"
+
+    for day in entry_days:
+        info = cached_days_info.get(day)
+        if info is None:
+            days_to_relabel.add(day)
+        else:
+            cached_expiry = info.get("max_expiry", "9999-99-99")
+            # Normalize: if cached_expiry is compact, convert to ISO
+            if len(cached_expiry) == 8 and cached_expiry.isdigit():
+                cached_expiry = f"{cached_expiry[:4]}-{cached_expiry[4:6]}-{cached_expiry[6:]}"
+            if cached_expiry >= min_new_iso:
+                days_to_relabel.add(day)
+
+    return days_to_relabel
+
+
+def _load_labeled_cache_day(cache_dir: Path, day_str: str) -> list[dict]:
+    """Load labeled candidates for one entry day from the label cache.
+
+    Returns an empty list if the file is missing or corrupt so callers
+    can fall back to re-labeling.
+    """
+    fp = cache_dir / f"{day_str}.parquet"
+    if not fp.exists():
+        return []
+    try:
+        return pd.read_parquet(fp).to_dict("records")
+    except Exception:
+        logger.warning("Corrupt label cache %s — will re-label", fp)
+        return []
+
+
+def _save_labeled_cache_day(cache_dir: Path, day_str: str, candidates: list[dict]) -> None:
+    """Write labeled candidates for one entry day to the label cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fp = cache_dir / f"{day_str}.parquet"
+    if candidates:
+        df = pd.DataFrame(candidates)
+        safe_cols = [c for c in df.columns if not df[c].apply(lambda v: isinstance(v, (dict, list))).any()]
+        df[safe_cols].to_parquet(fp, index=False)
+    elif fp.exists():
+        fp.unlink()
 
 
 # ===================================================================
@@ -2056,17 +2223,23 @@ def _init_candidate_worker(
     uq_df_bytes: bytes,
     skew_daily_dict: dict,
     cal_map_dict: dict,
+    active_grid: dict[str, Any] | None = None,
 ) -> None:
     """Initializer for candidate-generation worker processes.
 
     Deserializes shared read-only reference data into module-level storage
     so each worker can access it without re-reading from disk.
+    On macOS (spawn-based multiprocessing), the parent's _ACTIVE_GRID is
+    NOT inherited, so it must be passed explicitly here.
     """
+    global _ACTIVE_GRID
     import pickle
     _WORKER_REF["spy_df"] = pickle.loads(spy_df_bytes)
     _WORKER_REF["uq_df"] = pickle.loads(uq_df_bytes)
     _WORKER_REF["skew_daily"] = skew_daily_dict
     _WORKER_REF["cal_map"] = cal_map_dict
+    if active_grid is not None:
+        _ACTIVE_GRID = active_grid
 
 
 def _generate_candidates_for_day(day_str: str) -> list[dict]:
@@ -2101,8 +2274,14 @@ def _generate_candidates_for_day(day_str: str) -> list[dict]:
     all_expiries = sorted({info["expiry"] for info in inst_map.values()})
     dte_map = build_dte_lookup(all_expiries, day_date)
 
+    grid_times = _get_grid_param("DECISION_MINUTES_ET")
+    grid_dtes = _get_grid_param("DTE_TARGETS")
+    grid_sides = _get_grid_param("SPREAD_SIDES")
+    grid_deltas = _get_grid_param("DELTA_TARGETS")
+    grid_widths = _get_grid_param("WIDTH_TARGETS")
+
     candidates: list[dict] = []
-    for hour, minute in DECISION_MINUTES_ET:
+    for hour, minute in grid_times:
         dec_et = datetime(
             day_date.year, day_date.month, day_date.day,
             hour, minute, tzinfo=ET,
@@ -2150,13 +2329,13 @@ def _generate_candidates_for_day(day_str: str) -> list[dict]:
                 snapshot, inst_map, oi_df, spx_spot, day_date,
             )
 
-        for dte_target in DTE_TARGETS:
+        for dte_target in grid_dtes:
             expiry = find_expiry_for_dte(dte_map, dte_target)
             if expiry is None:
                 continue
-            for side in SPREAD_SIDES:
-                for delta_target in DELTA_TARGETS:
-                    for width in WIDTH_TARGETS:
+            for side in grid_sides:
+                for delta_target in grid_deltas:
+                    for width in grid_widths:
                         cands = build_candidates_for_snapshot(
                             snapshot=snapshot,
                             inst_map=inst_map,
@@ -2196,9 +2375,18 @@ def _generate_candidates_for_day(day_str: str) -> list[dict]:
 
 
 def _compute_code_version() -> str:
-    """SHA-256 of this script, used to invalidate cache on code changes."""
-    src = Path(__file__).read_bytes()
-    return hashlib.sha256(src).hexdigest()[:16]
+    """SHA-256 of this script and its key dependencies for cache invalidation.
+
+    Includes _constants.py (CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT) and
+    regime_utils.py so that changes to contract economics or regime logic
+    also invalidate the candidate and label caches.
+    """
+    hasher = hashlib.sha256(Path(__file__).read_bytes())
+    for dep in ("_constants.py", "regime_utils.py"):
+        dep_path = Path(__file__).resolve().parent / dep
+        if dep_path.exists():
+            hasher.update(dep_path.read_bytes())
+    return hasher.hexdigest()[:16]
 
 
 def _load_cache_manifest(cache_dir: Path) -> dict:
@@ -2207,7 +2395,7 @@ def _load_cache_manifest(cache_dir: Path) -> dict:
     if manifest_path.exists():
         try:
             return json.loads(manifest_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             logger.warning("Corrupt cache manifest, ignoring: %s", exc)
     return {}
 
@@ -2237,12 +2425,19 @@ def _cache_day_candidates(
 
 
 def _load_cached_day(cache_dir: Path, day_str: str) -> list[dict]:
-    """Load cached candidates for a single day from Parquet."""
+    """Load cached candidates for a single day from Parquet.
+
+    Returns an empty list if the file is missing or corrupt so callers
+    can fall back to regeneration.
+    """
     parquet_path = cache_dir / f"{day_str}.parquet"
     if not parquet_path.exists():
         return []
-    df = pd.read_parquet(parquet_path)
-    return df.to_dict("records")
+    try:
+        return pd.read_parquet(parquet_path).to_dict("records")
+    except Exception:
+        logger.warning("Corrupt candidate cache %s — will regenerate", parquet_path)
+        return []
 
 
 # ===================================================================
@@ -2257,6 +2452,8 @@ def run_pipeline(
     workers: int = 8,
     force_regen: bool = False,
     cache_dir: Path = CANDIDATES_CACHE_DIR,
+    label_cache_dir: Path = LABELS_CACHE_DIR,
+    training_config: "TrainingGridConfig | None" = None,
 ) -> None:
     """Execute the full offline training pipeline end-to-end.
 
@@ -2274,7 +2471,26 @@ def run_pipeline(
     ----------
     force_regen : If True, ignore the candidate cache and regenerate all days.
     cache_dir : Directory for per-day Parquet candidate cache files.
+    training_config : Optional YAML-loaded grid config. When provided,
+        overrides module-level constants for entry times, DTEs, deltas,
+        widths, and spread sides.
     """
+    global _ACTIVE_GRID
+    if training_config is not None:
+        _ACTIVE_GRID = {
+            "DECISION_MINUTES_ET": training_config.as_tuples(),
+            "DTE_TARGETS": training_config.dte_targets,
+            "DELTA_TARGETS": training_config.delta_targets,
+            "SPREAD_SIDES": training_config.spread_sides,
+            "WIDTH_TARGETS": training_config.width_targets,
+            "TAKE_PROFIT_PCT": training_config.take_profit_pct,
+            "STOP_LOSS_PCT": training_config.stop_loss_pct,
+            "LABEL_MARK_INTERVAL_MINUTES": training_config.label_mark_interval_minutes,
+        }
+        print(f"[PIPELINE] Training config: {training_config.name} "
+              f"(hash={training_config.content_hash()})", flush=True)
+    else:
+        _ACTIVE_GRID = None
     t0 = time.time()
 
     # -- 1. Discover trading days --
@@ -2330,12 +2546,12 @@ def run_pipeline(
     # -- 3. Generate candidates (parallel across days, with incremental cache) --
     code_version = _compute_code_version()
     manifest = _load_cache_manifest(cache_dir)
-    decision_key = str(DECISION_MINUTES_ET)
+    grid_hash = training_config.content_hash() if training_config else "default"
 
     cache_valid = (
         not force_regen
         and manifest.get("code_version") == code_version
-        and manifest.get("decision_minutes") == decision_key
+        and manifest.get("grid_hash") == grid_hash
     )
     if force_regen:
         print("[PIPELINE] --force-regen: ignoring candidate cache", flush=True)
@@ -2345,7 +2561,7 @@ def run_pipeline(
         elif manifest.get("code_version") != code_version:
             reason = "code changed"
         else:
-            reason = "entry times changed"
+            reason = "grid config changed"
         print(f"[PIPELINE] Cache invalidated ({reason}), regenerating all days", flush=True)
 
     cached_days_info = manifest.get("days", {}) if cache_valid else {}
@@ -2383,7 +2599,7 @@ def run_pipeline(
             with Pool(
                 candidate_workers,
                 initializer=_init_candidate_worker,
-                initargs=(spy_bytes, uq_bytes, skew_daily, cal_map),
+                initargs=(spy_bytes, uq_bytes, skew_daily, cal_map, _ACTIVE_GRID),
             ) as pool:
                 for di, day_cands in enumerate(
                     pool.imap(_generate_candidates_for_day, days_to_generate),
@@ -2401,7 +2617,7 @@ def run_pipeline(
                             flush=True,
                         )
         else:
-            _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map)
+            _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map, _ACTIVE_GRID)
             for day_str in days_to_generate:
                 day_cands = _generate_candidates_for_day(day_str)
                 all_candidates.extend(day_cands)
@@ -2421,7 +2637,7 @@ def run_pipeline(
         # Update manifest
         _save_cache_manifest(cache_dir, {
             "code_version": code_version,
-            "decision_minutes": decision_key,
+            "grid_hash": grid_hash,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "days": new_manifest_days,
         })
@@ -2435,9 +2651,105 @@ def run_pipeline(
         print("[PIPELINE] No candidates generated. Check data paths.")
         return
 
-    # -- 4. Label candidates --
-    print(f"[PIPELINE] Labeling candidates (forward-looking, workers={workers}) ...", flush=True)
-    labeled = label_candidates_fast(all_candidates, trading_days, workers=workers)
+    # -- 4. Label candidates (with incremental label cache) --
+    labels_cache = label_cache_dir
+    labels_manifest = _load_labels_manifest(labels_cache)
+    label_code_hash = _compute_label_code_hash()
+
+    days_to_relabel = _determine_relabel_days(
+        all_candidates, labels_manifest, trading_days, label_code_hash, force_regen,
+        grid_hash=grid_hash,
+    )
+    cached_days_info = labels_manifest.get("days", {}) if not force_regen else {}
+
+    # Split candidates by entry day
+    cands_by_day: dict[str, list[dict]] = defaultdict(list)
+    for c in all_candidates:
+        cands_by_day[c["day"]].append(c)
+
+    reusable_days = set(cands_by_day.keys()) - days_to_relabel
+    reusable_from_cache = {d for d in reusable_days if d in cached_days_info}
+    n_reuse = sum(cached_days_info.get(d, {}).get("rows", 0) for d in reusable_from_cache)
+    n_relabel = sum(len(cands_by_day[d]) for d in days_to_relabel)
+
+    print(f"[PIPELINE] Label cache: {len(reusable_from_cache)} days reusable "
+          f"(~{n_reuse:,} candidates), {len(days_to_relabel)} days to relabel "
+          f"({n_relabel:,} candidates)", flush=True)
+
+    # Gather candidates that need labeling
+    cands_to_label = []
+    for day in sorted(days_to_relabel):
+        cands_to_label.extend(cands_by_day[day])
+
+    # Label the subset
+    if cands_to_label:
+        print(f"[PIPELINE] Labeling {len(cands_to_label):,} candidates "
+              f"(forward-looking, workers={workers}) ...", flush=True)
+        label_candidates_fast(cands_to_label, trading_days, workers=workers)
+
+    # Save newly labeled candidates to cache (per entry day)
+    new_labels_days_info = dict(cached_days_info)
+    for day in sorted(days_to_relabel):
+        day_cands = cands_by_day[day]
+        max_expiry = max((c.get("expiry", "0000-00-00") for c in day_cands), default="0000-00-00")
+        _save_labeled_cache_day(labels_cache, day, day_cands)
+        new_labels_days_info[day] = {
+            "rows": len(day_cands),
+            "max_expiry": max_expiry,
+            "file": f"{day}.parquet",
+        }
+
+    # Load cached labeled candidates for reusable days, verifying row counts
+    cached_labeled: list[dict] = []
+    missing_cache_days: list[str] = []
+    for day in sorted(reusable_from_cache):
+        expected_rows = len(cands_by_day[day])
+        cached_rows = cached_days_info.get(day, {}).get("rows", 0)
+        if cached_rows != expected_rows:
+            logger.warning(
+                "Label cache row mismatch for %s: cached=%d, expected=%d — relabeling",
+                day, cached_rows, expected_rows,
+            )
+            missing_cache_days.append(day)
+            continue
+        day_labeled = _load_labeled_cache_day(labels_cache, day)
+        if day_labeled:
+            cached_labeled.extend(day_labeled)
+        else:
+            missing_cache_days.append(day)
+
+    if missing_cache_days:
+        logger.warning(
+            "Label cache files missing for %d 'reusable' days — relabeling them: %s",
+            len(missing_cache_days), missing_cache_days[:5],
+        )
+        fallback_cands = []
+        for day in missing_cache_days:
+            fallback_cands.extend(cands_by_day[day])
+        if fallback_cands:
+            label_candidates_fast(fallback_cands, trading_days, workers=workers)
+            cands_to_label.extend(fallback_cands)
+            for day in missing_cache_days:
+                day_cands = cands_by_day[day]
+                max_expiry = max((c.get("expiry", "0000-00-00") for c in day_cands), default="0000-00-00")
+                _save_labeled_cache_day(labels_cache, day, day_cands)
+                new_labels_days_info[day] = {
+                    "rows": len(day_cands),
+                    "max_expiry": max_expiry,
+                    "file": f"{day}.parquet",
+                }
+
+    # Persist manifest AFTER recovery so repaired days are included
+    _save_labels_manifest(labels_cache, {
+        "code_hash": label_code_hash,
+        "grid_hash": grid_hash,
+        "trading_days_list": trading_days,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "days": new_labels_days_info,
+    })
+
+    # Merge: freshly labeled + cached
+    labeled = cands_to_label + cached_labeled
     resolved = [c for c in labeled if c.get("resolved")]
     print(f"[PIPELINE] Labeled: {len(labeled)}, Resolved: {len(resolved)}", flush=True)
 
@@ -2802,11 +3114,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--force-regen", action="store_true",
-        help="Ignore candidate cache and regenerate all days from scratch",
+        help="Ignore both candidate and label caches — regenerate and relabel all days from scratch",
     )
     parser.add_argument(
         "--cache-dir", type=str, default=str(CANDIDATES_CACHE_DIR),
         help=f"Directory for per-day Parquet candidate cache (default: {CANDIDATES_CACHE_DIR})",
+    )
+    parser.add_argument(
+        "--label-cache-dir", type=str, default=str(LABELS_CACHE_DIR),
+        help=f"Directory for per-day Parquet label cache (default: {LABELS_CACHE_DIR})",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a training grid YAML config file. Overrides hardcoded "
+             "entry times, DTEs, deltas, widths, and sides. "
+             "(e.g. backend/configs/training/narrow.yaml)",
     )
     args = parser.parse_args()
 
@@ -2815,6 +3137,25 @@ def main() -> None:
         return
 
     if args.relabel:
+        if args.config:
+            sys.path.insert(0, str(_BACKEND))
+            from configs.training.schema import load_training_config
+            _cfg = load_training_config(args.config)
+            global _ACTIVE_GRID
+            _ACTIVE_GRID = {
+                "DECISION_MINUTES_ET": _cfg.as_tuples(),
+                "DTE_TARGETS": _cfg.dte_targets,
+                "DELTA_TARGETS": _cfg.delta_targets,
+                "SPREAD_SIDES": _cfg.spread_sides,
+                "WIDTH_TARGETS": _cfg.width_targets,
+                "TAKE_PROFIT_PCT": _cfg.take_profit_pct,
+                "STOP_LOSS_PCT": _cfg.stop_loss_pct,
+                "LABEL_MARK_INTERVAL_MINUTES": _cfg.label_mark_interval_minutes,
+            }
+            print(f"[RELABEL] Using config '{_cfg.name}' "
+                  f"(TP={_cfg.take_profit_pct}, SL={_cfg.stop_loss_pct}) — "
+                  f"applies to SL re-evaluation and mark downsampling only; "
+                  f"non-SL rows keep existing labels from CSV", flush=True)
         relabel_from_csv()
         return
 
@@ -2823,6 +3164,12 @@ def main() -> None:
         xgb_main()
         return
 
+    training_config = None
+    if args.config:
+        sys.path.insert(0, str(_BACKEND))
+        from configs.training.schema import load_training_config
+        training_config = load_training_config(args.config)
+
     run_pipeline(
         max_days=args.max_days,
         deploy=args.deploy,
@@ -2830,6 +3177,8 @@ def main() -> None:
         workers=args.workers,
         force_regen=args.force_regen,
         cache_dir=Path(args.cache_dir),
+        label_cache_dir=Path(args.label_cache_dir),
+        training_config=training_config,
     )
 
 

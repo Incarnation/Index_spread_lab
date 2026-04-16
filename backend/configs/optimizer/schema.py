@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 class PortfolioGrid(BaseModel):
     """Allowed sweep values for PortfolioConfig fields."""
+    model_config = ConfigDict(extra="forbid")
     starting_capital: list[float] = [20_000]
     max_trades_per_day: list[int] = [2]
     monthly_drawdown_limit: list[float | None] = [0.15]
@@ -42,6 +43,7 @@ class PortfolioGrid(BaseModel):
 
 class TradingGrid(BaseModel):
     """Allowed sweep values for TradingConfig fields."""
+    model_config = ConfigDict(extra="forbid")
     tp_pct: list[float] = [0.50]
     sl_mult: list[float | None] = [None]
     max_vix: list[float | None] = [None]
@@ -54,6 +56,7 @@ class TradingGrid(BaseModel):
 
 class EventGrid(BaseModel):
     """Allowed sweep values for EventConfig fields."""
+    model_config = ConfigDict(extra="forbid")
     enabled: list[bool] = [False]
     signal_mode: list[str] = ["any"]
     budget_mode: list[str] = ["shared"]
@@ -77,6 +80,7 @@ class EventGrid(BaseModel):
 
 class RegimeGrid(BaseModel):
     """Allowed sweep values for RegimeThrottle fields."""
+    model_config = ConfigDict(extra="forbid")
     enabled: list[bool] = [False]
     high_vix_threshold: list[float] = [30.0]
     high_vix_multiplier: list[float] = [0.5]
@@ -89,6 +93,7 @@ class RegimeGrid(BaseModel):
 
 class FilterRules(BaseModel):
     """Post-generation filters to prune invalid combos."""
+    model_config = ConfigDict(extra="forbid")
     min_dte_lt_max_dte: bool = True
     min_delta_lt_max_delta: bool = True
     shared_single_event_trade: bool = True
@@ -97,6 +102,9 @@ class FilterRules(BaseModel):
 
 class OptimizerGridConfig(BaseModel):
     """Top-level YAML schema for an optimizer grid definition."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str = ""
     portfolio: PortfolioGrid = PortfolioGrid()
@@ -120,7 +128,7 @@ class OptimizerGridConfig(BaseModel):
 def _load_yaml(path: Path) -> OptimizerGridConfig:
     """Parse and validate a YAML grid definition file."""
     with open(path) as f:
-        raw = yaml.safe_load(f)
+        raw = yaml.safe_load(f) or {}
     return OptimizerGridConfig(**raw)
 
 

@@ -94,6 +94,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _constants import CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT
+from regime_utils import compute_regime_metrics
 
 DATA_DIR = _SCRIPTS_DIR.parents[1] / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
@@ -429,7 +430,8 @@ def precompute_pnl_columns(
     t0 = time.time()
 
     max_profit = df["entry_credit"] * CONTRACT_MULT * CONTRACTS
-    fallback = df["final_pnl_at_expiry"].fillna(df["realized_pnl"])
+    final_pnl = df.get("final_pnl_at_expiry", pd.Series(np.nan, index=df.index))
+    fallback = final_pnl.fillna(df["realized_pnl"])
     resolved = df.get("resolved", pd.Series(True, index=df.index))
     valid_entry = df["entry_credit"].notna() & (df["entry_credit"] > 0) & (resolved == True)  # noqa: E712 — intentional for NaN-safe Pandas comparison
     max_adverse = df.get("max_adverse_pnl", pd.Series(np.nan, index=df.index))
@@ -718,6 +720,7 @@ class BacktestResult:
     win_days: int
     sharpe: float
     monthly: pd.DataFrame
+    regime_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def _precompute_day_selections(
@@ -1045,6 +1048,8 @@ def run_backtest(
         })
         running_eq = m_end
 
+    regime_met = compute_regime_metrics(ec_df, daily_signals)
+
     return BacktestResult(
         config=config, label=label, curve=curve,
         final_equity=final, total_return_pct=total_ret,
@@ -1054,6 +1059,7 @@ def run_backtest(
         days_traded=days_traded, days_stopped=days_stopped,
         win_days=win_days, sharpe=sharpe,
         monthly=pd.DataFrame(monthly_rows),
+        regime_metrics=regime_met,
     )
 
 
@@ -1589,6 +1595,7 @@ def _backtest_worker(cfg: FullConfig) -> dict[str, Any]:
         "win_days": result.win_days,
         "win_rate": result.win_days / max(result.days_traded, 1),
     })
+    row.update(result.regime_metrics)
     return row
 
 
@@ -1676,6 +1683,7 @@ def _run_grid(
                 "win_days": result.win_days,
                 "win_rate": result.win_days / max(result.days_traded, 1),
             })
+            row.update(result.regime_metrics)
             rows.append(row)
 
             if (i + 1) % 500 == 0:
@@ -2439,6 +2447,7 @@ def walkforward_split(
 def _run_window_optimizer(
     df_slice: pd.DataFrame,
     top_n: int = 10,
+    config_path: str | None = None,
 ) -> pd.DataFrame:
     """Run the full optimizer grid on a data slice and return top-N rows.
 
@@ -2446,13 +2455,25 @@ def _run_window_optimizer(
     ----------
     df_slice : Subset of training candidates for this window.
     top_n : Number of top configs to return.
+    config_path : Optional YAML grid config. Uses YAML grid when provided,
+        falls back to the hardcoded ``_build_optimizer_grid()`` otherwise.
 
     Returns
     -------
     DataFrame with top-N rows by Sharpe, including all config columns.
     """
     daily_signals = precompute_daily_signals(df_slice)
-    configs = _build_optimizer_grid()
+    if config_path is not None:
+        from configs.optimizer.schema import build_configs_from_yaml
+        configs = build_configs_from_yaml(config_path)
+        if not configs:
+            logger.warning("YAML grid %s produced zero configs — returning empty DataFrame", config_path)
+            return pd.DataFrame()
+        tp_vals = sorted({c.trading.tp_pct for c in configs})
+        sl_vals = sorted({c.trading.sl_mult for c in configs}, key=lambda x: x or 0)
+        precompute_pnl_columns(df_slice, tp_vals, sl_vals)
+    else:
+        configs = _build_optimizer_grid()
 
     precomp_cache: dict[tuple, dict] = {}
     rows: list[dict[str, Any]] = []
@@ -2477,6 +2498,7 @@ def _run_window_optimizer(
             "win_days": result.win_days,
             "win_rate": result.win_days / max(result.days_traded, 1),
         })
+        row.update(result.regime_metrics)
         rows.append(row)
 
     results_df = pd.DataFrame(rows)
@@ -2491,7 +2513,8 @@ def _config_signature(row: pd.Series) -> str:
     lots = "grad" if row.get("p_lot_per_equity", 0) < 100_000 else "fixed"
     calls = "C" if row.get("p_calls_only") else "B"
     evt = "E" if row.get("e_enabled") else ""
-    bm = row.get("e_budget_mode", "")[0].upper() if row.get("e_enabled") else ""
+    _bm_raw = row.get("e_budget_mode", "") if row.get("e_enabled") else ""
+    bm = _bm_raw[0].upper() if _bm_raw else ""
     return f"{trades}/d|{stop_s}|{lots}|{calls}{evt}{bm}"
 
 
@@ -2503,7 +2526,8 @@ def _config_key(row: pd.Series) -> tuple:
     """
     return tuple(
         _opt_val(row.get(c)) for c in [
-            "p_max_trades_per_day", "p_monthly_drawdown_limit", "p_lot_per_equity",
+            "p_starting_capital", "p_max_trades_per_day", "p_monthly_drawdown_limit",
+            "p_lot_per_equity", "p_max_equity_risk_pct", "p_max_margin_pct",
             "p_calls_only", "p_min_dte", "p_max_delta",
             "t_tp_pct", "t_sl_mult", "t_max_vix", "t_max_term_structure",
             "t_avoid_opex", "t_prefer_event_days", "t_width_filter", "t_entry_count",
@@ -2528,6 +2552,7 @@ def run_walkforward(
     top_n: int = 10,
     *,
     windows: list[dict[str, str]] | None = None,
+    config_path: str | None = None,
 ) -> pd.DataFrame:
     """Run rolling walk-forward validation across all windows.
 
@@ -2542,6 +2567,9 @@ def run_walkforward(
     windows : Optional custom window list.  When ``None`` the hard-coded
         ``WALKFORWARD_WINDOWS`` are used.  Pass the output of
         ``generate_auto_windows()`` for data-driven window placement.
+    config_path : Optional YAML grid config for the optimizer. When
+        provided, walk-forward uses the same YAML grid as ``--optimize
+        --config``. When ``None``, uses the hardcoded exhaustive grid.
 
     Returns
     -------
@@ -2550,6 +2578,17 @@ def run_walkforward(
     effective_windows = windows if windows is not None else WALKFORWARD_WINDOWS
     all_rows: list[dict[str, Any]] = []
     config_appearances: dict[tuple, list[str]] = {}
+
+    data_min = df["day"].min()
+    data_max = df["day"].max()
+    any_overlap = any(
+        w["train_start"] <= data_max and w["test_end"] >= data_min
+        for w in effective_windows
+    )
+    if not any_overlap:
+        print(f"\n  WARNING: None of the {len(effective_windows)} walk-forward windows "
+              f"overlap with data range [{data_min} .. {data_max}]. "
+              f"Consider using --wf-auto to auto-generate windows.", flush=True)
 
     for window in effective_windows:
         wname = window["name"]
@@ -2572,9 +2611,10 @@ def run_walkforward(
             print("  SKIP: insufficient data in this window")
             continue
 
-        print(f"  Optimizing on train set ({len(_build_optimizer_grid()):,} configs) ...")
+        config_source = f"yaml:{Path(config_path).name}" if config_path else "exhaustive"
+        print(f"  Optimizing on train set (source={config_source}) ...")
         t0 = time.time()
-        top_train = _run_window_optimizer(train_df, top_n=top_n)
+        top_train = _run_window_optimizer(train_df, top_n=top_n, config_path=config_path)
         train_elapsed = time.time() - t0
         print(f"  Train optimization done in {train_elapsed:.0f}s")
 
@@ -2633,6 +2673,7 @@ def run_walkforward(
                 "train_max_dd_pct": train_dd,
                 "test_max_dd_pct": test_dd,
                 "verdict": verdict,
+                "config_source": config_source,
             })
             all_rows.append(row_out)
 
@@ -2662,11 +2703,125 @@ def run_walkforward(
         print("  This suggests high regime-dependence; consider simpler / more robust configs.")
 
     results_df = pd.DataFrame(all_rows)
-    if not results_df.empty:
-        results_df.to_csv(output_csv, index=False)
+    results_df.to_csv(output_csv, index=False)
+    if results_df.empty:
+        print(f"\n  Walk-forward: no valid windows produced results. Empty CSV at {output_csv}")
+    else:
         print(f"\n  Walk-forward results exported to {output_csv}")
 
     return results_df
+
+
+# ===================================================================
+# Holdout evaluation
+# ===================================================================
+
+
+def run_holdout_evaluation(
+    results_df: pd.DataFrame,
+    df_holdout: pd.DataFrame,
+    output_dir: Path,
+    top_n: int = 5,
+) -> pd.DataFrame:
+    """Evaluate top optimizer configs on a held-out data slice.
+
+    Picks the top-N configs by Sharpe from ``results_df``, runs each on
+    ``df_holdout``, and writes a comparison CSV showing development vs
+    holdout performance with a degradation percentage.
+
+    Ranking uses ``test_sharpe`` (out-of-sample Sharpe from walk-forward
+    windows) when that column exists in ``results_df``.  This gives a more
+    realistic ranking than in-sample ``sharpe``.  When ``test_sharpe`` is
+    absent (e.g. plain ``--optimize`` runs), ``sharpe`` is used instead.
+
+    Parameters
+    ----------
+    results_df : Optimizer results (from --optimize or --walkforward).
+    df_holdout : Held-out candidates DataFrame (never seen during optimization).
+    output_dir : Directory to write ``holdout_results.csv``.
+    top_n : Number of top configs to evaluate.
+
+    Returns
+    -------
+    DataFrame with development + holdout metrics for each config.
+    """
+    if results_df.empty or df_holdout.empty:
+        print("  Holdout: skipped (empty results or holdout data)")
+        return pd.DataFrame()
+
+    holdout_signals = precompute_daily_signals(df_holdout)
+    holdout_days = df_holdout["day"].nunique()
+    print(f"\n{'=' * 100}")
+    print(f"  HOLDOUT EVALUATION: {holdout_days} trading days, "
+          f"{len(df_holdout):,} candidates")
+    print(f"{'=' * 100}")
+
+    # Use test_sharpe (OOS) for ranking when available (walkforward results),
+    # fall back to sharpe (train/full-sample) for optimizer results
+    rank_col = "test_sharpe" if "test_sharpe" in results_df.columns else "sharpe"
+
+    # Deduplicate: when walk-forward produces the same config across multiple
+    # windows, keep only the row with the best ranking metric per unique config.
+    # Uses _config_key (NaN-normalized tuple) for consistent identity.
+    results_df = results_df.copy()
+    results_df["_dedup_key"] = results_df.apply(_config_key, axis=1)
+    deduped = (
+        results_df
+        .sort_values(rank_col, ascending=False)
+        .drop_duplicates(subset=["_dedup_key"], keep="first")
+        .drop(columns=["_dedup_key"])
+    )
+    top = deduped.nlargest(top_n, rank_col)
+    precomp_cache: dict[tuple, dict] = {}
+    rows: list[dict[str, Any]] = []
+
+    print(f"\n  {'#':>3} {'Config':<30} {'Dev Sharpe':>11} {'HO Sharpe':>10} "
+          f"{'Dev Ret':>8} {'HO Ret':>8} {'Degrade':>8}")
+    print("  " + "-" * 90)
+
+    for rank, (_, trow) in enumerate(top.iterrows(), 1):
+        cfg = _row_to_config(trow)
+        tpc_key = (cfg.trading.width_filter, cfg.trading.entry_count)
+        if tpc_key not in precomp_cache:
+            precomp_cache[tpc_key] = _precompute_day_selections(
+                df_holdout, width_filter=tpc_key[0], entry_count=tpc_key[1],
+            )
+        ho_result = run_backtest(
+            df_holdout, holdout_signals, cfg,
+            day_precomp=precomp_cache[tpc_key],
+        )
+
+        dev_sharpe = float(trow["sharpe"])
+        ho_sharpe = ho_result.sharpe
+        dev_ret = float(trow["return_pct"])
+        ho_ret = ho_result.total_return_pct
+
+        degradation = (1 - ho_sharpe / dev_sharpe) * 100 if dev_sharpe > 0 else 0
+
+        sig = _config_signature(trow)
+        print(f"  {rank:>3} {sig:<30} {dev_sharpe:>11.2f} {ho_sharpe:>10.2f} "
+              f"{dev_ret:>+7.0f}% {ho_ret:>+7.0f}% {degradation:>+7.0f}%")
+
+        row_out = trow.to_dict()
+        row_out.update({
+            "dev_sharpe": dev_sharpe,
+            "dev_return_pct": dev_ret,
+            "dev_max_dd_pct": float(trow.get("max_dd_pct", 0)),
+            "holdout_sharpe": ho_sharpe,
+            "holdout_return_pct": ho_ret,
+            "holdout_max_dd_pct": ho_result.max_drawdown_pct,
+            "holdout_trades": ho_result.total_trades,
+            "holdout_days": holdout_days,
+            "degradation_pct": round(degradation, 1),
+        })
+        row_out.update({f"ho_{k}": v for k, v in ho_result.regime_metrics.items()})
+        rows.append(row_out)
+
+    holdout_df = pd.DataFrame(rows)
+    ho_csv = output_dir / "holdout_results.csv"
+    holdout_df.to_csv(ho_csv, index=False)
+    print(f"\n  Holdout results exported to {ho_csv}")
+    return holdout_df
 
 
 # ===================================================================
@@ -2752,6 +2907,17 @@ def main() -> None:
     parser.add_argument("--git-tag", action="store_true", default=False,
                         help="Create a git tag for the experiment run")
 
+    parser.add_argument("--holdout-months", type=int, default=0,
+                        help="Reserve the most recent N months as a true out-of-sample holdout "
+                             "(0 = disabled, default). Data in the holdout is excluded from "
+                             "--optimize and --walkforward, then the top configs are "
+                             "automatically evaluated on it.")
+    parser.add_argument("--holdout-end", type=str, default=None,
+                        help="Explicit end date for the holdout window (YYYY-MM-DD). "
+                             "Defaults to the last day in the data.")
+    parser.add_argument("--holdout-top-n", type=int, default=5,
+                        help="Number of top configs to evaluate on the holdout set (default: 5)")
+
     args = parser.parse_args()
     args.backtest_workers = max(1, args.backtest_workers)
 
@@ -2800,6 +2966,31 @@ def main() -> None:
     print(f"  {len(df):,} candidates across {df['day'].nunique()} trading days")
     print(f"  Period: {df['day'].min()} to {df['day'].max()}")
 
+    # -- Holdout split --
+    df_holdout = pd.DataFrame()
+    if args.holdout_months > 0:
+        from dateutil.relativedelta import relativedelta
+        from datetime import datetime as _dt
+
+        holdout_end_str = args.holdout_end or df["day"].max()
+        holdout_end = _dt.strptime(holdout_end_str, "%Y%m%d") if len(holdout_end_str) == 8 \
+            else _dt.strptime(holdout_end_str, "%Y-%m-%d")
+        holdout_start = holdout_end - relativedelta(months=args.holdout_months)
+        ho_start_str = holdout_start.strftime("%Y-%m-%d")
+        ho_end_str = holdout_end.strftime("%Y-%m-%d")
+
+        df_holdout = df[(df["day"] >= ho_start_str) & (df["day"] <= ho_end_str)].copy()
+        df = df[df["day"] < ho_start_str].copy()
+
+        ho_days = df_holdout["day"].nunique()
+        dev_days = df["day"].nunique()
+        print(f"\n  HOLDOUT SPLIT: reserving {ho_days} trading days "
+              f"({ho_start_str} to {ho_end_str})")
+        print(f"  Development set: {dev_days} trading days, "
+              f"{len(df):,} candidates")
+        print(f"  Holdout set:     {ho_days} trading days, "
+              f"{len(df_holdout):,} candidates\n")
+
     print("Precomputing daily signals ...")
     daily_signals = precompute_daily_signals(df)
 
@@ -2816,7 +3007,15 @@ def main() -> None:
             )
             print(f"Auto-generated {len(wf_windows)} walk-forward windows from {min_day} to {max_day}")
         wf_output = Path(args.output_csv).parent / "walkforward_results.csv"
-        run_walkforward(df, output_csv=wf_output, windows=wf_windows)
+        wf_results = run_walkforward(df, output_csv=wf_output, windows=wf_windows,
+                                     config_path=args.config)
+
+        if not df_holdout.empty and not wf_results.empty:
+            run_holdout_evaluation(
+                wf_results, df_holdout,
+                output_dir=Path(args.output_csv).parent,
+                top_n=args.holdout_top_n,
+            )
 
     elif args.optimize_staged or args.optimize_event_only or args.optimize_selective or args.optimize:
         # Determine optimizer mode
@@ -2864,20 +3063,33 @@ def main() -> None:
             elif args.config:
                 from configs.optimizer.schema import build_configs_from_yaml
                 configs = build_configs_from_yaml(args.config)
-                tp_vals = sorted({c.trading.tp_pct for c in configs})
-                sl_vals = sorted({c.trading.sl_mult for c in configs}, key=lambda x: x or 0)
-                precompute_pnl_columns(df, tp_vals, sl_vals)
-                results_df = _run_grid(configs, df, daily_signals, "YAML-Grid",
-                                       num_workers=args.backtest_workers)
-                results_df.sort_values("sharpe", ascending=False, ignore_index=True, inplace=True)
-                results_df.to_csv(Path(args.output_csv), index=False)
-                print(f"\n  Results exported to {args.output_csv}", flush=True)
+                if not configs:
+                    print(f"\n  ERROR: YAML grid {args.config} produced zero configs — nothing to optimize.",
+                          flush=True)
+                    results_df = pd.DataFrame()
+                else:
+                    tp_vals = sorted({c.trading.tp_pct for c in configs})
+                    sl_vals = sorted({c.trading.sl_mult for c in configs}, key=lambda x: x or 0)
+                    precompute_pnl_columns(df, tp_vals, sl_vals)
+                    results_df = _run_grid(configs, df, daily_signals, "YAML-Grid",
+                                           num_workers=args.backtest_workers)
+                    results_df.sort_values("sharpe", ascending=False, ignore_index=True, inplace=True)
+                    results_df.to_csv(Path(args.output_csv), index=False)
+                    print(f"\n  Results exported to {args.output_csv}", flush=True)
             else:
                 results_df = run_optimizer(df, daily_signals, Path(args.output_csv),
                                            num_workers=args.backtest_workers)
 
-            for metric in ["sharpe", "return_pct", "max_dd_pct"]:
-                print_optimizer_top(results_df, metric)
+            if not results_df.empty:
+                for metric in ["sharpe", "return_pct", "max_dd_pct"]:
+                    print_optimizer_top(results_df, metric)
+
+            if not df_holdout.empty and not results_df.empty:
+                run_holdout_evaluation(
+                    results_df, df_holdout,
+                    output_dir=Path(args.output_csv).parent,
+                    top_n=args.holdout_top_n,
+                )
 
             # Finalize experiment tracking
             if tracker is not None:
@@ -2891,7 +3103,7 @@ def main() -> None:
                     tracker.log_artifact(output_path, "results.csv")
                 if args.config:
                     tracker.log_artifact(Path(args.config), "config.yaml")
-                top_n = results_df.nlargest(10, "sharpe")
+                top_n = results_df.nlargest(10, "sharpe") if not results_df.empty else results_df
                 tracker.log_summary({
                     "mode": mode,
                     "total_configs": len(results_df),

@@ -1,0 +1,24 @@
+# Default training candidate grid — matches current production constants.
+# Generates the full universe: 7 times × 6 DTEs × 4 deltas × 2 sides × 4 widths
+# = 1,344 candidate slots per trading day.
+
+name: default
+description: Full production grid covering all entry times, DTEs, deltas, and widths.
+
+decision_minutes_et:
+  - [10, 0]
+  - [11, 0]
+  - [12, 0]
+  - [13, 0]
+  - [14, 0]
+  - [15, 0]
+  - [16, 0]
+
+dte_targets: [0, 1, 3, 5, 7, 10]
+delta_targets: [0.10, 0.15, 0.20, 0.25]
+spread_sides: [put, call]
+width_targets: [5.0, 10.0, 15.0, 20.0]
+
+take_profit_pct: 0.50
+stop_loss_pct: 2.00
+label_mark_interval_minutes: 5
