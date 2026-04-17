@@ -207,6 +207,10 @@ def main() -> None:
                 cmd.extend(["--cache-dir", args.cache_dir])
             if args.label_cache_dir:
                 cmd.extend(["--label-cache-dir", args.label_cache_dir])
+            if args.start_date:
+                cmd.extend(["--start-date", args.start_date])
+            if args.end_date:
+                cmd.extend(["--end-date", args.end_date])
 
             if not _run_phase(
                 "Generate training candidates", cmd,

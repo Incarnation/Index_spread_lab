@@ -1779,6 +1779,8 @@ def label_candidates_fast(
 
     print(f"  Processing in {n_batches} batch(es) of up to {BATCH_SIZE:,}", flush=True)
 
+    t_label_start = time.time()
+
     for batch_idx in range(n_batches):
         batch_start = batch_idx * BATCH_SIZE
         batch_end = min(batch_start + BATCH_SIZE, n_cands)
@@ -1804,10 +1806,15 @@ def label_candidates_fast(
                 ):
                     for ci, marks in day_results:
                         batch_marks[ci - batch_start].extend(marks)
-                    if (di + 1) % 10 == 0 or di + 1 == n_batch_days:
+                    done = di + 1
+                    if done % 25 == 0 or done == n_batch_days:
+                        elapsed = time.time() - t_label_start
+                        rate = done / elapsed if elapsed > 0 else 0
+                        eta = (n_batch_days - done) / rate if rate > 0 else 0
                         print(
                             f"  Batch {batch_idx + 1}/{n_batches}: "
-                            f"extracted marks {di + 1}/{n_batch_days} forward days",
+                            f"extracted marks {done}/{n_batch_days} forward days "
+                            f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]",
                             flush=True,
                         )
         else:
@@ -1815,10 +1822,15 @@ def label_candidates_fast(
                 day_results = _extract_marks_for_day(day_item)
                 for ci, marks in day_results:
                     batch_marks[ci - batch_start].extend(marks)
-                if (di + 1) % 10 == 0 or di + 1 == n_batch_days:
+                done = di + 1
+                if done % 25 == 0 or done == n_batch_days:
+                    elapsed = time.time() - t_label_start
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = (n_batch_days - done) / rate if rate > 0 else 0
                     print(
                         f"  Batch {batch_idx + 1}/{n_batches}: "
-                        f"extracted marks {di + 1}/{n_batch_days} forward days",
+                        f"extracted marks {done}/{n_batch_days} forward days "
+                        f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]",
                         flush=True,
                     )
 
@@ -2454,6 +2466,8 @@ def run_pipeline(
     cache_dir: Path = CANDIDATES_CACHE_DIR,
     label_cache_dir: Path = LABELS_CACHE_DIR,
     training_config: "TrainingGridConfig | None" = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> None:
     """Execute the full offline training pipeline end-to-end.
 
@@ -2500,6 +2514,17 @@ def run_pipeline(
     if not trading_days:
         logger.error("No trading days found in %s or %s", SPXW_CBBO, SPX_CBBO)
         sys.exit(2)
+    # Apply date range filters (normalize YYYY-MM-DD to YYYYMMDD for comparison)
+    if start_date:
+        sd = start_date.replace("-", "")
+        before = len(trading_days)
+        trading_days = [d for d in trading_days if d >= sd]
+        print(f"[PIPELINE] --start-date {start_date}: {before} -> {len(trading_days)} days", flush=True)
+    if end_date:
+        ed = end_date.replace("-", "")
+        before = len(trading_days)
+        trading_days = [d for d in trading_days if d <= ed]
+        print(f"[PIPELINE] --end-date {end_date}: {before} -> {len(trading_days)} days", flush=True)
     if max_days:
         trading_days = trading_days[:max_days]
     print(
@@ -2595,6 +2620,9 @@ def run_pipeline(
 
         new_manifest_days = dict(cached_days_info)
 
+        t_gen_start = time.time()
+        n_gen_total = len(days_to_generate)
+
         if candidate_workers > 1:
             with Pool(
                 candidate_workers,
@@ -2616,9 +2644,20 @@ def run_pipeline(
                             f"  [{day_str}] {len(day_cands)} candidates (new)",
                             flush=True,
                         )
+                    done = di + 1
+                    if done % 25 == 0 or done == n_gen_total:
+                        elapsed = time.time() - t_gen_start
+                        rate = done / elapsed if elapsed > 0 else 0
+                        eta = (n_gen_total - done) / rate if rate > 0 else 0
+                        print(
+                            f"[PIPELINE] Candidates: {done}/{n_gen_total} days "
+                            f"({len(all_candidates):,} candidates) "
+                            f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]",
+                            flush=True,
+                        )
         else:
             _init_candidate_worker(spy_bytes, uq_bytes, skew_daily, cal_map, _ACTIVE_GRID)
-            for day_str in days_to_generate:
+            for di, day_str in enumerate(days_to_generate):
                 day_cands = _generate_candidates_for_day(day_str)
                 all_candidates.extend(day_cands)
                 n_cached = _cache_day_candidates(cache_dir, day_str, day_cands)
@@ -2629,6 +2668,17 @@ def run_pipeline(
                 if verbose:
                     print(
                         f"  [{day_str}] {len(day_cands)} candidates (new)",
+                        flush=True,
+                    )
+                done = di + 1
+                if done % 25 == 0 or done == n_gen_total:
+                    elapsed = time.time() - t_gen_start
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = (n_gen_total - done) / rate if rate > 0 else 0
+                    print(
+                        f"[PIPELINE] Candidates: {done}/{n_gen_total} days "
+                        f"({len(all_candidates):,} candidates) "
+                        f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]",
                         flush=True,
                     )
 
@@ -3130,6 +3180,14 @@ def main() -> None:
              "entry times, DTEs, deltas, widths, and sides. "
              "(e.g. backend/configs/training/narrow.yaml)",
     )
+    parser.add_argument(
+        "--start-date", type=str, default=None,
+        help="Only process trading days on or after this date (YYYYMMDD or YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date", type=str, default=None,
+        help="Only process trading days on or before this date (YYYYMMDD or YYYY-MM-DD)",
+    )
     args = parser.parse_args()
 
     if args.precompute_gex:
@@ -3179,6 +3237,8 @@ def main() -> None:
         cache_dir=Path(args.cache_dir),
         label_cache_dir=Path(args.label_cache_dir),
         training_config=training_config,
+        start_date=args.start_date,
+        end_date=args.end_date,
     )
 
 
