@@ -332,36 +332,54 @@ class TestPortfolioClosureIdempotency:
 
     @pytest.mark.asyncio
     async def test_first_closure_updates_equity(self):
-        """Normal closure flow adjusts equity."""
+        """Normal closure flow adjusts equity.
+
+        Mocks both the portfolio_trades UPDATE (rowcount=1) and the
+        atomic-delta portfolio_state UPDATE...RETURNING (fetchone returns
+        the post-write equity / trades_placed pair) since the equity
+        adjustment now flows through ``_apply_equity_delta`` instead of
+        the deleted ``_update_day_state`` helper.
+        """
         pm = PortfolioManager()
         pm.equity = 20000.0
         pm._trades_today = 1
+        pm._state_id = 1  # required by _apply_equity_delta
 
-        mock_result = MagicMock()
-        mock_result.rowcount = 1
+        update_result = MagicMock()
+        update_result.rowcount = 1
+        delta_result = MagicMock()
+        delta_result.rowcount = 1
+        delta_result.fetchone.return_value = (20150.0, 1)
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=[update_result, delta_result])
 
-        with patch.object(pm, "_update_day_state", new_callable=AsyncMock):
-            await pm.record_closure(trade_id=1, realized_pnl=150.0, session=mock_session)
+        await pm.record_closure(trade_id=1, realized_pnl=150.0, session=mock_session)
 
         assert pm.equity == 20150.0
 
     @pytest.mark.asyncio
     async def test_replay_closure_no_equity_change(self):
-        """Replayed closure (rowcount=0) leaves equity unchanged."""
+        """Replayed closure (rowcount=0 + row exists) leaves equity unchanged.
+
+        Now that ``record_closure`` distinguishes idempotent retries from
+        true split-brain, an existing row with non-NULL realized_pnl
+        triggers the no-op idempotent path: probe SELECT 1 returns 1, no
+        equity update happens, no exception raised.
+        """
         pm = PortfolioManager()
         pm.equity = 20000.0
         pm._trades_today = 1
 
-        mock_result = MagicMock()
-        mock_result.rowcount = 0
+        update_result = MagicMock()
+        update_result.rowcount = 0
+        probe_result = MagicMock()
+        probe_result.scalar.return_value = 1  # row exists (already closed)
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=[update_result, probe_result])
 
         await pm.record_closure(trade_id=1, realized_pnl=150.0, session=mock_session)
 
-        assert pm.equity == 20000.0, "Equity must not change on replayed closure"
+        assert pm.equity == 20000.0, "Equity must not change on idempotent replay"
 
 
 # ---------------------------------------------------------------------------
@@ -557,12 +575,18 @@ class TestIsExpiredIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 12. Portfolio replay: verify _update_day_state NOT called (T6)
+# 12. Portfolio replay: verify atomic-delta UPDATE NOT called on idempotent
+# replay; called exactly once on first closure.
 # ---------------------------------------------------------------------------
 
 
 class TestPortfolioReplaySkipsUpdate:
-    """On replay (rowcount=0), _update_day_state must not be called."""
+    """Idempotent replay must skip the equity-mutating UPDATE.
+
+    Rewritten after the ``_update_day_state`` -> ``_apply_equity_delta``
+    refactor.  The "did we mutate equity?" check is now expressed as
+    "did ``_apply_equity_delta`` get awaited?" on the public PM surface.
+    """
 
     @pytest.mark.asyncio
     async def test_replay_skips_day_state_update(self):
@@ -570,15 +594,17 @@ class TestPortfolioReplaySkipsUpdate:
         pm.equity = 20000.0
         pm._trades_today = 1
 
-        mock_result = MagicMock()
-        mock_result.rowcount = 0
+        update_result = MagicMock()
+        update_result.rowcount = 0
+        probe_result = MagicMock()
+        probe_result.scalar.return_value = 1  # row exists -> idempotent path
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(side_effect=[update_result, probe_result])
 
-        with patch.object(pm, "_update_day_state", new_callable=AsyncMock) as mock_update:
+        with patch.object(pm, "_apply_equity_delta", new_callable=AsyncMock) as mock_apply:
             await pm.record_closure(trade_id=1, realized_pnl=150.0, session=mock_session)
 
-        mock_update.assert_not_awaited()
+        mock_apply.assert_not_awaited()
         assert pm.equity == 20000.0
 
     @pytest.mark.asyncio
@@ -586,16 +612,21 @@ class TestPortfolioReplaySkipsUpdate:
         pm = PortfolioManager()
         pm.equity = 20000.0
         pm._trades_today = 1
+        pm._state_id = 1
 
-        mock_result = MagicMock()
-        mock_result.rowcount = 1
+        update_result = MagicMock()
+        update_result.rowcount = 1
         mock_session = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.execute = AsyncMock(return_value=update_result)
 
-        with patch.object(pm, "_update_day_state", new_callable=AsyncMock) as mock_update:
+        async def fake_apply(*, equity_delta, trades_delta, **kwargs):
+            pm.equity += equity_delta
+            return pm.equity, pm._trades_today
+
+        with patch.object(pm, "_apply_equity_delta", side_effect=fake_apply) as mock_apply:
             await pm.record_closure(trade_id=1, realized_pnl=150.0, session=mock_session)
 
-        mock_update.assert_awaited_once()
+        mock_apply.assert_awaited_once()
         assert pm.equity == 20150.0
 
 

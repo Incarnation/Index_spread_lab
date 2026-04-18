@@ -32,7 +32,6 @@ from generate_training_data import (  # noqa: E402
     _load_cached_day,
     _load_gex_csv,
     _load_labels_manifest,
-    _mid,
     _save_cache_manifest,
     _save_labels_manifest,
     _time_to_expiry_years,
@@ -55,6 +54,13 @@ from generate_training_data import (  # noqa: E402
     merge_underlying_quotes,
     walk_forward_validate,
 )
+# After the cross-cutting bid/ask helper migration the offline pipeline
+# uses the canonical ``mid_price`` from spx_backend.utils.pricing instead
+# of a script-local ``_mid``.  TestMid below now exercises that helper
+# through the same import path the script uses.  Aliasing to ``_mid``
+# keeps the existing test bodies untouched while reflecting the new
+# canonical helper.
+from spx_backend.utils.pricing import mid_price as _mid  # noqa: E402
 
 
 # ===================================================================

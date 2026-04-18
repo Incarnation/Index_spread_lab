@@ -507,7 +507,7 @@ class FeatureBuilderJob:
 
             for spread_side in spread_sides:
                 for target_dte in target_dtes:
-                    snapshot = await helper._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    snapshot = await helper._get_latest_snapshot_for_dte(session, now_et, target_dte)
                     if snapshot is None:
                         continue
                     options = await helper._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)

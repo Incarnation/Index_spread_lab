@@ -16,6 +16,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from spx_backend.config import settings
 from spx_backend.database.connection import engine
 
+
+class PortfolioClosureSplitBrainError(RuntimeError):
+    """Raised when ``record_closure`` cannot find the matching row.
+
+    Indicates the system is in a split-brain state: ``trades`` table
+    knows about a closure for a portfolio-managed trade but the
+    accompanying ``portfolio_trades`` row is missing (or already had
+    a non-NULL ``realized_pnl``).  The trade_pnl_job catches this
+    exception, sends an operator alert, and rolls back the closure
+    so the next pass can retry.
+
+    Carrying the offending ``trade_id`` lets the alert handler key
+    its cooldown on a single trade without spamming the inbox for
+    every concurrent closure attempt.
+    """
+
+    def __init__(self, trade_id: int, message: str) -> None:
+        super().__init__(message)
+        self.trade_id = trade_id
+
+
 MARGIN_PER_LOT = 1000  # keep in sync with scripts/_constants.py
 
 
@@ -111,31 +132,48 @@ class PortfolioManager:
             # doesn't reset the drawdown baseline to the current equity.
             db_month = await self._load_month_start_equity(month_key)
             self.month_start_equity = db_month if db_month is not None else self.equity
-            self._month_stopped = False
+            # Recover monthly_stop_active too, so a process restart after a
+            # drawdown trip doesn't accidentally allow new trades for the
+            # rest of the month.  We read the LATEST row in the current
+            # month: if any prior run flipped the flag, we honour it.
+            self._month_stopped = await self._load_month_stop_active(month_key)
 
         self._state_id = await self._upsert_day_state(
             equity_start=self._equity_start_today,
             month_start_equity=self.month_start_equity,
         )
         logger.info(
-            "portfolio_day_start date={} equity={:.0f} month_start={:.0f} lots={} trades_today={}",
+            "portfolio_day_start date={} equity={:.0f} month_start={:.0f} "
+            "lots={} trades_today={} month_stopped={}",
             today, self.equity, self.month_start_equity, self.compute_lots(),
-            self._trades_today,
+            self._trades_today, self._month_stopped,
         )
 
-    def can_trade(self) -> bool:
-        """Return True if another trade is permitted right now."""
+    async def can_trade(self) -> bool:
+        """Return True if another trade is permitted right now.
+
+        Async so that when the monthly drawdown limit trips for the
+        first time we can immediately persist ``monthly_stop_active=True``
+        to ``portfolio_state``.  Without that write, a process restart
+        between the trip and the next ``record_trade`` / ``record_closure``
+        call would lose the trip and the system would resume trading
+        within a stopped month.
+        """
         if self._month_stopped:
             return False
         if self.equity < _margin_per_lot():
             return False
         if self.monthly_dd_limit is not None:
-            if self.equity < self.month_start_equity * (1 - self.monthly_dd_limit):
+            threshold = self.month_start_equity * (1 - self.monthly_dd_limit)
+            if self.equity < threshold:
                 self._month_stopped = True
                 logger.warning(
                     "portfolio_monthly_stop equity={:.0f} threshold={:.0f}",
-                    self.equity, self.month_start_equity * (1 - self.monthly_dd_limit),
+                    self.equity, threshold,
                 )
+                # Persist immediately so a crash/restart between this trip
+                # and the next equity-mutating call doesn't lose the stop.
+                await self._persist_month_stop()
                 return False
         if self._trades_today >= self.max_trades:
             return False
@@ -170,6 +208,7 @@ class PortfolioManager:
         source: str = "scheduled",
         event_signal: str | None = None,
         session: AsyncSession | None = None,
+        margin_dollars: float | None = None,
     ) -> float:
         """Record a new trade entry and persist to database.
 
@@ -189,15 +228,46 @@ class PortfolioManager:
             instead of opening a new connection.  Required when the caller has
             an uncommitted ``trades`` row in the same session (avoids cross-txn
             FK violations under READ COMMITTED isolation).
+        margin_dollars : Per-trade total margin actually committed.  When
+            provided, persisted as ``portfolio_trades.margin_committed`` so
+            risk dashboards reflect the *actual* per-trade ``max_loss``
+            instead of the synthetic ``lots * MARGIN_PER_LOT`` derivation.
+            When ``None`` we fall back to the synthetic value for backward
+            compatibility with callers that don't yet pass it.
 
         Returns
         -------
         float : Total PnL booked for this entry.
         """
-        equity_before = self.equity
+        if lots <= 0:
+            # Defence-in-depth: production callers go through compute_lots()
+            # which is bounded >= 1, but a future caller passing lots=0 (or
+            # negative) would silently overwrite portfolio_state.lots_per_trade
+            # via the COALESCE in _apply_equity_delta.  Reject explicitly so
+            # the bug surfaces at the call site rather than as quiet state
+            # corruption discovered hours/days later.
+            raise ValueError(f"record_trade requires lots >= 1; got lots={lots}")
+
         total_pnl = pnl_per_lot * lots
-        self.equity += total_pnl
-        self._trades_today += 1
+        margin_committed = (
+            float(margin_dollars)
+            if margin_dollars is not None
+            else lots * _margin_per_lot()
+        )
+        equity_before = self.equity
+
+        # Atomic delta first so the UPDATE's RETURNING gives us the
+        # post-write equity (and trades_placed) value to use as
+        # equity_after on the portfolio_trades row.  Pass lots so the
+        # day's sizing decision is recorded once at entry and isn't
+        # later clobbered by closures (record_closure deliberately omits
+        # lots_per_trade so the COALESCE preserves the entry value).
+        new_equity, _ = await self._apply_equity_delta(
+            equity_delta=total_pnl,
+            trades_delta=1,
+            lots_per_trade=lots,
+            session=session,
+        )
 
         await self._insert_portfolio_trade(
             session=session,
@@ -205,18 +275,15 @@ class PortfolioManager:
             source=source,
             event_signal=event_signal,
             lots=lots,
-            margin=lots * _margin_per_lot(),
+            margin=margin_committed,
             pnl=None,
             equity_before=equity_before,
-            equity_after=self.equity,
-        )
-        await self._update_day_state(
-            equity_end=self.equity, trades=self._trades_today, session=session,
+            equity_after=new_equity,
         )
 
         logger.info(
-            "portfolio_trade source={} pnl={:.0f} lots={} equity={:.0f}->={:.0f}",
-            source, total_pnl, lots, equity_before, self.equity,
+            "portfolio_trade source={} pnl={:.0f} lots={} margin={:.0f} equity={:.0f}->={:.0f}",
+            source, total_pnl, lots, margin_committed, equity_before, new_equity,
         )
         return total_pnl
 
@@ -233,9 +300,15 @@ class PortfolioManager:
         and adjusts ``portfolio_state.equity_end`` so that lot sizing and
         drawdown checks reflect actual realized outcomes.
 
-        If no ``portfolio_trades`` row exists for the given trade (e.g. a
-        legacy trade pre-dating the portfolio system), the equity update is
-        skipped with a warning -- the ``trades`` table closure still stands.
+        Raises
+        ------
+        PortfolioClosureSplitBrainError
+            When no matching ``portfolio_trades`` row exists for the given
+            ``trade_id`` and the portfolio system is enabled.  This is a
+            data-integrity failure: the ``trades`` table is about to record
+            a closure for a portfolio-managed trade but the corresponding
+            ``portfolio_trades`` row is missing.  The caller is expected to
+            catch the exception, alert an operator, and roll back.
 
         Parameters
         ----------
@@ -261,22 +334,42 @@ class PortfolioManager:
                 result = await conn.execute(stmt, params)
 
         if result.rowcount == 0:
-            logger.warning(
-                "portfolio_closure_skip: no matching portfolio_trades row for "
-                "trade_id={} (missing or already closed)", trade_id,
+            # Probe whether ANY portfolio_trades row exists for this trade
+            # (regardless of realized_pnl).  Two paths:
+            #   * Row exists but already has realized_pnl: idempotent retry
+            #     of an already-closed trade -> silently no-op (legacy
+            #     behaviour preserved; this is normal in retry storms).
+            #   * Row truly missing: split-brain.  Raise so the caller
+            #     can alert + rollback.
+            existed = await self._portfolio_trade_row_exists(
+                trade_id=trade_id, session=session,
             )
-            return
+            if existed:
+                logger.info(
+                    "portfolio_closure_idempotent: trade_id={} already had "
+                    "realized_pnl set; no-op",
+                    trade_id,
+                )
+                return
+            # Truly missing row + portfolio is enabled = split-brain.
+            raise PortfolioClosureSplitBrainError(
+                trade_id=trade_id,
+                message=(
+                    f"portfolio_trades row missing for trade_id={trade_id}; "
+                    "trades table closure must be rolled back"
+                ),
+            )
 
         equity_before = self.equity
-        self.equity += realized_pnl
-
-        await self._update_day_state(
-            equity_end=self.equity, trades=self._trades_today, session=session,
+        new_equity, _ = await self._apply_equity_delta(
+            equity_delta=realized_pnl,
+            trades_delta=0,
+            session=session,
         )
 
         logger.info(
             "portfolio_closure trade_id={} pnl={:.2f} equity={:.2f}->{:.2f}",
-            trade_id, realized_pnl, equity_before, self.equity,
+            trade_id, realized_pnl, equity_before, new_equity,
         )
 
     # ── DB helpers ────────────────────────────────────────────────
@@ -339,6 +432,55 @@ class PortfolioManager:
             result = row.fetchone()
             return float(result[0]) if result else None
 
+    async def _load_month_stop_active(self, month_key: str) -> bool:
+        """Read the latest ``monthly_stop_active`` flag in the given month.
+
+        On process restart we need to know whether a prior run tripped the
+        monthly drawdown stop.  We read the LATEST row of the month rather
+        than the earliest because the trip can happen any day; once tripped
+        the flag stays True for the remainder of the month, so the latest
+        row's value is authoritative.
+
+        Returns False when no rows exist for the month or when the column
+        is NULL (defensive: schema default is False so this should be rare).
+        """
+        async with engine.connect() as conn:
+            row = await conn.execute(text(
+                "SELECT monthly_stop_active FROM portfolio_state "
+                "WHERE to_char(date, 'YYYY-MM') = :mk "
+                "ORDER BY date DESC LIMIT 1"
+            ), {"mk": month_key})
+            result = row.fetchone()
+            if result is None or result[0] is None:
+                return False
+            return bool(result[0])
+
+    async def _persist_month_stop(self) -> None:
+        """Persist ``monthly_stop_active=True`` to today's portfolio_state row.
+
+        Called from ``can_trade()`` the moment the drawdown trip is detected
+        so the flag is durable across restarts even if no further write
+        (record_trade / record_closure) happens before the process dies.
+
+        Always opens its own short-lived transaction (no ``session`` kwarg)
+        because the trip can fire from any caller context, including ones
+        that haven't opened a session.
+        """
+        if self._state_id is None:
+            logger.warning(
+                "_persist_month_stop: skipped (state_id not initialized; "
+                "begin_day was likely not called)"
+            )
+            return
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE portfolio_state SET monthly_stop_active = TRUE "
+                    "WHERE id = :sid"
+                ),
+                {"sid": self._state_id},
+            )
+
     async def _upsert_day_state(
         self,
         equity_start: float,
@@ -361,41 +503,154 @@ class PortfolioManager:
             ), {"d": self._today, "es": equity_start, "ms": month_start_equity})
             return row.scalar_one()
 
-    async def _update_day_state(
+    async def _apply_equity_delta(
         self,
-        equity_end: float,
-        trades: int,
+        *,
+        equity_delta: float,
+        trades_delta: int,
+        lots_per_trade: int | None = None,
         event_signals: list[str] | None = None,
         session: AsyncSession | None = None,
-    ) -> None:
-        """Update today's portfolio_state with end-of-day values.
+    ) -> tuple[float, int]:
+        """Atomically apply equity / trades deltas and return refreshed state.
+
+        Replaces the previous absolute-overwrite ``_update_day_state``.
+        Two concurrent trades booked in different sessions used to race:
+        each read ``self.equity``, added their PnL, and overwrote
+        ``equity_end`` -- the second write wiped the first's PnL.
+
+        Now we let Postgres do the addition with a single SQL statement
+        keyed on the row id, then refresh the in-memory cache with the
+        ``RETURNING`` row.  ``daily_pnl`` is recomputed from the new
+        equity_end so it never drifts from ``equity_end - equity_start``.
 
         Parameters
         ----------
-        session : Optional existing session; when provided the UPDATE runs
-            inside that transaction instead of opening a standalone one.
+        equity_delta:
+            Signed dollar change to apply to ``equity_end``.  ``0`` is
+            allowed (e.g. zero-PnL closure) and produces a no-op equity
+            change but still refreshes the in-memory cache.
+        trades_delta:
+            Signed integer change to apply to ``trades_placed``.
+            ``record_trade`` passes ``1``; ``record_closure`` passes ``0``.
+        lots_per_trade:
+            Optional per-day lot-sizing snapshot to merge into the row
+            via ``COALESCE(:lpt, lots_per_trade)``.  ``record_trade``
+            passes the freshly-computed ``lots`` so the entry path
+            durably records the day's sizing decision; ``record_closure``
+            omits it so the closure path doesn't clobber the original
+            entry value with a stale fallback (the previous implementation
+            derived ``lpt`` from ``self._lots_today`` which is ``None`` on
+            the closure path's fresh PortfolioManager instance, causing
+            every closure to overwrite ``lots_per_trade`` with ``1``).
+        event_signals:
+            Optional list of event-signal names to merge into the JSONB
+            column.  ``None`` preserves the existing column value rather
+            than overwriting with NULL.
+        session:
+            Optional existing async session; when provided the UPDATE runs
+            inside that transaction so the caller can roll back the trade
+            insert and the equity update together.
+
+        Returns
+        -------
+        tuple[float, int]
+            The post-update ``(equity_end, trades_placed)`` as read from
+            ``RETURNING``.  These values are also written into
+            ``self.equity`` and ``self._trades_today`` so the in-memory
+            cache stays consistent for the next ``can_trade`` call.
+
+        Notes
+        -----
+        ``monthly_stop_active`` is intentionally NOT in the ``RETURNING``
+        clause.  The flag is written eagerly by ``_persist_month_stop``
+        the moment ``can_trade`` trips the drawdown gate, and reloaded by
+        ``begin_day`` via ``_load_month_stop_active`` whenever the
+        ``PortfolioManager`` enters a new calendar month -- which in
+        production includes every freshly-constructed instance, since
+        ``decision_job._run_portfolio_managed`` builds a new
+        ``ProdPortfolioManager`` per run and ``_current_month`` starts as
+        ``None``.  Refreshing the flag from every equity-delta would
+        couple two unrelated write paths and require additional retry
+        logic if the column went NULL on a legacy row, with no
+        observable benefit.
         """
-        params = {
-            "ee": equity_end,
-            "tp": trades,
-            "dpnl": equity_end - self._equity_start_today,
-            "ms": self._month_stopped,
-            "lpt": self._lots_today or 1,
+        if self._state_id is None:
+            raise RuntimeError(
+                "_apply_equity_delta called before begin_day initialized "
+                "self._state_id"
+            )
+        params: dict[str, Any] = {
+            "delta": float(equity_delta),
+            "tdelta": int(trades_delta),
+            "lpt": int(lots_per_trade) if lots_per_trade is not None else None,
             "ev": json.dumps(event_signals) if event_signals else None,
             "sid": self._state_id,
         }
+        # COALESCE for both equity_end and trades_placed because the row
+        # was inserted with equity_end = equity_start (non-null) but the
+        # trades_placed default could be NULL on legacy rows.  Using
+        # COALESCE keeps the increment safe regardless.
+        # lots_per_trade and event_signals both use COALESCE(:param,
+        # column) so passing None preserves the current value instead of
+        # nulling it out -- closures must not overwrite the entry-time
+        # sizing or the entry-time signal list.
         stmt = text(
             "UPDATE portfolio_state SET "
-            "  equity_end = :ee, trades_placed = :tp, daily_pnl = :dpnl, "
-            "  monthly_stop_active = :ms, lots_per_trade = :lpt, "
-            "  event_signals = :ev "
-            "WHERE id = :sid"
+            "  equity_end = COALESCE(equity_end, equity_start) + :delta, "
+            "  trades_placed = COALESCE(trades_placed, 0) + :tdelta, "
+            "  daily_pnl = COALESCE(equity_end, equity_start) + :delta - equity_start, "
+            "  lots_per_trade = COALESCE(:lpt, lots_per_trade), "
+            "  event_signals = COALESCE(:ev::jsonb, event_signals) "
+            "WHERE id = :sid "
+            "RETURNING equity_end, trades_placed"
         )
         if session is not None:
-            await session.execute(stmt, params)
+            result = await session.execute(stmt, params)
         else:
             async with engine.begin() as conn:
-                await conn.execute(stmt, params)
+                result = await conn.execute(stmt, params)
+        row = result.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"_apply_equity_delta: no portfolio_state row for "
+                f"id={self._state_id} (race or manual delete?)"
+            )
+        new_equity = float(row[0])
+        new_trades = int(row[1])
+        # Refresh in-memory cache so subsequent can_trade() / compute_lots
+        # decisions see the durable post-write state.
+        self.equity = new_equity
+        self._trades_today = new_trades
+        return new_equity, new_trades
+
+    async def _portfolio_trade_row_exists(
+        self,
+        *,
+        trade_id: int,
+        session: AsyncSession | None,
+    ) -> bool:
+        """Probe whether ANY portfolio_trades row exists for ``trade_id``.
+
+        Used by ``record_closure`` to distinguish the two reasons a 0-rowcount
+        UPDATE can happen:
+
+        * Row exists with non-NULL realized_pnl -> idempotent retry, ok.
+        * Row truly missing -> split-brain, raise.
+
+        Runs in the caller's session when provided so it sees uncommitted
+        writes from the same transaction.
+        """
+        stmt = text(
+            "SELECT 1 FROM portfolio_trades WHERE trade_id = :tid LIMIT 1"
+        )
+        params = {"tid": trade_id}
+        if session is not None:
+            result = await session.execute(stmt, params)
+        else:
+            async with engine.connect() as conn:
+                result = await conn.execute(stmt, params)
+        return result.scalar() is not None
 
     async def _insert_portfolio_trade(
         self,

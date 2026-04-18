@@ -8,7 +8,7 @@ import pytest
 
 import spx_backend.jobs.decision_job as decision_module
 from spx_backend.config import settings
-from spx_backend.jobs.decision_job import DecisionJob
+from spx_backend.jobs.decision_job import CreatedTrade, DecisionJob
 
 
 class _FakeResult:
@@ -161,7 +161,7 @@ async def test_snapshot_selection_queries_are_freshness_scoped(monkeypatch: pyte
     snapshot_row = (10, datetime(2026, 2, 12, 16, 58, 0, tzinfo=ZoneInfo("UTC")), date(2026, 2, 20), 8)
     session = _FakeSession(rows=[None, snapshot_row])
 
-    result = await job._get_latest_snapshot_for_dte(session, now_et, target_dte=0, force=False)
+    result = await job._get_latest_snapshot_for_dte(session, now_et, target_dte=0)
 
     assert result is not None
     assert result["snapshot_id"] == 10
@@ -174,20 +174,29 @@ async def test_snapshot_selection_queries_are_freshness_scoped(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_snapshot_selection_force_mode_disables_freshness_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_snapshot_selection_always_applies_freshness_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freshness must always be enforced.
+
+    Replaces the previous ``force=True`` test which used to verify the
+    bypass.  After the correctness fix, ``force`` no longer participates
+    in snapshot selection (it remains a top-level run_once flag for
+    bypassing entry-time / RTH checks only).
+    """
     _set_default_decision_settings(monkeypatch)
     job = DecisionJob()
     now_et = datetime(2026, 2, 12, 12, 0, 0, tzinfo=ZoneInfo("America/New_York"))
     snapshot_row = (11, datetime(2026, 2, 12, 10, 0, 0, tzinfo=ZoneInfo("UTC")), date(2026, 2, 20), 8)
     session = _FakeSession(rows=[snapshot_row])
 
-    result = await job._get_latest_snapshot_for_dte(session, now_et, target_dte=0, force=True)
+    result = await job._get_latest_snapshot_for_dte(session, now_et, target_dte=0)
 
     assert result is not None
     sql, params = session.calls[0]
     assert "ts <= :now_ts" in sql
-    assert "ts >= :min_ts" not in sql
+    # Freshness clause is now mandatory; this is the regression guard.
+    assert "ts >= :min_ts" in sql
     assert "now_ts" in params
+    assert "min_ts" in params
 
 
 def test_decision_spread_sides_list_parses_csv_and_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,10 +359,23 @@ async def test_run_once_creates_top_n_with_dedupe(monkeypatch: pytest.MonkeyPatc
         return decision_id
 
     async def fake_create_trade(self, **kwargs):  # noqa: ANN001
-        """Return incrementing trade IDs for created trades."""
+        """Return CreatedTrade payloads for created trades.
+
+        After the Phase-5 refactor the real ``_create_trade_from_decision``
+        returns a :class:`CreatedTrade` dataclass so the portfolio path can
+        read ``max_loss``.  The fake mirrors that contract; ``trade_id`` is
+        what callers care about, the rest are filler values that satisfy
+        the dataclass.
+        """
         trade_id = 700 + len(trade_ids) + 1
         trade_ids.append(trade_id)
-        return trade_id
+        return CreatedTrade(
+            trade_id=trade_id,
+            max_loss=1000.0,
+            spread_side="put",
+            entry_credit=1.0,
+            contracts=1,
+        )
 
     monkeypatch.setattr(DecisionJob, "_max_open_trades", fake_max_open)
     monkeypatch.setattr(DecisionJob, "_trades_today", fake_trades_today)
@@ -463,10 +485,20 @@ async def test_run_once_clips_by_day_cap(monkeypatch: pytest.MonkeyPatch) -> Non
         return 1200 + len(created_trade_ids) + 1
 
     async def fake_create_trade(self, **kwargs):  # noqa: ANN001
-        """Return incrementing trade IDs for one expected insertion."""
+        """Return CreatedTrade payloads for one expected insertion.
+
+        Mirrors the production ``_create_trade_from_decision`` contract so
+        the run_once caller can read ``created.trade_id``.
+        """
         trade_id = 2200 + len(created_trade_ids) + 1
         created_trade_ids.append(trade_id)
-        return trade_id
+        return CreatedTrade(
+            trade_id=trade_id,
+            max_loss=1000.0,
+            spread_side="put",
+            entry_credit=1.0,
+            contracts=1,
+        )
 
     monkeypatch.setattr(DecisionJob, "_max_open_trades", fake_max_open)
     monkeypatch.setattr(DecisionJob, "_trades_today", fake_trades_today)

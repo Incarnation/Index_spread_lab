@@ -13,16 +13,33 @@ from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
 from spx_backend.services.portfolio_manager import PortfolioManager as ProdPortfolioManager
 from spx_backend.services.event_signals import EventSignalDetector as ProdEventSignalDetector
+from spx_backend.utils.pricing import mid_price
 
 if TYPE_CHECKING:
     from spx_backend.services.sms_notifier import SmsNotifier
 
 
-def _mid(bid: float | None, ask: float | None) -> float | None:
-    """Return mid price when both bid/ask are present."""
-    if bid is None or ask is None:
-        return None
-    return (float(bid) + float(ask)) / 2.0
+@dataclass(frozen=True)
+class CreatedTrade:
+    """Return payload from :meth:`DecisionJob._create_trade_from_decision`.
+
+    Hoisted to a typed object so callers (notably the portfolio path)
+    can pass the per-trade ``max_loss`` straight into
+    ``PortfolioManager.record_trade(margin_dollars=...)`` without
+    re-deriving it.  The legacy non-portfolio caller only needs
+    ``trade_id``; treating the return value as a plain ``int`` would
+    silently lose the new fields.
+    """
+
+    trade_id: int
+    # Naming intentional: matches ``trades.max_loss`` schema column and
+    # the existing ``trade.max_loss`` accessor in ``trade_pnl_job``.
+    # Renaming to ``max_loss_dollars`` would create a vocabulary split
+    # for no behavioural benefit.
+    max_loss: float
+    spread_side: str
+    entry_credit: float
+    contracts: int
 
 
 @dataclass(frozen=True)
@@ -168,7 +185,7 @@ class DecisionJob:
                     logger.info("decision_job: skipping OPEX day {}", now_et.date())
                     return self._build_run_result(now_et=now_et, skipped=True, reason="opex_day")
 
-        if not pm.can_trade():
+        if not await pm.can_trade():
             skip_reason = f"portfolio_{pm.status_label() if hasattr(pm, 'status_label') else 'limit'}"
             dte_list = settings.decision_dte_targets_list()
             delta_list = settings.decision_delta_targets_list()
@@ -203,8 +220,15 @@ class DecisionJob:
 
         drop_signals = [s for s in signals if s != "rally"]
         event_side_raw = settings.event_side_preference.rstrip("s")
+        # has_drop drives "use event_side_preference for the spread side"
+        # vs "use the configured spread sides".  We mirror the backtester
+        # here: only outright drop signals (spx_drop*) and VIX signals
+        # (vix_spike, vix_elevated) qualify.  term_inversion was previously
+        # included in live but excluded by the backtester, causing live
+        # event trades on inversion-only days to bias toward the wrong
+        # side relative to the historical study.
         has_drop = any(
-            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated", "term_inversion")
+            s.startswith("spx_drop") or s in ("vix_spike", "vix_elevated")
             for s in drop_signals
         )
 
@@ -226,7 +250,7 @@ class DecisionJob:
             for spread_side in all_sides:
                 side_delta_targets = settings.decision_delta_targets_for_side(spread_side)
                 for target_dte in decision_dtes:
-                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte)
                     if snapshot is None:
                         continue
                     options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
@@ -273,6 +297,12 @@ class DecisionJob:
             sms_trade_infos: list[dict] = []
 
             run_limit = settings.portfolio_max_trades_per_run
+            # Shared dedupe across event + scheduled loops: a high-rank
+            # candidate placed by the event loop must not be placed again
+            # as a "scheduled" trade in the same run.  Previously
+            # seen_keys was scoped to the scheduled loop, which let the
+            # same spread duplicate when both loops fired in one run.
+            seen_keys: set[tuple] = set()
 
             if settings.event_enabled and drop_signals:
                 event_cap = min(settings.event_max_trades, run_limit)
@@ -285,8 +315,11 @@ class DecisionJob:
                     and c["delta_target"] <= settings.event_max_delta
                 ]
                 for c in event_candidates[:event_cap]:
-                    if not pm.can_trade():
+                    if not await pm.can_trade():
                         break
+                    key = self._candidate_dedupe_key(c)
+                    if key in seen_keys:
+                        continue
                     decision_id = await self._insert_decision(
                         session=session, now_et=now_et, entry_slot=entry_slot,
                         target_dte=c["target_dte"], delta_target=c["delta_target"],
@@ -296,27 +329,34 @@ class DecisionJob:
                         strategy_params_json=c["strategy_params_json"],
                         decision_source="portfolio_event",
                     )
-                    trade_id = await self._create_trade_from_decision(
+                    created = await self._create_trade_from_decision(
                         session=session, decision_id=decision_id,
                         now_et=now_et, chosen=c, candidate_ref={},
                         contracts_override=lots,
                     )
-                    await pm.record_trade(trade_id, 0.0, lots,
-                                          source="event",
-                                          event_signal=",".join(drop_signals),
-                                          session=session)
+                    await pm.record_trade(
+                        created.trade_id, 0.0, lots,
+                        source="event",
+                        event_signal=",".join(drop_signals),
+                        session=session,
+                        margin_dollars=created.max_loss,
+                    )
                     decisions_created.append({
-                        "decision_id": int(decision_id), "trade_id": int(trade_id),
+                        "decision_id": int(decision_id),
+                        "trade_id": int(created.trade_id),
                         "target_dte": c["target_dte"], "delta_target": c["delta_target"],
                         "spread_side": (c.get("chosen_legs_json") or {}).get("spread_side", ""),
                         "score": c["credit_to_width"], "decision_source": "portfolio_event",
                     })
-                    trades_created.append(int(trade_id))
+                    trades_created.append(int(created.trade_id))
                     sms_trade_infos.append(self._build_sms_trade_info(
                         c, contracts=lots, source="portfolio_event",
                         event_signals=drop_signals,
                     ))
                     event_trades_placed += 1
+                    # Mark this candidate seen so the scheduled loop below
+                    # does not pick the same legs again.
+                    seen_keys.add(key)
 
             # Scheduled trades (capped by per-run stagger limit)
             if not skip_scheduled and not settings.event_only_mode:
@@ -325,10 +365,11 @@ class DecisionJob:
                     sched_limit = max(0, sched_limit - event_trades_placed)
                 sched_ranked = [c for c in ranked if c.get("spread_side", "").lower() in sched_sides]
                 sched_candidates = sched_ranked[:sched_limit * 2]
-                seen_keys: set[tuple] = set()
                 placed = 0
                 for c in sched_candidates:
-                    if placed >= sched_limit or not pm.can_trade():
+                    if placed >= sched_limit:
+                        break
+                    if not await pm.can_trade():
                         break
                     key = self._candidate_dedupe_key(c)
                     if key in seen_keys:
@@ -344,20 +385,24 @@ class DecisionJob:
                         strategy_params_json=c["strategy_params_json"],
                         decision_source="portfolio_scheduled",
                     )
-                    trade_id = await self._create_trade_from_decision(
+                    created = await self._create_trade_from_decision(
                         session=session, decision_id=decision_id,
                         now_et=now_et, chosen=c, candidate_ref={},
                         contracts_override=lots,
                     )
-                    await pm.record_trade(trade_id, 0.0, lots, source="scheduled",
-                                          session=session)
+                    await pm.record_trade(
+                        created.trade_id, 0.0, lots, source="scheduled",
+                        session=session,
+                        margin_dollars=created.max_loss,
+                    )
                     decisions_created.append({
-                        "decision_id": int(decision_id), "trade_id": int(trade_id),
+                        "decision_id": int(decision_id),
+                        "trade_id": int(created.trade_id),
                         "target_dte": c["target_dte"], "delta_target": c["delta_target"],
                         "spread_side": (c.get("chosen_legs_json") or {}).get("spread_side", ""),
                         "score": c["credit_to_width"], "decision_source": "portfolio_scheduled",
                     })
-                    trades_created.append(int(trade_id))
+                    trades_created.append(int(created.trade_id))
                     sms_trade_infos.append(self._build_sms_trade_info(
                         c, contracts=lots, source="portfolio_scheduled",
                     ))
@@ -540,7 +585,7 @@ class DecisionJob:
             for spread_side in eligible_spread_sides:
                 side_delta_targets = settings.decision_delta_targets_for_side(spread_side)
                 for target_dte in decision_dtes:
-                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte, force=force)
+                    snapshot = await self._get_latest_snapshot_for_dte(session, now_et, target_dte)
                     if snapshot is None:
                         continue
                     options = await self._get_option_rows(session, snapshot["snapshot_id"], spread_side=spread_side)
@@ -767,7 +812,7 @@ class DecisionJob:
                     prediction_id=(int(prediction_id) if prediction_id is not None else None),
                     model_version_id=(int(model_version_id) if model_version_id is not None else None),
                 )
-                trade_id = await self._create_trade_from_decision(
+                created = await self._create_trade_from_decision(
                     session=session,
                     decision_id=decision_id,
                     now_et=now_et,
@@ -779,7 +824,7 @@ class DecisionJob:
                 decisions_created.append(
                     {
                         "decision_id": int(decision_id),
-                        "trade_id": int(trade_id),
+                        "trade_id": int(created.trade_id),
                         "target_dte": int(chosen["target_dte"]),
                         "delta_target": float(chosen["delta_target"]),
                         "spread_side": spread_side if spread_side in {"put", "call"} else settings.decision_spread_side.lower(),
@@ -787,7 +832,7 @@ class DecisionJob:
                         "decision_source": decision_source,
                     }
                 )
-                trades_created.append(int(trade_id))
+                trades_created.append(int(created.trade_id))
                 sms_trade_infos.append(self._build_sms_trade_info(
                     chosen, contracts=int(settings.decision_contracts or 1),
                     source=decision_source,
@@ -841,16 +886,24 @@ class DecisionJob:
         session,
         now_et: datetime,
         target_dte: int,
-        *,
-        force: bool = False,
     ) -> dict | None:
-        """Select the most recent snapshot within DTE tolerance and age window."""
+        """Select the most recent snapshot within DTE tolerance and age window.
+
+        ``force`` mode in ``run_once`` bypasses entry-time and RTH guards
+        but MUST NOT bypass snapshot freshness: trading on a 2-day-old
+        chain because an admin manually triggered a run is exactly the
+        kind of mistake we want to fail closed.  The freshness clause is
+        therefore always applied here.
+        """
         tol = settings.decision_dte_tolerance_days
         min_dte = target_dte - tol
         max_dte = target_dte + tol
         now_utc = now_et.astimezone(ZoneInfo("UTC"))
         min_ts = now_utc - timedelta(minutes=settings.decision_snapshot_max_age_minutes)
-        freshness_sql = "" if force else "AND ts >= :min_ts"
+        # Always-on freshness guard.  Previously this was conditionally
+        # disabled when the caller passed force=True, which silently
+        # allowed admin-triggered runs to use stale chain data.
+        freshness_sql = "AND ts >= :min_ts"
         row = await session.execute(
             text(
                 f"""
@@ -988,8 +1041,8 @@ class DecisionJob:
         if side_lower == "call" and long["strike"] <= short["strike"]:
             return None
 
-        short_mid = _mid(short["bid"], short["ask"])
-        long_mid = _mid(long["bid"], long["ask"])
+        short_mid = mid_price(short["bid"], short["ask"])
+        long_mid = mid_price(long["bid"], long["ask"])
         if short_mid is None or long_mid is None:
             return None
 
@@ -1385,8 +1438,12 @@ class DecisionJob:
         candidate_ref: dict,
         model_version_id: int | None = None,
         contracts_override: int | None = None,
-    ) -> int:
+    ) -> CreatedTrade:
         """Insert one OPEN trade and its legs from the chosen decision candidate.
+
+        Returns a :class:`CreatedTrade` so the portfolio path can pass the
+        per-trade ``max_loss`` straight into ``record_trade(margin_dollars=...)``
+        instead of re-deriving it.
 
         Parameters
         ----------
@@ -1406,6 +1463,17 @@ class DecisionJob:
         entry_credit = float(chosen.get("credit") or 0.0)
         max_profit = max(entry_credit, 0.0) * contracts * multiplier
         max_loss = max(width_points - entry_credit, 0.0) * contracts * multiplier
+        # max_loss == 0 means the spread sells for full width (no risk),
+        # which only happens with stale/dead quotes that slipped past
+        # mid_price's strict gate.  Refuse to insert such a trade rather
+        # than silently book a zero-margin position that the portfolio
+        # manager (and downstream PnL math) will treat as risk-free.
+        if max_loss <= 0.0:
+            raise RuntimeError(
+                f"_create_trade_from_decision: refusing trade with non-positive "
+                f"max_loss={max_loss} (width={width_points}, credit={entry_credit}, "
+                f"contracts={contracts}, multiplier={multiplier})"
+            )
         take_profit_target = max_profit * settings.trade_pnl_take_profit_pct
         sl_basis_value = (
             max_loss if settings.trade_pnl_stop_loss_basis == "max_loss"
@@ -1523,7 +1591,13 @@ class DecisionJob:
                 "option_right": option_right,
             },
         )
-        return trade_id
+        return CreatedTrade(
+            trade_id=trade_id,
+            max_loss=float(max_loss),
+            spread_side=spread_side,
+            entry_credit=float(entry_credit),
+            contracts=int(contracts),
+        )
 
     async def _max_open_trades(self, session) -> int:
         """Count OPEN trades to enforce risk limits."""

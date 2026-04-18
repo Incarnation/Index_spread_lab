@@ -10,13 +10,7 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
-
-
-def _mid(bid: float | None, ask: float | None) -> float | None:
-    """Return mid quote when both bid and ask are available."""
-    if bid is None or ask is None:
-        return None
-    return (float(bid) + float(ask)) / 2.0
+from spx_backend.utils.pricing import mid_price
 
 
 def _to_json(value: dict | None) -> str | None:
@@ -92,8 +86,8 @@ def evaluate_candidate_outcome(
     last_ts: datetime | None = None
 
     for mark in marks:
-        short_mid = _mid(mark.short_bid, mark.short_ask)
-        long_mid = _mid(mark.long_bid, mark.long_ask)
+        short_mid = mid_price(mark.short_bid, mark.short_ask)
+        long_mid = mid_price(mark.long_bid, mark.long_ask)
         if short_mid is None or long_mid is None:
             continue
         exit_cost = short_mid - long_mid

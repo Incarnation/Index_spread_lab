@@ -62,6 +62,12 @@ class TestRecordTradeNullPnl:
         """When called with a session, the portfolio_trades INSERT must use
         realized_pnl=NULL so record_closure can match it later."""
         mock_session = AsyncMock()
+        # _apply_equity_delta now precedes the INSERT; supply a fetchone
+        # payload so the RETURNING read doesn't blow up.
+        delta_result = MagicMock()
+        delta_result.rowcount = 1
+        delta_result.fetchone.return_value = (20_000.0, 1)
+        mock_session.execute = AsyncMock(return_value=delta_result)
         pm = self._setup_pm()
 
         run(pm.record_trade(
@@ -82,6 +88,12 @@ class TestRecordTradeNullPnl:
 
     def test_record_trade_inserts_null_realized_pnl_via_engine(self):
         """Without a session, the engine path must also use realized_pnl=NULL."""
+        # Atomic delta in record_trade goes through engine.begin() too;
+        # supply RETURNING fetchone payload via the begin connection.
+        delta_result = MagicMock()
+        delta_result.rowcount = 1
+        delta_result.fetchone.return_value = (20_000.0, 1)
+        self.mock_begin_conn.execute = AsyncMock(return_value=delta_result)
         pm = self._setup_pm()
 
         run(pm.record_trade(trade_id=43, pnl_per_lot=0.0, lots=1))
@@ -101,9 +113,12 @@ class TestRecordTradeNullPnl:
         """record_closure's SQL uses WHERE realized_pnl IS NULL, confirming
         it pairs with the NULL inserted by record_trade."""
         mock_session = AsyncMock()
-        result_mock = MagicMock()
-        result_mock.rowcount = 1
-        mock_session.execute = AsyncMock(return_value=result_mock)
+        # First execute: portfolio_trades UPDATE rowcount=1
+        # Second execute: _apply_equity_delta UPDATE...RETURNING fetchone
+        delta_result = MagicMock()
+        delta_result.rowcount = 1
+        delta_result.fetchone.return_value = (20_150.0, 1)
+        mock_session.execute = AsyncMock(return_value=delta_result)
 
         pm = self._setup_pm()
         pm._trades_today = 1

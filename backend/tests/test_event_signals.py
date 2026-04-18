@@ -9,7 +9,14 @@ from spx_backend.services.event_signals import EventSignalDetector
 
 @pytest.fixture()
 def detector() -> EventSignalDetector:
-    """Detector with explicit thresholds independent of env config."""
+    """Detector with explicit thresholds independent of env config.
+
+    Uses ``signal_mode="any"`` so existing trigger-threshold tests can keep
+    isolating one signal at a time without being suppressed by the new
+    spx_and_vix gate that was introduced in the trade-lifecycle correctness
+    batch.  The gating behavior itself is exercised in
+    :class:`TestSignalModeGating`.
+    """
     return EventSignalDetector(
         spx_drop_threshold=-0.01,
         spx_drop_2d_threshold=-0.02,
@@ -18,6 +25,7 @@ def detector() -> EventSignalDetector:
         term_inversion_threshold=1.0,
         rally_avoidance=True,
         rally_threshold=0.01,
+        signal_mode="any",
     )
 
 
@@ -107,6 +115,7 @@ class TestEvaluate:
             term_inversion_threshold=1.0,
             rally_avoidance=False,
             rally_threshold=0.01,
+            signal_mode="any",
         )
         ctx = {"prev_spx_return": 0.05, "prev_spx_return_2d": 0.0,
                "prev_vix_pct_change": 0.0, "vix": 15.0, "term_structure": 0.9}
@@ -164,3 +173,91 @@ class TestDetectFromDict:
         ctx = {"prev_spx_return": 0.001, "prev_spx_return_2d": 0.002,
                "prev_vix_pct_change": 0.01, "vix": 14.0, "term_structure": 0.85}
         assert detector.detect_from_dict(ctx) == []
+
+
+class TestSignalModeGating:
+    """Tests for the signal_mode filter introduced by the trade-lifecycle batch.
+
+    The backtester's EventConfig only fires non-rally trades when *both* an
+    SPX-drop signal AND a VIX signal (spike OR elevated) co-fire.  Live mode
+    historically fired on any single trigger; setting
+    ``settings.event_signal_mode = "spx_and_vix"`` brings live into parity.
+    """
+
+    @staticmethod
+    def _make(signal_mode: str) -> EventSignalDetector:
+        return EventSignalDetector(
+            spx_drop_threshold=-0.01,
+            spx_drop_2d_threshold=-0.02,
+            vix_spike_threshold=0.15,
+            vix_elevated_threshold=25.0,
+            term_inversion_threshold=1.0,
+            rally_avoidance=True,
+            rally_threshold=0.01,
+            signal_mode=signal_mode,
+        )
+
+    def test_spx_only_dropped_in_spx_and_vix(self) -> None:
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": -0.02, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.0, "vix": 15.0, "term_structure": 0.9}
+        assert det._evaluate(ctx) == []
+
+    def test_vix_only_dropped_in_spx_and_vix(self) -> None:
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": 0.0, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.20, "vix": 30.0, "term_structure": 0.9}
+        assert det._evaluate(ctx) == []
+
+    def test_spx_plus_vix_kept_in_spx_and_vix(self) -> None:
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": -0.02, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.20, "vix": 15.0, "term_structure": 0.9}
+        signals = det._evaluate(ctx)
+        assert "spx_drop_1d" in signals and "vix_spike" in signals
+
+    def test_spx_plus_vix_elevated_kept_in_spx_and_vix(self) -> None:
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": -0.02, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.0, "vix": 30.0, "term_structure": 0.9}
+        signals = det._evaluate(ctx)
+        assert "spx_drop_1d" in signals and "vix_elevated" in signals
+
+    def test_term_only_dropped_in_spx_and_vix(self) -> None:
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": 0.0, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.0, "vix": 15.0, "term_structure": 1.15}
+        assert det._evaluate(ctx) == []
+
+    def test_all_mode_requires_term_too(self) -> None:
+        det = self._make("all")
+        ctx_no_term = {"prev_spx_return": -0.02, "prev_spx_return_2d": 0.0,
+                       "prev_vix_pct_change": 0.20, "vix": 15.0, "term_structure": 0.9}
+        assert det._evaluate(ctx_no_term) == []
+        ctx_with_term = dict(ctx_no_term, term_structure=1.15)
+        signals = det._evaluate(ctx_with_term)
+        assert {"spx_drop_1d", "vix_spike", "term_inversion"}.issubset(set(signals))
+
+    def test_rally_passes_through_in_spx_and_vix(self) -> None:
+        """Rally is special-cased: it suppresses event entries via the
+        avoidance gate elsewhere; the detector must always emit it so
+        downstream policy can see it."""
+        det = self._make("spx_and_vix")
+        ctx = {"prev_spx_return": 0.02, "prev_spx_return_2d": 0.0,
+               "prev_vix_pct_change": 0.0, "vix": 15.0, "term_structure": 0.9}
+        assert det._evaluate(ctx) == ["rally"]
+
+    def test_spx_2d_drop_suppressed_when_calendar_gap_too_wide(self) -> None:
+        """A long calendar gap between t-2 and t-0 means the 2-day return
+        is computed across stale data; the detector must suppress the
+        signal in that case rather than fire on a misleading number."""
+        det = self._make("any")
+        ctx = {
+            "prev_spx_return": 0.0,
+            "prev_spx_return_2d": -0.05,
+            "prev_spx_return_2d_gap_days": 10,
+            "prev_vix_pct_change": 0.0,
+            "vix": 15.0,
+            "term_structure": 0.9,
+        }
+        assert det._evaluate(ctx) == []

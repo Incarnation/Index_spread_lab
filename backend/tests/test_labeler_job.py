@@ -86,20 +86,23 @@ def test_evaluate_candidate_outcome_none_for_empty_marks() -> None:
 
 
 def test_evaluate_candidate_outcome_tracks_tp100_at_expiry_even_if_tp50_hit_early() -> None:
+    # Bids must be strictly positive after the strict mid_price hardening
+    # in utils/pricing.py.  Use 0.01 instead of 0.00 to keep the original
+    # economic intent (deep-OTM long, near-zero short at expiry).
     marks = [
         LabelMark(
             ts=datetime(2026, 2, 13, 15, 0, tzinfo=ZoneInfo("UTC")),
             short_bid=0.35,
             short_ask=0.45,
-            long_bid=0.00,
+            long_bid=0.01,
             long_ask=0.05,
         ),
         LabelMark(
             ts=datetime(2026, 2, 13, 15, 5, tzinfo=ZoneInfo("UTC")),
-            short_bid=0.00,
-            short_ask=0.00,
-            long_bid=0.00,
-            long_ask=0.00,
+            short_bid=0.01,
+            short_ask=0.05,
+            long_bid=0.01,
+            long_ask=0.05,
         ),
     ]
     # entry_credit = 1.00 -> TP50 threshold = 50, TP100-at-expiry threshold = 100

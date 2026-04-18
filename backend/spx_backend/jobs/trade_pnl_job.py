@@ -11,17 +11,16 @@ from sqlalchemy import text
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
-from spx_backend.services.portfolio_manager import PortfolioManager
+from spx_backend.services.alerts import send_alert
+from spx_backend.services.portfolio_manager import (
+    PortfolioClosureSplitBrainError,
+    PortfolioManager,
+)
+from spx_backend.utils.options import resolve_option_right
+from spx_backend.utils.pricing import mid_price
 
 if TYPE_CHECKING:
     from spx_backend.services.sms_notifier import SmsNotifier
-
-
-def _mid(bid: float | None, ask: float | None) -> float | None:
-    """Return mid quote when both bid and ask are available."""
-    if bid is None or ask is None:
-        return None
-    return (float(bid) + float(ask)) / 2.0
 
 
 def derive_stop_loss_target(
@@ -286,37 +285,88 @@ class TradePnlJob:
             await self._pm.begin_day(now_et.date())
         return self._pm
 
+    async def _close_with_portfolio(
+        self,
+        *,
+        pm: PortfolioManager,
+        trade_id: int,
+        pnl: float,
+        session,
+    ) -> None:
+        """Call ``pm.record_closure`` with split-brain alert + rollback semantics.
+
+        ``record_closure`` raises :class:`PortfolioClosureSplitBrainError`
+        when the portfolio is enabled but the corresponding
+        ``portfolio_trades`` row is missing.  In that case we:
+
+        1. Send a SendGrid operator alert keyed on the trade_id (so the
+           same offending trade doesn't spam the inbox on every retry
+           attempt -- the cooldown is per-trade).
+        2. Re-raise so the surrounding ``SessionLocal`` context exits
+           without committing.  The earlier ``_close_trade`` UPDATE in
+           the same session is rolled back, leaving the trade OPEN so
+           the next ``trade_pnl_job`` run can retry once the operator
+           has reconciled the portfolio_trades row.
+        """
+        try:
+            await pm.record_closure(trade_id, pnl, session=session)
+        except PortfolioClosureSplitBrainError as exc:
+            # Fire alert before re-raising.  send_alert swallows its
+            # own SendGrid errors so the alert delivery can never
+            # mask the underlying split-brain.
+            await send_alert(
+                subject=(
+                    f"[IndexSpreadLab] Portfolio closure split-brain "
+                    f"trade_id={trade_id}"
+                ),
+                body_html=(
+                    f"<p><strong>Portfolio closure split-brain detected.</strong></p>"
+                    f"<p>trade_id={trade_id}, attempted realized_pnl={pnl:.2f}.</p>"
+                    f"<p>The trades-table closure has been rolled back; "
+                    f"the next trade_pnl_job run will retry once the "
+                    f"portfolio_trades row is reconciled manually.</p>"
+                    f"<p>Detail: {exc}</p>"
+                ),
+                cooldown_key=f"split_brain:trade_id={trade_id}",
+                cooldown_minutes=60,
+            )
+            raise
+
     @staticmethod
     def _intrinsic_exit_cost(
-        strategy_type: str | None,
+        option_right: str | None,
         short_strike: float | None,
         long_strike: float | None,
         spot: float | None,
     ) -> float | None:
         """Compute intrinsic-value exit cost at expiration from spot and strikes.
 
+        ``option_right`` must be one of ``"put"`` / ``"call"`` -- typically
+        produced by :func:`spx_backend.utils.options.resolve_option_right`
+        from the trade's ``trade_legs.option_right`` (with strategy_type
+        substring fallback for legacy rows).
+
         For a put credit spread (short put above long put):
-          - spot >= short_strike → both expire worthless → exit_cost = 0
-          - spot <= long_strike  → max loss → exit_cost = short - long
-          - otherwise            → partial intrinsic on short, long worthless
+          - spot >= short_strike -> both expire worthless -> exit_cost = 0
+          - spot <= long_strike  -> max loss -> exit_cost = short - long
+          - otherwise            -> partial intrinsic on short, long worthless
 
         For a call credit spread (short call below long call):
-          - spot <= short_strike → both expire worthless → exit_cost = 0
-          - spot >= long_strike  → max loss → exit_cost = -(long - short)
-          - otherwise            → partial intrinsic on short, long worthless
+          - spot <= short_strike -> both expire worthless -> exit_cost = 0
+          - spot >= long_strike  -> max loss -> exit_cost = -(long - short)
+          - otherwise            -> partial intrinsic on short, long worthless
 
         Returns exit_cost in points (same sign convention as mark-based:
-        exit_cost = short_value - long_value), or None if inputs are insufficient.
+        ``exit_cost = short_value - long_value``), or ``None`` when
+        inputs are insufficient (missing spot/strikes/right).
         """
         if spot is None or short_strike is None or long_strike is None:
             return None
-        st = (strategy_type or "").lower()
-
-        if "put" in st:
+        if option_right == "put":
             short_intrinsic = max(short_strike - spot, 0.0)
             long_intrinsic = max(long_strike - spot, 0.0)
             return short_intrinsic - long_intrinsic
-        elif "call" in st:
+        if option_right == "call":
             short_intrinsic = max(spot - short_strike, 0.0)
             long_intrinsic = max(spot - long_strike, 0.0)
             return short_intrinsic - long_intrinsic
@@ -368,20 +418,31 @@ class TradePnlJob:
                     long_symbol=long_leg_ref["option_symbol"],
                     now_utc=now_utc,
                 )
-                short_mid = _mid(mark["short_bid"], mark["short_ask"]) if mark else None
-                long_mid = _mid(mark["long_bid"], mark["long_ask"]) if mark else None
+                short_mid = mid_price(mark["short_bid"], mark["short_ask"]) if mark else None
+                long_mid = mid_price(mark["long_bid"], mark["long_ask"]) if mark else None
                 if short_mid is not None and long_mid is not None:
                     exit_cost = short_mid - long_mid
                     pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
                     short_exit = short_mid
                     long_exit = long_mid
                 else:
-                    # Tier 2: intrinsic settlement from spot and leg strikes
+                    # Tier 2: intrinsic settlement from spot and leg strikes.
+                    # Resolve put/call from trade_legs.option_right first,
+                    # falling back to strategy_type substring for legacy
+                    # rows.  Avoids the previous bug where strategy_type
+                    # values without "put"/"call" tokens (e.g.
+                    # "credit_spread") silently returned None and dropped
+                    # to tier 3 even with valid leg strikes.
                     if not spot_loaded:
                         spot = await self._latest_spot(session, now_utc=now_utc)
                         spot_loaded = True
+                    option_right = resolve_option_right(
+                        getattr(trade, "strategy_type", None),
+                        short_leg_ref,
+                        long_leg_ref,
+                    )
                     intrinsic = self._intrinsic_exit_cost(
-                        strategy_type=getattr(trade, "strategy_type", None),
+                        option_right=option_right,
                         short_strike=short_leg_ref.get("strike"),
                         long_strike=long_leg_ref.get("strike"),
                         spot=spot,
@@ -390,10 +451,26 @@ class TradePnlJob:
                         exit_cost = intrinsic
                         pnl = (entry_credit - exit_cost) * contracts * contract_multiplier
                     else:
-                        pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                        # Tier 3: refuse to default to zero PnL when we
+                        # can't even derive max_loss.  Raising rolls back
+                        # the surrounding session so the next run can
+                        # retry with fresher spot/mark data instead of
+                        # silently booking the trade as flat.
+                        if trade.max_loss is None:
+                            raise RuntimeError(
+                                f"trade_pnl_job: cannot settle expired trade_id={trade.trade_id}; "
+                                "no mark, no spot/intrinsic, and trade.max_loss is NULL"
+                            )
+                        pnl = -abs(float(trade.max_loss))
                         exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
             else:
-                pnl = -abs(float(trade.max_loss)) if trade.max_loss else 0.0
+                # No legs at all: same tier-3 hard-fail rule applies.
+                if trade.max_loss is None:
+                    raise RuntimeError(
+                        f"trade_pnl_job: cannot settle expired trade_id={trade.trade_id}; "
+                        "no legs available and trade.max_loss is NULL"
+                    )
+                pnl = -abs(float(trade.max_loss))
                 exit_cost = entry_credit - (pnl / max(contracts * contract_multiplier, 1))
 
             await self._close_trade(
@@ -411,7 +488,9 @@ class TradePnlJob:
 
             if settings.portfolio_enabled:
                 pm = await self._get_portfolio_manager(now_et)
-                await pm.record_closure(trade.trade_id, pnl, session=session)
+                await self._close_with_portfolio(
+                    pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
+                )
 
             expired_closed += 1
             closed += 1
@@ -560,8 +639,8 @@ class TradePnlJob:
                     skipped_stale += 1
                     continue
 
-                short_mid = _mid(mark["short_bid"], mark["short_ask"])
-                long_mid = _mid(mark["long_bid"], mark["long_ask"])
+                short_mid = mid_price(mark["short_bid"], mark["short_ask"])
+                long_mid = mid_price(mark["long_bid"], mark["long_ask"])
                 if short_mid is None or long_mid is None:
                     skipped_no_mark += 1
                     continue
@@ -657,7 +736,9 @@ class TradePnlJob:
 
                     if settings.portfolio_enabled:
                         pm = await self._get_portfolio_manager(now_et)
-                        await pm.record_closure(trade.trade_id, pnl, session=session)
+                        await self._close_with_portfolio(
+                            pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
+                        )
 
                     sms_close_infos.append({
                         "trade_id": trade.trade_id,

@@ -50,6 +50,7 @@ from spx_backend.jobs.modeling import (
     summarize_strategy_quality,
     train_bucket_model,
 )
+from spx_backend.utils.pricing import mid_price
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -909,7 +910,7 @@ def compute_offline_gex(
         if oi_val <= 0:
             continue
 
-        mid = _mid(row.get("bid_px_00"), row.get("ask_px_00"))
+        mid = mid_price(row.get("bid_px_00"), row.get("ask_px_00"))
         if mid is None or mid < MIN_MID_PRICE:
             continue
 
@@ -1081,11 +1082,9 @@ def derive_spx_from_parity(
         info = inst_map.get(iid)
         if info is None or info["expiry"] != nearest_expiry:
             continue
-        bid = float(row["bid_px_00"])
-        ask = float(row["ask_px_00"])
-        if bid <= 0 or ask <= 0:
+        mid = mid_price(row["bid_px_00"], row["ask_px_00"])
+        if mid is None:
             continue
-        mid = (bid + ask) / 2.0
         strike = info["strike"]
         if info["put_call"] == "C":
             calls[strike] = mid
@@ -1183,7 +1182,18 @@ def build_candidates_for_snapshot(
     opts["bid"] = opts["bid_px_00"].astype(float)
     opts["ask"] = opts["ask_px_00"].astype(float)
     opts["mid"] = (opts["bid"] + opts["ask"]) / 2.0
-    opts = opts[(opts["bid"] > 0) & (opts["ask"] > 0) & (opts["mid"] >= MIN_MID_PRICE)]
+    # Apply the same policy as utils.pricing.mid_price: strict positivity,
+    # finite values, and crossed-book rejection.  Vectorised here for speed
+    # rather than per-row mid_price() calls which would dominate runtime
+    # over the multi-million-row offline training scan.
+    opts = opts[
+        (opts["bid"] > 0)
+        & (opts["ask"] > 0)
+        & np.isfinite(opts["bid"])
+        & np.isfinite(opts["ask"])
+        & (opts["bid"] <= opts["ask"])
+        & (opts["mid"] >= MIN_MID_PRICE)
+    ]
     if opts.empty:
         return []
 
@@ -1289,14 +1299,13 @@ def build_candidates_for_snapshot(
 # LABEL RESOLUTION
 # ===================================================================
 
-def _mid(bid: float | None, ask: float | None) -> float | None:
-    """Mid-price when both sides are positive and finite; None otherwise."""
-    if bid is None or ask is None:
-        return None
-    b, a = float(bid), float(ask)
-    if math.isnan(b) or math.isnan(a) or b <= 0 or a <= 0:
-        return None
-    return (b + a) / 2.0
+# Note: the local ``_mid`` helper has been removed in favour of the
+# canonical :func:`spx_backend.utils.pricing.mid_price`.  ``mid_price`` is
+# strictly stricter than the original helper: in addition to rejecting
+# NaN and non-positive quotes, it also rejects non-finite values (Inf)
+# and crossed books (bid > ask).  These additional rejections are
+# intentional data-quality gates and any historically-valid two-sided
+# quote (positive, finite, non-crossed) yields the identical midpoint.
 
 
 def _downsample_marks(
@@ -1418,8 +1427,8 @@ def _evaluate_outcome(entry_credit: float, marks: list[dict]) -> dict:
     last_pnl: float | None = None
 
     for m in marks:
-        s_mid = _mid(m["short_bid"], m["short_ask"])
-        l_mid = _mid(m["long_bid"], m["long_ask"])
+        s_mid = mid_price(m["short_bid"], m["short_ask"])
+        l_mid = mid_price(m["long_bid"], m["long_ask"])
         if s_mid is None or l_mid is None:
             continue
         exit_cost = s_mid - l_mid

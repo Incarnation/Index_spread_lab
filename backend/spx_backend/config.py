@@ -255,6 +255,19 @@ class Settings(BaseSettings):
     event_only_mode: bool = False
     """When True, skip all scheduled (non-event) trades.  Only event-signal
     trades are placed.  Equivalent to the backtest ``e_event_only=True`` flag."""
+    event_signal_mode: str = "spx_and_vix"
+    """Filter applied to raw event signals before they reach the decision
+    pipeline.  Mirrors the backtester's ``EventConfig.signal_mode``:
+
+    * ``"any"`` -- emit every signal that fired (legacy live behaviour).
+    * ``"spx_and_vix"`` -- require at least one ``spx_drop*`` AND at least
+      one of ``{"vix_spike", "vix_elevated"}`` in non-rally signals; else
+      drop all non-rally signals.  Default; opinionated and stricter.
+    * ``"all"`` -- require all three classes (spx_drop, vix, term_inversion)
+      to fire; else drop all non-rally signals.
+
+    The ``rally`` signal is always preserved regardless of mode because it
+    drives rally-avoidance, not entries."""
 
     # ─── Hard day-level filters ──────────────────────────────────
     decision_avoid_opex: bool = False
@@ -300,6 +313,20 @@ class Settings(BaseSettings):
                 f"trade_pnl_stop_loss_basis must be one of {sorted(allowed)}, got {v!r}"
             )
         return v
+
+    @field_validator("event_signal_mode")
+    @classmethod
+    def _check_event_signal_mode(cls, v: str) -> str:
+        # Same allowed set as the backtester's EventConfig.signal_mode.
+        # Normalize to lowercase so EVENT_SIGNAL_MODE=Any in .env still
+        # parses without surprising the operator.
+        allowed = {"any", "spx_and_vix", "all"}
+        normalized = v.strip().lower()
+        if normalized not in allowed:
+            raise ValueError(
+                f"event_signal_mode must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return normalized
 
     def _parse_int_csv(self, value: str) -> list[int]:
         """Parse comma-separated integer values, ignoring malformed items."""

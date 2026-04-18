@@ -8,8 +8,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from spx_backend.jobs.trade_pnl_job import TradePnlJob, _mid, build_trade_pnl_job
+from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
 from spx_backend.services.portfolio_manager import PortfolioManager
+from spx_backend.utils.pricing import mid_price
 
 
 # ---------------------------------------------------------------------------
@@ -85,22 +86,30 @@ class FakeSession:
 
 
 # ---------------------------------------------------------------------------
-# Unit: _mid
+# Unit: mid_price (delegated to shared util; smoke tests only)
 # ---------------------------------------------------------------------------
 
 
 class TestMid:
+    """Smoke checks that the trade_pnl_job uses the strict shared helper.
+
+    Detailed acceptance/rejection scenarios live in
+    ``test_utils_pricing.py``; these are kept here so the trade_pnl_job
+    test module trips fast if the import wiring regresses (e.g. if a
+    future refactor reintroduces a permissive local helper).
+    """
+
     def test_both_present(self):
-        assert _mid(1.0, 2.0) == 1.5
+        assert mid_price(1.0, 2.0) == 1.5
 
     def test_bid_none(self):
-        assert _mid(None, 2.0) is None
+        assert mid_price(None, 2.0) is None
 
     def test_ask_none(self):
-        assert _mid(1.0, None) is None
+        assert mid_price(1.0, None) is None
 
     def test_both_none(self):
-        assert _mid(None, None) is None
+        assert mid_price(None, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -849,12 +858,20 @@ class TestMultiContractPnl(TestRunOnce):
 
 
 class TestIntrinsicSettlement:
-    """Verify intrinsic-value settlement when marks are missing."""
+    """Verify intrinsic-value settlement when marks are missing.
+
+    The helper now takes ``option_right`` directly ("put" / "call" /
+    None) instead of branching on ``strategy_type``; the live caller
+    resolves the right via
+    :func:`spx_backend.utils.options.resolve_option_right` and passes
+    the resolved value in.  See ``test_utils_options.py`` for the
+    full resolution-precedence test matrix.
+    """
 
     def test_put_spread_expires_otm(self):
-        """Put credit spread fully OTM at expiry → exit_cost = 0."""
+        """Put credit spread fully OTM at expiry: exit_cost = 0."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_put",
+            option_right="put",
             short_strike=5800.0,
             long_strike=5775.0,
             spot=5900.0,
@@ -862,9 +879,9 @@ class TestIntrinsicSettlement:
         assert result == 0.0
 
     def test_put_spread_expires_full_loss(self):
-        """Put credit spread fully ITM at expiry → exit_cost = width."""
+        """Put credit spread fully ITM at expiry: exit_cost = width."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_put",
+            option_right="put",
             short_strike=5800.0,
             long_strike=5775.0,
             spot=5700.0,
@@ -872,9 +889,9 @@ class TestIntrinsicSettlement:
         assert result == 25.0
 
     def test_put_spread_partial_intrinsic(self):
-        """Put credit spread partially ITM → short has intrinsic, long is worthless."""
+        """Put credit spread partially ITM: short has intrinsic, long worthless."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_put",
+            option_right="put",
             short_strike=5800.0,
             long_strike=5775.0,
             spot=5790.0,
@@ -883,9 +900,9 @@ class TestIntrinsicSettlement:
         assert abs(result - 10.0) < 0.01
 
     def test_call_spread_expires_otm(self):
-        """Call credit spread fully OTM at expiry → exit_cost = 0."""
+        """Call credit spread fully OTM at expiry: exit_cost = 0."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_call",
+            option_right="call",
             short_strike=5900.0,
             long_strike=5925.0,
             spot=5800.0,
@@ -893,9 +910,9 @@ class TestIntrinsicSettlement:
         assert result == 0.0
 
     def test_call_spread_expires_full_loss(self):
-        """Call credit spread fully ITM at expiry → exit_cost = width."""
+        """Call credit spread fully ITM at expiry: exit_cost = width."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_call",
+            option_right="call",
             short_strike=5900.0,
             long_strike=5925.0,
             spot=6000.0,
@@ -903,9 +920,9 @@ class TestIntrinsicSettlement:
         assert result == 25.0
 
     def test_call_spread_partial_intrinsic(self):
-        """Call credit spread partially ITM → short has intrinsic, long is worthless."""
+        """Call credit spread partially ITM: short has intrinsic, long worthless."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_call",
+            option_right="call",
             short_strike=5900.0,
             long_strike=5925.0,
             spot=5910.0,
@@ -914,21 +931,267 @@ class TestIntrinsicSettlement:
         assert abs(result - 10.0) < 0.01
 
     def test_returns_none_when_spot_missing(self):
-        """Returns None when spot is unavailable (triggers max-loss fallback)."""
+        """Returns None when spot is unavailable (triggers tier-3 fallback)."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="credit_vertical_put",
+            option_right="put",
             short_strike=5800.0,
             long_strike=5775.0,
             spot=None,
         )
         assert result is None
 
-    def test_returns_none_for_unknown_strategy(self):
-        """Returns None for unrecognized strategy type."""
+    def test_returns_none_for_unknown_right(self):
+        """Returns None when option_right cannot be resolved."""
         result = TradePnlJob._intrinsic_exit_cost(
-            strategy_type="iron_condor",
+            option_right=None,
             short_strike=5800.0,
             long_strike=5775.0,
             spot=5900.0,
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tier-3 NULL max_loss hard-fail
+# ---------------------------------------------------------------------------
+
+
+class TestTier3NullMaxLoss:
+    """Tier-3 fallback for expired trades hard-fails on NULL ``max_loss``.
+
+    Previously the job silently booked PnL = 0 when both tier 1 (mark)
+    and tier 2 (intrinsic from spot/strikes) failed AND ``max_loss`` was
+    NULL.  That hides a data-integrity issue (every closed trade should
+    have a known max_loss recorded at entry) and silently misstates
+    portfolio equity.
+
+    The new contract: raise ``RuntimeError`` so the surrounding session
+    rolls back -- the trade stays OPEN and the next ``trade_pnl_job``
+    run can retry once data has been backfilled."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self):
+        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+            mock_settings.tz = "America/New_York"
+            mock_settings.trade_pnl_enabled = True
+            mock_settings.trade_pnl_allow_outside_rth = True
+            mock_settings.trade_pnl_mark_max_age_minutes = 30
+            mock_settings.trade_pnl_take_profit_pct = 0.50
+            mock_settings.trade_pnl_stop_loss_enabled = False
+            mock_settings.trade_pnl_stop_loss_pct = 1.00
+            mock_settings.trade_pnl_contract_multiplier = 100
+            mock_settings.decision_contracts = 1
+            mock_settings.portfolio_enabled = False
+            self.mock_settings = mock_settings
+            yield
+
+    def _make_session_with_trades(self, trades):
+        """Same FakeSession-with-rowcount pattern as TestPortfolioClosure."""
+        session = FakeSession()
+        open_result = MagicMock()
+        open_result.fetchall = MagicMock(return_value=trades)
+        open_result.rowcount = 1
+
+        async def fake_execute(stmt, params=None):
+            session.calls.append((str(stmt), params or {}))
+            return open_result
+
+        session.execute = fake_execute
+        return session
+
+    @pytest.mark.asyncio
+    async def test_expired_trade_with_no_legs_and_null_max_loss_raises(self):
+        """No legs at all + NULL max_loss -> RuntimeError, no closure."""
+        trade = _make_trade(
+            trade_id=900,
+            entry_credit=2.0,
+            expiration=_today_et() - timedelta(days=1),
+            max_loss=None,
+        )
+        session = self._make_session_with_trades([trade])
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
+            patch.object(TradePnlJob, "_market_open", new_callable=AsyncMock, return_value=True),
+        ):
+            job = TradePnlJob()
+            # Note: force=True is intentionally omitted here -- Phase 1 of
+            # run_once always processes _close_expired_trades regardless of
+            # the force flag (force only gates Phase 2's RTH check, and we
+            # already set trade_pnl_allow_outside_rth=True in the fixture).
+            with pytest.raises(RuntimeError, match="trade.max_loss is NULL"):
+                await job.run_once()
+
+        # No close-trade UPDATE should have run with this trade_id.
+        close_calls = [
+            c for c in session.calls
+            if c[1].get("trade_id") == 900
+            and "EXPIRED" in str(c[1].get("exit_reason", ""))
+        ]
+        assert len(close_calls) == 0, (
+            "trade with NULL max_loss must NOT be closed; the surrounding "
+            "session should roll back and the trade stays OPEN for retry"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expired_trade_with_legs_no_spot_and_null_max_loss_raises(self):
+        """Legs present but no spot/intrinsic AND NULL max_loss -> RuntimeError.
+
+        This is the tier-2 -> tier-3 path: legs exist, but
+        ``_intrinsic_exit_cost`` returns None because no spot is loaded
+        (we patch ``_latest_spot`` to return None) and there's no last
+        snapshot mark.  With NULL max_loss the tier-3 fallback must hard
+        fail rather than book PnL = 0.
+        """
+        trade = _make_trade(
+            trade_id=901,
+            entry_credit=2.0,
+            expiration=_today_et() - timedelta(days=1),
+            max_loss=None,
+        )
+        session = self._make_session_with_trades([trade])
+        legs = {901: (
+            {"leg_index": 0, "option_symbol": "S", "side": "STO", "qty": 1,
+             "entry_price": 3.0, "strike": 5800.0, "option_right": "put"},
+            {"leg_index": 1, "option_symbol": "L", "side": "BTO", "qty": 1,
+             "entry_price": 1.0, "strike": 5775.0, "option_right": "put"},
+        )}
+
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
+            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value=legs),
+            patch.object(TradePnlJob, "_market_open", new_callable=AsyncMock, return_value=True),
+            patch.object(TradePnlJob, "_latest_spread_mark", new_callable=AsyncMock, return_value=None),
+            patch.object(TradePnlJob, "_latest_spot", new_callable=AsyncMock, return_value=None),
+        ):
+            job = TradePnlJob()
+            # See note in test_expired_trade_with_no_legs_and_null_max_loss_raises:
+            # force=True is unnecessary because Phase 1 always runs.
+            with pytest.raises(RuntimeError, match="trade.max_loss is NULL"):
+                await job.run_once()
+
+        # Mirror the close_calls assertion from the no-legs test: even when
+        # legs exist but tier-2/tier-3 fail with NULL max_loss, no close
+        # UPDATE should be issued for this trade.  The session's outer
+        # transaction must roll back so the trade stays OPEN for retry.
+        close_calls = [
+            c for c in session.calls
+            if c[1].get("trade_id") == 901
+            and "EXPIRED" in str(c[1].get("exit_reason", ""))
+        ]
+        assert len(close_calls) == 0, (
+            "trade with legs but NULL max_loss must NOT be closed; the "
+            "surrounding session should roll back and the trade stays "
+            "OPEN for retry once data has been backfilled"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _close_with_portfolio split-brain wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestCloseWithPortfolio:
+    """The ``_close_with_portfolio`` helper wraps ``pm.record_closure``
+    so a ``PortfolioClosureSplitBrainError`` triggers an alert + re-raise
+    (so the surrounding session rolls back and the trade stays OPEN for
+    operator reconciliation).
+
+    These tests exercise the wrapper in isolation rather than through
+    the full ``run_once`` flow, so we can pin the alert-emission and
+    re-raise semantics independent of the rest of the trade lifecycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_passthrough_no_alert(self):
+        """No exception -> no alert fired, helper returns normally and
+        forwards the exact session object it was given.
+
+        We capture ``session`` in a local before the call so the assertion
+        compares against a stable reference rather than reading
+        ``mock_pm.record_closure.await_args.kwargs['session']`` (which is
+        what we just wrote and would tautologically equal itself).
+        """
+        from spx_backend.services.portfolio_manager import PortfolioManager
+        mock_pm = AsyncMock(spec=PortfolioManager)
+        mock_pm.record_closure = AsyncMock()  # succeeds
+        session = AsyncMock()
+
+        with patch(
+            "spx_backend.jobs.trade_pnl_job.send_alert", new_callable=AsyncMock,
+        ) as mock_alert:
+            job = TradePnlJob()
+            await job._close_with_portfolio(
+                pm=mock_pm, trade_id=10, pnl=42.5, session=session,
+            )
+
+        mock_pm.record_closure.assert_awaited_once_with(10, 42.5, session=session)
+        mock_alert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_split_brain_sends_alert_and_reraises(self):
+        """``PortfolioClosureSplitBrainError`` -> alert sent ONCE with the
+        correct cooldown_key, then exception re-raised so the surrounding
+        session rolls back."""
+        from spx_backend.services.portfolio_manager import (
+            PortfolioClosureSplitBrainError,
+            PortfolioManager,
+        )
+
+        mock_pm = AsyncMock(spec=PortfolioManager)
+        mock_pm.record_closure = AsyncMock(
+            side_effect=PortfolioClosureSplitBrainError(
+                trade_id=77, message="row missing",
+            ),
+        )
+
+        with patch(
+            "spx_backend.jobs.trade_pnl_job.send_alert", new_callable=AsyncMock,
+        ) as mock_alert:
+            job = TradePnlJob()
+            with pytest.raises(PortfolioClosureSplitBrainError):
+                await job._close_with_portfolio(
+                    pm=mock_pm, trade_id=77, pnl=-50.0, session=AsyncMock(),
+                )
+
+        mock_alert.assert_awaited_once()
+        # Verify the cooldown_key targets the specific trade so that
+        # other trades' split-brain alerts aren't suppressed by this
+        # trade's cooldown window.
+        kwargs = mock_alert.await_args.kwargs
+        assert kwargs["cooldown_key"] == "split_brain:trade_id=77"
+        assert kwargs["cooldown_minutes"] == 60
+        assert "trade_id=77" in kwargs["subject"]
+        assert "split-brain" in kwargs["subject"].lower()
+
+    @pytest.mark.asyncio
+    async def test_split_brain_reraises_even_if_alert_returns_false(self):
+        """Even if ``send_alert`` returns False (cooldown active, creds
+        missing, SendGrid down), the original split-brain error must
+        STILL propagate.  Otherwise an alert-channel outage would
+        silently swallow a data-integrity bug."""
+        from spx_backend.services.portfolio_manager import (
+            PortfolioClosureSplitBrainError,
+            PortfolioManager,
+        )
+
+        mock_pm = AsyncMock(spec=PortfolioManager)
+        mock_pm.record_closure = AsyncMock(
+            side_effect=PortfolioClosureSplitBrainError(
+                trade_id=88, message="row missing",
+            ),
+        )
+
+        with patch(
+            "spx_backend.jobs.trade_pnl_job.send_alert",
+            new_callable=AsyncMock,
+            return_value=False,  # alert suppressed by cooldown
+        ) as mock_alert:
+            job = TradePnlJob()
+            with pytest.raises(PortfolioClosureSplitBrainError):
+                await job._close_with_portfolio(
+                    pm=mock_pm, trade_id=88, pnl=0.0, session=AsyncMock(),
+                )
+
+        mock_alert.assert_awaited_once()
