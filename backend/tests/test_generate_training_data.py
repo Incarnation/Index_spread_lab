@@ -953,6 +953,25 @@ class TestComputeOfflineGex:
 class TestLoadFrdQuotes:
     """load_frd_quotes should read parquet and produce uq-compatible schema."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_production_fallback(self, tmp_path, monkeypatch):
+        """Redirect ``PRODUCTION_UNDERLYING_DIR`` to an empty tmp dir.
+
+        ``load_frd_quotes`` falls back to reading
+        ``PRODUCTION_UNDERLYING_DIR / {SYMBOL}_1min.parquet`` when the
+        FRD parquet path doesn't satisfy the request.  On dev machines
+        with real production exports present, that fallback returned the
+        live VIX/SPX history and polluted both the
+        ``test_loads_parquet_with_correct_schema`` row-count assertion
+        (extra rows appended) and the ``test_missing_file_returns_empty``
+        empty-DataFrame assertion (returned the prod history instead).
+        Pointing the constant at an empty tmp directory keeps the
+        fallback present in the production code path while making the
+        tests deterministic regardless of what's on disk.
+        """
+        import generate_training_data as gtd
+        monkeypatch.setattr(gtd, "PRODUCTION_UNDERLYING_DIR", tmp_path / "prod_empty")
+
     def test_loads_parquet_with_correct_schema(self, tmp_path: Path) -> None:
         """Output should have columns ts, symbol, last (close renamed)."""
         df = pd.DataFrame({
