@@ -19,17 +19,12 @@ from spx_backend.ingestion.tradier_client import get_tradier_client
 from spx_backend.jobs.cboe_gex_job import build_cboe_gex_job
 from spx_backend.jobs.decision_job import DecisionJob
 from spx_backend.jobs.eod_events_job import EodEventsJob
-from spx_backend.jobs.feature_builder_job import FeatureBuilderJob
 from spx_backend.jobs.gex_job import GexJob
-from spx_backend.jobs.labeler_job import LabelerJob
 from spx_backend.jobs.performance_analytics_job import build_performance_analytics_job
-from spx_backend.jobs.promotion_gate_job import PromotionGateJob
 from spx_backend.jobs.quote_job import QuoteJob
-from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob
 from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job, build_vix_snapshot_job
 from spx_backend.jobs.staleness_monitor_job import build_staleness_monitor_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
-from spx_backend.jobs.trainer_job import TrainerJob
 from spx_backend.market_clock import MarketClockCache
 from spx_backend.services.sms_notifier import SmsNotifier
 
@@ -281,31 +276,6 @@ def build_market_open_guarded_runner(
     return _run
 
 
-def trainer_followup_time(*, trainer_hour: int, trainer_minute: int, offset_minutes: int = 60) -> tuple[int, int]:
-    """Compute one follow-up cron time offset after trainer scheduling.
-
-    Parameters
-    ----------
-    trainer_hour:
-        Hour component used by the trainer cron job.
-    trainer_minute:
-        Minute component used by the trainer cron job.
-    offset_minutes:
-        Positive offset in minutes for the follow-up weekly job.
-
-    Returns
-    -------
-    tuple[int, int]
-        ``(hour, minute)`` tuple for the follow-up schedule.
-    """
-    total_minutes = (trainer_hour * 60) + trainer_minute + offset_minutes
-    followup_hour = (total_minutes // 60) % 24
-    followup_minute = total_minutes % 60
-    if total_minutes >= (24 * 60):
-        logger.warning("scheduler: trainer follow-up wrapped past midnight; keeping same cron weekday")
-    return followup_hour, followup_minute
-
-
 def _schedule_rth_window_job(
     scheduler: Any,
     *,
@@ -377,12 +347,7 @@ class SchedulerContext:
     gex_job: GexJob
     cboe_gex_job: Any | None
     decision_job: DecisionJob
-    feature_builder_job: FeatureBuilderJob
-    labeler_job: LabelerJob
     trade_pnl_job: TradePnlJob
-    trainer_job: TrainerJob
-    shadow_inference_job: ShadowInferenceJob
-    promotion_gate_job: PromotionGateJob
     performance_analytics_job: Any | None
     staleness_monitor_job: Any | None
 
@@ -391,17 +356,15 @@ class SchedulerContext:
     def attach_to_app_state(self, app: Any) -> None:
         """Copy all job references onto ``app.state`` for router access.
 
-        This replaces the 18 individual ``app.state.foo = ...`` lines that
-        previously lived in the lifespan function.
+        Mirrors the per-job ``app.state.foo = ...`` assignments that the
+        lifespan function previously maintained inline.
         """
         for attr in [
             "scheduler", "tradier", "clock_cache",
             "snapshot_job", "spy_snapshot_job", "vix_snapshot_job",
             "quote_job", "gex_job", "cboe_gex_job",
-            "decision_job", "feature_builder_job", "labeler_job",
-            "trade_pnl_job", "trainer_job", "shadow_inference_job",
-            "promotion_gate_job", "performance_analytics_job",
-            "staleness_monitor_job",
+            "decision_job", "trade_pnl_job",
+            "performance_analytics_job", "staleness_monitor_job",
         ]:
             setattr(app.state, attr, getattr(self, attr))
 
@@ -453,12 +416,7 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
     cboe_gex_job = build_cboe_gex_job(clock_cache=clock_cache) if cfg.cboe_gex_enabled else None
     sms_notifier = SmsNotifier()
     decision_job = DecisionJob(clock_cache=clock_cache, notifier=sms_notifier)
-    feature_builder_job = FeatureBuilderJob(clock_cache=clock_cache)
-    labeler_job = LabelerJob()
     trade_pnl_job = TradePnlJob(clock_cache=clock_cache, notifier=sms_notifier)
-    trainer_job = TrainerJob()
-    shadow_inference_job = ShadowInferenceJob()
-    promotion_gate_job = PromotionGateJob()
     performance_analytics_job = build_performance_analytics_job() if cfg.performance_analytics_enabled else None
 
     # -- RTH-window jobs (snapshot, quote, GEX) --------------------------------
@@ -508,13 +466,7 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
             allow_outside_rth=cfg.cboe_gex_allow_outside_rth, **rth_kwargs,
         )
 
-    # -- Entry-time jobs (feature builder + decision) --------------------------
-    feature_builder_entry_runner = build_market_open_guarded_runner(
-        build_serialized_run_once_runner(feature_builder_job),
-        clock_cache=clock_cache, timezone=cfg.tz, job_id="feature_builder_job",
-        open_trading_days=open_trading_days,
-        allow_outside_rth=cfg.feature_builder_allow_outside_rth,
-    )
+    # -- Entry-time jobs (decision) --------------------------------------------
     decision_entry_runner = build_market_open_guarded_runner(
         build_serialized_run_once_runner(decision_job),
         clock_cache=clock_cache, timezone=cfg.tz, job_id="decision_job",
@@ -522,13 +474,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
         allow_outside_rth=cfg.decision_allow_outside_rth,
     )
     for hour, minute in cfg.decision_entry_times_list():
-        if cfg.feature_builder_enabled:
-            scheduler.add_job(
-                feature_builder_entry_runner, "cron",
-                day_of_week="mon-fri", hour=hour, minute=minute,
-                id=f"feature_builder_job_{hour:02d}{minute:02d}",
-                replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
-            )
         scheduler.add_job(
             decision_entry_runner, "cron",
             day_of_week="mon-fri", hour=hour, minute=minute,
@@ -536,19 +481,7 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
             replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
         )
 
-    # -- After-close jobs (labeler, shadow inference, EOD events) ---------------
-    if cfg.labeler_enabled:
-        labeler_after_close_runner = build_market_open_guarded_runner(
-            build_serialized_run_once_runner(labeler_job),
-            clock_cache=clock_cache, timezone=cfg.tz, job_id="labeler_job", open_trading_days=open_trading_days,
-        )
-        scheduler.add_job(
-            labeler_after_close_runner, "cron",
-            day_of_week="mon-fri", hour=16, minute=15,
-            kwargs={"force": True}, id="labeler_job",
-            replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
-        )
-
+    # -- After-close jobs (trade PnL, EOD events) ------------------------------
     if cfg.trade_pnl_enabled:
         trade_pnl_runner = build_serialized_run_once_runner(trade_pnl_job)
         scheduler.add_job(
@@ -563,27 +496,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
             interval_minutes=cfg.performance_analytics_interval_minutes, **rth_kwargs,
         )
 
-    # -- Weekly jobs (trainer, promotion gate) ---------------------------------
-    if cfg.trainer_enabled:
-        trainer_runner = build_serialized_run_once_runner(trainer_job)
-        scheduler.add_job(
-            trainer_runner, "cron",
-            day_of_week=cfg.trainer_weekday, hour=cfg.trainer_hour, minute=cfg.trainer_minute,
-            id="trainer_job", replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
-        )
-
-    if cfg.shadow_inference_enabled:
-        shadow_after_close_runner = build_market_open_guarded_runner(
-            build_serialized_run_once_runner(shadow_inference_job),
-            clock_cache=clock_cache, timezone=cfg.tz, job_id="shadow_inference_job", open_trading_days=open_trading_days,
-        )
-        scheduler.add_job(
-            shadow_after_close_runner, "cron",
-            day_of_week="mon-fri", hour=16, minute=20,
-            kwargs={"force": True}, id="shadow_inference_job",
-            replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
-        )
-
     if cfg.eod_events_enabled:
         eod_events_job = EodEventsJob()
         eod_events_runner = build_market_open_guarded_runner(
@@ -595,17 +507,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
             day_of_week="mon-fri", hour=cfg.eod_events_hour, minute=cfg.eod_events_minute,
             kwargs={"force": True}, id="eod_events_job",
             replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
-        )
-
-    if cfg.promotion_gate_enabled:
-        promotion_gate_hour, promotion_gate_minute = trainer_followup_time(
-            trainer_hour=cfg.trainer_hour, trainer_minute=cfg.trainer_minute, offset_minutes=60,
-        )
-        promotion_gate_runner = build_serialized_run_once_runner(promotion_gate_job)
-        scheduler.add_job(
-            promotion_gate_runner, "cron",
-            day_of_week=cfg.trainer_weekday, hour=promotion_gate_hour, minute=promotion_gate_minute,
-            id="promotion_gate_job", replace_existing=True, max_instances=max_job_instances, misfire_grace_time=misfire_grace_seconds,
         )
 
     # -- Daily retention job (3 AM ET) ------------------------------------------
@@ -658,12 +559,7 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
         gex_job=gex_job,
         cboe_gex_job=cboe_gex_job,
         decision_job=decision_job,
-        feature_builder_job=feature_builder_job,
-        labeler_job=labeler_job,
         trade_pnl_job=trade_pnl_job,
-        trainer_job=trainer_job,
-        shadow_inference_job=shadow_inference_job,
-        promotion_gate_job=promotion_gate_job,
         performance_analytics_job=performance_analytics_job,
         staleness_monitor_job=staleness_monitor_job,
         _warmup_jobs=warmup_jobs,

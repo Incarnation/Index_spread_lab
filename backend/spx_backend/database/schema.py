@@ -23,10 +23,6 @@ ALL_APP_TABLES = [
     "market_clock_audit",
     "strategy_versions",
     "model_versions",
-    "training_runs",
-    "feature_snapshots",
-    "trade_candidates",
-    "model_predictions",
     "backtest_runs",
     "strategy_recommendations",
     "trade_decisions",
@@ -46,15 +42,14 @@ ALL_APP_TABLES = [
     "optimizer_walkforward",
     "schema_migrations",
 ]
+# Note: the online-ML tables (`training_runs`, `feature_snapshots`,
+# `trade_candidates`, `model_predictions`) were dropped by migration 015
+# (Track A.7).  `model_versions` is retained for offline ML re-entry.
 
 # Tables dropped by ML-only reset (db_reset_ml_tables.sql).
 ML_RESET_TABLES = [
     "strategy_versions",
     "model_versions",
-    "training_runs",
-    "feature_snapshots",
-    "trade_candidates",
-    "model_predictions",
     "backtest_runs",
     "strategy_recommendations",
     "trade_decisions",
@@ -144,11 +139,20 @@ async def _applied_versions() -> set[str]:
 async def _run_migrations() -> None:
     """Run only *pending* migration SQL files, recording each on success.
 
-    On the very first run (empty ``schema_migrations`` table) all existing
-    migration files are seeded as already-applied.  This is safe because
-    production has already executed them, and on a fresh database the base
-    schema DDL in ``db_schema.sql`` makes the data-modifying migrations
-    no-ops (no rows to update/delete).
+    Behaviour matrix:
+
+    * Production / populated DB: each numbered ``.sql`` file under
+      ``database/sql/migrations/`` is executed exactly once and recorded
+      in ``schema_migrations``.  Already-applied versions are skipped.
+    * Fresh DB built from ``db_schema.sql`` (empty ``schema_migrations``):
+      all numbered files are **seeded as already-applied without being
+      executed**.  This is required because ``db_schema.sql`` is kept
+      in sync with the post-migration schema, so re-running historical
+      DDL migrations (e.g. ``ALTER TABLE`` on a column that the base
+      schema already defines, or DROP statements like migration 015
+      that target tables no longer present) would error rather than
+      no-op.  The seed path therefore records intent ("treat these as
+      done") rather than relying on idempotent SQL.
     """
     mig_dir = _migrations_dir()
     if not mig_dir.exists():

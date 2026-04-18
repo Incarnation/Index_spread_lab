@@ -45,8 +45,6 @@ async def test_list_trades_shapes_response() -> None:
                 SimpleNamespace(
                     trade_id=101,
                     decision_id=91,
-                    candidate_id=81,
-                    feature_snapshot_id=71,
                     status="OPEN",
                     trade_source="live",
                     strategy_type="PUT_CREDIT_SPREAD",

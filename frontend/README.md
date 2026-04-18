@@ -25,7 +25,6 @@ flowchart LR
   Shell --> Portfolio
   Shell --> Trades
   Shell --> Decisions
-  Shell --> ModelMonitor["Model Monitor"]
   Shell --> Performance
   Shell --> GEX
   Shell --> Strategy["Strategy Config"]
@@ -34,6 +33,8 @@ flowchart LR
   Shell --> AuthAudit["Auth Audit"]
 ```
 
+The `/model` route (`ModelMonitorPage`) was removed in Track A when the online ML pipeline was decommissioned.
+
 | Route | Page | Description |
 |-------|------|-------------|
 | `/login` | LoginPage | Username/password form; JWT login via AuthContext |
@@ -41,7 +42,6 @@ flowchart LR
 | `/portfolio` | PortfolioPage | Portfolio KPIs, event-signal badges, 90-day equity chart, source-filtered trades |
 | `/trades` | TradesPage | Full trade list with source filter (all/scheduled/event), open/closed tabs |
 | `/decisions` | DecisionsPage | Decision log with filters; click row for detail drawer (legs, strategy JSON) |
-| `/model` | ModelMonitorPage | Model ops KPIs, accuracy chart, calibration scatter, confusion matrix, PnL attribution |
 | `/performance` | PerformancePage | Performance analytics: mode selector, lookback filter, equity + drawdown charts, breakdowns |
 | `/gex` | GexPage | GEX snapshots by underlying/source/DTE, composed chart with spot + zero-gamma lines |
 | `/strategy` | StrategyConfigPage | Active config from live API + hardcoded backtest metrics + walk-forward table |
@@ -88,7 +88,7 @@ All API calls live in a single file: `src/api.ts`.
 
 - **`API_BASE`** -- Read from `import.meta.env.VITE_API_BASE_URL`.
 - **`fetchWithAuth(url, options)`** -- Adds `Authorization: Bearer <token>` header. On 401 response, clears token and dispatches `UNAUTHORIZED_EVENT` (caught by `AuthContext` to redirect to login).
-- Typed fetch functions for each endpoint group: admin triggers, GEX data, trades, decisions, performance analytics, model ops, portfolio, optimizer.
+- Typed fetch functions for each endpoint group: admin triggers, GEX data, trades, decisions, performance analytics, portfolio, optimizer.
 
 ---
 
@@ -201,7 +201,6 @@ src/
     PortfolioPage.tsx    Portfolio view
     TradesPage.tsx       Trade browser
     DecisionsPage.tsx    Decision log
-    ModelMonitorPage.tsx ML model monitoring
     PerformancePage.tsx  Performance analytics
     GexPage.tsx          GEX visualization
     StrategyConfigPage.tsx  Strategy config + backtest metrics

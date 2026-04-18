@@ -176,60 +176,11 @@ export async function runGexNow(): Promise<GenericAdminRunResult> {
   return safeJson<GenericAdminRunResult>(r);
 }
 
-/**
- * Trigger a manual feature-builder run.
- */
-export async function runFeatureBuilderNow(): Promise<GenericAdminRunResult> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/run-feature-builder`), {
-    method: "POST",
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<GenericAdminRunResult>(r);
-}
-
-/**
- * Trigger a manual labeler run.
- */
-export async function runLabelerNow(): Promise<GenericAdminRunResult> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/run-labeler`), {
-    method: "POST",
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<GenericAdminRunResult>(r);
-}
-
-/**
- * Trigger a manual trainer run.
- */
-export async function runTrainerNow(): Promise<GenericAdminRunResult> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/run-trainer`), {
-    method: "POST",
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<GenericAdminRunResult>(r);
-}
-
-/**
- * Trigger a manual shadow-inference run.
- */
-export async function runShadowInferenceNow(): Promise<GenericAdminRunResult> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/run-shadow-inference`), {
-    method: "POST",
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<GenericAdminRunResult>(r);
-}
-
-/**
- * Trigger a manual promotion-gate run.
- */
-export async function runPromotionGatesNow(): Promise<GenericAdminRunResult> {
-  const r = await fetchWithAuth(apiUrl(`/api/admin/run-promotion-gates`), {
-    method: "POST",
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<GenericAdminRunResult>(r);
-}
+// runFeatureBuilderNow / runLabelerNow / runTrainerNow /
+// runShadowInferenceNow / runPromotionGatesNow were removed when the
+// online ML pipeline was decommissioned.  Their corresponding backend
+// routes (/api/admin/run-feature-builder, /run-labeler, /run-trainer,
+// /run-shadow-inference, /run-promotion-gates) no longer exist.
 
 /**
  * Trigger a manual performance-analytics refresh.
@@ -364,8 +315,9 @@ export type TradeLeg = {
 export type TradeRow = {
   trade_id: number;
   decision_id: number | null;
-  candidate_id: number | null;
-  feature_snapshot_id: number | null;
+  // `candidate_id` and `feature_snapshot_id` were removed from the response
+  // when their backing columns on `trades` were dropped by Track A.7
+  // migration 015 (online ML schema decommission).
   status: string;
   trade_source: string;
   strategy_type: string;
@@ -488,67 +440,11 @@ export async function fetchPerformanceAnalytics(
   return safeJson<PerformanceAnalyticsResponse>(r);
 }
 
-export type ModelOpsGate = {
-  passed: boolean;
-  checks: Record<string, { value: number; threshold: number; pass: boolean }>;
-  summary?: Record<string, number>;
-};
-
-export type ModelOpsModelVersion = {
-  model_version_id: number;
-  version: string;
-  rollout_status: string;
-  is_active: boolean;
-  created_at_utc: string | null;
-  promoted_at_utc: string | null;
-  metrics?: {
-    tp50_rate_test?: number | null;
-    expectancy_test?: number | null;
-    max_drawdown_test?: number | null;
-    tail_loss_proxy_test?: number | null;
-    avg_margin_usage_test?: number | null;
-  };
-};
-
-export type ModelOpsTrainingRun = {
-  training_run_id: number;
-  model_version_id: number | null;
-  status: string;
-  started_at_utc: string | null;
-  finished_at_utc: string | null;
-  rows_train: number;
-  rows_test: number;
-  notes: string | null;
-  skip_reason: string | null;
-  gate: ModelOpsGate | null;
-};
-
-export type ModelOpsResponse = {
-  model_name: string;
-  counts: {
-    model_versions: number;
-    training_runs: number;
-    model_predictions: number;
-    model_predictions_24h: number;
-  };
-  latest_prediction_ts: string | null;
-  latest_model_version: ModelOpsModelVersion | null;
-  active_model_version: ModelOpsModelVersion | null;
-  latest_training_run: ModelOpsTrainingRun | null;
-  warnings: string[];
-};
-
-/**
- * Fetch model-ops status for monitoring training/gates/prediction activity.
- */
-export async function fetchModelOps(modelName?: string, signal?: AbortSignal): Promise<ModelOpsResponse> {
-  const params = new URLSearchParams();
-  if (modelName && modelName.trim()) params.set("model_name", modelName.trim());
-  const query = params.toString();
-  const r = await fetchWithAuth(apiUrl(`/api/model-ops${query ? `?${query}` : ""}`), { signal });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<ModelOpsResponse>(r);
-}
+// ModelOpsGate / ModelOpsModelVersion / ModelOpsTrainingRun / ModelOpsResponse
+// + fetchModelOps were removed when the online ML pipeline was decommissioned.
+// The backend route /api/model-ops no longer exists.  ``model_versions`` is
+// preserved on the backend for offline ML re-entry but currently has no
+// dedicated frontend surface.
 
 export type AdminPreflightCounts = {
   underlying_quotes: number;
@@ -556,12 +452,12 @@ export type AdminPreflightCounts = {
   option_chain_rows: number;
   gex_snapshots: number;
   trade_decisions: number;
-  feature_snapshots: number;
-  trade_candidates: number;
-  labeled_candidates: number;
+  // ``trade_candidates``, ``labeled_candidates``, ``training_runs``,
+  // ``model_predictions``, ``feature_snapshots`` were dropped from the
+  // admin preflight payload when the online ML pipeline was decommissioned
+  // and migration 015 (Track A.7) removed the underlying tables.
+  // ``model_versions`` is preserved (offline ML re-entry).
   model_versions: number;
-  training_runs: number;
-  model_predictions: number;
   trades: number;
   open_trades: number;
   closed_trades: number;
@@ -572,11 +468,9 @@ export type AdminPreflightLatest = {
   snapshot_ts: string | null;
   gex_ts: string | null;
   decision_ts: string | null;
-  feature_ts: string | null;
-  candidate_ts: string | null;
+  // ``candidate_ts``, ``training_run_ts``, ``prediction_ts``, ``feature_ts``
+  // were dropped alongside their counts above.
   model_version_ts: string | null;
-  training_run_ts: string | null;
-  prediction_ts: string | null;
   trade_mark_ts: string | null;
   trade_entry_ts: string | null;
   market_clock_ts: string | null;
@@ -699,139 +593,32 @@ export async function fetchAuthAudit(
 }
 
 // ---------------------------------------------------------------------------
-// Model monitoring endpoints (Phase 3)
+// Model monitoring endpoints (REMOVED -- Phase 3 deletion)
 // ---------------------------------------------------------------------------
-
-export type ModelPredictionRow = {
-  prediction_id: number;
-  candidate_id: number | null;
-  model_version_id: number;
-  model_name: string;
-  model_version: string;
-  probability_win: number | null;
-  expected_value: number | null;
-  score_raw: number | null;
-  decision_hint: string | null;
-  created_at: string | null;
-  hold_realized_pnl: number | null;
-  hold_hit_tp50: string | null;
-  hold_exit_reason: string | null;
-  realized_pnl: number | null;
-  label_status: string | null;
-};
-
-export type ModelPredictionsResponse = {
-  total: number;
-  limit: number;
-  offset: number;
-  items: ModelPredictionRow[];
-};
-
-/**
- * Fetch paginated model predictions with outcome data for the prediction browser.
- */
-export async function fetchModelPredictions(
-  limit = 50,
-  offset = 0,
-  modelVersionId?: number,
-  decision?: string,
-  dateFrom?: string,
-  dateTo?: string,
-  signal?: AbortSignal,
-): Promise<ModelPredictionsResponse> {
-  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  if (modelVersionId != null) params.set("model_version_id", String(modelVersionId));
-  if (decision) params.set("decision", decision);
-  if (dateFrom) params.set("date_from", dateFrom);
-  if (dateTo) params.set("date_to", dateTo);
-  const r = await fetchWithAuth(apiUrl(`/api/model-predictions?${params.toString()}`), { signal });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<ModelPredictionsResponse>(r);
-}
-
-export type AccuracyWindow = {
-  period: string | null;
-  total: number;
-  true_positive: number;
-  false_positive: number;
-  true_negative: number;
-  false_negative: number;
-  accuracy: number | null;
-  precision: number | null;
-  recall: number | null;
-  avg_pnl_traded: number | null;
-  avg_pnl_skipped: number | null;
-};
-
-export type ModelAccuracyResponse = {
-  model_name: string;
-  window: string;
-  windows: AccuracyWindow[];
-};
-
-/**
- * Fetch accuracy metrics aggregated over time windows (weekly/monthly).
- */
-export async function fetchModelAccuracy(modelName?: string, window = "week", signal?: AbortSignal): Promise<ModelAccuracyResponse> {
-  const params = new URLSearchParams({ window });
-  if (modelName) params.set("model_name", modelName);
-  const r = await fetchWithAuth(apiUrl(`/api/model-accuracy?${params.toString()}`), { signal });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<ModelAccuracyResponse>(r);
-}
-
-export type CalibrationBin = {
-  bin_lower: number;
-  bin_upper: number;
-  predicted_avg: number;
-  observed_rate: number | null;
-  count: number;
-};
-
-export type ModelCalibrationResponse = {
-  model_name: string;
-  bins: CalibrationBin[];
-};
-
-/**
- * Fetch calibration curve data for the model monitor.
- */
-export async function fetchModelCalibration(modelName?: string, bins = 10, signal?: AbortSignal): Promise<ModelCalibrationResponse> {
-  const params = new URLSearchParams({ bins: String(bins) });
-  if (modelName) params.set("model_name", modelName);
-  const r = await fetchWithAuth(apiUrl(`/api/model-calibration?${params.toString()}`), { signal });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<ModelCalibrationResponse>(r);
-}
-
-export type ModelPnlAttributionResponse = {
-  model_name: string;
-  baseline_pnl: number;
-  model_pnl: number;
-  saved_pnl: number;
-  missed_pnl: number;
-  net_impact: number;
-  trade_count: number;
-  skip_count: number;
-  total_candidates: number;
-};
-
-/**
- * Fetch PnL attribution comparing model-filtered vs baseline trades.
- */
-export async function fetchModelPnlAttribution(modelName?: string, signal?: AbortSignal): Promise<ModelPnlAttributionResponse> {
-  const params = new URLSearchParams();
-  if (modelName) params.set("model_name", modelName);
-  const query = params.toString();
-  const r = await fetchWithAuth(apiUrl(`/api/model-pnl-attribution${query ? `?${query}` : ""}`), { signal });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return safeJson<ModelPnlAttributionResponse>(r);
-}
+// The Phase 3 model-monitoring API surface (ModelPredictionRow,
+// ModelPredictionsResponse, AccuracyWindow, ModelAccuracyResponse,
+// CalibrationBin, ModelCalibrationResponse, ModelPnlAttributionResponse,
+// fetchModelPredictions, fetchModelAccuracy, fetchModelCalibration,
+// fetchModelPnlAttribution) was removed when the online ML pipeline was
+// decommissioned.  The corresponding backend routes
+// (/api/model-predictions, /api/model-accuracy, /api/model-calibration,
+// /api/model-pnl-attribution) and the underlying ``model_predictions``
+// table no longer exist.
 
 // ---------------------------------------------------------------------------
 // Portfolio management endpoints
 // ---------------------------------------------------------------------------
 
+/**
+ * Live portfolio status snapshot returned by `/api/portfolio/status`.
+ *
+ * Note: the legacy `portfolio_enabled` field was removed when the
+ * `PORTFOLIO_ENABLED` flag was deleted (the live decision job is always
+ * portfolio-managed after the online ML decommission).  Consumers that
+ * previously branched on `portfolio_enabled` should now treat the
+ * presence of a non-null `PortfolioStatus` as "portfolio data is
+ * available" and fall back to legacy metrics only on fetch error.
+ */
 export type PortfolioStatus = {
   date: string;
   equity: number;
@@ -844,7 +631,6 @@ export type PortfolioStatus = {
   monthly_stop_active: boolean;
   daily_pnl: number;
   event_signals: string[];
-  portfolio_enabled: boolean;
 };
 
 export type PortfolioHistoryDay = {

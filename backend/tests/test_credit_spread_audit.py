@@ -11,18 +11,26 @@ Covers:
 """
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from spx_backend.config import Settings, settings
-from spx_backend.jobs.decision_job import DecisionJob
-from spx_backend.jobs.labeler_job import LabelMark, evaluate_candidate_outcome
-from spx_backend.jobs.trade_pnl_job import derive_stop_loss_target
-from spx_backend.services.portfolio_manager import PortfolioManager
+# LabelMark + evaluate_candidate_outcome live in backend/scripts/_label_helpers.py
+# (relocated when the online ML pipeline was decommissioned).  We mirror the
+# sys.path pattern used by test_xgb_model.py / test_backtest_strategy.py / etc.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from _label_helpers import LabelMark, evaluate_candidate_outcome  # noqa: E402
+
+from spx_backend.config import Settings, settings  # noqa: E402
+from spx_backend.jobs.decision_job import DecisionJob  # noqa: E402
+from spx_backend.jobs.trade_pnl_job import derive_stop_loss_target  # noqa: E402
+from spx_backend.services.portfolio_manager import PortfolioManager  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")

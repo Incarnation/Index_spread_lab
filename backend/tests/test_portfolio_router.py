@@ -26,8 +26,13 @@ def _fake_user():
 
 
 def _make_app(monkeypatch) -> FastAPI:
-    """Create a minimal FastAPI app with portfolio router and no-auth override."""
-    monkeypatch.setattr(settings, "portfolio_enabled", True)
+    """Create a minimal FastAPI app with portfolio router and no-auth override.
+
+    Note: ``settings.portfolio_enabled`` was removed when the online ML
+    pipeline was decommissioned -- the live decision job is always
+    portfolio-managed, so the flag (and the test monkeypatch for it) no
+    longer exist.
+    """
     monkeypatch.setattr(settings, "portfolio_starting_capital", 20_000.0)
     monkeypatch.setattr(settings, "portfolio_max_trades_per_day", 2)
     monkeypatch.setattr(settings, "portfolio_max_trades_per_run", 1)
@@ -131,10 +136,14 @@ class TestPortfolioConfig:
         assert "decision" in data
 
     def test_portfolio_fields(self, client_empty: TestClient) -> None:
-        """Portfolio section contains expected config keys."""
+        """Portfolio section contains expected config keys.
+
+        ``enabled`` was dropped from the response when ``portfolio_enabled``
+        was removed (the live decision job is always portfolio-managed).
+        """
         data = client_empty.get("/api/portfolio/config").json()
         p = data["portfolio"]
-        assert p["enabled"] is True
+        assert "enabled" not in p
         assert p["starting_capital"] == 20_000
         assert p["max_trades_per_day"] == 2
         assert p["max_trades_per_run"] == 1
@@ -179,7 +188,10 @@ class TestPortfolioStatus:
         assert data["max_trades_per_day"] == 2
         assert data["max_trades_per_run"] == 1
         assert data["monthly_stop_active"] is False
-        assert data["portfolio_enabled"] is True
+        # ``portfolio_enabled`` was removed from the response when the
+        # config flag was deleted; assert explicitly that no consumer
+        # accidentally re-adds it.
+        assert "portfolio_enabled" not in data
         assert "spx_drop_1d" in data["event_signals"]
 
     @patch("spx_backend.web.routers.portfolio.EventSignalDetector")

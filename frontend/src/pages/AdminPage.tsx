@@ -12,16 +12,16 @@ import {
   runDecisionNow,
   runTradePnlNow,
   runGexNow,
-  runFeatureBuilderNow,
-  runLabelerNow,
-  runTrainerNow,
-  runShadowInferenceNow,
-  runPromotionGatesNow,
   runPerformanceAnalyticsNow,
   runCboeGexNow,
 } from "@/api";
-import { Activity, Database, AlertTriangle, Play } from "lucide-react";
+import { AlertTriangle, Play } from "lucide-react";
 
+// Online-ML run buttons (Feature Builder, Labeler, Trainer, Shadow
+// Inference, Promotion Gate) were removed from this list when the
+// online ML pipeline was decommissioned -- the corresponding admin
+// endpoints (/api/admin/run-feature-builder, /run-labeler, /run-trainer,
+// /run-shadow-inference, /run-promotion-gates) no longer exist.
 const JOBS = [
   { label: "Quotes", fn: runQuotesNow },
   { label: "Snapshot", fn: runSnapshotNow },
@@ -30,11 +30,6 @@ const JOBS = [
   { label: "Decision", fn: runDecisionNow },
   { label: "Trade PnL", fn: runTradePnlNow },
   { label: "Perf Analytics", fn: runPerformanceAnalyticsNow },
-  { label: "Feature Builder", fn: runFeatureBuilderNow },
-  { label: "Labeler", fn: runLabelerNow },
-  { label: "Trainer", fn: runTrainerNow },
-  { label: "Shadow Inference", fn: runShadowInferenceNow },
-  { label: "Promotion Gate", fn: runPromotionGatesNow },
 ] as const;
 
 /**
@@ -105,10 +100,8 @@ export function AdminPage() {
             { label: "Snapshots", ts: l.snapshot_ts },
             { label: "GEX", ts: l.gex_ts },
             { label: "Decisions", ts: l.decision_ts },
-            { label: "Features", ts: l.feature_ts },
-            { label: "Predictions", ts: l.prediction_ts },
             { label: "Trade Mark", ts: l.trade_mark_ts },
-            { label: "Training", ts: l.training_run_ts },
+            { label: "Models", ts: l.model_version_ts },
           ].map(({ label, ts }) => (
             <Card key={label}>
               <CardHeader className="pb-1">
@@ -130,8 +123,6 @@ export function AdminPage() {
             { label: "Open", val: c.open_trades },
             { label: "Closed", val: c.closed_trades },
             { label: "Decisions", val: c.trade_decisions },
-            { label: "Candidates", val: c.trade_candidates },
-            { label: "Predictions", val: c.model_predictions },
             { label: "Snapshots", val: c.chain_snapshots },
             { label: "GEX", val: c.gex_snapshots },
             { label: "Models", val: c.model_versions },

@@ -169,11 +169,25 @@ class TestBulkTradeLegs:
 
 
 class TestRunOnce:
-    """Test the full run_once flow with mocked DB and settings."""
+    """Test the full run_once flow with mocked DB and settings.
+
+    The class previously pinned ``portfolio_enabled=False`` to keep the
+    closure path from instantiating a real ``PortfolioManager``.  After the
+    flag was removed, the closure branch always runs, so we patch both
+    ``_get_portfolio_manager`` (to avoid a live ``PortfolioManager()`` /
+    ``begin_day`` DB hit) and ``_close_with_portfolio`` (to skip the
+    ``record_closure`` write) for every test in the class.
+    ``TestPortfolioClosure`` overrides these with its own real-pm mocks
+    to assert ``record_closure`` is invoked.
+    """
 
     @pytest.fixture(autouse=True)
     def _patch_settings(self):
-        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings,
+            patch.object(TradePnlJob, "_get_portfolio_manager", new_callable=AsyncMock),
+            patch.object(TradePnlJob, "_close_with_portfolio", new_callable=AsyncMock),
+        ):
             mock_settings.tz = "America/New_York"
             mock_settings.trade_pnl_enabled = True
             mock_settings.trade_pnl_allow_outside_rth = True
@@ -184,7 +198,6 @@ class TestRunOnce:
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
-            mock_settings.portfolio_enabled = False
             self.mock_settings = mock_settings
             yield
 
@@ -530,11 +543,22 @@ class TestFactory:
 
 
 class TestExpirationOutsideRTH:
-    """Verify that expired trades close even when market is closed."""
+    """Verify that expired trades close even when market is closed.
+
+    See ``TestRunOnce`` for why ``_get_portfolio_manager`` and
+    ``_close_with_portfolio`` are patched at the fixture level:
+    closure-flow tests in this class focus on the expiration branch and
+    do not exercise the portfolio side, but the code path always invokes
+    these helpers now that ``portfolio_enabled`` is gone.
+    """
 
     @pytest.fixture(autouse=True)
     def _patch_settings(self):
-        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings,
+            patch.object(TradePnlJob, "_get_portfolio_manager", new_callable=AsyncMock),
+            patch.object(TradePnlJob, "_close_with_portfolio", new_callable=AsyncMock),
+        ):
             mock_settings.tz = "America/New_York"
             mock_settings.trade_pnl_enabled = True
             mock_settings.trade_pnl_allow_outside_rth = False
@@ -544,7 +568,6 @@ class TestExpirationOutsideRTH:
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
-            mock_settings.portfolio_enabled = False
             self.mock_settings = mock_settings
             yield
 
@@ -670,7 +693,6 @@ class TestPortfolioClosure:
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
-            mock_settings.portfolio_enabled = True
             self.mock_settings = mock_settings
             yield
 
@@ -754,27 +776,10 @@ class TestPortfolioClosure:
         call_args = mock_pm.record_closure.await_args
         assert call_args[0][0] == 61
 
-    @pytest.mark.asyncio
-    async def test_portfolio_disabled_skips_record_closure(self):
-        """When portfolio_enabled=False, record_closure should not be called."""
-        self.mock_settings.portfolio_enabled = False
-        expired_trade = _make_trade(
-            trade_id=62, entry_credit=2.0,
-            expiration=_today_et() - timedelta(days=1),
-            max_loss=300.0,
-        )
-        session = self._make_session_with_trades([expired_trade])
-
-        with (
-            patch("spx_backend.jobs.trade_pnl_job.SessionLocal", return_value=session),
-            patch.object(TradePnlJob, "_bulk_trade_legs", new_callable=AsyncMock, return_value={}),
-            patch("spx_backend.jobs.trade_pnl_job.PortfolioManager") as mock_pm_cls,
-        ):
-            job = TradePnlJob()
-            result = await job.run_once(force=True)
-
-        assert result["expired_closed"] == 1
-        mock_pm_cls.assert_not_called()
+# NOTE: ``test_portfolio_disabled_skips_record_closure`` was deleted along
+# with the ``portfolio_enabled`` flag in the online-ML decommission -- the
+# closure path is unconditional now and there is no "disabled" branch to
+# assert against.
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +976,15 @@ class TestTier3NullMaxLoss:
 
     @pytest.fixture(autouse=True)
     def _patch_settings(self):
-        with patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings:
+        # See ``TestRunOnce`` for why ``_get_portfolio_manager`` and
+        # ``_close_with_portfolio`` are patched at the fixture level:
+        # this class focuses on max-loss validation and does not exercise
+        # the real portfolio writer.
+        with (
+            patch("spx_backend.jobs.trade_pnl_job.settings") as mock_settings,
+            patch.object(TradePnlJob, "_get_portfolio_manager", new_callable=AsyncMock),
+            patch.object(TradePnlJob, "_close_with_portfolio", new_callable=AsyncMock),
+        ):
             mock_settings.tz = "America/New_York"
             mock_settings.trade_pnl_enabled = True
             mock_settings.trade_pnl_allow_outside_rth = True
@@ -981,7 +994,6 @@ class TestTier3NullMaxLoss:
             mock_settings.trade_pnl_stop_loss_pct = 1.00
             mock_settings.trade_pnl_contract_multiplier = 100
             mock_settings.decision_contracts = 1
-            mock_settings.portfolio_enabled = False
             self.mock_settings = mock_settings
             yield
 

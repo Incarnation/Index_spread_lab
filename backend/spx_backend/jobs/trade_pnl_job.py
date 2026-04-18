@@ -486,11 +486,13 @@ class TradePnlJob:
                 long_exit_price=long_exit,
             )
 
-            if settings.portfolio_enabled:
-                pm = await self._get_portfolio_manager(now_et)
-                await self._close_with_portfolio(
-                    pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
-                )
+            # Always run the portfolio closure path -- ``portfolio_enabled``
+            # was removed in the online-ML decommission and the system
+            # now has a single (portfolio-managed) live trading path.
+            pm = await self._get_portfolio_manager(now_et)
+            await self._close_with_portfolio(
+                pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
+            )
 
             expired_closed += 1
             closed += 1
@@ -734,11 +736,12 @@ class TradePnlJob:
                         long_exit_price=long_mid,
                     )
 
-                    if settings.portfolio_enabled:
-                        pm = await self._get_portfolio_manager(now_et)
-                        await self._close_with_portfolio(
-                            pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
-                        )
+                    # See the expiry-close branch above: portfolio closure
+                    # is unconditional now that ``portfolio_enabled`` is gone.
+                    pm = await self._get_portfolio_manager(now_et)
+                    await self._close_with_portfolio(
+                        pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,
+                    )
 
                     sms_close_infos.append({
                         "trade_id": trade.trade_id,

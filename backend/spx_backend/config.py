@@ -98,72 +98,13 @@ class Settings(BaseSettings):
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
 
-    # ML feature/candidate generation (step 1)
-    feature_builder_enabled: bool = True
-    feature_builder_allow_outside_rth: bool = False
-    feature_schema_version: str = "fs_v2"
-    candidate_schema_version: str = "cand_v2"
-
-    # ML label resolver (step 2)
-    labeler_enabled: bool = True
-    labeler_batch_limit: int = 200
-    labeler_min_age_minutes: int = 10
-    labeler_max_wait_hours: int = 336
-    labeler_take_profit_pct: float = 0.50
-    label_schema_version: str = "label_v1"
-    label_contract_multiplier: int = 100
-
-    # Weekly trainer (step 3)
-    trainer_enabled: bool = True
-    trainer_weekday: str = "sat"  # mon..sun accepted by APScheduler cron.
-    trainer_hour: int = 9
-    trainer_minute: int = 0
-    trainer_model_name: str = "cand_bucket_v1"
-    trainer_lookback_days: int = 365
-    trainer_test_days: int = 28
-    trainer_min_rows: int = 200
-    trainer_min_train_rows: int = 100
-    trainer_min_test_rows: int = 50
-    trainer_sparse_cv_enabled: bool = True
-    trainer_sparse_cv_min_rows: int = 30
-    trainer_sparse_cv_folds: int = 4
-    trainer_sparse_cv_min_train_rows: int = 12
-    trainer_sparse_cv_min_test_rows: int = 6
-    trainer_min_bucket_size: int = 12
-    trainer_prior_strength: float = 8.0
-    trainer_adaptive_prior_enabled: bool = True
-    trainer_adaptive_prior_reference_rows: int = 200
-    trainer_adaptive_prior_min: float = 2.0
-    trainer_adaptive_prior_max: float = 24.0
-    trainer_utility_prob_weight: float = 0.35
-    trainer_utility_tail_penalty: float = 0.20
-    trainer_utility_margin_penalty: float = 0.02
-
-    # Shadow inference (step 4)
-    shadow_inference_enabled: bool = True
-    shadow_inference_batch_limit: int = 500
-    shadow_inference_lookback_minutes: int = 1440
-    shadow_inference_model_name: str = "spx_credit_spread_v1"
-
-    # Promotion gate evaluator (step 5)
-    promotion_gate_enabled: bool = True
-    promotion_gate_model_name: str = "cand_bucket_v1"
-    promotion_gate_min_resolved: int = 100
-    promotion_gate_min_tp50_rate: float = 0.50
-    promotion_gate_min_expectancy: float = 0.0
-    promotion_gate_max_drawdown: float = 15000.0
-    promotion_gate_min_tail_loss_proxy: float = -5000.0
-    promotion_gate_max_avg_margin_usage: float = 5000.0
-    promotion_gate_auto_activate: bool = False
-
-    # Hybrid execution policy (step 6)
-    decision_hybrid_enabled: bool = False
-    decision_hybrid_model_name: str = "spx_credit_spread_v1"
-    decision_hybrid_min_probability: float = 0.50
-    decision_hybrid_min_expected_pnl: float = 0.0
-    decision_hybrid_min_bucket_count: int = 8
-    decision_hybrid_max_pnl_std: float = 250.0
-    decision_hybrid_require_active_model: bool = True
+    # NOTE: the online-ML pipeline (feature builder / labeler / trainer /
+    # shadow inference / promotion gate) and its hybrid execution policy
+    # were decommissioned in Track A.  All `*_enabled`, `trainer_*`,
+    # `labeler_*`, `shadow_inference_*`, `promotion_gate_*`, and
+    # `decision_hybrid_*` settings were removed at the same time.  The
+    # offline ML toolkit (`backend/scripts/`) and `model_versions` table
+    # remain so ML can be re-introduced later on the portfolio path.
 
     # EOD economic-events seeder
     eod_events_enabled: bool = True
@@ -231,9 +172,6 @@ class Settings(BaseSettings):
     portfolio_max_equity_risk_pct: float = 0.10
     portfolio_max_margin_pct: float = 0.30
     portfolio_calls_only: bool = True
-    portfolio_enabled: bool = False
-    """Gate for the new portfolio-managed decision path.
-    When False the legacy ML/rules pipeline runs unchanged."""
 
     # ─── Event-driven signal layer ───────────────────────────────
     event_enabled: bool = False

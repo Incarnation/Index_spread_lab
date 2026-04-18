@@ -917,7 +917,10 @@ def extract_xgb_features(
     Parameters
     ----------
     candidate_json:
-        Raw candidate payload from trade_candidates.
+        Raw candidate payload (``dict``).  Historically sourced from the
+        decommissioned ``trade_candidates`` table; the offline training
+        scripts under ``backend/scripts/`` now build this payload
+        directly from ``trades`` + ``chain_snapshots`` instead.
     max_loss_points:
         Max loss in spread points (width - credit).  Stored directly as
         the ``max_loss`` feature to match the offline training CSV scale.

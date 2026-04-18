@@ -202,8 +202,6 @@ class _RouterAwareSession:
                     SimpleNamespace(
                         trade_id=501,
                         decision_id=77,
-                        candidate_id=701,
-                        feature_snapshot_id=801,
                         status="OPEN",
                         trade_source="live",
                         strategy_type="credit_spread_put",
@@ -234,97 +232,12 @@ class _RouterAwareSession:
                 ]
             )
 
-        if "FROM trade_candidates" in sql and "realized_pnl IS NOT NULL" in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(
-                        ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        realized_pnl=40.0,
-                        hit_tp50=True,
-                        hit_tp100=False,
-                        spread_side="put",
-                        max_loss=8.0,
-                        contracts=1,
-                    ),
-                    SimpleNamespace(
-                        ts=datetime(2026, 2, 2, 15, 0, tzinfo=timezone.utc),
-                        realized_pnl=-20.0,
-                        hit_tp50=False,
-                        hit_tp100=False,
-                        spread_side="put",
-                        max_loss=8.0,
-                        contracts=1,
-                    ),
-                ]
-            )
-
-        if "FROM trade_candidates" in sql and "AS resolved_count" in sql and "GROUP BY spread_side" not in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(
-                        resolved_count=10,
-                        tp50_count=6,
-                        tp100_count=3,
-                        avg_realized_pnl=12.5,
-                    )
-                ]
-            )
-
-        if "GROUP BY spread_side" in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(spread_side="call", resolved_count=4, tp50_count=2, tp100_count=1, avg_realized_pnl=8.0),
-                    SimpleNamespace(spread_side="put", resolved_count=6, tp50_count=4, tp100_count=2, avg_realized_pnl=15.5),
-                ]
-            )
-
-        if "model_versions_count" in sql and "model_predictions_24h_count" in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(
-                        model_versions_count=2,
-                        training_runs_count=1,
-                        model_predictions_count=20,
-                        model_predictions_24h_count=5,
-                        latest_prediction_ts=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                    )
-                ]
-            )
-
-        if "FROM model_versions" in sql and "metrics_json" in sql and "LIMIT 1" in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(
-                        model_version_id=11,
-                        version="wf_20260201",
-                        rollout_status="shadow",
-                        is_active=False,
-                        created_at=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        promoted_at=None,
-                        metrics_json={"tp50_rate_test": 0.55, "expectancy_test": 11.0},
-                    )
-                ]
-            )
-
-        if "FROM training_runs tr" in sql:
-            return _FakeExecResult(
-                [
-                    SimpleNamespace(
-                        training_run_id=31,
-                        model_version_id=11,
-                        status="COMPLETED",
-                        started_at=datetime(2026, 2, 1, 14, 0, tzinfo=timezone.utc),
-                        finished_at=datetime(2026, 2, 1, 15, 0, tzinfo=timezone.utc),
-                        rows_train=500,
-                        rows_test=120,
-                        notes="ok",
-                        metrics_json={"gate": {"passed": True}},
-                    )
-                ]
-            )
-
-        if "FROM model_versions" in sql and "AND is_active = true" in sql:
-            return _FakeExecResult([])
+        # Online-ML SQL handlers removed: ``/api/label-metrics``,
+        # ``/api/strategy-metrics``, and ``/api/model-ops`` were
+        # decommissioned along with the ``trade_candidates``,
+        # ``training_runs``, ``model_predictions`` tables.  No fake
+        # rows are needed for those queries because the endpoints
+        # themselves no longer exist.
 
         if "DELETE FROM trade_decisions" in sql:
             if int(query_params.get("decision_id", 0)) == 1:
@@ -333,6 +246,16 @@ class _RouterAwareSession:
 
         if "SELECT" in sql and "quotes_count" in sql and "latest_market_clock_ts" in sql:
             fresh_ts = datetime.now(tz=timezone.utc)
+            # Mirrors the post-A.7 admin preflight SELECT in
+            # ``backend/spx_backend/web/routers/admin.py``.  The dropped
+            # online-ML count/timestamp columns (``trade_candidates_count``,
+            # ``labeled_candidates_count``, ``training_runs_count``,
+            # ``model_predictions_count``, ``feature_snapshots_count``,
+            # ``latest_candidate_ts``, ``latest_training_run_ts``,
+            # ``latest_prediction_ts``, ``latest_feature_ts``) are
+            # intentionally absent because the underlying tables were
+            # dropped by migration 015 and the production query no longer
+            # references them.
             return _FakeExecResult(
                 [
                     SimpleNamespace(
@@ -341,12 +264,7 @@ class _RouterAwareSession:
                         chain_rows_count=1000,
                         gex_snapshots_count=40,
                         decisions_count=20,
-                        feature_snapshots_count=60,
-                        trade_candidates_count=120,
-                        labeled_candidates_count=80,
                         model_versions_count=2,
-                        training_runs_count=1,
-                        model_predictions_count=20,
                         trades_count=10,
                         open_trades_count=4,
                         closed_trades_count=6,
@@ -354,11 +272,7 @@ class _RouterAwareSession:
                         latest_snapshot_ts=fresh_ts,
                         latest_gex_ts=fresh_ts,
                         latest_decision_ts=fresh_ts,
-                        latest_feature_ts=fresh_ts,
-                        latest_candidate_ts=fresh_ts,
                         latest_model_version_ts=fresh_ts,
-                        latest_training_run_ts=fresh_ts,
-                        latest_prediction_ts=fresh_ts,
                         latest_trade_mark_ts=fresh_ts,
                         latest_trade_entry_ts=fresh_ts,
                         latest_market_clock_ts=fresh_ts,
@@ -495,13 +409,11 @@ def _build_test_client(monkeypatch):
     test_app.state.gex_job = _FakeJob("gex")
     test_app.state.cboe_gex_job = _FakeJob("cboe_gex")
     test_app.state.decision_job = _FakeJob("decision")
-    test_app.state.feature_builder_job = _FakeJob("feature_builder")
-    test_app.state.labeler_job = _FakeJob("labeler")
     test_app.state.trade_pnl_job = _FakeJob("trade_pnl")
     test_app.state.performance_analytics_job = _FakeJob("performance_analytics")
-    test_app.state.trainer_job = _FakeJob("trainer")
-    test_app.state.shadow_inference_job = _FakeJob("shadow_inference")
-    test_app.state.promotion_gate_job = _FakeJob("promotion_gate")
+    # Online-ML jobs (feature_builder/labeler/trainer/shadow_inference/
+    # promotion_gate) and their corresponding admin run-* endpoints were
+    # decommissioned, so we no longer wire them into ``app.state``.
     test_app.state.tradier = _FakeTradier()
 
     return TestClient(test_app), fake_session
@@ -539,17 +451,10 @@ def test_e2e_public_api_surface(monkeypatch) -> None:
     assert trades.json()["items"][0]["status"] == "OPEN"
     assert len(trades.json()["items"][0]["legs"]) == 2
 
-    label_metrics = client.get("/api/label-metrics?lookback_days=90", headers=headers)
-    assert label_metrics.status_code == 200
-    assert label_metrics.json()["summary"]["resolved"] == 10
-
-    strategy_metrics = client.get("/api/strategy-metrics?lookback_days=90", headers=headers)
-    assert strategy_metrics.status_code == 200
-    assert strategy_metrics.json()["summary"]["resolved"] == 2
-
-    model_ops = client.get("/api/model-ops", headers=headers)
-    assert model_ops.status_code == 200
-    assert model_ops.json()["counts"]["model_versions"] == 2
+    # Decommissioned online-ML endpoints (``/api/label-metrics``,
+    # ``/api/strategy-metrics``, ``/api/model-ops``) were removed from
+    # ``public.py``; no e2e coverage is needed once the routes no
+    # longer exist.
 
     gex_snapshots = client.get("/api/gex/snapshots?limit=1", headers=headers)
     assert gex_snapshots.status_code == 200
@@ -580,19 +485,17 @@ def test_e2e_admin_auth_and_run_endpoints(monkeypatch) -> None:
     assert unauthorized.status_code == 401
 
     headers = _e2e_auth_headers(client)
+    # Online-ML run endpoints (``run-feature-builder``, ``run-labeler``,
+    # ``run-trainer``, ``run-shadow-inference``, ``run-promotion-gates``)
+    # were removed from ``admin.py`` along with the ML jobs themselves.
     run_paths = [
         "/api/admin/run-snapshot",
         "/api/admin/run-quotes",
         "/api/admin/run-gex",
         "/api/admin/run-cboe-gex",
         "/api/admin/run-decision",
-        "/api/admin/run-feature-builder",
-        "/api/admin/run-labeler",
         "/api/admin/run-trade-pnl",
         "/api/admin/run-performance-analytics",
-        "/api/admin/run-trainer",
-        "/api/admin/run-shadow-inference",
-        "/api/admin/run-promotion-gates",
     ]
     for path in run_paths:
         resp = client.post(path, headers=headers)

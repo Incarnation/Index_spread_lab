@@ -13,13 +13,14 @@ from spx_backend.web.routers import admin, auth, optimizer, portfolio, public
 from spx_backend.web.routers.public import (
     get_performance_analytics,
     get_gex_curve,
-    get_label_metrics,
-    get_model_ops,
-    get_strategy_metrics,
     list_gex_dtes,
     list_gex_expirations,
     list_trades,
 )
+# ``get_label_metrics``, ``get_model_ops``, and ``get_strategy_metrics`` were
+# removed when the online ML pipeline was decommissioned; the corresponding
+# routes (`/api/label-metrics`, `/api/model-ops`, `/api/strategy-metrics`)
+# no longer exist on ``public.router``.
 
 
 @asynccontextmanager
@@ -91,11 +92,11 @@ __all__ = [
     "app",
     "lifespan",
     # Re-exported endpoint symbols for tests/backward compatibility.
+    # ``get_label_metrics``, ``get_model_ops``, ``get_strategy_metrics``
+    # were removed alongside the online ML pipeline -- their routes no
+    # longer exist on ``public.router``.
     "list_trades",
-    "get_label_metrics",
     "get_performance_analytics",
-    "get_model_ops",
-    "get_strategy_metrics",
     "list_gex_dtes",
     "list_gex_expirations",
     "get_gex_curve",

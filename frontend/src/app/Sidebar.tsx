@@ -4,7 +4,6 @@ import {
   LayoutDashboard,
   TrendingUp,
   ArrowLeftRight,
-  Brain,
   BarChart3,
   Activity,
   Settings,
@@ -23,7 +22,9 @@ const NAV_ITEMS: { to: string; icon: typeof LayoutDashboard; label: string; end?
   { to: "/portfolio", icon: Wallet, label: "Portfolio" },
   { to: "/trades", icon: TrendingUp, label: "Trades" },
   { to: "/decisions", icon: ArrowLeftRight, label: "Decisions" },
-  { to: "/model", icon: Brain, label: "Model Monitor" },
+  // "Model Monitor" link removed -- the online ML pipeline (and the
+  // /api/model-ops, /api/label-metrics, /api/strategy-metrics endpoints
+  // it consumed) was decommissioned.
   { to: "/performance", icon: BarChart3, label: "Performance" },
   { to: "/gex", icon: Activity, label: "GEX / Market" },
   { to: "/strategy", icon: FlaskConical, label: "Strategy" },

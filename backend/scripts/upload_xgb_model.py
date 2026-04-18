@@ -1,10 +1,13 @@
 """Upload a trained XGBoost entry model to the model_versions table.
 
-Supports two deployment paths:
-  1. ``--upload``  (default): push model artifact into ``model_versions``
-     so the shadow_inference_job can score live candidates on Railway.
-  2. ``--batch-predict``: load model from disk, score unscored candidates
-     directly from the DB, and write predictions to ``model_predictions``.
+The script's only deployment path is ``--upload``: push a model artifact
+into ``model_versions`` so it is available for offline / future ML re-entry
+on the portfolio path.
+
+The legacy ``--batch-predict`` workflow was removed in Track A.7 along
+with the ``trade_candidates`` and ``model_predictions`` tables; live
+inference will be re-introduced at decision time on the portfolio path
+rather than via pre-baked prediction rows.
 """
 from __future__ import annotations
 
@@ -63,7 +66,11 @@ async def upload_model(
     Parameters
     ----------
     model_dir : directory containing classifier.json / regressor.json / metadata.json.
-    model_name : the model_name value (must match shadow_inference_model_name config).
+    model_name : the ``model_name`` value to register on the new
+        ``model_versions`` row.  Pick a stable identifier so the offline
+        ML re-entry path can look the artifact up later (the legacy
+        ``shadow_inference_model_name`` config that this used to mirror
+        was removed in Track A).
     activate : if True, set rollout_status='active' and is_active=True.
 
     Returns
@@ -128,103 +135,8 @@ async def upload_model(
     return mvid
 
 
-async def batch_predict(
-    model_dir: Path,
-    model_name: str,
-    limit: int = 5000,
-) -> int:
-    """Score unscored candidates using the local model and write to DB.
-
-    Parameters
-    ----------
-    model_dir : directory with model artifacts.
-    model_name : model_name to look up the model_version_id.
-    limit : max candidates to score per run.
-
-    Returns
-    -------
-    Number of predictions inserted.
-    """
-    from spx_backend.database import SessionLocal
-    from spx_backend.jobs.modeling import extract_xgb_features, predict_xgb_entry
-
-    payload = _load_model_artifacts(model_dir)
-
-    async with SessionLocal() as session:
-        mv_row = (await session.execute(
-            text("""
-                SELECT model_version_id FROM model_versions
-                WHERE model_name = :mn AND algorithm = 'xgb_entry_v1'
-                ORDER BY created_at DESC LIMIT 1
-            """),
-            {"mn": model_name},
-        )).fetchone()
-
-        if mv_row is None:
-            logger.error("No xgb_entry_v1 model_version found. Run --upload first.")
-            return 0
-        mvid = int(mv_row.model_version_id)
-
-        candidates = (await session.execute(
-            text("""
-                SELECT tc.candidate_id, tc.candidate_json, tc.max_loss, tc.ts
-                FROM trade_candidates tc
-                LEFT JOIN model_predictions mp
-                  ON mp.candidate_id = tc.candidate_id
-                 AND mp.model_version_id = :mvid
-                WHERE tc.candidate_json IS NOT NULL
-                  AND mp.prediction_id IS NULL
-                ORDER BY tc.ts DESC
-                LIMIT :lim
-            """),
-            {"mvid": mvid, "lim": limit},
-        )).fetchall()
-
-        inserted = 0
-        for row in candidates:
-            cj = row.candidate_json if isinstance(row.candidate_json, dict) else {}
-            ts = row.ts if hasattr(row, "ts") else None
-            features = extract_xgb_features(cj, candidate_ts=ts)
-            pred = predict_xgb_entry(payload, features)
-
-            score_raw = pred["utility_score"]
-            await session.execute(
-                text("""
-                    INSERT INTO model_predictions (
-                        candidate_id, model_version_id,
-                        prediction_schema_version, score_raw, score_calibrated,
-                        probability_win, expected_value, decision, meta_json
-                    ) VALUES (
-                        :cid, :mvid, 'pred_v1', :sr, :sc,
-                        :pw, :ev, :dec, CAST(:meta AS jsonb)
-                    )
-                    ON CONFLICT (candidate_id, model_version_id) DO UPDATE
-                    SET score_raw = EXCLUDED.score_raw,
-                        score_calibrated = EXCLUDED.score_calibrated,
-                        probability_win = EXCLUDED.probability_win,
-                        expected_value = EXCLUDED.expected_value,
-                        decision = EXCLUDED.decision,
-                        meta_json = EXCLUDED.meta_json
-                """),
-                {
-                    "cid": int(row.candidate_id),
-                    "mvid": mvid,
-                    "sr": score_raw,
-                    "sc": score_raw,
-                    "pw": pred["probability_win"],
-                    "ev": pred["expected_pnl"],
-                    "dec": "TRADE" if pred["probability_win"] >= 0.5 else "SKIP",
-                    "meta": json.dumps({"source": "batch_predict", "model_type": "xgb_entry_v1"}),
-                },
-            )
-            inserted += 1
-
-        await session.commit()
-    return inserted
-
-
 def main() -> None:
-    """CLI entry point for model upload and batch prediction."""
+    """CLI entry point for uploading a model artifact to ``model_versions``."""
     parser = argparse.ArgumentParser(description="Upload XGBoost entry model to DB")
     parser.add_argument(
         "--model-dir", type=str,
@@ -233,12 +145,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-name", type=str, default="spx_credit_spread_v1",
-        help="model_name in model_versions (must match shadow_inference_model_name)",
+        help="model_name to register in the `model_versions` table",
     )
     parser.add_argument("--activate", action="store_true", help="Set model as active immediately")
-    parser.add_argument("--batch-predict", action="store_true", dest="batch",
-                        help="Score unscored candidates locally and write to model_predictions")
-    parser.add_argument("--limit", type=int, default=5000, help="Max candidates for --batch-predict")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -246,15 +155,10 @@ def main() -> None:
         logger.error("Model directory not found: %s", model_dir)
         sys.exit(1)
 
-    if args.batch:
-        print(f"[BATCH] Scoring up to {args.limit} candidates from {model_dir} ...")
-        n = asyncio.run(batch_predict(model_dir, args.model_name, args.limit))
-        print(f"[BATCH] Inserted/updated {n} predictions.")
-    else:
-        print(f"[UPLOAD] Uploading model from {model_dir} ...")
-        mvid = asyncio.run(upload_model(model_dir, args.model_name, args.activate))
-        status = "ACTIVE" if args.activate else "SHADOW"
-        print(f"[UPLOAD] Created model_version_id={mvid} ({status})")
+    print(f"[UPLOAD] Uploading model from {model_dir} ...")
+    mvid = asyncio.run(upload_model(model_dir, args.model_name, args.activate))
+    status = "ACTIVE" if args.activate else "SHADOW"
+    print(f"[UPLOAD] Created model_version_id={mvid} ({status})")
 
 
 if __name__ == "__main__":

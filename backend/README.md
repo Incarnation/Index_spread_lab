@@ -1,6 +1,6 @@
 # IndexSpreadLab -- Backend
 
-FastAPI + APScheduler service that captures SPX/SPY/VIX option data, computes GEX, generates trade candidates, runs ML pipelines, manages paper-trade execution with portfolio budgeting, and serves the optimizer dashboard.
+FastAPI + APScheduler service that captures SPX/SPY/VIX option data, computes GEX, runs a rules-based capital-budgeted decision engine for paper-trade execution with portfolio budgeting, and serves the optimizer dashboard. An offline ML toolkit (`backend/scripts/` + `model_versions` table) is preserved for future re-introduction of model-driven entries on the portfolio path; the previous online ML pipeline (feature builder, labeler, trainer, shadow inference, promotion gate) was decommissioned in Track A.
 
 ---
 
@@ -31,18 +31,15 @@ spx_backend/
     snapshot_job.py          SPX/SPY/VIX chain capture with DTE policy
     gex_job.py               Tradier-computed GEX aggregation
     cboe_gex_job.py          CBOE precomputed GEX fetch
-    feature_builder_job.py   Feature snapshots + ranked candidate generation
-    decision_job.py          Execution policy (rules + optional hybrid ML)
-    labeler_job.py           Outcome labeling + orphan cascade
+    decision_job.py          Rules-based, portfolio-managed execution policy (credit_to_width)
     trade_pnl_job.py         Mark-to-market + TP/SL/expiry close + SMS
-    trainer_job.py           Walk-forward XGBoost trainer (sparse CV fallback)
-    shadow_inference_job.py  Shadow model scoring
-    promotion_gate_job.py    Quality/risk gate evaluation
     performance_analytics_job.py  Win rate, expectancy, drawdown aggregation
     staleness_monitor_job.py      Pipeline freshness alerting (SendGrid)
     eod_events_job.py        End-of-day signal capture + economic calendar
     retention_job.py         Batch purge of old chain/GEX data
-    modeling.py              XGBoost model utilities (train, predict, features)
+    modeling.py              XGBoost model utilities (offline; used by backend/scripts/)
+    # NOTE: feature_builder_job, labeler_job, trainer_job, shadow_inference_job,
+    # and promotion_gate_job were deleted in Track A (online ML decommission).
 
   services/
     portfolio_manager.py  Capital budgeting, lot scaling, drawdown stops
@@ -53,10 +50,10 @@ spx_backend/
     connection.py       Async engine + session factory
     schema.py           Startup schema bootstrap + migration runner
     sql/
-      db_schema.sql              Base table definitions (30+ tables)
-      migrations/                14 numbered idempotent SQL migrations
+      db_schema.sql              Base table definitions
+      migrations/                15 numbered idempotent SQL migrations
       db_reset_all_tables.sql    Full destructive reset
-      db_reset_ml_tables.sql     ML-only destructive reset
+      db_reset_ml_tables.sql     ML-only destructive reset (preserves model_versions)
 
 configs/
   optimizer/
@@ -70,9 +67,9 @@ configs/
     selective.yaml             Selective high-win-rate config sweep
     portfolio_sweep.yaml       Portfolio-only param sweep
 
-scripts/                       21 offline CLI tools (see Scripts section below)
+scripts/                       Offline CLI tools (backtester, optimizer, ML training, ops; see Scripts section below)
 
-tests/                         53 test files (unit + integration + E2E)
+tests/                         Pytest suite (unit + integration + E2E)
 ```
 
 ---
@@ -95,15 +92,12 @@ flowchart TD
     ChS["chain_snapshots"]
     OCR["option_chain_rows"]
     GS["gex_snapshots"]
-    FS["feature_snapshots"]
-    TC["trade_candidates"]
     TD["trade_decisions"]
     TR["trades"]
     TM["trade_marks"]
     PS["portfolio_state"]
     PT["portfolio_trades"]
     MV["model_versions"]
-    MP["model_predictions"]
     TP["trade_performance_*"]
     EE["economic_events"]
     OR["optimizer_*"]
@@ -116,14 +110,6 @@ flowchart TD
     SmsNotifier["SmsNotifier"]
   end
 
-  subgraph ml [ML Pipeline]
-    FeatureBuilder["feature_builder_job"]
-    Labeler["labeler_job"]
-    Trainer["trainer_job"]
-    Shadow["shadow_inference_job"]
-    Promotion["promotion_gate_job"]
-  end
-
   subgraph monitoring [Monitoring]
     TradePnl["trade_pnl_job"]
     PerfAnalytics["performance_analytics_job"]
@@ -132,36 +118,36 @@ flowchart TD
     Retention["retention_job"]
   end
 
-  subgraph offline [Offline Optimizer]
+  subgraph offline ["Offline Optimizer + ML"]
     GenTraining["generate_training_data.py"]
     BacktestEngine["backtest_strategy.py"]
     YamlConfig["YAML configs"]
     IngestScript["ingest_optimizer_results.py"]
+    XgbTrain["xgb_model.py + upload_xgb_model.py"]
   end
 
   QuoteJob --> UQ & CS
   SnapshotJob --> ChS & OCR
   SnapshotJob --> GexJob["gex_job"] --> GS
   CboeGexJob --> GS
-  GS & CS --> FeatureBuilder --> FS & TC
+  ChS & GS & CS --> DecisionJob
   EventSignals --> DecisionJob
   PortfolioMgr --> DecisionJob
-  TC --> DecisionJob --> TD & TR
+  DecisionJob --> TD & TR
   DecisionJob --> SmsNotifier
   TR --> TradePnl --> TM
   TradePnl --> SmsNotifier
   TradePnl --> PS & PT
-  TC --> Labeler
-  Labeler --> Trainer --> MV
-  MV --> Shadow --> MP
-  MP --> Promotion
   TM --> PerfAnalytics --> TP
   EodEvents --> EE
 
   GenTraining --> BacktestEngine
   YamlConfig --> BacktestEngine
   BacktestEngine --> IngestScript --> OR
+  GenTraining --> XgbTrain --> MV
 ```
+
+The decision job no longer reads from a precomputed candidates table. Candidates are constructed inline at each entry-time tick from `chain_snapshots` + `option_chain_rows` and ranked by `credit_to_width` under portfolio gates. The four online-ML tables (`feature_snapshots`, `trade_candidates`, `model_predictions`, `training_runs`) were dropped by migration 015 in Track A.
 
 ---
 
@@ -174,16 +160,13 @@ All jobs are registered in `scheduler_builder.py`. The scheduler uses these patt
 - A separate 16:00 ET `force=True` trigger runs the final capture.
 - Market-open guard skips holidays by checking Tradier clock state; a date is only marked as a trading day when an earlier guarded run observes `is_open=True`.
 
-**Entry-time jobs** (feature builder, decision):
+**Entry-time jobs** (decision):
 - Fire at configured `DECISION_ENTRY_TIMES` (e.g., `10:01,11:01,12:01,13:01,14:01,15:01,16:01`).
 - Market-open guarded.
-- Decision job evaluates event signals at each entry time, allowing intraday signal changes (e.g., a midday SPX drop triggers event trades at the next entry).
+- Decision job constructs candidates inline from the latest chain snapshot, evaluates event signals, and runs portfolio gates. Intraday signal changes (e.g., a midday SPX drop) are reflected at the next entry.
 
-**After-close jobs** (labeler at 16:15, shadow inference at 16:20, EOD events at configurable time):
+**After-close jobs** (EOD events at configurable time):
 - Guarded so they only run on dates that had an observed open market earlier.
-
-**Weekly jobs** (trainer on configured weekday, promotion gate 60 min after trainer):
-- Standard cron triggers.
 
 **Interval jobs** (trade PnL, staleness monitor):
 - Simple interval triggers (not RTH-gated for trade PnL so marks update continuously).
@@ -207,7 +190,7 @@ All jobs are registered in `scheduler_builder.py`. The scheduler uses these patt
 
 **GEX dual-source**: Both Tradier-computed and CBOE precomputed GEX are stored with `source` discrimination. CBOE is preferred for canonical `gex_net`; Tradier is the fallback. `context_snapshots` has separate `gex_net_tradier` / `gex_net_cboe` columns to avoid overwrite races.
 
-**Decision policy**: Hard risk guardrails run first (day caps, open-trade caps, per-side caps). If all pass, rules-based scoring selects the best candidate. When hybrid mode is enabled and eligible model predictions exist, model ranking is applied subject to minimum probability and expected PnL thresholds.
+**Decision policy**: Hard risk guardrails run first (day caps, open-trade caps, per-side caps). If all pass, candidates are constructed inline from the latest `chain_snapshots` + `option_chain_rows`, ranked by `credit_to_width`, and one is selected per side under portfolio constraints. The legacy hybrid-ML branch was removed in Track A; future ML re-entry will plug into this same portfolio path rather than restoring a parallel branch.
 
 **Event-only mode**: When `EVENT_EVENT_ONLY=true`, scheduled trades are suppressed entirely. Trades are only placed when the event signal detector fires (VIX spike, SPX drop, elevated VIX, etc.). This is the current production mode.
 
@@ -215,17 +198,15 @@ All jobs are registered in `scheduler_builder.py`. The scheduler uses these patt
 
 **Term inversion disabled**: Backtesting showed term-structure inversion was not a profitable signal on its own — it triggered put credit spreads on non-drop days that underperformed. The C3 configuration disables it by setting the threshold to 99.0 (unreachable).
 
-**Portfolio management**: When `PORTFOLIO_ENABLED=true`, the decision job delegates to `PortfolioManager` for capital budgeting. Lot sizing scales with equity (`PORTFOLIO_LOT_PER_EQUITY`). Monthly drawdown stops halt new trades when cumulative monthly loss exceeds `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`. Event-driven trades share or have separate budget depending on `EVENT_BUDGET_MODE`.
+**Portfolio management**: The decision job is unconditionally portfolio-managed -- the `PORTFOLIO_ENABLED` flag was removed when the online ML pipeline was decommissioned. The `PortfolioManager` performs capital budgeting: lot sizing scales with equity (`PORTFOLIO_LOT_PER_EQUITY`), monthly drawdown stops halt new trades when cumulative monthly loss exceeds `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`, and event-driven trades share or have separate budget depending on `EVENT_BUDGET_MODE`.
+
+**Live trading paths**: There is exactly one live decision path -- `DecisionJob._run_portfolio_managed`. Offline ML training tooling lives in `backend/scripts/` (`generate_training_data.py`, `xgb_model.py`, `upload_xgb_model.py`) and registers artifacts in `model_versions`; this is the re-entry path for ML on the portfolio decision when it is reintroduced.
 
 **SMS notifications**: `SmsNotifier` sends Twilio SMS on trade open and close events. Errors never block the pipeline (fire-and-forget with logging). Configurable per source via `SMS_NOTIFY_SOURCES`.
 
 **Optimizer YAML configs**: Parameter sweeps are defined in YAML files (`configs/optimizer/`). The `schema.py` Pydantic model validates configs and builds the Cartesian product of all list-valued fields, applying filter rules to prune invalid combinations.
 
-**Labeler orphan cascade**: Feature snapshots with no linked candidates after a configurable grace period are automatically expired to prevent unbounded growth.
-
-**Trainer sparse fallback**: When walk-forward split has insufficient rows for time-series CV, the trainer falls back to sparse cross-validation to still produce a model version.
-
-**Schema migrations**: Numbered SQL files in `database/sql/migrations/` run automatically on startup. Each migration is idempotent (uses `IF NOT EXISTS`, `IF NOT EXISTS ADD COLUMN`, etc). The `schema_migrations` table tracks which have been applied.
+**Schema migrations**: Numbered SQL files in `database/sql/migrations/` run automatically on startup. Each migration is idempotent (uses `IF NOT EXISTS`, `IF NOT EXISTS ADD COLUMN`, etc). The `schema_migrations` table tracks which have been applied. On a fresh DB built from `db_schema.sql`, the migration runner seeds all numbered migrations as already-applied without executing them (the base schema already reflects the post-migration shape); on a populated DB, only un-applied migrations execute.
 
 **Retention safety**: The retention job excludes chain snapshots referenced by open trades to prevent data loss during active positions.
 
@@ -355,9 +336,9 @@ Optimizer:
 - `optimizer_walkforward`: walk-forward validation results per window per config
 
 ML/backtest:
-- `strategy_versions`, `model_versions`, `training_runs`
-- `feature_snapshots`, `trade_candidates`, `model_predictions`
+- `strategy_versions`, `model_versions` (preserved for offline ML re-entry)
 - `backtest_runs`, `strategy_recommendations`
+- The online-ML tables `training_runs`, `feature_snapshots`, `trade_candidates`, and `model_predictions` were dropped by migration 015 (Track A).
 
 Other:
 - `economic_events`, `schema_migrations`
@@ -375,14 +356,7 @@ Other:
 | GET | `/api/chain-snapshots` | Recent chain snapshot metadata |
 | GET | `/api/trade-decisions` | Recent TRADE/SKIP decisions |
 | GET | `/api/trades` | Paper trades with legs and PnL |
-| GET | `/api/label-metrics` | TP50/TP100 and realized PnL summary |
-| GET | `/api/strategy-metrics` | Strategy quality/risk metrics |
 | GET | `/api/performance-analytics` | Performance with breakdowns |
-| GET | `/api/model-ops` | Model/training/prediction ops summary |
-| GET | `/api/model-predictions` | Paginated prediction browser |
-| GET | `/api/model-accuracy` | Accuracy/precision/recall over windows |
-| GET | `/api/model-calibration` | Calibration curve bins |
-| GET | `/api/model-pnl-attribution` | Model PnL attribution vs baseline |
 | GET | `/api/gex/snapshots` | Recent GEX snapshot batches |
 | GET | `/api/gex/dtes` | Available DTEs for a GEX batch |
 | GET | `/api/gex/expirations` | Available expirations for a GEX batch |
@@ -420,13 +394,8 @@ Other:
 | POST | `/api/admin/run-gex` | Trigger GEX job |
 | POST | `/api/admin/run-cboe-gex` | Trigger CBOE GEX job |
 | POST | `/api/admin/run-decision` | Trigger decision job |
-| POST | `/api/admin/run-feature-builder` | Trigger feature builder |
-| POST | `/api/admin/run-labeler` | Trigger labeler |
 | POST | `/api/admin/run-trade-pnl` | Trigger trade PnL job |
 | POST | `/api/admin/run-performance-analytics` | Trigger performance analytics |
-| POST | `/api/admin/run-trainer` | Trigger trainer |
-| POST | `/api/admin/run-shadow-inference` | Trigger shadow inference |
-| POST | `/api/admin/run-promotion-gates` | Trigger promotion gates |
 | DELETE | `/api/admin/trade-decisions/{id}` | Delete a decision |
 | GET | `/api/admin/expirations` | Fetch expirations from Tradier |
 | GET | `/api/admin/auth-audit` | Authentication audit log |
@@ -456,7 +425,6 @@ Key backend-specific settings:
 - `TRADE_PNL_TAKE_PROFIT_PCT`, `TRADE_PNL_STOP_LOSS_PCT`, `TRADE_PNL_STOP_LOSS_ENABLED`: exit thresholds.
 - `EVENT_ENABLED`, `EVENT_SIGNAL_MODE`, `EVENT_MAX_TRADES`, `EVENT_EVENT_ONLY`: event trading.
 - `SMS_ENABLED`, `SMS_ACCOUNT_SID`, `SMS_AUTH_TOKEN`, `SMS_FROM_NUMBER`, `SMS_TO_NUMBER`: Twilio SMS.
-- `TRAINER_WEEKDAY`, `TRAINER_HOUR`, `TRAINER_MINUTE`: weekly trainer schedule.
 - `SENDGRID_API_KEY`, `EMAIL_ALERT_RECIPIENT`: alerting credentials.
 
 ---
@@ -516,6 +484,6 @@ make test-e2e-down      # Stop test DB
 ## Known Limitations
 
 - Live broker order/fill automation is scaffolded (`orders`, `fills` tables) but not wired to a real broker yet.
-- The trainer requires a minimum number of resolved labels before producing a first model version. After a fresh DB reset, `no_model_versions` and `no_model_predictions` warnings are expected initially.
+- The live decision path is rules-only after the Track A decommission. The `model_versions` table is preserved so the offline ML toolkit (`backend/scripts/upload_xgb_model.py`) can register artifacts; wiring those artifacts back into `decision_job` is future work. `no_model_versions` warnings on a fresh DB are expected and not actionable for the rules path.
 - CBOE GEX data availability depends on the vendor API; outages are logged but do not block other pipeline stages.
 - Walk-forward validation mode (`--walkforward`) uses a hardcoded grid from `_build_optimizer_grid()`; it does not read YAML configs. For YAML-driven walk-forward, use a custom script that calls `run_backtest` directly.

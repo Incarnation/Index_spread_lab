@@ -70,7 +70,6 @@ async def get_portfolio_status(
         "monthly_stop_active": bool(state.monthly_stop_active) if state else False,
         "daily_pnl": round(float(state.daily_pnl or 0), 2) if state else 0.0,
         "event_signals": signals,
-        "portfolio_enabled": settings.portfolio_enabled,
     }
 
 
@@ -174,7 +173,6 @@ async def get_portfolio_config(
     """Return current portfolio and event configuration (read-only, no secrets)."""
     return {
         "portfolio": {
-            "enabled": settings.portfolio_enabled,
             "starting_capital": settings.portfolio_starting_capital,
             "max_trades_per_day": settings.portfolio_max_trades_per_day,
             "max_trades_per_run": settings.portfolio_max_trades_per_run,

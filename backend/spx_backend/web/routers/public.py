@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal, get_db_session
-from spx_backend.jobs.modeling import compute_margin_usage_dollars, compute_max_drawdown, summarize_strategy_quality
+from spx_backend.jobs.modeling import compute_max_drawdown
 from spx_backend.web.routers.auth import UserOut, get_current_user
 
 router = APIRouter()
@@ -296,8 +296,10 @@ async def list_trades(
             SELECT
               t.trade_id,
               t.decision_id,
-              t.candidate_id,
-              t.feature_snapshot_id,
+              -- `candidate_id` and `feature_snapshot_id` were dropped from
+              -- the `trades` table by migration 015 when their referenced
+              -- tables (`trade_candidates`, `feature_snapshots`) were
+              -- removed in Track A.7.  The fields are no longer surfaced.
               t.status,
               t.trade_source,
               t.strategy_type,
@@ -359,8 +361,9 @@ async def list_trades(
             {
                 "trade_id": row.trade_id,
                 "decision_id": row.decision_id,
-                "candidate_id": row.candidate_id,
-                "feature_snapshot_id": row.feature_snapshot_id,
+                # `candidate_id` / `feature_snapshot_id` were removed from
+                # the response when their backing columns were dropped by
+                # migration 015 (Track A.7).
                 "status": row.status,
                 "trade_source": row.trade_source,
                 "strategy_type": row.strategy_type,
@@ -390,192 +393,14 @@ async def list_trades(
     }
 
 
-@router.get("/api/label-metrics")
-async def get_label_metrics(
-    lookback_days: int = 90,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return TP50/TP100 label metrics overall and by spread side."""
-    if lookback_days <= 0 or lookback_days > 3650:
-        raise HTTPException(status_code=400, detail="invalid_lookback_days")
-
-    window_start = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=lookback_days)
-
-    summary_row = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  COUNT(*)::bigint AS resolved_count,
-                  SUM(CASE WHEN COALESCE(hit_tp50_before_sl_or_expiry, false) THEN 1 ELSE 0 END)::bigint AS tp50_count,
-                  SUM(CASE WHEN COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) THEN 1 ELSE 0 END)::bigint AS tp100_count,
-                  AVG(realized_pnl) AS avg_realized_pnl
-                FROM trade_candidates
-                WHERE label_status = 'resolved'
-                  AND ts >= :window_start
-                """
-            ),
-            {"window_start": window_start},
-        )
-    ).fetchone()
-
-    side_rows = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  COALESCE(candidate_json->>'spread_side', 'unknown') AS spread_side,
-                  COUNT(*)::bigint AS resolved_count,
-                  SUM(CASE WHEN COALESCE(hit_tp50_before_sl_or_expiry, false) THEN 1 ELSE 0 END)::bigint AS tp50_count,
-                  SUM(CASE WHEN COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) THEN 1 ELSE 0 END)::bigint AS tp100_count,
-                  AVG(realized_pnl) AS avg_realized_pnl
-                FROM trade_candidates
-                WHERE label_status = 'resolved'
-                  AND ts >= :window_start
-                GROUP BY spread_side
-                ORDER BY spread_side ASC
-                """
-            ),
-            {"window_start": window_start},
-        )
-    ).fetchall()
-
-    def _rate(numerator: int, denominator: int) -> float | None:
-        """Safely compute a ratio, returning None when denominator is zero."""
-        if denominator <= 0:
-            return None
-        return numerator / denominator
-
-    total_resolved = int(summary_row.resolved_count or 0) if summary_row is not None else 0
-    total_tp50 = int(summary_row.tp50_count or 0) if summary_row is not None else 0
-    total_tp100 = int(summary_row.tp100_count or 0) if summary_row is not None else 0
-    total_avg_pnl = float(summary_row.avg_realized_pnl) if (summary_row is not None and summary_row.avg_realized_pnl is not None) else None
-
-    by_side = []
-    for row in side_rows:
-        resolved_count = int(row.resolved_count or 0)
-        tp50_count = int(row.tp50_count or 0)
-        tp100_count = int(row.tp100_count or 0)
-        by_side.append(
-            {
-                "spread_side": row.spread_side,
-                "resolved": resolved_count,
-                "tp50": tp50_count,
-                "tp100_at_expiry": tp100_count,
-                "tp50_rate": _rate(tp50_count, resolved_count),
-                "tp100_at_expiry_rate": _rate(tp100_count, resolved_count),
-                "avg_realized_pnl": (float(row.avg_realized_pnl) if row.avg_realized_pnl is not None else None),
-            }
-        )
-
-    return {
-        "lookback_days": lookback_days,
-        "window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
-        "summary": {
-            "resolved": total_resolved,
-            "tp50": total_tp50,
-            "tp100_at_expiry": total_tp100,
-            "tp50_rate": _rate(total_tp50, total_resolved),
-            "tp100_at_expiry_rate": _rate(total_tp100, total_resolved),
-            "avg_realized_pnl": total_avg_pnl,
-        },
-        "by_side": by_side,
-    }
-
-
-@router.get("/api/strategy-metrics")
-async def get_strategy_metrics(
-    lookback_days: int = 90,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return v2 strategy-quality and risk metrics overall + by side."""
-    if lookback_days <= 0 or lookback_days > 3650:
-        raise HTTPException(status_code=400, detail="invalid_lookback_days")
-
-    window_start = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=lookback_days)
-    rows = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  ts,
-                  realized_pnl,
-                  COALESCE(hit_tp50_before_sl_or_expiry, false) AS hit_tp50,
-                  COALESCE((label_json->>'hit_tp100_at_expiry')::boolean, false) AS hit_tp100,
-                  COALESCE(candidate_json->>'spread_side', 'unknown') AS spread_side,
-                  max_loss,
-                  COALESCE((candidate_json->>'contracts')::int, 1) AS contracts
-                FROM trade_candidates
-                WHERE label_status = 'resolved'
-                  AND ts >= :window_start
-                  AND realized_pnl IS NOT NULL
-                ORDER BY ts ASC
-                """
-            ),
-            {"window_start": window_start},
-        )
-    ).fetchall()
-
-    realized_pnls: list[float] = []
-    margins: list[float] = []
-    tp50_count = 0
-    tp100_count = 0
-    by_side_data: dict[str, dict[str, object]] = {}
-
-    for row in rows:
-        pnl = float(row.realized_pnl)
-        contracts = int(row.contracts or 1)
-        max_loss_points = float(row.max_loss) if row.max_loss is not None else None
-        margin_usage = compute_margin_usage_dollars(
-            max_loss_points=max_loss_points,
-            contracts=contracts,
-            contract_multiplier=settings.label_contract_multiplier,
-        )
-        realized_pnls.append(pnl)
-        margins.append(margin_usage)
-        if bool(row.hit_tp50):
-            tp50_count += 1
-        if bool(row.hit_tp100):
-            tp100_count += 1
-
-        spread_side = str(row.spread_side or "unknown")
-        bucket = by_side_data.setdefault(spread_side, {"pnls": [], "margins": [], "tp50": 0, "tp100": 0})
-        cast_pnls = bucket["pnls"]
-        cast_margins = bucket["margins"]
-        if isinstance(cast_pnls, list):
-            cast_pnls.append(pnl)
-        if isinstance(cast_margins, list):
-            cast_margins.append(margin_usage)
-        if bool(row.hit_tp50):
-            bucket["tp50"] = int(bucket["tp50"]) + 1
-        if bool(row.hit_tp100):
-            bucket["tp100"] = int(bucket["tp100"]) + 1
-
-    summary = summarize_strategy_quality(
-        realized_pnls=realized_pnls,
-        margin_usages=margins,
-        hit_tp50_count=tp50_count,
-        hit_tp100_count=tp100_count,
-    )
-    by_side = []
-    for spread_side in sorted(by_side_data.keys()):
-        payload = by_side_data[spread_side]
-        side_summary = summarize_strategy_quality(
-            realized_pnls=list(payload["pnls"]) if isinstance(payload["pnls"], list) else [],
-            margin_usages=list(payload["margins"]) if isinstance(payload["margins"], list) else [],
-            hit_tp50_count=int(payload["tp50"]),
-            hit_tp100_count=int(payload["tp100"]),
-        )
-        by_side.append({"spread_side": spread_side, **side_summary})
-
-    return {
-        "lookback_days": lookback_days,
-        "window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
-        "summary": summary,
-        "by_side": by_side,
-    }
+### REMOVED IN ONLINE-ML DECOMMISSION ###################################
+# ``GET /api/label-metrics`` and ``GET /api/strategy-metrics`` were
+# removed because both endpoints aggregated outcomes from the
+# decommissioned ``trade_candidates`` table (scheduled to be dropped in
+# the A.7 schema-cleanup migration).  Per-strategy / TP50-TP100 metrics
+# can be reconstructed from ``trades`` + ``trade_marks`` if needed for
+# the offline ML re-entry path.
+########################################################################
 
 
 @router.get("/api/performance-analytics")
@@ -783,199 +608,16 @@ async def get_performance_analytics(
     }
 
 
-@router.get("/api/model-ops")
-async def get_model_ops(
-    model_name: str | None = None,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return latest model version, training attempt, and prediction activity."""
-    selected_model_name = model_name.strip() if isinstance(model_name, str) and model_name.strip() else settings.trainer_model_name
+### REMOVED IN ONLINE-ML DECOMMISSION ###################################
+# ``GET /api/model-ops`` was removed because it surfaced freshness/health
+# of the decommissioned ``training_runs`` and ``model_predictions``
+# tables (scheduled to be dropped in the A.7 schema-cleanup migration).
+# ``model_versions`` -- which is preserved for offline ML re-entry --
+# is still surfaced via ``/api/admin/preflight``'s ``model_versions``
+# count + ``model_version_ts``.
+########################################################################
 
-    counts_row = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  (SELECT COUNT(*) FROM model_versions WHERE model_name = :model_name) AS model_versions_count,
-                  (SELECT COUNT(*)
-                    FROM training_runs tr
-                    LEFT JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
-                    WHERE COALESCE(NULLIF(tr.config_json->>'model_name', ''), mv.model_name) = :model_name
-                  ) AS training_runs_count,
-                  (SELECT COUNT(*) FROM model_predictions mp
-                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-                    WHERE mv.model_name = :model_name) AS model_predictions_count,
-                  (SELECT COUNT(*) FROM model_predictions mp
-                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-                    WHERE mv.model_name = :model_name AND mp.created_at >= :since_24h) AS model_predictions_24h_count,
-                  (SELECT MAX(mp.created_at) FROM model_predictions mp
-                    JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-                    WHERE mv.model_name = :model_name) AS latest_prediction_ts
-                """
-            ),
-            {"model_name": selected_model_name, "since_24h": datetime.now(tz=ZoneInfo("UTC")) - timedelta(hours=24)},
-        )
-    ).fetchone()
 
-    latest_model_row = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  model_version_id,
-                  version,
-                  rollout_status,
-                  is_active,
-                  created_at,
-                  promoted_at,
-                  metrics_json
-                FROM model_versions
-                WHERE model_name = :model_name
-                ORDER BY created_at DESC, model_version_id DESC
-                LIMIT 1
-                """
-            ),
-            {"model_name": selected_model_name},
-        )
-    ).fetchone()
-
-    latest_training_row = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  tr.training_run_id,
-                  tr.model_version_id,
-                  tr.status,
-                  tr.started_at,
-                  tr.finished_at,
-                  tr.rows_train,
-                  tr.rows_test,
-                  tr.notes,
-                  tr.metrics_json
-                FROM training_runs tr
-                LEFT JOIN model_versions mv ON mv.model_version_id = tr.model_version_id
-                WHERE COALESCE(NULLIF(tr.config_json->>'model_name', ''), mv.model_name) = :model_name
-                ORDER BY COALESCE(tr.finished_at, tr.started_at) DESC NULLS LAST, tr.training_run_id DESC
-                LIMIT 1
-                """
-            ),
-            {"model_name": selected_model_name},
-        )
-    ).fetchone()
-
-    active_model_row = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                  model_version_id,
-                  version,
-                  rollout_status,
-                  is_active,
-                  created_at,
-                  promoted_at
-                FROM model_versions
-                WHERE model_name = :model_name
-                  AND is_active = true
-                ORDER BY promoted_at DESC NULLS LAST, created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"model_name": selected_model_name},
-        )
-    ).fetchone()
-
-    def _iso(ts: Any) -> str | None:
-        """Convert nullable timestamps into ISO strings for API responses."""
-        return ts.isoformat() if ts is not None else None
-
-    model_metrics = latest_model_row.metrics_json if (latest_model_row is not None and isinstance(latest_model_row.metrics_json, dict)) else {}
-    model_metrics_summary = {
-        "tp50_rate_test": model_metrics.get("tp50_rate_test"),
-        "expectancy_test": model_metrics.get("expectancy_test"),
-        "max_drawdown_test": model_metrics.get("max_drawdown_test"),
-        "tail_loss_proxy_test": model_metrics.get("tail_loss_proxy_test"),
-        "avg_margin_usage_test": model_metrics.get("avg_margin_usage_test"),
-    }
-
-    training_metrics = (
-        latest_training_row.metrics_json if (latest_training_row is not None and isinstance(latest_training_row.metrics_json, dict)) else {}
-    )
-    gate = training_metrics.get("gate") if isinstance(training_metrics.get("gate"), dict) else None
-    skip_reason = training_metrics.get("skipped_reason") if isinstance(training_metrics.get("skipped_reason"), str) else None
-    warnings: list[str] = []
-    if counts_row is not None:
-        if int(counts_row.model_versions_count or 0) == 0:
-            warnings.append("no_model_versions")
-        if int(counts_row.training_runs_count or 0) == 0:
-            warnings.append("no_training_runs")
-        if int(counts_row.model_predictions_count or 0) == 0:
-            warnings.append("no_model_predictions")
-    if latest_training_row is not None:
-        latest_training_status = str(latest_training_row.status or "").upper()
-        if latest_training_status == "SKIPPED":
-            warnings.append("latest_training_skipped")
-        elif latest_training_status == "FAILED":
-            warnings.append("latest_training_failed")
-
-    return {
-        "model_name": selected_model_name,
-        "counts": {
-            "model_versions": int(counts_row.model_versions_count or 0) if counts_row is not None else 0,
-            "training_runs": int(counts_row.training_runs_count or 0) if counts_row is not None else 0,
-            "model_predictions": int(counts_row.model_predictions_count or 0) if counts_row is not None else 0,
-            "model_predictions_24h": int(counts_row.model_predictions_24h_count or 0) if counts_row is not None else 0,
-        },
-        "latest_prediction_ts": (_iso(counts_row.latest_prediction_ts) if counts_row is not None else None),
-        "latest_model_version": (
-            None
-            if latest_model_row is None
-            else {
-                "model_version_id": int(latest_model_row.model_version_id),
-                "version": str(latest_model_row.version),
-                "rollout_status": str(latest_model_row.rollout_status),
-                "is_active": bool(latest_model_row.is_active),
-                "created_at_utc": _iso(latest_model_row.created_at),
-                "promoted_at_utc": _iso(latest_model_row.promoted_at),
-                "metrics": model_metrics_summary,
-            }
-        ),
-        "active_model_version": (
-            None
-            if active_model_row is None
-            else {
-                "model_version_id": int(active_model_row.model_version_id),
-                "version": str(active_model_row.version),
-                "rollout_status": str(active_model_row.rollout_status),
-                "is_active": bool(active_model_row.is_active),
-                "created_at_utc": _iso(active_model_row.created_at),
-                "promoted_at_utc": _iso(active_model_row.promoted_at),
-            }
-        ),
-        "latest_training_run": (
-            None
-            if latest_training_row is None
-            else {
-                "training_run_id": int(latest_training_row.training_run_id),
-                "model_version_id": (
-                    int(latest_training_row.model_version_id)
-                    if latest_training_row.model_version_id is not None
-                    else None
-                ),
-                "status": str(latest_training_row.status),
-                "started_at_utc": _iso(latest_training_row.started_at),
-                "finished_at_utc": _iso(latest_training_row.finished_at),
-                "rows_train": int(latest_training_row.rows_train or 0),
-                "rows_test": int(latest_training_row.rows_test or 0),
-                "notes": latest_training_row.notes,
-                "skip_reason": skip_reason,
-                "gate": gate,
-            }
-        ),
-        "warnings": warnings,
-    }
 
 
 @router.get("/api/gex/snapshots")
@@ -1253,326 +895,21 @@ async def get_gex_curve(
     }
 
 
-@router.get("/api/model-predictions")
-async def list_model_predictions(
-    limit: int = 50,
-    offset: int = 0,
-    model_version_id: int | None = None,
-    decision: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return paginated model predictions joined with candidate outcomes.
-
-    Joins model_predictions -> trade_candidates (for outcome labels) and
-    model_versions (for model metadata). Supports filtering by model version,
-    decision hint, and date range.
-    """
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    where_parts: list[str] = []
-    params: dict[str, object] = {"limit": limit, "offset": offset}
-
-    if model_version_id is not None:
-        where_parts.append("mp.model_version_id = :mv_id")
-        params["mv_id"] = model_version_id
-    if decision:
-        where_parts.append("COALESCE(mp.meta_json->>'decision_hint', mp.decision) = :decision")
-        params["decision"] = decision.strip().upper()
-    if date_from:
-        where_parts.append("mp.created_at >= :date_from")
-        params["date_from"] = date_from
-    if date_to:
-        where_parts.append("mp.created_at <= :date_to")
-        params["date_to"] = date_to
-
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-
-    r = await db.execute(
-        text(
-            f"""
-            SELECT
-              mp.prediction_id,
-              mp.candidate_id,
-              mp.model_version_id,
-              mv.model_name,
-              mv.version AS model_version,
-              mp.probability_win,
-              mp.expected_value,
-              mp.score_raw,
-              mp.meta_json,
-              mp.decision,
-              mp.created_at,
-              tc.realized_pnl,
-              tc.hit_tp50_before_sl_or_expiry AS hit_tp50,
-              tc.label_json->>'hold_realized_pnl' AS hold_realized_pnl,
-              tc.label_json->>'hold_hit_tp50' AS hold_hit_tp50,
-              tc.label_json->>'hold_exit_reason' AS hold_exit_reason,
-              tc.label_status
-            FROM model_predictions mp
-            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
-            {where_clause}
-            ORDER BY mp.created_at DESC
-            LIMIT :limit OFFSET :offset
-            """
-        ),
-        params,
-    )
-    rows = r.fetchall()
-
-    count_r = await db.execute(
-        text(
-            f"""
-            SELECT COUNT(*) AS total
-            FROM model_predictions mp
-            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
-            {where_clause}
-            """
-        ),
-        {k: v for k, v in params.items() if k not in ("limit", "offset")},
-    )
-    total = int((count_r.fetchone() or (0,))[0])
-
-    items = []
-    for row in rows:
-        meta = row.meta_json if isinstance(row.meta_json, dict) else {}
-        items.append({
-            "prediction_id": row.prediction_id,
-            "candidate_id": row.candidate_id,
-            "model_version_id": row.model_version_id,
-            "model_name": row.model_name,
-            "model_version": row.model_version,
-            "probability_win": float(row.probability_win) if row.probability_win is not None else None,
-            "expected_value": float(row.expected_value) if row.expected_value is not None else None,
-            "score_raw": float(row.score_raw) if row.score_raw is not None else None,
-            "decision_hint": meta.get("decision_hint") or getattr(row, "decision", None),
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "hold_realized_pnl": _try_float(row.hold_realized_pnl),
-            "hold_hit_tp50": row.hold_hit_tp50,
-            "hold_exit_reason": row.hold_exit_reason,
-            "realized_pnl": float(row.realized_pnl) if row.realized_pnl is not None else None,
-            "label_status": row.label_status,
-        })
-
-    return {"total": total, "limit": limit, "offset": offset, "items": items}
-
-
-@router.get("/api/model-accuracy")
-async def get_model_accuracy(
-    model_name: str | None = None,
-    window: str = "week",
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return accuracy metrics aggregated over time windows.
-
-    Computes precision, recall, accuracy for the TRADE decision by comparing
-    model predictions against actual trade outcomes (hold_realized_pnl >= 0 = win).
-    """
-    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
-    trunc = "week" if window == "week" else "month"
-
-    r = await db.execute(
-        text(
-            f"""
-            WITH pred_outcomes AS (
-              SELECT
-                date_trunc(:trunc, mp.created_at) AS period,
-                COALESCE(mp.meta_json->>'decision_hint', mp.decision) AS decision_hint,
-                CASE
-                  WHEN tc.label_status = 'resolved' AND tc.realized_pnl IS NOT NULL
-                    THEN CASE WHEN tc.realized_pnl >= 0 THEN true ELSE false END
-                  ELSE NULL
-                END AS actual_win,
-                tc.realized_pnl
-              FROM model_predictions mp
-              JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-              LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
-              WHERE mv.model_name = :model_name
-                AND tc.label_status = 'resolved'
-            )
-            SELECT
-              period,
-              COUNT(*) AS total,
-              SUM(CASE WHEN decision_hint = 'TRADE' AND actual_win = true THEN 1 ELSE 0 END) AS true_positive,
-              SUM(CASE WHEN decision_hint = 'TRADE' AND actual_win = false THEN 1 ELSE 0 END) AS false_positive,
-              SUM(CASE WHEN decision_hint = 'SKIP' AND actual_win = false THEN 1 ELSE 0 END) AS true_negative,
-              SUM(CASE WHEN decision_hint = 'SKIP' AND actual_win = true THEN 1 ELSE 0 END) AS false_negative,
-              AVG(CASE WHEN decision_hint = 'TRADE' THEN realized_pnl END) AS avg_pnl_traded,
-              AVG(CASE WHEN decision_hint = 'SKIP' THEN realized_pnl END) AS avg_pnl_skipped
-            FROM pred_outcomes
-            WHERE period IS NOT NULL
-            GROUP BY period
-            ORDER BY period ASC
-            """
-        ),
-        {"model_name": selected_model, "trunc": trunc},
-    )
-    rows = r.fetchall()
-
-    windows = []
-    for row in rows:
-        tp = int(row.true_positive or 0)
-        fp = int(row.false_positive or 0)
-        tn = int(row.true_negative or 0)
-        fn = int(row.false_negative or 0)
-        total = tp + fp + tn + fn
-        accuracy = (tp + tn) / total if total > 0 else None
-        precision = tp / (tp + fp) if (tp + fp) > 0 else None
-        recall = tp / (tp + fn) if (tp + fn) > 0 else None
-        windows.append({
-            "period": row.period.isoformat() if row.period else None,
-            "total": total,
-            "true_positive": tp,
-            "false_positive": fp,
-            "true_negative": tn,
-            "false_negative": fn,
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "avg_pnl_traded": float(row.avg_pnl_traded) if row.avg_pnl_traded is not None else None,
-            "avg_pnl_skipped": float(row.avg_pnl_skipped) if row.avg_pnl_skipped is not None else None,
-        })
-
-    return {"model_name": selected_model, "window": trunc, "windows": windows}
-
-
-@router.get("/api/model-calibration")
-async def get_model_calibration(
-    model_name: str | None = None,
-    bins: int = 10,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return calibration curve data: predicted probability bins vs observed win rate.
-
-    Bins predictions by probability_win decile and computes the observed outcome
-    rate per bin to assess model calibration.
-    """
-    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
-    bins = max(2, min(bins, 20))
-    bin_width = 1.0 / bins
-
-    r = await db.execute(
-        text(
-            """
-            SELECT
-              mp.probability_win,
-              CASE
-                WHEN tc.label_status = 'resolved' AND tc.realized_pnl IS NOT NULL
-                  THEN CASE WHEN tc.realized_pnl >= 0 THEN 1.0 ELSE 0.0 END
-                ELSE NULL
-              END AS actual_outcome
-            FROM model_predictions mp
-            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
-            WHERE mv.model_name = :model_name
-              AND mp.probability_win IS NOT NULL
-              AND tc.label_status = 'resolved'
-            """
-        ),
-        {"model_name": selected_model},
-    )
-    rows = r.fetchall()
-
-    bin_data: list[dict[str, list[float]]] = [{"predicted": [], "actual": []} for _ in range(bins)]
-    for row in rows:
-        prob = float(row.probability_win)
-        actual = float(row.actual_outcome) if row.actual_outcome is not None else None
-        if actual is None:
-            continue
-        bin_idx = min(int(prob / bin_width), bins - 1)
-        bin_data[bin_idx]["predicted"].append(prob)
-        bin_data[bin_idx]["actual"].append(actual)
-
-    result_bins = []
-    for i, bd in enumerate(bin_data):
-        bin_lower = i * bin_width
-        bin_upper = (i + 1) * bin_width
-        count = len(bd["predicted"])
-        predicted_avg = sum(bd["predicted"]) / count if count > 0 else (bin_lower + bin_upper) / 2
-        observed_rate = sum(bd["actual"]) / count if count > 0 else None
-        result_bins.append({
-            "bin_lower": round(bin_lower, 3),
-            "bin_upper": round(bin_upper, 3),
-            "predicted_avg": round(predicted_avg, 4),
-            "observed_rate": round(observed_rate, 4) if observed_rate is not None else None,
-            "count": count,
-        })
-
-    return {"model_name": selected_model, "bins": result_bins}
-
-
-@router.get("/api/model-pnl-attribution")
-async def get_model_pnl_attribution(
-    model_name: str | None = None,
-    current_user: UserOut = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Return PnL attribution comparing model-filtered trades vs baseline.
-
-    baseline_pnl: total PnL if all candidates were traded.
-    model_pnl: total PnL of candidates the model said TRADE.
-    saved_pnl: losses avoided by skipping (negative PnL candidates that were SKIPped).
-    missed_pnl: wins missed by skipping (positive PnL candidates that were SKIPped).
-    """
-    selected_model = (model_name or "").strip() or settings.shadow_inference_model_name
-
-    r = await db.execute(
-        text(
-            """
-            SELECT
-              COALESCE(mp.meta_json->>'decision_hint', mp.decision) AS decision_hint,
-              tc.realized_pnl
-            FROM model_predictions mp
-            JOIN model_versions mv ON mv.model_version_id = mp.model_version_id
-            LEFT JOIN trade_candidates tc ON tc.candidate_id = mp.candidate_id
-            WHERE mv.model_name = :model_name
-              AND tc.label_status = 'resolved'
-              AND tc.realized_pnl IS NOT NULL
-            """
-        ),
-        {"model_name": selected_model},
-    )
-    rows = r.fetchall()
-
-    baseline_pnl = 0.0
-    model_pnl = 0.0
-    saved_pnl = 0.0
-    missed_pnl = 0.0
-    trade_count = 0
-    skip_count = 0
-
-    for row in rows:
-        pnl = float(row.realized_pnl)
-        hint = (row.decision_hint or "").upper()
-        baseline_pnl += pnl
-        if hint == "TRADE":
-            model_pnl += pnl
-            trade_count += 1
-        else:
-            skip_count += 1
-            if pnl < 0:
-                saved_pnl += abs(pnl)
-            else:
-                missed_pnl += pnl
-
-    return {
-        "model_name": selected_model,
-        "baseline_pnl": round(baseline_pnl, 2),
-        "model_pnl": round(model_pnl, 2),
-        "saved_pnl": round(saved_pnl, 2),
-        "missed_pnl": round(missed_pnl, 2),
-        "net_impact": round(model_pnl - baseline_pnl, 2),
-        "trade_count": trade_count,
-        "skip_count": skip_count,
-        "total_candidates": trade_count + skip_count,
-    }
+### REMOVED IN ONLINE-ML DECOMMISSION ###################################
+# The following endpoints were removed because they read from the
+# decommissioned ``model_predictions`` and ``trade_candidates`` tables
+# (both scheduled to be dropped in the A.7 schema-cleanup migration):
+#
+#   GET /api/model-predictions     - paginated model predictions
+#   GET /api/model-accuracy        - precision/recall/accuracy windows
+#   GET /api/model-calibration     - calibration curve bins
+#   GET /api/model-pnl-attribution - model-vs-baseline PnL attribution
+#
+# The frontend ML monitoring page that consumed these endpoints
+# (``ModelMonitorPage``) is being removed in Track A.6.  Future ML
+# re-entry will plug into the portfolio path rather than restoring
+# this monitoring surface unchanged.
+########################################################################
 
 
 @router.get("/api/backtest-results")

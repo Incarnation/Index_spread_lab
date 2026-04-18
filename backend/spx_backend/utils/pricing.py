@@ -2,9 +2,10 @@
 
 Background
 ----------
-Several jobs (``decision_job``, ``trade_pnl_job``, ``labeler_job``)
-historically defined their own ``_mid(bid, ask)`` helper.  Each copy
-quietly accepted dead quotes such as ``(0, 0)`` or crossed books
+Several jobs (``decision_job``, ``trade_pnl_job``, and the offline
+labeler/training scripts under ``backend/scripts/``) historically
+defined their own ``_mid(bid, ask)`` helper.  Each copy quietly
+accepted dead quotes such as ``(0, 0)`` or crossed books
 (``bid > ask``), producing a midpoint of ``0`` that flowed straight
 into entry-credit and exit-cost math.  In practice that allowed
 "free money" entries (credit-to-width gates trivially passing on a

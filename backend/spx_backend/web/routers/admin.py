@@ -12,16 +12,18 @@ from spx_backend.database import get_db_session
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
 from spx_backend.jobs.cboe_gex_job import CboeGexJob, build_cboe_gex_job
 from spx_backend.jobs.decision_job import DecisionJob, build_decision_job
-from spx_backend.jobs.feature_builder_job import FeatureBuilderJob, build_feature_builder_job
 from spx_backend.jobs.gex_job import GexJob
-from spx_backend.jobs.labeler_job import LabelerJob, build_labeler_job
 from spx_backend.jobs.performance_analytics_job import PerformanceAnalyticsJob, build_performance_analytics_job
-from spx_backend.jobs.promotion_gate_job import PromotionGateJob, build_promotion_gate_job
 from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
-from spx_backend.jobs.shadow_inference_job import ShadowInferenceJob, build_shadow_inference_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
-from spx_backend.jobs.trainer_job import TrainerJob, build_trainer_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
+
+# NOTE: imports for the five online ML jobs (FeatureBuilderJob, LabelerJob,
+# TrainerJob, ShadowInferenceJob, PromotionGateJob) and their corresponding
+# admin POST endpoints (run-feature-builder, run-labeler, run-trainer,
+# run-shadow-inference, run-promotion-gates) were removed when the online
+# ML pipeline was decommissioned.  Offline backtests/training live in
+# ``backend/scripts`` and are no longer exposed through the admin API.
 
 router = APIRouter()
 
@@ -109,28 +111,6 @@ async def admin_run_decision(
     return result
 
 
-@router.post("/api/admin/run-feature-builder")
-async def admin_run_feature_builder(
-    request: Request,
-    current_user: UserOut = Depends(require_admin),
-) -> dict:
-    """Admin-only. Force feature builder run immediately."""
-    job: FeatureBuilderJob = getattr(request.app.state, "feature_builder_job", build_feature_builder_job())
-    result = await job.run_once(force=True)
-    return result
-
-
-@router.post("/api/admin/run-labeler")
-async def admin_run_labeler(
-    request: Request,
-    current_user: UserOut = Depends(require_admin),
-) -> dict:
-    """Admin-only. Force labeler run immediately."""
-    job: LabelerJob = getattr(request.app.state, "labeler_job", build_labeler_job())
-    result = await job.run_once(force=True)
-    return result
-
-
 @router.post("/api/admin/run-trade-pnl")
 async def admin_run_trade_pnl(
     request: Request,
@@ -150,39 +130,6 @@ async def admin_run_performance_analytics(
     """Admin-only. Force performance-analytics aggregate refresh immediately."""
     state_job = getattr(request.app.state, "performance_analytics_job", None)
     job: PerformanceAnalyticsJob = state_job if state_job is not None else build_performance_analytics_job()
-    result = await job.run_once(force=True)
-    return result
-
-
-@router.post("/api/admin/run-trainer")
-async def admin_run_trainer(
-    request: Request,
-    current_user: UserOut = Depends(require_admin),
-) -> dict:
-    """Admin-only. Force weekly trainer run immediately."""
-    job: TrainerJob = getattr(request.app.state, "trainer_job", build_trainer_job())
-    result = await job.run_once(force=True)
-    return result
-
-
-@router.post("/api/admin/run-shadow-inference")
-async def admin_run_shadow_inference(
-    request: Request,
-    current_user: UserOut = Depends(require_admin),
-) -> dict:
-    """Admin-only. Force shadow inference run immediately."""
-    job: ShadowInferenceJob = getattr(request.app.state, "shadow_inference_job", build_shadow_inference_job())
-    result = await job.run_once(force=True)
-    return result
-
-
-@router.post("/api/admin/run-promotion-gates")
-async def admin_run_promotion_gates(
-    request: Request,
-    current_user: UserOut = Depends(require_admin),
-) -> dict:
-    """Admin-only. Force promotion gate evaluation immediately."""
-    job: PromotionGateJob = getattr(request.app.state, "promotion_gate_job", build_promotion_gate_job())
     result = await job.run_once(force=True)
     return result
 
@@ -292,6 +239,11 @@ async def admin_preflight(
         """Convert nullable timestamps into ISO strings for preflight payloads."""
         return ts.isoformat() if ts is not None else None
 
+    # The online-ML tables (`trade_candidates`, `training_runs`,
+    # `model_predictions`, `feature_snapshots`) were dropped by migration
+    # 015 in Track A.7, so their counts/freshness are no longer surfaced
+    # through preflight.  `model_versions` is preserved for offline ML
+    # re-entry.
     r = await db.execute(
         text(
             """
@@ -301,12 +253,7 @@ async def admin_preflight(
               (SELECT COUNT(*) FROM option_chain_rows) AS chain_rows_count,
               (SELECT COUNT(*) FROM gex_snapshots) AS gex_snapshots_count,
               (SELECT COUNT(*) FROM trade_decisions) AS decisions_count,
-              (SELECT COUNT(*) FROM feature_snapshots) AS feature_snapshots_count,
-              (SELECT COUNT(*) FROM trade_candidates) AS trade_candidates_count,
-              (SELECT COUNT(*) FROM trade_candidates WHERE label_status = 'resolved') AS labeled_candidates_count,
               (SELECT COUNT(*) FROM model_versions) AS model_versions_count,
-              (SELECT COUNT(*) FROM training_runs) AS training_runs_count,
-              (SELECT COUNT(*) FROM model_predictions) AS model_predictions_count,
               (SELECT COUNT(*) FROM trades) AS trades_count,
               (SELECT COUNT(*) FROM trades WHERE status = 'OPEN') AS open_trades_count,
               (SELECT COUNT(*) FROM trades WHERE status = 'CLOSED') AS closed_trades_count,
@@ -314,11 +261,7 @@ async def admin_preflight(
               (SELECT MAX(ts) FROM chain_snapshots) AS latest_snapshot_ts,
               (SELECT MAX(ts) FROM gex_snapshots) AS latest_gex_ts,
               (SELECT MAX(ts) FROM trade_decisions) AS latest_decision_ts,
-              (SELECT MAX(ts) FROM feature_snapshots) AS latest_feature_ts,
-              (SELECT MAX(ts) FROM trade_candidates) AS latest_candidate_ts,
               (SELECT MAX(created_at) FROM model_versions) AS latest_model_version_ts,
-              (SELECT MAX(finished_at) FROM training_runs) AS latest_training_run_ts,
-              (SELECT MAX(created_at) FROM model_predictions) AS latest_prediction_ts,
               (SELECT MAX(last_mark_ts) FROM trades) AS latest_trade_mark_ts,
               (SELECT MAX(entry_time) FROM trades) AS latest_trade_entry_ts,
               (SELECT MAX(ts) FROM market_clock_audit) AS latest_market_clock_ts
@@ -378,18 +321,19 @@ async def admin_preflight(
         )
     ).fetchall()
 
+    # Online-ML keys (`trade_candidates`, `labeled_candidates`,
+    # `training_runs`, `model_predictions`, `feature_snapshots`,
+    # `candidate_ts`, `training_run_ts`, `prediction_ts`, `feature_ts`)
+    # were dropped from the preflight response when the online ML pipeline
+    # was decommissioned and the schema cleanup landed in migration 015.
+    # Frontend consumers no longer reference these counts/timestamps.
     counts = {
         "underlying_quotes": int(summary.quotes_count or 0),
         "chain_snapshots": int(summary.snapshots_count or 0),
         "option_chain_rows": int(summary.chain_rows_count or 0),
         "gex_snapshots": int(summary.gex_snapshots_count or 0),
         "trade_decisions": int(summary.decisions_count or 0),
-        "feature_snapshots": int(summary.feature_snapshots_count or 0),
-        "trade_candidates": int(summary.trade_candidates_count or 0),
-        "labeled_candidates": int(summary.labeled_candidates_count or 0),
         "model_versions": int(summary.model_versions_count or 0),
-        "training_runs": int(summary.training_runs_count or 0),
-        "model_predictions": int(summary.model_predictions_count or 0),
         "trades": int(summary.trades_count or 0),
         "open_trades": int(summary.open_trades_count or 0),
         "closed_trades": int(summary.closed_trades_count or 0),
@@ -399,11 +343,7 @@ async def admin_preflight(
         "snapshot_ts": _iso(summary.latest_snapshot_ts),
         "gex_ts": _iso(summary.latest_gex_ts),
         "decision_ts": _iso(summary.latest_decision_ts),
-        "feature_ts": _iso(summary.latest_feature_ts),
-        "candidate_ts": _iso(summary.latest_candidate_ts),
         "model_version_ts": _iso(summary.latest_model_version_ts),
-        "training_run_ts": _iso(summary.latest_training_run_ts),
-        "prediction_ts": _iso(summary.latest_prediction_ts),
         "trade_mark_ts": _iso(summary.latest_trade_mark_ts),
         "trade_entry_ts": _iso(summary.latest_trade_entry_ts),
         "market_clock_ts": _iso(summary.latest_market_clock_ts),
@@ -436,16 +376,8 @@ async def admin_preflight(
         warnings.append("no_gex_snapshots")
     if counts["trade_decisions"] == 0:
         warnings.append("no_trade_decisions")
-    if counts["feature_snapshots"] == 0:
-        warnings.append("no_feature_snapshots")
-    if counts["trade_candidates"] == 0:
-        warnings.append("no_trade_candidates")
     if counts["model_versions"] == 0:
         warnings.append("no_model_versions")
-    if counts["training_runs"] == 0:
-        warnings.append("no_training_runs")
-    if counts["model_predictions"] == 0:
-        warnings.append("no_model_predictions")
     if counts["trades"] == 0:
         warnings.append("no_trades")
     if _is_stale(quote_age_min, quote_stale_threshold_min):

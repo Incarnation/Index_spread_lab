@@ -49,15 +49,14 @@ TABLES_TO_TRUNCATE = [
     "orders",
     "trades",
     "trade_decisions",
-    "model_predictions",
     "strategy_recommendations",
-    "trade_candidates",
-    "feature_snapshots",
     "backtest_runs",
-    "training_runs",
     "model_versions",
     "strategy_versions",
 ]
+# `trade_candidates`, `model_predictions`, `feature_snapshots`, and
+# `training_runs` were dropped in Track A.7 (migration 015) and no longer
+# exist, so they are not part of the truncate set.
 
 TABLES_TO_PRESERVE = [
     "underlying_quotes",

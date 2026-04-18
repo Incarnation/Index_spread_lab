@@ -128,9 +128,14 @@ async def check_tradier(verbose: bool) -> tuple[str, str]:
 
 
 def check_portfolio_config() -> tuple[str, str]:
-    """Verify critical PORTFOLIO_* env vars are set."""
+    """Verify critical PORTFOLIO_* env vars are set.
+
+    ``PORTFOLIO_ENABLED`` is no longer required: the live decision job is
+    always portfolio-managed after the online-ML decommission.  We still
+    surface a warning if any sizing knob is unset because those drive lot
+    sizing and capital allocation.
+    """
     required = [
-        "PORTFOLIO_ENABLED",
         "PORTFOLIO_STARTING_CAPITAL",
         "PORTFOLIO_MAX_TRADES_PER_DAY",
         "PORTFOLIO_MAX_TRADES_PER_RUN",
@@ -138,11 +143,8 @@ def check_portfolio_config() -> tuple[str, str]:
     missing = [k for k in required if not _env(k)]
     if missing:
         return WARN, f"missing: {', '.join(missing)}"
-    enabled = _env("PORTFOLIO_ENABLED", "false").lower() in ("true", "1", "yes")
-    if not enabled:
-        return WARN, "PORTFOLIO_ENABLED is false"
     return PASS, (
-        f"enabled, capital=${_env('PORTFOLIO_STARTING_CAPITAL')}, "
+        f"capital=${_env('PORTFOLIO_STARTING_CAPITAL')}, "
         f"trades/day={_env('PORTFOLIO_MAX_TRADES_PER_DAY')}, "
         f"trades/run={_env('PORTFOLIO_MAX_TRADES_PER_RUN')}"
     )

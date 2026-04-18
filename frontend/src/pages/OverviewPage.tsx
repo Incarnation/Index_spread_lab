@@ -102,7 +102,12 @@ export function OverviewPage() {
   const openTrades = trades.filter((t) => t.status === "OPEN");
   const closedTrades = trades.filter((t) => t.status === "CLOSED");
   const summary = perf?.summary;
-  const portfolioActive = portfolio?.portfolio_enabled === true;
+  // ``portfolio_enabled`` was removed from ``PortfolioStatus`` when the
+  // ``PORTFOLIO_ENABLED`` flag was deleted.  The decision job is always
+  // portfolio-managed now, so we treat "portfolio data available" as the
+  // active signal -- the page falls back to the legacy KPI layout only
+  // when the portfolio fetch fails (``portfolio`` is undefined).
+  const portfolioActive = portfolio != null;
 
   const todayPnl = (() => {
     if (portfolioActive && portfolio) return portfolio.daily_pnl;

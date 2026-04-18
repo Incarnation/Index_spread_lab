@@ -94,11 +94,12 @@ export function PortfolioPage() {
         </div>
       )}
 
-      {!status?.portfolio_enabled && !loading && (
-        <div className="rounded-lg border border-warning/30 bg-warning-bg p-3 text-sm text-warning">
-          Portfolio management is not enabled. Set <code>PORTFOLIO_ENABLED=true</code> to activate.
-        </div>
-      )}
+      {/*
+       * The "portfolio management is not enabled" warning was removed
+       * along with the `PORTFOLIO_ENABLED` flag in the online-ML
+       * decommission -- the decision job is always portfolio-managed
+       * now, so the disabled-state UI was unreachable.
+       */}
 
       {/* KPI stat cards */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
