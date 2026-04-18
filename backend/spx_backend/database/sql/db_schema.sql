@@ -463,6 +463,43 @@ CREATE TABLE IF NOT EXISTS economic_events (
     PRIMARY KEY (date, event_type)
 );
 
+-- Portfolio state and trade tracking for the capital-budgeted strategy.
+-- Mirrors migration 007_portfolio_state.sql so that fresh databases
+-- bootstrapped from db_schema.sql (which seeds migrations as already-applied
+-- without re-executing them) still get these tables.  Both tables also
+-- appear in db_reset_all_tables.sql's drop list and in ALL_APP_TABLES.
+CREATE TABLE IF NOT EXISTS portfolio_state (
+    id            BIGSERIAL       PRIMARY KEY,
+    date          DATE            NOT NULL UNIQUE,
+    equity_start  DOUBLE PRECISION,
+    equity_end    DOUBLE PRECISION,
+    month_start_equity DOUBLE PRECISION,
+    trades_placed INTEGER         DEFAULT 0,
+    lots_per_trade INTEGER        DEFAULT 1,
+    daily_pnl     DOUBLE PRECISION DEFAULT 0,
+    monthly_stop_active BOOLEAN   DEFAULT false,
+    event_signals JSONB           NULL,
+    created_at    TIMESTAMPTZ     DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_trades (
+    id                BIGSERIAL       PRIMARY KEY,
+    trade_id          BIGINT          REFERENCES trades(trade_id),
+    portfolio_state_id BIGINT         REFERENCES portfolio_state(id),
+    trade_source      TEXT            NOT NULL DEFAULT 'scheduled',
+    event_signal      TEXT            NULL,
+    lots              INTEGER         NOT NULL,
+    margin_committed  DOUBLE PRECISION,
+    realized_pnl      DOUBLE PRECISION,
+    equity_before     DOUBLE PRECISION,
+    equity_after      DOUBLE PRECISION,
+    created_at        TIMESTAMPTZ     DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_state_date ON portfolio_state (date);
+CREATE INDEX IF NOT EXISTS idx_portfolio_trades_trade_id ON portfolio_trades (trade_id);
+CREATE INDEX IF NOT EXISTS idx_portfolio_trades_source ON portfolio_trades (trade_source);
+
 -- Optimizer dashboard: run history, per-config results, walk-forward validation.
 CREATE TABLE IF NOT EXISTS optimizer_runs (
     id              SERIAL PRIMARY KEY,
