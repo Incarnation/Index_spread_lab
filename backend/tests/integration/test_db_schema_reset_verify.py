@@ -18,11 +18,20 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from spx_backend.database import schema
+from spx_backend.database.schema import _strip_sql_comments
 
 
 async def _execute_sql_file(engine, path: Path) -> None:
-    """Execute SQL file statement-by-statement for asyncpg compatibility."""
-    sql = path.read_text(encoding="utf-8")
+    """Execute SQL file statement-by-statement for asyncpg compatibility.
+
+    Mirrors :func:`spx_backend.database.schema._execute_sql_file` so that
+    test DB setup tokenizes migrations identically to production.  In
+    particular, ``--`` and ``/* */`` comments are stripped before splitting
+    on ``;`` so an embedded ``;`` inside a comment cannot truncate a
+    statement.
+    """
+    raw = path.read_text(encoding="utf-8")
+    sql = _strip_sql_comments(raw)
     statements = [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
     async with engine.begin() as conn:
         for stmt in statements:

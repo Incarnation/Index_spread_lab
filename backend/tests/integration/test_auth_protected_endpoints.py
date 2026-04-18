@@ -16,13 +16,23 @@ from sqlalchemy import text
 
 from spx_backend.config import settings
 from spx_backend.database import get_db_session
+from spx_backend.database.schema import _strip_sql_comments
 from spx_backend.web.routers import admin, auth, public
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 async def _execute_sql_file(engine, path: Path) -> None:
-    sql = path.read_text(encoding="utf-8")
+    """Execute SQL file statement-by-statement for asyncpg compatibility.
+
+    Mirrors :func:`spx_backend.database.schema._execute_sql_file` so that
+    test DB setup tokenizes migrations identically to production.  In
+    particular, ``--`` and ``/* */`` comments are stripped before splitting
+    on ``;`` so an embedded ``;`` inside a comment cannot truncate a
+    statement.
+    """
+    raw = path.read_text(encoding="utf-8")
+    sql = _strip_sql_comments(raw)
     statements = [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
     async with engine.begin() as conn:
         for stmt in statements:

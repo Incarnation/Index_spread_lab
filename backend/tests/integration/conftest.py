@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from spx_backend.database.schema import _strip_sql_comments
+
 
 def _ensure_safe_test_database_url(url: str) -> None:
     """Fail fast when DATABASE_URL_TEST does not look like a local test database."""
@@ -24,8 +26,18 @@ def _ensure_safe_test_database_url(url: str) -> None:
 
 
 async def _execute_sql_file(engine, path: Path) -> None:  # noqa: ANN001
-    """Execute SQL file statement-by-statement for asyncpg compatibility."""
-    sql = path.read_text(encoding="utf-8")
+    """Execute SQL file statement-by-statement for asyncpg compatibility.
+
+    Mirrors :func:`spx_backend.database.schema._execute_sql_file` so that
+    test DB setup tokenizes migrations identically to production.  In
+    particular, ``--`` and ``/* */`` comments are stripped before splitting
+    on ``;`` so an embedded ``;`` inside a comment cannot truncate a
+    statement.  The production helper binds to the module-level engine,
+    which is unsuitable here because each integration-test fixture builds
+    its own per-test engine; hence the parameter rather than re-export.
+    """
+    raw = path.read_text(encoding="utf-8")
+    sql = _strip_sql_comments(raw)
     statements = [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
     async with engine.begin() as conn:
         for stmt in statements:
