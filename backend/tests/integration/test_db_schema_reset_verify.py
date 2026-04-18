@@ -38,6 +38,29 @@ async def _execute_sql_file(engine, path: Path) -> None:
             await conn.exec_driver_sql(stmt)
 
 
+async def _seed_migrations_as_applied(engine, mig_dir: Path) -> None:
+    """Record every migration in ``mig_dir`` as already-applied without running it.
+
+    Mirrors the fresh-DB branch of
+    :func:`spx_backend.database.schema._run_migrations`.  ``db_schema.sql``
+    is the post-migration source of truth, so historical DDL files (e.g.
+    migration 008 / 011 which target tables dropped by migration 015) are
+    recorded as applied rather than re-executed against a schema that no
+    longer contains those tables.
+    """
+    paths = sorted(mig_dir.glob("*.sql"))
+    if not paths:
+        return
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql("DELETE FROM schema_migrations")
+        for p in paths:
+            await conn.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT DO NOTHING",
+                (p.stem,),
+            )
+
+
 async def _insert_cboe_rows_for_dte_cleanup(engine) -> None:
     """Seed CBOE snapshots spanning trading-slot DTE 0..12 with stale labels.
 
@@ -129,8 +152,13 @@ async def fresh_test_engine(database_url_test: str):  # noqa: ANN201
     await _execute_sql_file(engine, sql_dir / "db_schema.sql")
     mig_dir = sql_dir / "migrations"
     if mig_dir.exists():
-        for path in sorted(mig_dir.glob("*.sql")):
-            await _execute_sql_file(engine, path)
+        # Mirror production's fresh-DB behaviour: db_schema.sql is the
+        # post-migration source of truth, so historical DDL files are
+        # recorded as applied rather than re-executed.  Tests that need
+        # to exercise a specific migration (e.g.
+        # test_migration_004_cboe_dte_cleanup_is_idempotent) call
+        # _execute_sql_file directly afterwards.
+        await _seed_migrations_as_applied(engine, mig_dir)
     try:
         yield engine
     finally:

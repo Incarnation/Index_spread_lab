@@ -44,6 +44,37 @@ async def _execute_sql_file(engine, path: Path) -> None:  # noqa: ANN001
             await conn.exec_driver_sql(stmt)
 
 
+async def _seed_migrations_as_applied(engine, mig_dir: Path) -> None:  # noqa: ANN001
+    """Record every migration in ``mig_dir`` as already-applied without running it.
+
+    Mirrors the fresh-DB branch of
+    :func:`spx_backend.database.schema._run_migrations` (the ``if not applied
+    and paths`` block).  ``db_schema.sql`` is kept in sync with the
+    post-migration schema, so re-executing historical DDL on a fresh DB
+    would error rather than no-op -- e.g. migration 008 ALTERs
+    ``feature_snapshots`` and migration 011 ALTERs ``trade_candidates``,
+    both of which were dropped by migration 015 and are no longer created
+    by ``db_schema.sql``.
+
+    The seed path therefore records intent ("treat these as done"), exactly
+    matching what production does the first time it boots against an empty
+    ``schema_migrations`` table.
+    """
+    paths = sorted(mig_dir.glob("*.sql"))
+    if not paths:
+        return
+    async with engine.begin() as conn:
+        # db_schema.sql already creates schema_migrations; clear any rows that
+        # survived a prior test run on the same database before reseeding.
+        await conn.exec_driver_sql("DELETE FROM schema_migrations")
+        for p in paths:
+            await conn.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT DO NOTHING",
+                (p.stem,),
+            )
+
+
 @pytest.fixture(scope="session")
 def database_url_test() -> str:
     """Load DATABASE_URL_TEST for DB-backed integration tests."""
@@ -63,8 +94,10 @@ async def integration_db_session(database_url_test: str) -> AsyncSession:
     await _execute_sql_file(engine, sql_dir / "db_schema.sql")
     mig_dir = sql_dir / "migrations"
     if mig_dir.exists():
-        for path in sorted(mig_dir.glob("*.sql")):
-            await _execute_sql_file(engine, path)
+        # Mirror production's fresh-DB behaviour: db_schema.sql is the
+        # post-migration source of truth, so historical DDL files are
+        # recorded as applied rather than re-executed.
+        await _seed_migrations_as_applied(engine, mig_dir)
 
     session_factory = async_sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     session = session_factory()
