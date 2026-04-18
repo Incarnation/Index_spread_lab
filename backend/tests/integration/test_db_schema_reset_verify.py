@@ -169,17 +169,30 @@ async def fresh_test_engine(database_url_test: str):  # noqa: ANN201
 async def test_verify_table_counts_returns_zero_for_all_after_reset(
     database_url_test: str, fresh_test_engine
 ):
-    """
-    After a full reset + init_db, verify_table_counts() should return 0 for every app table
-    when run against that database.
+    """After a full reset + init_db, every *data* table should be empty.
+
+    `schema_migrations` is the one intentional exception: production's
+    `_run_migrations()` seeds it with every migration version on a fresh DB
+    (because db_schema.sql is the post-migration source of truth), and the
+    test fixture mirrors that.  Asserting it equals the number of migration
+    files locks the fixture and production behaviour together.
     """
     import spx_backend.database.schema as schema_mod
 
     with patch.object(schema_mod, "engine", fresh_test_engine):
         counts = await schema.verify_table_counts(schema.ALL_APP_TABLES)
 
+    sql_dir = Path(schema.__file__).resolve().parent / "sql"
+    expected_seeded_versions = len(sorted((sql_dir / "migrations").glob("*.sql")))
+
     assert list(counts.keys()) == schema.ALL_APP_TABLES
     for name, n in counts.items():
+        if name == "schema_migrations":
+            assert n == expected_seeded_versions, (
+                f"schema_migrations should be seeded with {expected_seeded_versions} "
+                f"versions on a fresh DB, got {n}"
+            )
+            continue
         assert n == 0, f"Table {name} should be empty after reset, got {n}"
 
 
