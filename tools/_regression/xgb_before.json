@@ -1,0 +1,189 @@
+{
+  "module": "xgb_model",
+  "symbols": {
+    "Any": {
+      "hash": "1eba772d8733d0e9",
+      "kind": "class"
+    },
+    "BIG_LOSS_THRESHOLD": {
+      "hash": "b1147dc1d1ad644b",
+      "kind": "value"
+    },
+    "BINARY_FEATURES": {
+      "hash": "719fae5d47b7ebce",
+      "kind": "value"
+    },
+    "CATEGORICAL_FEATURES": {
+      "hash": "19a2c09cc7b575ff",
+      "kind": "value"
+    },
+    "CONTINUOUS_FEATURES": {
+      "hash": "3f3cf63f787b1b55",
+      "kind": "value"
+    },
+    "DEFAULT_CLS_PARAMS": {
+      "hash": "3a10a3976e816e01",
+      "kind": "value"
+    },
+    "DEFAULT_REG_PARAMS": {
+      "hash": "648cb58b371ebbf9",
+      "kind": "value"
+    },
+    "HOLD_TARGET_CLS": {
+      "hash": "f7e04abb4294ec7f",
+      "kind": "value"
+    },
+    "HOLD_TARGET_REG": {
+      "hash": "e6c9c563b3f0464b",
+      "kind": "value"
+    },
+    "HOLD_VS_CLOSE_TARGET": {
+      "hash": "4203e5d3a48b7770",
+      "kind": "value"
+    },
+    "ORDINAL_FEATURES": {
+      "hash": "bc0e1fe1c2602242",
+      "kind": "value"
+    },
+    "Path": {
+      "hash": "0acfad4a96df48fc",
+      "kind": "class"
+    },
+    "TARGET_CLS": {
+      "hash": "7533939197e5e6f0",
+      "kind": "value"
+    },
+    "TARGET_REG": {
+      "hash": "f6efb34218bbfbca",
+      "kind": "value"
+    },
+    "V2_EXTRA_FEATURES": {
+      "hash": "8f65113102797a47",
+      "kind": "value"
+    },
+    "XGBClassifier": {
+      "hash": "a504a02ce747a7db",
+      "kind": "class"
+    },
+    "XGBRegressor": {
+      "hash": "e7b2290f39344fc9",
+      "kind": "class"
+    },
+    "_add_v2_features": {
+      "hash": "3a22b5c97df371d9",
+      "kind": "function"
+    },
+    "_calibration_by_decile": {
+      "hash": "5a14f86309f48a39",
+      "kind": "function"
+    },
+    "_extract_entry_rules": {
+      "hash": "7596267f9d93d7a0",
+      "kind": "function"
+    },
+    "_extract_rules": {
+      "hash": "80610939975fea3a",
+      "kind": "function"
+    },
+    "_fit_full_after_early_stopping": {
+      "hash": "81175afb4d72c94d",
+      "kind": "function"
+    },
+    "_max_drawdown": {
+      "hash": "bde9955640839192",
+      "kind": "function"
+    },
+    "_resolve_targets": {
+      "hash": "0192e461cdfc2f69",
+      "kind": "function"
+    },
+    "_run_entry": {
+      "hash": "f2cce9b5dcc2d97a",
+      "kind": "function"
+    },
+    "_run_entry_v2": {
+      "hash": "c0c8f80da078f59c",
+      "kind": "function"
+    },
+    "_run_hold_vs_close": {
+      "hash": "300ee7cbb645dd11",
+      "kind": "function"
+    },
+    "_run_tp50": {
+      "hash": "efe06355543a2372",
+      "kind": "function"
+    },
+    "annotations": {
+      "hash": "697387a71e174328",
+      "kind": "value"
+    },
+    "brier_score_loss": {
+      "hash": "aff8bff3fd7cb2b0",
+      "kind": "function"
+    },
+    "build_entry_feature_matrix": {
+      "hash": "f95d5fc55d004b6a",
+      "kind": "function"
+    },
+    "build_entry_v2_feature_matrix": {
+      "hash": "c2ef3e88f09bdc16",
+      "kind": "function"
+    },
+    "build_feature_matrix": {
+      "hash": "cb3771767b7e8d19",
+      "kind": "function"
+    },
+    "build_hold_vs_close_targets": {
+      "hash": "da3fccc47620f247",
+      "kind": "function"
+    },
+    "get_feature_names": {
+      "hash": "4535401b340c4a76",
+      "kind": "function"
+    },
+    "load_model": {
+      "hash": "339f1873a8aaed8e",
+      "kind": "function"
+    },
+    "logger": {
+      "hash": "b522a96e335f13e8",
+      "kind": "value"
+    },
+    "main": {
+      "hash": "73e9f21ee3360a13",
+      "kind": "function"
+    },
+    "mean_absolute_error": {
+      "hash": "aff8bff3fd7cb2b0",
+      "kind": "function"
+    },
+    "predict_xgb": {
+      "hash": "8bb4268b7c007e8d",
+      "kind": "function"
+    },
+    "save_model": {
+      "hash": "9f934e484757cf8d",
+      "kind": "function"
+    },
+    "train_final_model": {
+      "hash": "3677aea8d985734f",
+      "kind": "function"
+    },
+    "train_xgb_models": {
+      "hash": "b6018c39c0b8eafa",
+      "kind": "function"
+    },
+    "walk_forward_hold_vs_close": {
+      "hash": "b113226654152cb8",
+      "kind": "function"
+    },
+    "walk_forward_rolling": {
+      "hash": "d4ca07ba12203b4a",
+      "kind": "function"
+    },
+    "walk_forward_validate_xgb": {
+      "hash": "7619e0ccdd86e2a5",
+      "kind": "function"
+    }
+  }
+}

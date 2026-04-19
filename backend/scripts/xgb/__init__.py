@@ -1,19 +1,16 @@
-"""Back-compat shim.
+"""Auto-generated package re-exports.
 
-The implementation moved to ``scripts.xgb`` --
-this module simply re-exports the public surface so existing
-``from xxx import yyy`` callers keep working without changes.
+Produced by ``tools/split_monolith.py`` from ``backend/scripts/xgb_model.py``.
+Edit the underlying submodules, not this file.
 """
 from __future__ import annotations
 
-from xgb import (  # noqa: F401
+from .features import (
     Any,
     BIG_LOSS_THRESHOLD,
     BINARY_FEATURES,
     CATEGORICAL_FEATURES,
     CONTINUOUS_FEATURES,
-    DEFAULT_CLS_PARAMS,
-    DEFAULT_REG_PARAMS,
     HOLD_TARGET_CLS,
     HOLD_TARGET_REG,
     HOLD_VS_CLOSE_TARGET,
@@ -22,37 +19,45 @@ from xgb import (  # noqa: F401
     TARGET_CLS,
     TARGET_REG,
     V2_EXTRA_FEATURES,
-    XGBClassifier,
-    XGBRegressor,
     _add_v2_features,
-    _calibration_by_decile,
-    _extract_entry_rules,
-    _extract_rules,
-    _fit_full_after_early_stopping,
-    _max_drawdown,
     _resolve_targets,
-    _run_entry,
-    _run_entry_v2,
-    _run_hold_vs_close,
-    _run_tp50,
     annotations,
-    brier_score_loss,
     build_entry_feature_matrix,
     build_entry_v2_feature_matrix,
     build_feature_matrix,
     build_hold_vs_close_targets,
     get_feature_names,
-    load_model,
     logger,
-    main,
-    mean_absolute_error,
+)
+from .training import (
+    DEFAULT_CLS_PARAMS,
+    DEFAULT_REG_PARAMS,
+    XGBClassifier,
+    XGBRegressor,
+    _fit_full_after_early_stopping,
+    load_model,
     predict_xgb,
     save_model,
     train_final_model,
     train_xgb_models,
+)
+from .walkforward import (
+    _calibration_by_decile,
+    _extract_entry_rules,
+    _extract_rules,
+    _max_drawdown,
+    brier_score_loss,
+    mean_absolute_error,
     walk_forward_hold_vs_close,
     walk_forward_rolling,
     walk_forward_validate_xgb,
+)
+from .cli import (
+    _run_entry,
+    _run_entry_v2,
+    _run_hold_vs_close,
+    _run_tp50,
+    main,
 )
 
 __all__ = [
@@ -103,15 +108,3 @@ __all__ = [
     'walk_forward_rolling',
     'walk_forward_validate_xgb',
 ]
-
-
-if __name__ == "__main__":
-    import sys
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception as exc:  # noqa: BLE001
-        import logging
-        logging.getLogger(__name__).error("Fatal: %s", exc, exc_info=True)
-        sys.exit(1)
