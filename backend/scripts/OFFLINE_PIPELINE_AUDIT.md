@@ -770,7 +770,7 @@ implementation; backtest constructs the prod evaluator from a row.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in gap-closure Phase 2.2 -- `--tp {50,60,75}` CLI flag wired through `compute_trade_pnl` / `evaluate_strategy` / `slice_by_dimension`; main() warns when the matching `min_pnl_before_tp{N}` column is missing. 10 new parametrized tests in `test_sl_recovery_analysis.py::TestTpLevelParametrization`.  **Resolved:** 2026-04-16. |
 
 [`sl_recovery_analysis.py:97-108`](sl_recovery_analysis.py)
 `compute_trade_pnl` hardcodes TP50 ordering (uses `min_pnl_before_tp50` for

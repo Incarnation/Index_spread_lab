@@ -391,3 +391,144 @@ class TestMainSmoke:
         assert "STRATEGY SWEEP" in out
         # Recovery is gated on has_trajectory, so it must be silent.
         assert "STOP-LOSS RECOVERY ANALYSIS" not in out
+
+
+# ── --tp CLI flag parametrization (audit M8) ───────────────────────
+
+
+def _make_row_with_tp(tp_level: int, **overrides) -> pd.Series:
+    """Return a row with the trajectory columns for ``tp_level`` filled in.
+
+    Mirrors ``_make_row`` but also populates ``min_pnl_before_tp{N}`` and
+    ``first_tp{N}_pnl`` so :func:`compute_trade_pnl(..., tp_level=N)` can
+    take the trajectory path rather than falling back.
+    """
+    base = {
+        "resolved": True,
+        "entry_credit": 1.0,
+        "realized_pnl": 50.0,
+        "exit_reason": "TAKE_PROFIT_50",
+        # Always include the legacy TP50 columns since other helpers
+        # poke at them defensively.
+        "min_pnl_before_tp50": -20.0,
+        "first_tp50_pnl": 50.0,
+        "final_pnl_at_expiry": 100.0,
+        "hold_realized_pnl": 80.0,
+        "recovered_after_sl": False,
+        "hold_hit_tp50": True,
+    }
+    base[f"min_pnl_before_tp{tp_level}"] = -20.0
+    base[f"first_tp{tp_level}_pnl"] = float(tp_level)  # distinct per level
+    base.update(overrides)
+    return pd.Series(base)
+
+
+class TestTpLevelParametrization:
+    """Audit M8 -- ensure ``--tp`` actually swaps which columns drive PnL."""
+
+    @pytest.mark.parametrize("tp_level", [50, 60, 75])
+    def test_compute_trade_pnl_reads_matching_tp_column(self, tp_level):
+        # When SL doesn't fire (-20 vs threshold -200), the helper
+        # returns ``first_tp{tp_level}_pnl``.  We made each level's
+        # column carry a distinct value so any wrong-column read is
+        # caught.
+        row = _make_row_with_tp(tp_level)
+        out = compute_trade_pnl(row, sl_mult=2.0,
+                                exit_rule=f"tp{tp_level}",
+                                tp_level=tp_level)
+        assert out == float(tp_level), (
+            f"compute_trade_pnl(tp_level={tp_level}) should have read "
+            f"first_tp{tp_level}_pnl ({float(tp_level)}) but returned {out}"
+        )
+
+    @pytest.mark.parametrize("tp_level", [50, 60, 75])
+    def test_sl_threshold_uses_tp_specific_min_pnl(self, tp_level):
+        # SL threshold is -100 (sl_mult=1, max_profit=100).
+        # min_pnl_before_tp{N}=-150 means SL fires *before* the TP hit,
+        # so the helper returns -100 regardless of tp_level.
+        row = _make_row_with_tp(
+            tp_level,
+            **{f"min_pnl_before_tp{tp_level}": -150.0},
+        )
+        out = compute_trade_pnl(row, sl_mult=1.0,
+                                exit_rule=f"tp{tp_level}",
+                                tp_level=tp_level)
+        assert out == -MAX_PROFIT * 1.0
+
+    def test_main_accepts_tp_flag_and_runs(self, tmp_path, monkeypatch):
+        # End-to-end smoke: --tp 60 with a CSV that has tp60 columns
+        # populated must complete and print a TP=60 banner.
+        rows = [_make_row_with_tp(60, dte_target=7,
+                                  spread_side="put",
+                                  delta_target=0.20,
+                                  vix=15.0).to_dict()
+                for _ in range(6)]
+        df = pd.DataFrame(rows)
+        csv_path = tmp_path / "tp60.csv"
+        df.to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(sys, "argv", [
+            "sl_recovery_analysis.py",
+            "--csv", str(csv_path),
+            "--tp", "60",
+        ])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main()
+        out = buf.getvalue()
+        assert "TP=60" in out, (
+            "Strategy-sweep banner should include the active TP level "
+            "so operators can tell sweeps apart."
+        )
+        assert "DONE" in out
+
+    def test_main_warns_when_tp_column_missing(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        # CSV has the TP50 columns but no TP60 columns; --tp 60 must
+        # warn so operators don't silently get fallback-only results.
+        df = _make_enhanced_df(4, with_sl_trade=False)
+        csv_path = tmp_path / "no_tp60.csv"
+        df.to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(sys, "argv", [
+            "sl_recovery_analysis.py",
+            "--csv", str(csv_path),
+            "--tp", "60",
+        ])
+
+        with caplog.at_level("WARNING"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                main()
+
+        assert any(
+            "min_pnl_before_tp60" in rec.message
+            for rec in caplog.records
+        ), (
+            "main() should warn when --tp's matching trajectory column "
+            "is absent (audit M8)."
+        )
+
+    def test_invalid_tp_value_rejected(self, tmp_path, monkeypatch):
+        # argparse must reject TP levels we haven't defined columns for.
+        df = _make_enhanced_df(2, with_sl_trade=False)
+        csv_path = tmp_path / "any.csv"
+        df.to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(sys, "argv", [
+            "sl_recovery_analysis.py",
+            "--csv", str(csv_path),
+            "--tp", "42",
+        ])
+        with pytest.raises(SystemExit):
+            main()
+
+    def test_default_tp_is_50_for_back_compat(self):
+        # Existing call sites (and the operator's habits) assume TP50
+        # is the default when --tp is omitted.
+        assert sra.DEFAULT_TP_LEVEL == 50
+        assert sra._exit_rules_for_tp(50) == ["tp50", "expiry"]
+        assert sra._exit_rules_for_tp(60) == ["tp60", "expiry"]
+        assert sra._exit_rules_for_tp(75) == ["tp75", "expiry"]

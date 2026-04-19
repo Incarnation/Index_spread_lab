@@ -39,7 +39,23 @@ DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 SL_LEVELS: list[float | None] = [
     None, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0,
 ]
-EXIT_RULES = ["tp50", "expiry"]
+
+# TP level is parameterized via ``--tp`` (audit M8).  The legacy default
+# is TP50; TP60 and TP75 are supported when the candidate CSV carries
+# the matching ``min_pnl_before_tp{N}`` / ``first_tp{N}_pnl`` columns
+# from a fresh ``generate_training_data.py --relabel`` run.
+SUPPORTED_TP_LEVELS: tuple[int, ...] = (50, 60, 75)
+DEFAULT_TP_LEVEL: int = 50
+
+
+def _exit_rules_for_tp(tp_level: int) -> list[str]:
+    """Return the (TP-aware, expiry) exit rule pair for *tp_level*.
+
+    Kept as a helper rather than a module constant so the rule label
+    stays consistent with the trajectory columns the rest of the
+    pipeline expects (``tp50`` / ``tp60`` / ``tp75``).
+    """
+    return [f"tp{tp_level}", "expiry"]
 
 
 # -------------------------------------------------------------------
@@ -50,6 +66,7 @@ def compute_trade_pnl(
     row: pd.Series,
     sl_mult: float | None,
     exit_rule: str,
+    tp_level: int = DEFAULT_TP_LEVEL,
 ) -> float | None:
     """Derive a single trade's PnL under a given (SL level, exit rule) policy.
 
@@ -61,8 +78,15 @@ def compute_trade_pnl(
         SL threshold as a multiple of credit (e.g. 2.0 = -200%).
         None means no stop-loss.
     exit_rule : str
-        ``"tp50"`` closes at 50 % take-profit; ``"expiry"`` holds to the
-        last mark (collecting TP100 if the options expire worthless).
+        ``"tp{tp_level}"`` closes at the TP_level take-profit;
+        ``"expiry"`` holds to the last mark (collecting TP100 if the
+        options expire worthless).
+    tp_level : int, default 50
+        Take-profit level to model. Must be one of
+        :data:`SUPPORTED_TP_LEVELS`. Reads ``min_pnl_before_tp{N}`` and
+        ``first_tp{N}_pnl`` from the row -- so a fresh ``--relabel``
+        run is required when changing this. Audit M8 in
+        ``backend/scripts/OFFLINE_PIPELINE_AUDIT.md``.
 
     Returns
     -------
@@ -76,68 +100,73 @@ def compute_trade_pnl(
     if max_profit <= 0:
         return None
 
-    min_pnl_before_tp50 = row.get("min_pnl_before_tp50")
-    first_tp50_pnl = row.get("first_tp50_pnl")
+    # TP-level-specific trajectory columns (audit M8).
+    min_pnl_before_tp = row.get(f"min_pnl_before_tp{tp_level}")
+    first_tp_pnl = row.get(f"first_tp{tp_level}_pnl")
     final_pnl = row.get("final_pnl_at_expiry")
 
-    # All trajectory columns must be present for the full SL/TP path analysis.
-    # If any core field is missing/NaN, fall back to existing labels.
-    # Note: first_tp50_pnl and final_pnl may legitimately be NaN (no TP50 hit,
-    # or no expiry mark), so we only require min_pnl_before_tp50 plus the
-    # boolean/categorical columns that are always set during relabeling.
-    traj_vals = [min_pnl_before_tp50, row.get("recovered_after_sl"),
+    # All trajectory columns must be present for the full SL/TP path
+    # analysis. If any core field is missing/NaN, fall back to the
+    # backward-compatible labels. Note: first_tp{N}_pnl and final_pnl
+    # may legitimately be NaN (no TP{N} hit, or no expiry mark), so we
+    # only require min_pnl_before_tp{N} plus the boolean/categorical
+    # columns that are always set during relabeling.
+    traj_vals = [min_pnl_before_tp, row.get("recovered_after_sl"),
                  row.get("hold_hit_tp50"), row.get("exit_reason")]
     has_trajectory = all(v is not None and not _isnan(v) for v in traj_vals)
 
     if not has_trajectory:
-        return _fallback_pnl(row, sl_mult, exit_rule, max_profit)
+        return _fallback_pnl(row, sl_mult, exit_rule, max_profit, tp_level)
 
     sl_threshold = max_profit * sl_mult if sl_mult is not None else float("inf")
 
-    # Does SL fire before TP50?
-    sl_fires_before_tp50 = min_pnl_before_tp50 <= -sl_threshold
+    # Does SL fire before TP_level?
+    sl_fires_before_tp = min_pnl_before_tp <= -sl_threshold
 
-    if sl_fires_before_tp50 and sl_mult is not None:
-        # SL fires before any TP50 → trade closed at SL
+    if sl_fires_before_tp and sl_mult is not None:
+        # SL fires before any TP_level hit -> trade closed at SL.
         return -sl_threshold
-    elif first_tp50_pnl is not None and not _isnan(first_tp50_pnl):
-        # TP50 fires (SL either didn't fire or fires after TP50)
-        if exit_rule == "tp50":
-            return first_tp50_pnl
-        else:
-            return final_pnl if (final_pnl is not None and not _isnan(final_pnl)) else first_tp50_pnl
-    else:
-        if exit_rule == "expiry" and final_pnl is not None and not _isnan(final_pnl):
-            return final_pnl
-        return row.get("realized_pnl")
+    if first_tp_pnl is not None and not _isnan(first_tp_pnl):
+        # TP_level fires (SL either didn't fire or fires after TP).
+        if exit_rule == f"tp{tp_level}":
+            return first_tp_pnl
+        return final_pnl if (final_pnl is not None and not _isnan(final_pnl)) else first_tp_pnl
+    if exit_rule == "expiry" and final_pnl is not None and not _isnan(final_pnl):
+        return final_pnl
+    return row.get("realized_pnl")
 
 
 def _fallback_pnl(
-    row: pd.Series, sl_mult: float | None, exit_rule: str, max_profit: float,
+    row: pd.Series,
+    sl_mult: float | None,
+    exit_rule: str,
+    max_profit: float,
+    tp_level: int = DEFAULT_TP_LEVEL,
 ) -> float | None:
     """Compute PnL for non-SL trades where trajectory fields are missing.
 
-    For TP50/EXPIRY trades the backward-compatible columns are sufficient
-    because SL was never breached before TP50.
+    For TP/EXPIRY trades the backward-compatible columns are sufficient
+    because SL was never breached before the TP target. The ``tp_level``
+    parameter only affects the matching exit rule label (e.g. ``tp60``).
     """
     orig_exit = row.get("exit_reason", "")
     orig_pnl = row.get("realized_pnl")
 
     if orig_exit == "TAKE_PROFIT_50":
-        if exit_rule == "tp50":
+        if exit_rule == f"tp{tp_level}":
             return orig_pnl
-        # hold-to-expiry: we don't have final_pnl for TP50 trades (closed early)
+        # hold-to-expiry: we don't have final_pnl for TP-closed trades (closed early)
         return orig_pnl
-    elif orig_exit == "STOP_LOSS":
+    if orig_exit == "STOP_LOSS":
         if sl_mult is None:
             hold_pnl = row.get("hold_realized_pnl")
             return hold_pnl if hold_pnl is not None else orig_pnl
-        # Counterfactual: if an SL was applied, the trade would have been
-        # stopped at -sl_threshold (trajectory is missing so approximate).
+        # Counterfactual: if an SL was applied, the trade would have
+        # been stopped at -sl_threshold (trajectory is missing so we
+        # approximate).
         sl_threshold = max_profit * sl_mult
         return -sl_threshold
-    else:
-        return orig_pnl
+    return orig_pnl
 
 
 def _isnan(val) -> bool:
@@ -156,6 +185,7 @@ def evaluate_strategy(
     df: pd.DataFrame,
     sl_mult: float | None,
     exit_rule: str,
+    tp_level: int = DEFAULT_TP_LEVEL,
 ) -> dict:
     """Evaluate a single strategy across all trades.
 
@@ -166,7 +196,10 @@ def evaluate_strategy(
     sl_mult : float | None
         SL level (None = no SL).
     exit_rule : str
-        ``"tp50"`` or ``"expiry"``.
+        ``"tp{tp_level}"`` or ``"expiry"``.
+    tp_level : int, default 50
+        Take-profit level to model (audit M8). Forwarded to
+        :func:`compute_trade_pnl`.
 
     Returns
     -------
@@ -176,7 +209,7 @@ def evaluate_strategy(
     """
     pnls = []
     for _, row in df.iterrows():
-        pnl = compute_trade_pnl(row, sl_mult, exit_rule)
+        pnl = compute_trade_pnl(row, sl_mult, exit_rule, tp_level)
         if pnl is not None:
             pnls.append(pnl)
 
@@ -237,6 +270,7 @@ def slice_by_dimension(
     exit_rule: str,
     dim_col: str,
     buckets: dict[str, any] | None = None,
+    tp_level: int = DEFAULT_TP_LEVEL,
 ) -> list[dict]:
     """Evaluate a strategy broken down by a single dimension.
 
@@ -251,6 +285,9 @@ def slice_by_dimension(
     buckets : dict | None
         Optional mapping of bucket_name -> boolean mask.  If None,
         slices by unique values of ``dim_col``.
+    tp_level : int, default 50
+        Take-profit level to model (audit M8). Forwarded to
+        :func:`evaluate_strategy`.
 
     Returns
     -------
@@ -263,14 +300,14 @@ def slice_by_dimension(
             sub = df[mask]
             if sub.empty:
                 continue
-            r = evaluate_strategy(sub, sl_mult, exit_rule)
+            r = evaluate_strategy(sub, sl_mult, exit_rule, tp_level)
             r["dimension"] = dim_col
             r["slice"] = name
             results.append(r)
     else:
         for val in sorted(df[dim_col].dropna().unique()):
             sub = df[df[dim_col] == val]
-            r = evaluate_strategy(sub, sl_mult, exit_rule)
+            r = evaluate_strategy(sub, sl_mult, exit_rule, tp_level)
             r["dimension"] = dim_col
             r["slice"] = val
             results.append(r)
@@ -403,7 +440,19 @@ def main() -> None:
         "--csv", type=str, default=str(DEFAULT_CSV),
         help="Path to the enhanced training_candidates.csv",
     )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        choices=list(SUPPORTED_TP_LEVELS),
+        default=DEFAULT_TP_LEVEL,
+        help=(
+            "Take-profit level to model (50, 60, or 75; default 50). "
+            "Selects which `min_pnl_before_tp{N}` / `first_tp{N}_pnl` "
+            "trajectory columns drive the SL counterfactual. Audit M8."
+        ),
+    )
     args = parser.parse_args()
+    tp_level: int = args.tp
 
     csv_path = Path(args.csv)
     df = pd.read_csv(str(csv_path))
@@ -417,19 +466,32 @@ def main() -> None:
             "Falling back to backward-compatible columns only."
         )
 
+    # Verify the TP-level-specific trajectory columns are present, else
+    # the analysis silently degrades to fallback PnL for everything.
+    tp_col = f"min_pnl_before_tp{tp_level}"
+    if has_trajectory and tp_col not in df.columns:
+        logger.warning(
+            "CSV is missing the `%s` trajectory column required for "
+            "--tp %d analysis; results will use the fallback PnL path "
+            "instead. Re-run `generate_training_data.py --relabel` "
+            "with TP%d enabled to populate the missing column.",
+            tp_col, tp_level, tp_level,
+        )
+
     # --- Recovery analysis (SL-specific) ---
     if has_trajectory:
         recovery_analysis(df)
 
     # --- Strategy sweep ---
     print(f"\n{'='*70}")
-    print("STRATEGY SWEEP: SL level x Exit rule")
+    print(f"STRATEGY SWEEP: SL level x Exit rule (TP={tp_level})")
     print(f"{'='*70}")
 
     results = []
+    exit_rules = _exit_rules_for_tp(tp_level)
     for sl_mult in SL_LEVELS:
-        for exit_rule in EXIT_RULES:
-            r = evaluate_strategy(df, sl_mult, exit_rule)
+        for exit_rule in exit_rules:
+            r = evaluate_strategy(df, sl_mult, exit_rule, tp_level)
             results.append(r)
 
     results_df = pd.DataFrame(results)
@@ -459,7 +521,7 @@ def main() -> None:
             print(f"\n--- {strat['strategy']} ---")
 
             for dim_col in ["dte_target", "spread_side", "delta_target"]:
-                slices = slice_by_dimension(df, sl_m, er, dim_col)
+                slices = slice_by_dimension(df, sl_m, er, dim_col, tp_level=tp_level)
                 if slices:
                     print(f"\n  By {dim_col}:")
                     for s in slices:
@@ -470,7 +532,7 @@ def main() -> None:
 
             # VIX buckets
             vix_slices = slice_by_dimension(
-                df, sl_m, er, "vix", build_vix_buckets(df),
+                df, sl_m, er, "vix", build_vix_buckets(df), tp_level=tp_level,
             )
             if vix_slices:
                 print("\n  By VIX:")
@@ -483,7 +545,9 @@ def main() -> None:
             # Entry hour
             if "entry_dt" in df.columns:
                 df["_entry_hour"] = extract_entry_hour(df)
-                hour_slices = slice_by_dimension(df, sl_m, er, "_entry_hour")
+                hour_slices = slice_by_dimension(
+                    df, sl_m, er, "_entry_hour", tp_level=tp_level,
+                )
                 if hour_slices:
                     print("\n  By entry hour (ET):")
                     for s in hour_slices:
