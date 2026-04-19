@@ -4,10 +4,16 @@ Long-term reference for the 13 offline-pipeline scripts under `backend/scripts/`
 121 GB `data/` tree. Captures the findings of a deep readonly audit performed
 2026-04-16 and structures the fix work as Waves 0–5.
 
-> **Status**: Waves 0-5 landed in commit `6093bf6` (2026-04-16). Audit
-> documentation sweep landing in the gap-closure follow-up; small open
-> findings (M3, M8, M9, M12) and the three monolith splits remain in
-> progress. M5 and M11 deferred -- see "Future work" section.
+> **Status**: Waves 0-5 landed in commit `6093bf6` (2026-04-16). Documentation
+> sweep + small open findings (M3, M8, M9, M12) landed in the gap-closure
+> follow-up. M5 and M11 deferred -- see "Future work" section. All three
+> monolith splits landed as part of the gap-closure follow-up:
+> `xgb_model.py` -> `backend/scripts/xgb/` (46 public symbols byte-identical),
+> `backtest_strategy.py` -> `backend/scripts/backtest/` (95 byte-identical),
+> `generate_training_data.py` -> `backend/scripts/training/` (132 byte-identical
+> via proxy-shim that forwards `setattr` writes to submodules so existing
+> `monkeypatch` tests keep working). Original module names retained as
+> back-compatibility shims; full pytest suite (1059 tests) green.
 > See [`.cursor/plans/track_b_offline_audit_fixes_73d0812a.plan.md`](../../.cursor/plans/track_b_offline_audit_fixes_73d0812a.plan.md)
 > for the original work-tracking plan and
 > [`.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md`](../../.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md)
@@ -1117,6 +1123,22 @@ space) or live should switch to per-run accounting (riskier).
 **Trigger to revisit.** When the optimizer's daily-cap dimension shows
 material disagreement between backtest-Sharpe and live-Sharpe on the
 same parameter set.
+
+### Monolith splits (mechanical) -- completed in gap-closure Phase 3
+
+All three splits landed as pure move-only refactors with byte-identical
+bytecode regression on every public symbol. **Resolved:** 2026-04-16.
+
+| Monolith | New package | Public symbols byte-identical | Notes |
+|----------|-------------|-------------------------------|-------|
+| `xgb_model.py` (1,756 lines) | `backend/scripts/xgb/` (`features`, `training`, `walkforward`, `cli`) | 46 / 46 | Standard 5-way header + submodule split; shim re-exports preserve `import xgb_model` callers. |
+| `backtest_strategy.py` (3,295 lines) | `backend/scripts/backtest/` (`engine`, `optimizer`, `analysis`, `cli`) | 95 / 95 | Shim adds a `_locate_scripts_dir` helper (M3-related) so `sys.path` bootstrapping works regardless of nesting. CSV regression on a pinned date range matched byte-for-byte (equity curve + summary metrics). |
+| `generate_training_data.py` (3,537 lines) | `backend/scripts/training/` (`bs_gex_spot`, `io_loaders`, `candidates`, `labeling`, `cli`) | 132 / 132 | Adds a `_ProxyShim` module subclass to the back-compat shim so existing `monkeypatch.setattr(mod, "<CONST>", ...)` test pattern continues to mutate every submodule's verbatim header copy. |
+
+Per-split CSV/JSON regression on real Databento + production-DB data
+remains a recommended pre-merge step (operator-driven, out of CI scope),
+but the bytecode-byte-identical proof + 1059-test pytest sweep is the
+in-loop gate.
 
 ---
 

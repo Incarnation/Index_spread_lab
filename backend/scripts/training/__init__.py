@@ -1,12 +1,11 @@
-"""Back-compat shim.
+"""Auto-generated package re-exports.
 
-The implementation moved to ``scripts.training`` --
-this module simply re-exports the public surface so existing
-``from xxx import yyy`` callers keep working without changes.
+Produced by ``tools/split_monolith.py`` from ``backend/scripts/generate_training_data.py``.
+Edit the underlying submodules, not this file.
 """
 from __future__ import annotations
 
-from training import (  # noqa: F401
+from .bs_gex_spot import (
     Any,
     CANDIDATES_CACHE_DIR,
     CONTEXT_SNAPSHOTS_CSV,
@@ -28,7 +27,6 @@ from training import (  # noqa: F401
     GEX_MAX_DTE_DAYS,
     GEX_STRIKE_RANGE_PCT,
     IV_BISECT_ITERS,
-    LABELS_CACHE_DIR,
     LABEL_MARK_INTERVAL_MINUTES,
     MAX_IV,
     MIN_IV,
@@ -51,68 +49,50 @@ from training import (  # noqa: F401
     SPY_SPX_RATIO,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
-    TP_LEVELS,
-    TRAJECTORY_COLUMNS,
     WIDTH_POINTS,
     WIDTH_TARGETS,
     ZoneInfo,
     _ACTIVE_GRID,
     _BACKEND,
-    _PRODUCTION_CHAIN_CACHE_MAX,
-    _WORKER_REF,
     _assert_sl_alignment_with_live_settings,
-    _atomic_write_csv,
-    _available_day_files,
     _bs_d1,
-    _cache_day_candidates,
-    _compute_code_version,
-    _compute_days_hash,
-    _compute_label_code_hash,
-    _determine_relabel_days,
-    _downsample_marks,
-    _evaluate_outcome,
-    _extract_marks_for_day,
-    _generate_candidates_for_day,
     _get_grid_param,
-    _init_candidate_worker,
-    _input_data_fingerprint,
-    _load_cache_manifest,
-    _load_cached_day,
-    _load_dbn,
-    _load_gex_csv,
-    _load_labeled_cache_day,
-    _load_labels_manifest,
-    _load_merged_gex,
     _locate_backend_dir,
-    _production_chain_cache,
     _resolve_databento_dir,
-    _save_cache_manifest,
-    _save_labeled_cache_day,
-    _save_labels_manifest,
-    _symbol_to_iid,
     _time_to_expiry_years,
     annotations,
     bs_delta_vec,
     bs_price_vec,
-    build_candidates_for_snapshot,
     build_dte_lookup,
-    build_instrument_map,
-    build_training_rows,
-    cbbo_from_production,
     compute_offline_gex,
     date,
     datetime,
     defaultdict,
-    definitions_from_production,
-    deploy_model,
     derive_spx_from_parity,
     extract_candidate_features,
     find_expiry_for_dte,
     get_cbbo_snapshot_at,
     implied_vol_vec,
-    label_candidates,
-    label_candidates_fast,
-    label_candidates_sequential,
+    logger,
+    mid_price,
+    norm,
+    predict_with_bucket_model,
+    summarize_strategy_quality,
+    timedelta,
+    timezone,
+    train_bucket_model,
+)
+from .io_loaders import (
+    _PRODUCTION_CHAIN_CACHE_MAX,
+    _available_day_files,
+    _load_dbn,
+    _load_gex_csv,
+    _load_merged_gex,
+    _production_chain_cache,
+    _symbol_to_iid,
+    build_instrument_map,
+    cbbo_from_production,
+    definitions_from_production,
     lag_daily_to_next_session,
     load_cbbo,
     load_daily_parquet,
@@ -122,64 +102,51 @@ from training import (  # noqa: F401
     load_production_chain,
     load_spy_equity,
     load_statistics,
-    logger,
     lookup_gex_context,
     lookup_intraday_value,
-    main,
     merge_underlying_quotes,
-    mid_price,
-    norm,
-    precompute_offline_gex_to_csv,
-    predict_with_bucket_model,
-    relabel_from_csv,
-    run_pipeline,
     statistics_from_production,
-    summarize_strategy_quality,
-    timedelta,
-    timezone,
-    train_bucket_model,
+)
+from .candidates import (
+    _WORKER_REF,
+    _atomic_write_csv,
+    _cache_day_candidates,
+    _compute_code_version,
+    _generate_candidates_for_day,
+    _init_candidate_worker,
+    _input_data_fingerprint,
+    _load_cache_manifest,
+    _load_cached_day,
+    _save_cache_manifest,
+    build_candidates_for_snapshot,
+)
+from .labeling import (
+    LABELS_CACHE_DIR,
+    TP_LEVELS,
+    TRAJECTORY_COLUMNS,
+    _compute_days_hash,
+    _compute_label_code_hash,
+    _determine_relabel_days,
+    _downsample_marks,
+    _evaluate_outcome,
+    _extract_marks_for_day,
+    _load_labeled_cache_day,
+    _load_labels_manifest,
+    _save_labeled_cache_day,
+    _save_labels_manifest,
+    build_training_rows,
+    deploy_model,
+    label_candidates,
+    label_candidates_fast,
+    label_candidates_sequential,
+    relabel_from_csv,
     walk_forward_validate,
 )
-
-from training import bs_gex_spot as _sub_bs_gex_spot  # noqa: F401
-from training import io_loaders as _sub_io_loaders  # noqa: F401
-from training import candidates as _sub_candidates  # noqa: F401
-from training import labeling as _sub_labeling  # noqa: F401
-from training import cli as _sub_cli  # noqa: F401
-
-import sys as _sys
-import types as _types
-
-
-_PROXY_SUBMODULES = (
-    _sub_bs_gex_spot,
-    _sub_io_loaders,
-    _sub_candidates,
-    _sub_labeling,
-    _sub_cli,
+from .cli import (
+    main,
+    precompute_offline_gex_to_csv,
+    run_pipeline,
 )
-
-
-class _ProxyShim(_types.ModuleType):
-    """Module subclass that forwards attribute writes to submodules.
-
-    Tests historically monkeypatch module-level constants via
-    ``monkeypatch.setattr(<shim>, 'SOME_CONST', value)``.  After
-    the split, those constants live in submodules (each got its
-    own copy from the verbatim header).  This proxy ensures that
-    a write on the shim is propagated to *every* submodule that
-    has the same attribute name, preserving the original runtime
-    behaviour of the monolith.
-    """
-
-    def __setattr__(self, name, value):  # noqa: D401
-        super().__setattr__(name, value)
-        for _sub in _PROXY_SUBMODULES:
-            if hasattr(_sub, name):
-                setattr(_sub, name, value)
-
-
-_sys.modules[__name__].__class__ = _ProxyShim
 
 __all__ = [
     'Any',
@@ -315,15 +282,3 @@ __all__ = [
     'train_bucket_model',
     'walk_forward_validate',
 ]
-
-
-if __name__ == "__main__":
-    import sys
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception as exc:  # noqa: BLE001
-        import logging
-        logging.getLogger(__name__).error("Fatal: %s", exc, exc_info=True)
-        sys.exit(1)

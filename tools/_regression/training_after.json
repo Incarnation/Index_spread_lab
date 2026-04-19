@@ -1,0 +1,541 @@
+{
+  "module": "generate_training_data",
+  "symbols": {
+    "Any": {
+      "hash": "1eba772d8733d0e9",
+      "kind": "class"
+    },
+    "CANDIDATES_CACHE_DIR": {
+      "hash": "62fb93301bf7dfed",
+      "kind": "value"
+    },
+    "CONTEXT_SNAPSHOTS_CSV": {
+      "hash": "39914643212bb36c",
+      "kind": "value"
+    },
+    "CONTRACTS": {
+      "hash": "6b86b273ff34fce1",
+      "kind": "value"
+    },
+    "CONTRACT_MULT": {
+      "hash": "ad57366865126e55",
+      "kind": "value"
+    },
+    "DATABENTO_DIR": {
+      "hash": "4b6df1da83479483",
+      "kind": "value"
+    },
+    "DATA_DIR": {
+      "hash": "7bacf41ff31bcc7e",
+      "kind": "value"
+    },
+    "DECISION_MINUTES_ET": {
+      "hash": "7d2b059a3888b113",
+      "kind": "value"
+    },
+    "DELTA_TARGETS": {
+      "hash": "16adc9b3e5819a7c",
+      "kind": "value"
+    },
+    "DTE_TARGETS": {
+      "hash": "cf5559eea41b0750",
+      "kind": "value"
+    },
+    "ECONOMIC_CALENDAR_CSV": {
+      "hash": "c50bb318f8fddd09",
+      "kind": "value"
+    },
+    "ET": {
+      "hash": "3800e6a3adea6e50",
+      "kind": "value"
+    },
+    "FRD_DIR": {
+      "hash": "49c4bcd9451338e6",
+      "kind": "value"
+    },
+    "FRD_SKEW": {
+      "hash": "c1899b7281f3f231",
+      "kind": "value"
+    },
+    "FRD_SPX": {
+      "hash": "24c859085980a6e1",
+      "kind": "value"
+    },
+    "FRD_VIX": {
+      "hash": "cfdf15d4b699d0b3",
+      "kind": "value"
+    },
+    "FRD_VIX9D": {
+      "hash": "74e138c6b4d0c2c4",
+      "kind": "value"
+    },
+    "FRD_VVIX": {
+      "hash": "86a935a5fb39c66d",
+      "kind": "value"
+    },
+    "GEX_MAX_DTE_DAYS": {
+      "hash": "4a44dc15364204a8",
+      "kind": "value"
+    },
+    "GEX_STRIKE_RANGE_PCT": {
+      "hash": "221764976efe0413",
+      "kind": "value"
+    },
+    "IV_BISECT_ITERS": {
+      "hash": "39fa9ec190eee7b6",
+      "kind": "value"
+    },
+    "LABELS_CACHE_DIR": {
+      "hash": "de824cc0755dc9b6",
+      "kind": "value"
+    },
+    "LABEL_MARK_INTERVAL_MINUTES": {
+      "hash": "ef2d127de37b942b",
+      "kind": "value"
+    },
+    "MAX_IV": {
+      "hash": "a19a1584344c1f37",
+      "kind": "value"
+    },
+    "MIN_IV": {
+      "hash": "312b95ee5a344d2f",
+      "kind": "value"
+    },
+    "MIN_MID_PRICE": {
+      "hash": "0602d7c813c1f6e7",
+      "kind": "value"
+    },
+    "OFFLINE_GEX_CSV": {
+      "hash": "dcef722c9b4f9938",
+      "kind": "value"
+    },
+    "OUTPUT_CSV": {
+      "hash": "93748a7dcbe785c9",
+      "kind": "value"
+    },
+    "PRODUCTION_CHAINS_DIR": {
+      "hash": "37b133cb6c1f9cfe",
+      "kind": "value"
+    },
+    "PRODUCTION_UNDERLYING_DIR": {
+      "hash": "1fabbfe18aafd766",
+      "kind": "value"
+    },
+    "Path": {
+      "hash": "0acfad4a96df48fc",
+      "kind": "class"
+    },
+    "Pool": {
+      "hash": "872c84729657e0ec",
+      "kind": "value"
+    },
+    "RISK_FREE_RATE": {
+      "hash": "bc7ba99a37f63fd3",
+      "kind": "value"
+    },
+    "SPREAD_SIDES": {
+      "hash": "e417ff072c0e3e15",
+      "kind": "value"
+    },
+    "SPXW_CBBO": {
+      "hash": "ba2d0331da1132ba",
+      "kind": "value"
+    },
+    "SPXW_DEFS": {
+      "hash": "25ad466db85ab943",
+      "kind": "value"
+    },
+    "SPXW_STATS": {
+      "hash": "2b5c922643aeec6c",
+      "kind": "value"
+    },
+    "SPX_CBBO": {
+      "hash": "7fd97a82b846bcc0",
+      "kind": "value"
+    },
+    "SPX_DEFS": {
+      "hash": "cddb27068c0b8976",
+      "kind": "value"
+    },
+    "SPX_STATS": {
+      "hash": "194363f6045494de",
+      "kind": "value"
+    },
+    "SPY_EQUITY_PATH": {
+      "hash": "f13aca9e58667246",
+      "kind": "value"
+    },
+    "SPY_SPX_RATIO": {
+      "hash": "31d982fbecbb64b9",
+      "kind": "value"
+    },
+    "STOP_LOSS_PCT": {
+      "hash": "d84bdb34d4eeef40",
+      "kind": "value"
+    },
+    "TAKE_PROFIT_PCT": {
+      "hash": "d2cbad71ff333de6",
+      "kind": "value"
+    },
+    "TP_LEVELS": {
+      "hash": "80b2b6201116d4c6",
+      "kind": "value"
+    },
+    "TRAJECTORY_COLUMNS": {
+      "hash": "62ac0b669acc7ac3",
+      "kind": "value"
+    },
+    "WIDTH_POINTS": {
+      "hash": "f1e42019aecc858f",
+      "kind": "value"
+    },
+    "WIDTH_TARGETS": {
+      "hash": "b32e1b9d4611aa81",
+      "kind": "value"
+    },
+    "ZoneInfo": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "_ACTIVE_GRID": {
+      "hash": "74234e98afe7498f",
+      "kind": "value"
+    },
+    "_BACKEND": {
+      "hash": "78279289b51f84c6",
+      "kind": "value"
+    },
+    "_PRODUCTION_CHAIN_CACHE_MAX": {
+      "hash": "e629fa6598d73276",
+      "kind": "value"
+    },
+    "_PROXY_SUBMODULES": {
+      "hash": "ccd1a33f623ffc98",
+      "kind": "value"
+    },
+    "_ProxyShim": {
+      "hash": "3c16717577460628",
+      "kind": "class"
+    },
+    "_WORKER_REF": {
+      "hash": "44136fa355b3678a",
+      "kind": "value"
+    },
+    "_assert_sl_alignment_with_live_settings": {
+      "hash": "3e4f7780886098b1",
+      "kind": "function"
+    },
+    "_atomic_write_csv": {
+      "hash": "331ac894635101f2",
+      "kind": "function"
+    },
+    "_available_day_files": {
+      "hash": "6ebca96fef3ade23",
+      "kind": "function"
+    },
+    "_bs_d1": {
+      "hash": "99ef27a7505a84e5",
+      "kind": "function"
+    },
+    "_cache_day_candidates": {
+      "hash": "2db008d880e7445b",
+      "kind": "function"
+    },
+    "_compute_code_version": {
+      "hash": "d324963d8204751e",
+      "kind": "function"
+    },
+    "_compute_days_hash": {
+      "hash": "95da984e4a124083",
+      "kind": "function"
+    },
+    "_compute_label_code_hash": {
+      "hash": "4d93d37e1abffa2a",
+      "kind": "function"
+    },
+    "_determine_relabel_days": {
+      "hash": "ccf88514f24d2ef8",
+      "kind": "function"
+    },
+    "_downsample_marks": {
+      "hash": "1128e931014cd507",
+      "kind": "function"
+    },
+    "_evaluate_outcome": {
+      "hash": "a62716233fb1917f",
+      "kind": "function"
+    },
+    "_extract_marks_for_day": {
+      "hash": "8e5d0c70d2ab7f5c",
+      "kind": "function"
+    },
+    "_generate_candidates_for_day": {
+      "hash": "a378e1c63bace045",
+      "kind": "function"
+    },
+    "_get_grid_param": {
+      "hash": "aa66921e947ebc64",
+      "kind": "function"
+    },
+    "_init_candidate_worker": {
+      "hash": "4c1dac20fb75d100",
+      "kind": "function"
+    },
+    "_input_data_fingerprint": {
+      "hash": "9facbc4ec1f89a96",
+      "kind": "function"
+    },
+    "_load_cache_manifest": {
+      "hash": "0d4861d6d8e81208",
+      "kind": "function"
+    },
+    "_load_cached_day": {
+      "hash": "bcc6ddff5077564b",
+      "kind": "function"
+    },
+    "_load_dbn": {
+      "hash": "bba253aaf6da58d3",
+      "kind": "function"
+    },
+    "_load_gex_csv": {
+      "hash": "ac9bdd308b54824c",
+      "kind": "function"
+    },
+    "_load_labeled_cache_day": {
+      "hash": "d7b4e525d8e1e396",
+      "kind": "function"
+    },
+    "_load_labels_manifest": {
+      "hash": "d8fe694caf907572",
+      "kind": "function"
+    },
+    "_load_merged_gex": {
+      "hash": "a8a56b25a626a353",
+      "kind": "function"
+    },
+    "_locate_backend_dir": {
+      "hash": "e5550847280aa2d6",
+      "kind": "function"
+    },
+    "_production_chain_cache": {
+      "hash": "44136fa355b3678a",
+      "kind": "value"
+    },
+    "_resolve_databento_dir": {
+      "hash": "43e7ed68139c46e3",
+      "kind": "function"
+    },
+    "_save_cache_manifest": {
+      "hash": "5c067a2accf777f0",
+      "kind": "function"
+    },
+    "_save_labeled_cache_day": {
+      "hash": "428ef870dc50b280",
+      "kind": "function"
+    },
+    "_save_labels_manifest": {
+      "hash": "604cf92272a4fea0",
+      "kind": "function"
+    },
+    "_symbol_to_iid": {
+      "hash": "092b7c799d8c1c6d",
+      "kind": "function"
+    },
+    "_time_to_expiry_years": {
+      "hash": "e61937240d6b794d",
+      "kind": "function"
+    },
+    "annotations": {
+      "hash": "697387a71e174328",
+      "kind": "value"
+    },
+    "bs_delta_vec": {
+      "hash": "b283166b125f348a",
+      "kind": "function"
+    },
+    "bs_price_vec": {
+      "hash": "c557613db63cedd8",
+      "kind": "function"
+    },
+    "build_candidates_for_snapshot": {
+      "hash": "b25ad575bef7edbf",
+      "kind": "function"
+    },
+    "build_dte_lookup": {
+      "hash": "237c0ce7f46c1aa8",
+      "kind": "function"
+    },
+    "build_instrument_map": {
+      "hash": "1c0d4b17d49f8196",
+      "kind": "function"
+    },
+    "build_training_rows": {
+      "hash": "b6be03acae2bd84e",
+      "kind": "function"
+    },
+    "cbbo_from_production": {
+      "hash": "d40e770d46c4cbca",
+      "kind": "function"
+    },
+    "compute_offline_gex": {
+      "hash": "141455901c90863b",
+      "kind": "function"
+    },
+    "date": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "datetime": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "defaultdict": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "definitions_from_production": {
+      "hash": "46fa00b46df18e05",
+      "kind": "function"
+    },
+    "deploy_model": {
+      "hash": "d312b3ef319a68cc",
+      "kind": "function"
+    },
+    "derive_spx_from_parity": {
+      "hash": "95c112b1c25c7e07",
+      "kind": "function"
+    },
+    "extract_candidate_features": {
+      "hash": "883f92519a1aeb30",
+      "kind": "function"
+    },
+    "find_expiry_for_dte": {
+      "hash": "f2b0be71efe48b41",
+      "kind": "function"
+    },
+    "get_cbbo_snapshot_at": {
+      "hash": "cdf1c3d6ae71b121",
+      "kind": "function"
+    },
+    "implied_vol_vec": {
+      "hash": "c0d4e4a9a874778f",
+      "kind": "function"
+    },
+    "label_candidates": {
+      "hash": "f5193db488ef5a2d",
+      "kind": "function"
+    },
+    "label_candidates_fast": {
+      "hash": "ed17f4f1ecf7a068",
+      "kind": "function"
+    },
+    "label_candidates_sequential": {
+      "hash": "f5193db488ef5a2d",
+      "kind": "function"
+    },
+    "lag_daily_to_next_session": {
+      "hash": "324b68542c721908",
+      "kind": "function"
+    },
+    "load_cbbo": {
+      "hash": "51a97a770747ffa6",
+      "kind": "function"
+    },
+    "load_daily_parquet": {
+      "hash": "1a0e42c91d52947f",
+      "kind": "function"
+    },
+    "load_definitions": {
+      "hash": "575bcd55cc6e9c2d",
+      "kind": "function"
+    },
+    "load_economic_calendar": {
+      "hash": "7a2f4d63ce50b04d",
+      "kind": "function"
+    },
+    "load_frd_quotes": {
+      "hash": "8c154ac31fa5e274",
+      "kind": "function"
+    },
+    "load_production_chain": {
+      "hash": "249e0c0a6d0ce4dd",
+      "kind": "function"
+    },
+    "load_spy_equity": {
+      "hash": "e6aa7f0ac1a3e83a",
+      "kind": "function"
+    },
+    "load_statistics": {
+      "hash": "c26759b5c5b47282",
+      "kind": "function"
+    },
+    "logger": {
+      "hash": "b522a96e335f13e8",
+      "kind": "value"
+    },
+    "lookup_gex_context": {
+      "hash": "c357fa169b3fd8cd",
+      "kind": "function"
+    },
+    "lookup_intraday_value": {
+      "hash": "bf9afd82f49a08cb",
+      "kind": "function"
+    },
+    "main": {
+      "hash": "13bd7bb69cf3c296",
+      "kind": "function"
+    },
+    "merge_underlying_quotes": {
+      "hash": "f4ad02857b2556e4",
+      "kind": "function"
+    },
+    "mid_price": {
+      "hash": "2be3ec1c602ce147",
+      "kind": "function"
+    },
+    "norm": {
+      "hash": "bb4a68453c1131e2",
+      "kind": "value"
+    },
+    "precompute_offline_gex_to_csv": {
+      "hash": "28a1e3524bb757d1",
+      "kind": "function"
+    },
+    "predict_with_bucket_model": {
+      "hash": "e8356cb93b74cc9b",
+      "kind": "function"
+    },
+    "relabel_from_csv": {
+      "hash": "b0af595bcd8e9778",
+      "kind": "function"
+    },
+    "run_pipeline": {
+      "hash": "eaf6e7039738d42e",
+      "kind": "function"
+    },
+    "statistics_from_production": {
+      "hash": "7c65eaffbc876481",
+      "kind": "function"
+    },
+    "summarize_strategy_quality": {
+      "hash": "163b7474924c580d",
+      "kind": "function"
+    },
+    "timedelta": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "timezone": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "train_bucket_model": {
+      "hash": "a8ce90f9b658ccb7",
+      "kind": "function"
+    },
+    "walk_forward_validate": {
+      "hash": "1fdfacce271455e4",
+      "kind": "function"
+    }
+  }
+}
