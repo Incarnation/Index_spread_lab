@@ -22,9 +22,19 @@ This contract covers the boundary between:
 
 | Side                | Owner                                                    | File(s) |
 |---------------------|----------------------------------------------------------|---------|
-| **Producer (offline)** | Walk-forward training + artifact upload                | `backend/scripts/xgb_model.py`, `backend/scripts/upload_xgb_model.py` |
-| **Consumer (live)** | Inference inside the decision job                        | `backend/spx_backend/jobs/modeling.py::predict_xgb_entry`, `extract_xgb_features` |
+| **Producer (offline)** | Walk-forward training + artifact upload                | [`backend/scripts/xgb/cli.py`](../../scripts/xgb/cli.py), [`backend/scripts/xgb/training.py`](../../scripts/xgb/training.py) (`save_model`), [`backend/scripts/upload_xgb_model.py`](../../scripts/upload_xgb_model.py) |
+| **Consumer (live)** | Inference inside the decision job                        | [`backend/spx_backend/jobs/modeling.py`](modeling.py) (`predict_xgb_entry`, `extract_xgb_features`) |
 | **Storage**         | DB row carrying the artifact + selection metadata        | `model_versions` table (`data_snapshot_json`, `algorithm`, `is_active`) |
+
+> **Producer-path note.** Wave 5 of the offline pipeline gap-closure
+> (see [`OFFLINE_PIPELINE_AUDIT.md`](../../scripts/OFFLINE_PIPELINE_AUDIT.md))
+> split the original 1568-line `backend/scripts/xgb_model.py` monolith
+> into the [`backend/scripts/xgb/`](../../scripts/xgb/) package
+> (`features.py`, `training.py`, `walkforward.py`, `cli.py`).
+> [`backend/scripts/xgb_model.py`](../../scripts/xgb_model.py) remains
+> as a back-compat shim that re-exports the package's public surface
+> -- callers that still `from xgb_model import ...` keep working --
+> but new code should import from the package paths above.
 
 The decision job itself (`_run_portfolio_managed`) is **not** modified by
 this contract today. The hooks below describe the smallest patch that
@@ -56,20 +66,29 @@ want a pure loss-avoidance ordering for V2).
 
 ---
 
-## 3. Producer side: `xgb_model.py` → `upload_xgb_model.py`
+## 3. Producer side: `xgb/` package → `upload_xgb_model.py`
 
-### 3.1 Walk-forward training (xgb_model.py)
+### 3.1 Walk-forward training ([`backend/scripts/xgb/`](../../scripts/xgb/))
 
-* Walk-forward windows are sized by `walk_forward_rolling`. Each window
+The producer is the post-Wave-5 [`backend/scripts/xgb/`](../../scripts/xgb/)
+package; the legacy `xgb_model.py` shim re-exports the same public
+surface for back-compat. CLI entry point:
+[`backend/scripts/xgb/cli.py`](../../scripts/xgb/cli.py) (or
+`python -m scripts.xgb_model …` via the shim).
+
+* Walk-forward windows are sized by
+  [`walk_forward_rolling`](../../scripts/xgb/walkforward.py). Each window
   trains on a `train + val` slice and **evaluates** on a strictly later
   `test` slice. The recommended threshold returned for the window is
   selected on the validation rows only — never on test rows. (See C3 in
   the audit; locked-in by `tests/test_xgb_model.py::TestWalkForwardThresholdLeakage`.)
-* `train_final_model` re-fits on **100% of available rows** without a
-  validation split (per C2). The artifact written to disk is the
-  full-data refit, not the last walk-forward checkpoint.
+* [`train_final_model`](../../scripts/xgb/training.py) re-fits on
+  **100% of available rows** without a validation split (per C2). The
+  artifact written to disk is the full-data refit, not the last
+  walk-forward checkpoint.
 * The classifier and regressor are trained as separate XGBoost Boosters
-  and saved as `classifier.json` and `regressor.json` JSON dumps.
+  and saved as `classifier.json` and `regressor.json` JSON dumps via
+  [`save_model`](../../scripts/xgb/training.py).
 * `metadata.json` accompanies the model files and **must include**:
   * `model_type`: one of the strings in §2.
   * `feature_names`: ordered list matching the DMatrix column order
@@ -110,9 +129,27 @@ single transaction. Operators must explicitly opt-in by running
 
 The function builds a feature dict from a candidate's
 `chosen_legs_json` payload + market context. The output dict's keys are
-matched against `model_payload["feature_names"]` at inference time;
-missing keys are coerced to `0.0` (not `NaN`) so an absent V2 extra in
-a V1 caller does not poison the DMatrix.
+matched against `model_payload["feature_names"]` at inference time.
+
+> **Missing-feature semantics (verified against
+> [`modeling.py:1147`](modeling.py)).** The DMatrix row builder is:
+> ```python
+> row = [float(features.get(fn) or 0) if features.get(fn) is not None else float("nan")
+>        for fn in feature_names]
+> ```
+> So:
+> * **Key absent** (`features.get(fn) is None`) → `NaN`. XGBoost handles
+>   NaN natively via its default split direction.
+> * **Key present but falsy** (`0`, `0.0`, `""`, `False`) → `0.0` via
+>   the `or 0` guard. This is the path V1 callers hit for V2-extra
+>   keys *if and only if* they explicitly set them to `0` upstream.
+>
+> A V1 caller that omits the V2 extras therefore gets `NaN` for those
+> columns -- not `0.0`. V1/V2 isolation is enforced primarily by
+> `feature_names` length-matching (the DMatrix only has the columns
+> the model was trained on), not by zero-padding. Any caller that wants
+> deterministic 0.0 for "feature unavailable" must set the key
+> explicitly.
 
 V2-only inference requires the V1 features **plus** the V2 extras
 listed below (sourced from `xgb_model._add_v2_features`):
@@ -224,6 +261,24 @@ Before flipping a new model to `is_active=TRUE` in production:
 
 ## 7. Open follow-ups (deferred)
 
+* **`chosen_legs_json` shape mismatch (Track B follow-up).** Live
+  [`decision_job._build_candidate`](decision_job.py) writes the
+  selected legs at the **top level** of `chosen_legs_json`:
+  `{"short": {...}, "long": {...}, ...}` (see
+  [`decision_job.py:678-715`](decision_job.py)). But
+  [`extract_xgb_features`](modeling.py) reads them from the
+  **nested** `legs.short` / `legs.long` keys, with a flat
+  `short_iv` / `long_iv` fallback (see
+  [`modeling.py:995-1006`](modeling.py)). Neither path matches the
+  live shape, so leg-level features (`short_iv`, `long_iv`,
+  `short_delta`, `long_delta`, `iv_skew_ratio`, `credit_to_max_loss`)
+  would silently fall through to `None` → `NaN` if XGB scoring were
+  re-enabled today. **Recommended fix:** extend `extract_xgb_features`
+  to also try the top-level shape (`candidate_json.get("short")`)
+  before falling back to the nested or flat forms. Safer than changing
+  the live `_build_candidate` payload, which is consumed by
+  downstream telemetry and the trade row. Track this before flipping
+  any V1/V2 model to `is_active=TRUE`.
 * **Per-side models.** The current contract uses a single classifier +
   regressor pair. A future iteration may want separate (call vs put)
   models — that requires an additional `model_payload["side"]` key and

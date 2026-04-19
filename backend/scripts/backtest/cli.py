@@ -288,7 +288,7 @@ def main() -> None:
                              "that only trade on drop days (appends to results CSV)")
     parser.add_argument("--optimize-selective", action="store_true", default=False,
                         help="Run selective high-win-rate optimizer: conservative "
-                             "params targeting 90%+ day win rate (appends to results CSV)")
+                             "params targeting 90%% day win rate (appends to results CSV)")
     parser.add_argument("--analyze", action="store_true", default=False,
                         help="Deep-dive optimizer results (param importance, Pareto, robustness)")
     parser.add_argument("--walkforward", action="store_true", default=False,
