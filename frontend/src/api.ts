@@ -224,7 +224,8 @@ export type GexCurvePoint = {
  * Fetch recent GEX snapshot aggregates for the panel selector.
  *
  * When `underlying` is provided, the backend returns only that symbol's
- * snapshots so the UI can switch between SPX/SPY/VIX cleanly.
+ * snapshots so the UI can switch between SPX/SPY cleanly. (VIX snapshot
+ * + GEX support was removed in audit Wave 1 H3; see INGEST_AUDIT.md.)
  */
 export async function fetchGexSnapshots(limit = 20, underlying?: string, source?: string, signal?: AbortSignal): Promise<GexSnapshot[]> {
   const params = new URLSearchParams({ limit: String(limit) });

@@ -164,23 +164,6 @@ def _default_snapshot_job_config() -> SnapshotJobConfig:
     )
 
 
-def _default_vix_snapshot_job_config() -> SnapshotJobConfig:
-    """Build the default VIX snapshot configuration from global settings."""
-    return SnapshotJobConfig(
-        job_name="snapshot_job_vix",
-        underlying=settings.vix_snapshot_underlying,
-        dte_mode=settings.vix_snapshot_dte_mode,
-        dte_targets=settings.vix_snapshot_dte_targets_list(),
-        dte_min_days=settings.vix_snapshot_dte_min_days,
-        dte_max_days=settings.vix_snapshot_dte_max_days,
-        range_fallback_enabled=settings.vix_snapshot_range_fallback_enabled,
-        range_fallback_count=settings.vix_snapshot_range_fallback_count,
-        dte_tolerance_days=settings.vix_snapshot_dte_tolerance_days,
-        strikes_each_side=settings.vix_snapshot_strikes_each_side,
-        allow_outside_rth=settings.vix_allow_snapshot_outside_rth,
-    )
-
-
 def _default_spy_snapshot_job_config() -> SnapshotJobConfig:
     """Build the default SPY snapshot configuration from global settings."""
     return SnapshotJobConfig(
@@ -598,12 +581,6 @@ def build_snapshot_job(
     client = tradier or get_tradier_client()
     snapshot_config = config or _default_snapshot_job_config()
     return SnapshotJob(tradier=client, clock_cache=clock_cache, config=snapshot_config)
-
-
-def build_vix_snapshot_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> SnapshotJob:
-    """Factory helper for VIX snapshot ingestion job."""
-    client = tradier or get_tradier_client()
-    return SnapshotJob(tradier=client, clock_cache=clock_cache, config=_default_vix_snapshot_job_config())
 
 
 def build_spy_snapshot_job(clock_cache: MarketClockCache | None = None, tradier: TradierClient | None = None) -> SnapshotJob:

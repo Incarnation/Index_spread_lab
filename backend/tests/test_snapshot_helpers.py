@@ -165,7 +165,6 @@ class _EmptyChainTradier(_FakeTradier):
 @pytest.mark.parametrize(
     ("underlying", "job_name", "targets"),
     [
-        ("VIX", "snapshot_job_vix_test", [14, 21]),
         ("SPY", "snapshot_job_spy_test", [3, 5]),
     ],
 )
@@ -214,7 +213,7 @@ async def test_snapshot_job_skips_empty_chain_payloads(monkeypatch) -> None:
         tradier=_EmptyChainTradier(),
         config=SnapshotJobConfig(
             job_name="snapshot_job_empty_chain_test",
-            underlying="VIX",
+            underlying="SPX",
             dte_mode="targets",
             dte_targets=[14],
             dte_min_days=0,

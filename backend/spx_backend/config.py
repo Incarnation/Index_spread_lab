@@ -48,18 +48,11 @@ class Settings(BaseSettings):
     spy_snapshot_dte_tolerance_days: int = 1
     spy_snapshot_strikes_each_side: int = 75
     spy_allow_snapshot_outside_rth: bool = False
-    vix_snapshot_enabled: bool = False
-    vix_snapshot_interval_minutes: int = 5
-    vix_snapshot_underlying: str = "VIX"
-    vix_snapshot_dte_targets: str = "14,21,28"
-    vix_snapshot_dte_mode: str = "range"  # "range" or "targets"
-    vix_snapshot_dte_min_days: int = 0
-    vix_snapshot_dte_max_days: int = 10
-    vix_snapshot_range_fallback_enabled: bool = False
-    vix_snapshot_range_fallback_count: int = 3
-    vix_snapshot_dte_tolerance_days: int = 2
-    vix_snapshot_strikes_each_side: int = 50
-    vix_allow_snapshot_outside_rth: bool = False
+    # VIX option-chain snapshots were dropped in audit Wave 1 (finding
+    # H3): mzdata had 0% coverage for VIX exposure and the symbol's
+    # options aren't dealer-hedged the same way as SPX/SPY, so the
+    # ingested rows weren't usable. We still ingest VIX *index* quotes
+    # (see `quote_symbols` below) for term-structure features.
     quote_symbols: str = "SPX,VIX,VIX9D,SPY,VVIX,SKEW"
     quote_interval_minutes: int = 5
     gex_enabled: bool = True
@@ -74,7 +67,12 @@ class Settings(BaseSettings):
     gex_strike_limit: int = 150
     gex_max_dte_days: int = 10
     cboe_gex_enabled: bool = True
-    cboe_gex_underlyings: str = "SPX,SPY,VIX"
+    # Default scope is SPX + SPY only. VIX was dropped in audit Wave 1
+    # (finding H3). The CBOE writer also has a defense-in-depth guard
+    # in cboe_gex_job._run_once_for_underlying that skips VIX even when
+    # listed here, but keeping it out of the default avoids the noisy
+    # `vix_excluded` log line on every run.
+    cboe_gex_underlyings: str = "SPX,SPY"
     cboe_gex_underlying: str = "SPX"
     cboe_gex_interval_minutes: int = 5
     cboe_gex_allow_outside_rth: bool = False
@@ -308,10 +306,6 @@ class Settings(BaseSettings):
     def dte_targets_list(self) -> list[int]:
         """Parse snapshot DTE targets from comma-separated env configuration."""
         return self._parse_int_csv(self.snapshot_dte_targets)
-
-    def vix_snapshot_dte_targets_list(self) -> list[int]:
-        """Parse VIX snapshot DTE targets from comma-separated env configuration."""
-        return self._parse_int_csv(self.vix_snapshot_dte_targets)
 
     def spy_snapshot_dte_targets_list(self) -> list[int]:
         """Parse SPY snapshot DTE targets from comma-separated env configuration."""

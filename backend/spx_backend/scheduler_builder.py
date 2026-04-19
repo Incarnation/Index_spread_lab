@@ -22,7 +22,7 @@ from spx_backend.jobs.eod_events_job import EodEventsJob
 from spx_backend.jobs.gex_job import GexJob
 from spx_backend.jobs.performance_analytics_job import build_performance_analytics_job
 from spx_backend.jobs.quote_job import QuoteJob
-from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job, build_vix_snapshot_job
+from spx_backend.jobs.snapshot_job import build_snapshot_job, build_spy_snapshot_job
 from spx_backend.jobs.staleness_monitor_job import build_staleness_monitor_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob
 from spx_backend.market_clock import MarketClockCache
@@ -342,7 +342,6 @@ class SchedulerContext:
     clock_cache: MarketClockCache
     snapshot_job: Any
     spy_snapshot_job: Any | None
-    vix_snapshot_job: Any | None
     quote_job: QuoteJob
     gex_job: GexJob
     cboe_gex_job: Any | None
@@ -361,7 +360,7 @@ class SchedulerContext:
         """
         for attr in [
             "scheduler", "tradier", "clock_cache",
-            "snapshot_job", "spy_snapshot_job", "vix_snapshot_job",
+            "snapshot_job", "spy_snapshot_job",
             "quote_job", "gex_job", "cboe_gex_job",
             "decision_job", "trade_pnl_job",
             "performance_analytics_job", "staleness_monitor_job",
@@ -410,7 +409,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
     # -- Build job instances --------------------------------------------------
     snapshot_job = build_snapshot_job(tradier=tradier, clock_cache=clock_cache)
     spy_snapshot_job = build_spy_snapshot_job(tradier=tradier, clock_cache=clock_cache) if cfg.spy_snapshot_enabled else None
-    vix_snapshot_job = build_vix_snapshot_job(tradier=tradier, clock_cache=clock_cache) if cfg.vix_snapshot_enabled else None
     quote_job = QuoteJob(tradier=tradier, clock_cache=clock_cache)
     gex_job = GexJob(clock_cache=clock_cache)
     cboe_gex_job = build_cboe_gex_job(clock_cache=clock_cache) if cfg.cboe_gex_enabled else None
@@ -433,13 +431,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
         interval_minutes=cfg.snapshot_interval_minutes,
         allow_outside_rth=cfg.allow_snapshot_outside_rth, **rth_kwargs,
     )
-
-    if vix_snapshot_job is not None:
-        _schedule_rth_window_job(
-            scheduler, job=vix_snapshot_job, job_id="snapshot_job_vix",
-            interval_minutes=cfg.vix_snapshot_interval_minutes,
-            allow_outside_rth=cfg.vix_allow_snapshot_outside_rth, **rth_kwargs,
-        )
 
     if spy_snapshot_job is not None:
         _schedule_rth_window_job(
@@ -540,8 +531,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
     ]
     if spy_snapshot_job is not None:
         warmup_jobs.append(("snapshot_job_spy", spy_snapshot_job.run_once))
-    if vix_snapshot_job is not None:
-        warmup_jobs.append(("snapshot_job_vix", vix_snapshot_job.run_once))
     warmup_jobs.append(("gex_job", gex_job.run_once))
     if cboe_gex_job is not None:
         warmup_jobs.append(("cboe_gex_job", cboe_gex_job.run_once))
@@ -554,7 +543,6 @@ def build_scheduler(cfg: Settings | None = None) -> SchedulerContext:
         clock_cache=clock_cache,
         snapshot_job=snapshot_job,
         spy_snapshot_job=spy_snapshot_job,
-        vix_snapshot_job=vix_snapshot_job,
         quote_job=quote_job,
         gex_job=gex_job,
         cboe_gex_job=cboe_gex_job,

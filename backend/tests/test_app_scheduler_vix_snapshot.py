@@ -1,3 +1,13 @@
+"""Lifespan / scheduler wiring tests for optional ingestion jobs.
+
+Historical note: this file was originally named for the VIX snapshot
+job, which was dropped in audit Wave 1 (finding H3). The remaining
+tests cover SPY snapshot wiring, CBOE GEX wiring, performance
+analytics wiring, startup warm-up failure logging, holiday guards,
+and the market-open guarded runner. The VIX-specific cases are gone
+and the build_vix_snapshot_job monkeypatch has been removed
+everywhere because the symbol no longer exists in scheduler_builder.
+"""
 from __future__ import annotations
 
 import pytest
@@ -89,90 +99,6 @@ def _job_by_id(scheduler: _FakeScheduler, job_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_wires_vix_snapshot_job_when_enabled(monkeypatch) -> None:
-    """Verify optional VIX snapshot scheduler job is added and exposed on app.state."""
-    import apscheduler.schedulers.asyncio as aps_asyncio
-
-    spx_snapshot_job = _FakeJob()
-    vix_snapshot_job = _FakeJob()
-    spy_snapshot_job = _FakeJob()
-
-    monkeypatch.setattr(aps_asyncio, "AsyncIOScheduler", _FakeScheduler)
-    monkeypatch.setattr(app_module, "init_db", _fake_init_db)
-    monkeypatch.setattr(sb_module, "get_tradier_client", lambda: object())
-    monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
-    monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: vix_snapshot_job)
-    monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: spy_snapshot_job)
-    monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "DecisionJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "TradePnlJob", _FakeJob)
-
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", True)
-    monkeypatch.setattr(settings, "cboe_gex_enabled", False)
-    monkeypatch.setattr(settings, "skip_startup_warmup", False)
-    monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "trade_pnl_enabled", False)
-
-    async with app_module.lifespan(app_module.app):
-        scheduler = app_module.app.state.scheduler
-        job_ids = {job["id"] for job in scheduler.jobs}
-        assert "quote_job" in job_ids
-        assert "quote_job_close" in job_ids
-        assert "gex_job" in job_ids
-        assert "gex_job_close" in job_ids
-        assert "snapshot_job" in job_ids
-        assert "snapshot_job_close" in job_ids
-        assert "snapshot_job_vix" in job_ids
-        assert "snapshot_job_vix_close" in job_ids
-        assert app_module.app.state.vix_snapshot_job is vix_snapshot_job
-        assert vix_snapshot_job.run_calls == 1
-        assert _job_by_id(scheduler, "quote_job_close")["kwargs"]["kwargs"] == {"force": True}
-        assert _job_by_id(scheduler, "gex_job_close")["kwargs"]["kwargs"] == {"force": True}
-        assert _job_by_id(scheduler, "snapshot_job_close")["kwargs"]["kwargs"] == {"force": True}
-        assert _job_by_id(scheduler, "snapshot_job_vix_close")["kwargs"]["kwargs"] == {"force": True}
-        assert scheduler.listeners
-        for job in scheduler.jobs:
-            assert job["kwargs"]["max_instances"] == 1
-            assert job["kwargs"]["misfire_grace_time"] == 300
-
-
-@pytest.mark.asyncio
-async def test_lifespan_skips_vix_snapshot_job_when_disabled(monkeypatch) -> None:
-    """Verify no VIX scheduler job/state is created when feature is disabled."""
-    import apscheduler.schedulers.asyncio as aps_asyncio
-
-    spx_snapshot_job = _FakeJob()
-    spy_snapshot_job = _FakeJob()
-
-    monkeypatch.setattr(aps_asyncio, "AsyncIOScheduler", _FakeScheduler)
-    monkeypatch.setattr(app_module, "init_db", _fake_init_db)
-    monkeypatch.setattr(sb_module, "get_tradier_client", lambda: object())
-    monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
-    monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
-    monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: spy_snapshot_job)
-    monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "DecisionJob", _FakeJob)
-    monkeypatch.setattr(sb_module, "TradePnlJob", _FakeJob)
-
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "cboe_gex_enabled", False)
-    monkeypatch.setattr(settings, "skip_startup_warmup", False)
-    monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "trade_pnl_enabled", False)
-
-    async with app_module.lifespan(app_module.app):
-        scheduler = app_module.app.state.scheduler
-        job_ids = {job["id"] for job in scheduler.jobs}
-        assert "snapshot_job_vix" not in job_ids
-        assert "snapshot_job_vix_close" not in job_ids
-        assert app_module.app.state.vix_snapshot_job is None
-
-
-@pytest.mark.asyncio
 async def test_lifespan_wires_cboe_gex_job_when_enabled(monkeypatch) -> None:
     """Verify optional CBOE GEX scheduler job is added and exposed on app.state."""
     import apscheduler.schedulers.asyncio as aps_asyncio
@@ -185,7 +111,6 @@ async def test_lifespan_wires_cboe_gex_job_when_enabled(monkeypatch) -> None:
     monkeypatch.setattr(sb_module, "get_tradier_client", lambda: object())
     monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "build_cboe_gex_job", lambda **kwargs: cboe_gex_job)
     monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
@@ -196,7 +121,6 @@ async def test_lifespan_wires_cboe_gex_job_when_enabled(monkeypatch) -> None:
     monkeypatch.setattr(settings, "cboe_gex_enabled", True)
     monkeypatch.setattr(settings, "skip_startup_warmup", False)
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
 
     async with app_module.lifespan(app_module.app):
@@ -223,7 +147,6 @@ async def test_lifespan_wires_spy_snapshot_job_when_enabled(monkeypatch) -> None
     monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: spy_snapshot_job)
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
     monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
     monkeypatch.setattr(sb_module, "DecisionJob", _FakeJob)
@@ -232,7 +155,6 @@ async def test_lifespan_wires_spy_snapshot_job_when_enabled(monkeypatch) -> None
     monkeypatch.setattr(settings, "spy_snapshot_enabled", True)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)
     monkeypatch.setattr(settings, "skip_startup_warmup", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
 
     async with app_module.lifespan(app_module.app):
@@ -262,7 +184,6 @@ async def test_lifespan_wires_performance_analytics_job_when_enabled(monkeypatch
     monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "build_performance_analytics_job", lambda **kwargs: performance_analytics_job)
     monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
     monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
@@ -272,7 +193,6 @@ async def test_lifespan_wires_performance_analytics_job_when_enabled(monkeypatch
     monkeypatch.setattr(settings, "performance_analytics_enabled", True)
     monkeypatch.setattr(settings, "performance_analytics_interval_minutes", 5)
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)
     monkeypatch.setattr(settings, "skip_startup_warmup", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
@@ -293,7 +213,6 @@ async def test_lifespan_skips_spy_snapshot_job_when_disabled(monkeypatch) -> Non
     import apscheduler.schedulers.asyncio as aps_asyncio
 
     spx_snapshot_job = _FakeJob()
-    vix_snapshot_job = _FakeJob()
 
     monkeypatch.setattr(aps_asyncio, "AsyncIOScheduler", _FakeScheduler)
     monkeypatch.setattr(app_module, "init_db", _fake_init_db)
@@ -301,7 +220,6 @@ async def test_lifespan_skips_spy_snapshot_job_when_disabled(monkeypatch) -> Non
     monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: spx_snapshot_job)
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: vix_snapshot_job)
     monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
     monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
     monkeypatch.setattr(sb_module, "DecisionJob", _FakeJob)
@@ -310,7 +228,6 @@ async def test_lifespan_skips_spy_snapshot_job_when_disabled(monkeypatch) -> Non
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)
     monkeypatch.setattr(settings, "skip_startup_warmup", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
 
     async with app_module.lifespan(app_module.app):
@@ -341,7 +258,6 @@ async def test_lifespan_logs_startup_warmup_failures_without_crashing(monkeypatc
     monkeypatch.setattr(sb_module, "MarketClockCache", _FakeClockCache)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: snapshot_job)
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "QuoteJob", lambda *args, **kwargs: quote_job)
     monkeypatch.setattr(sb_module, "GexJob", lambda *args, **kwargs: gex_job)
     monkeypatch.setattr(sb_module, "DecisionJob", _FakeJob)
@@ -351,7 +267,6 @@ async def test_lifespan_logs_startup_warmup_failures_without_crashing(monkeypatc
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)
     monkeypatch.setattr(settings, "skip_startup_warmup", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
 
     async with app_module.lifespan(app_module.app):
@@ -360,7 +275,6 @@ async def test_lifespan_logs_startup_warmup_failures_without_crashing(monkeypatc
         assert gex_job.run_calls == 1
 
     assert any("startup_warmup: job_id=snapshot_job status=failed" in call for call in log_calls)
-
 
 
 @pytest.mark.asyncio
@@ -378,7 +292,6 @@ async def test_lifespan_holiday_guard_skips_hard_rth_and_entry_jobs(monkeypatch)
     monkeypatch.setattr(_FakeClockCache, "market_open", False)
     monkeypatch.setattr(sb_module, "build_snapshot_job", lambda **kwargs: snapshot_job)
     monkeypatch.setattr(sb_module, "build_spy_snapshot_job", lambda **kwargs: _FakeJob())
-    monkeypatch.setattr(sb_module, "build_vix_snapshot_job", lambda **kwargs: _FakeJob())
     monkeypatch.setattr(sb_module, "QuoteJob", _FakeJob)
     monkeypatch.setattr(sb_module, "GexJob", _FakeJob)
     monkeypatch.setattr(sb_module, "DecisionJob", lambda *args, **kwargs: decision_job)
@@ -386,7 +299,6 @@ async def test_lifespan_holiday_guard_skips_hard_rth_and_entry_jobs(monkeypatch)
 
     monkeypatch.setattr(settings, "skip_startup_warmup", True)
     monkeypatch.setattr(settings, "spy_snapshot_enabled", False)
-    monkeypatch.setattr(settings, "vix_snapshot_enabled", False)
     monkeypatch.setattr(settings, "cboe_gex_enabled", False)
     monkeypatch.setattr(settings, "performance_analytics_enabled", False)
     monkeypatch.setattr(settings, "trade_pnl_enabled", False)
@@ -409,18 +321,15 @@ async def test_lifespan_holiday_guard_skips_hard_rth_and_entry_jobs(monkeypatch)
         assert decision_job.run_calls == 0
 
 
-
 @pytest.mark.asyncio
 async def test_guard_allow_outside_rth_bypasses_market_closed_check() -> None:
     """When allow_outside_rth=True, the guard should invoke the job even if the market is closed."""
-    from datetime import date, datetime
-    from zoneinfo import ZoneInfo
-
     from spx_backend.scheduler_builder import build_market_open_guarded_runner
 
     invocations: list[dict] = []
 
     async def _fake_run(*, force: bool = False) -> dict:
+        """Capture force-flag value for guard-bypass assertions."""
         invocations.append({"force": force})
         return {"ok": True}
 
@@ -450,6 +359,7 @@ async def test_guard_default_skips_when_market_closed() -> None:
     invocations: list[dict] = []
 
     async def _fake_run(*, force: bool = False) -> dict:
+        """Capture force-flag value for default-guard assertions."""
         invocations.append({"force": force})
         return {"ok": True}
 

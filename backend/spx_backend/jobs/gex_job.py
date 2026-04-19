@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Final
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -10,15 +12,33 @@ from sqlalchemy import text
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services.gex_math import compute_gex_per_strike
+
+# Audit Wave 1 finding H4: 25% of TRADIER snapshots historically wrote
+# zero_gamma_level=NULL because the strike-count window
+# (settings.gex_strike_limit, default 150) is too narrow for chains where
+# the dealer-flip lives outside the densest strike cluster. The aggregate
+# gex_net columns are intentionally still windowed (performance), but the
+# zero-gamma walker now uses a percent-of-spot window so it can resolve
+# crossings in wider chains. The two constants are module-level so future
+# tuning is one edit.
+_ZERO_GAMMA_WINDOW_PCT_PRIMARY: Final[float] = 0.20
+_ZERO_GAMMA_WINDOW_PCT_FALLBACK: Final[float] = 0.35
 
 
 @dataclass(frozen=True)
 class GexJob:
     """Compute and persist GEX aggregates from Tradier option chain snapshots.
 
-    Uses the standard dollar-GEX formula: 0.01 * gamma * OI * multiplier * S^2.
-    CBOE (CboeGexJob) is the primary GEX source for the decision engine;
-    Tradier GEX serves as a cross-check and backup when CBOE data is unavailable.
+    Per-strike values are produced by
+    :func:`spx_backend.services.gex_math.compute_gex_per_strike` so the
+    SqueezeMetrics convention (``OI * gamma * multiplier * S^2 * 0.01``
+    with calls signed ``+`` and puts signed ``-``) lives in exactly one
+    place across both writers (TRADIER here and CBOE in ``cboe_gex_job``).
+
+    Per-snapshot magnitudes for SPX live in the canonical $1B-$100B
+    range; the cross-source parity check vs CBOE is documented in
+    ``backend/spx_backend/jobs/INGEST_AUDIT.md`` (finding C1).
     """
     clock_cache: MarketClockCache | None = None
 
@@ -159,11 +179,24 @@ class GexJob:
                             if strike is None or oi is None or gamma is None:
                                 continue
                             multiplier = contract_size or settings.gex_contract_multiplier
-                            sign = 1.0
-                            if settings.gex_puts_negative and (right == "P"):
-                                sign = -1.0
-                            # Standard dollar GEX: 0.01 * gamma * OI * multiplier * S^2
-                            gex_val = sign * 0.01 * float(gamma) * float(oi) * float(multiplier) * (float(spot) ** 2)
+                            # Route through the canonical SqueezeMetrics
+                            # formula in services/gex_math.py so any future
+                            # convention change is one edit. The canonical
+                            # formula always signs puts negative; the legacy
+                            # `gex_puts_negative` setting is enforced by
+                            # treating right == 'P' as positive when False
+                            # to preserve the original opt-out behavior.
+                            if (not settings.gex_puts_negative) and right == "P":
+                                effective_right = "C"  # opt-out flips the sign
+                            else:
+                                effective_right = right
+                            gex_val = compute_gex_per_strike(
+                                oi=int(oi),
+                                gamma_per_share=float(gamma),
+                                spot=float(spot),
+                                right=effective_right,
+                                contract_multiplier=int(multiplier),
+                            )
 
                             # Totals by option side
                             if right == "P":
@@ -193,8 +226,52 @@ class GexJob:
                                     pe["gex_calls"] += gex_val
                                 pe["oi"] += int(oi)
 
-                        # Compute zero gamma level from cumulative net gex by strike
-                        zero_gamma = self._zero_gamma_level(per_strike)
+                        # Build a separate per-strike map for the zero-gamma
+                        # walker (audit Wave 1 H4). The aggregate
+                        # gex_net/gex_calls/gex_puts/gex_abs above are
+                        # intentionally windowed by gex_strike_limit (150 by
+                        # default) for write performance, but the zero-gamma
+                        # walker needs to see strikes far enough out to find
+                        # sign changes that occur outside that strike-count
+                        # window. The widest possible window
+                        # (_ZERO_GAMMA_WINDOW_PCT_FALLBACK) is materialised
+                        # once here; _zero_gamma_level itself filters down to
+                        # the primary window first and falls back to the
+                        # wider window only if no crossing is found.
+                        zg_per_strike: dict[float, float] = {}
+                        zg_lo = float(spot) * (1.0 - _ZERO_GAMMA_WINDOW_PCT_FALLBACK)
+                        zg_hi = float(spot) * (1.0 + _ZERO_GAMMA_WINDOW_PCT_FALLBACK)
+                        for strike, right, oi, gamma, contract_size, expiration, dte in filtered:
+                            if strike is None or oi is None or gamma is None:
+                                continue
+                            s_val = float(strike)
+                            if s_val < zg_lo or s_val > zg_hi:
+                                continue
+                            multiplier_zg = contract_size or settings.gex_contract_multiplier
+                            # Mirror the gex_puts_negative opt-out so the
+                            # walker uses the same sign convention as the
+                            # aggregate; otherwise zero-gamma would be
+                            # computed under a different convention than
+                            # the gex_net it ships alongside.
+                            if (not settings.gex_puts_negative) and right == "P":
+                                effective_right_zg = "C"
+                            else:
+                                effective_right_zg = right
+                            gex_val_zg = compute_gex_per_strike(
+                                oi=int(oi),
+                                gamma_per_share=float(gamma),
+                                spot=float(spot),
+                                right=effective_right_zg,
+                                contract_multiplier=int(multiplier_zg),
+                            )
+                            zg_per_strike[s_val] = zg_per_strike.get(s_val, 0.0) + gex_val_zg
+
+                        zero_gamma = self._zero_gamma_level(
+                            zg_per_strike,
+                            spot=float(spot),
+                            snapshot_id=snapshot_id,
+                            underlying=underlying,
+                        )
                         gex_net = gex_calls + gex_puts
 
                         method = f"oi_gamma_spot_top{settings.gex_strike_limit}_dte{settings.gex_max_dte_days}"
@@ -401,28 +478,99 @@ class GexJob:
             return None
         return float(last)
 
-    def _zero_gamma_level(self, per_strike: dict) -> float | None:
-        """Estimate zero gamma level from cumulative net GEX by strike."""
+    def _zero_gamma_level(
+        self,
+        per_strike: Mapping[float, float],
+        *,
+        spot: float,
+        snapshot_id: int | None = None,
+        underlying: str | None = None,
+    ) -> float | None:
+        """Estimate the zero-gamma (dealer-flip) level by walking cumulative net GEX.
+
+        Args:
+            per_strike: Pre-built map of ``{strike: signed_net_gex}`` covering
+                strikes within ``±_ZERO_GAMMA_WINDOW_PCT_FALLBACK`` of spot.
+                Per-strike values are already signed via
+                :func:`compute_gex_per_strike` so this method only sums.
+            spot: Underlying spot price; defines the percent-of-spot window.
+            snapshot_id: For structured-log correlation when no crossing exists.
+            underlying: For structured-log correlation when no crossing exists.
+
+        Returns:
+            The interpolated dollar-strike at which cumulative net GEX crosses
+            zero, preferring the narrower ``±_ZERO_GAMMA_WINDOW_PCT_PRIMARY``
+            window. Falls back to ``±_ZERO_GAMMA_WINDOW_PCT_FALLBACK`` if the
+            primary window is monotone. Returns ``None`` and emits a structured
+            ``zero_gamma_chain_monotone`` warning if no crossing exists in
+            either window — distinguishing a genuinely sign-stable chain from
+            a search-window-too-narrow case (audit Wave 1 H4).
+        """
         if not per_strike:
             return None
-        strikes = sorted(per_strike.keys())
-        cum = 0.0
-        prev_cum = 0.0
-        prev_strike = None
-        for strike in strikes:
-            prev_cum = cum
-            cum += per_strike[strike]["gex_calls"] + per_strike[strike]["gex_puts"]
-            if prev_strike is None:
-                prev_strike = strike
+
+        # Try primary window first; fall back to wider window if monotone.
+        for window_pct, window_label in (
+            (_ZERO_GAMMA_WINDOW_PCT_PRIMARY, "primary"),
+            (_ZERO_GAMMA_WINDOW_PCT_FALLBACK, "fallback"),
+        ):
+            lo = float(spot) * (1.0 - window_pct)
+            hi = float(spot) * (1.0 + window_pct)
+            windowed = sorted(s for s in per_strike if lo <= s <= hi)
+            if len(windowed) < 2:
+                # Need at least two strikes to detect a crossing.
                 continue
-            if prev_cum == 0.0:
-                return float(prev_strike)
-            if (prev_cum < 0 and cum > 0) or (prev_cum > 0 and cum < 0):
-                # Linear interpolation between strikes
-                denom = abs(prev_cum) + abs(cum)
-                if denom == 0:
-                    return float(strike)
-                w = abs(prev_cum) / denom
-                return float(prev_strike + (strike - prev_strike) * w)
-            prev_strike = strike
+            cum = 0.0
+            prev_cum = 0.0
+            prev_strike: float | None = None
+            for strike in windowed:
+                prev_cum = cum
+                cum += float(per_strike[strike])
+                if prev_strike is None:
+                    prev_strike = strike
+                    continue
+                # Exact zero on the previous step is a crossing at prev_strike.
+                if prev_cum == 0.0:
+                    if window_label == "fallback":
+                        logger.info(
+                            "gex_job: zero_gamma_resolved_in_fallback_window "
+                            "snapshot_id={} underlying={} window_pct={} strike={}",
+                            snapshot_id,
+                            underlying,
+                            window_pct,
+                            float(prev_strike),
+                        )
+                    return float(prev_strike)
+                if (prev_cum < 0 and cum > 0) or (prev_cum > 0 and cum < 0):
+                    denom = abs(prev_cum) + abs(cum)
+                    if denom == 0:
+                        return float(strike)
+                    w = abs(prev_cum) / denom
+                    interpolated = float(prev_strike + (strike - prev_strike) * w)
+                    if window_label == "fallback":
+                        logger.info(
+                            "gex_job: zero_gamma_resolved_in_fallback_window "
+                            "snapshot_id={} underlying={} window_pct={} strike={}",
+                            snapshot_id,
+                            underlying,
+                            window_pct,
+                            interpolated,
+                        )
+                    return interpolated
+                prev_strike = strike
+
+        # Both windows monotone -> persist NULL and log the discriminator.
+        observed_min = min(per_strike.keys())
+        observed_max = max(per_strike.keys())
+        cum_total = sum(per_strike.values())
+        logger.warning(
+            "gex_job: zero_gamma_chain_monotone snapshot_id={} underlying={} "
+            "spot={} observed_min={} observed_max={} cum_net={}",
+            snapshot_id,
+            underlying,
+            float(spot),
+            observed_min,
+            observed_max,
+            cum_total,
+        )
         return None

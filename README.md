@@ -107,7 +107,6 @@ flowchart TB
     r_quote[quote_job]
     r_snap[snapshot_job]
     r_spy[spy_snapshot optional]
-    r_vix[vix_snapshot optional]
     r_gex[gex_job]
     r_cboe[cboe_gex_job]
     r_perf[performance_analytics_job]
@@ -382,7 +381,6 @@ Primary knobs:
   - `SNAPSHOT_DTE_MIN_DAYS`, `SNAPSHOT_DTE_MAX_DAYS`
   - `SNAPSHOT_STRIKES_EACH_SIDE`
   - `SPY_SNAPSHOT_ENABLED=true|false`
-  - `VIX_SNAPSHOT_ENABLED=true|false`
 - Decision (rules-based, capital-budgeted):
   - `DECISION_ENTRY_TIMES`
   - `DECISION_DTE_TARGETS`

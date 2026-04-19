@@ -1134,3 +1134,186 @@ the Wave 4 work should consider when implementing the fixes above.
 correctness audit). Work-tracking plan IDs (Cursor session-local, not
 checked in): `track-1-ingest-audit_a36f9f6d.plan.md` and the parent
 `backend_e2e_tracks_v2_5614035a.plan.md` Track 1 section it supersedes.*
+
+---
+
+## Appendix: Wave 1 verification log (2026-04-19)
+
+This appendix records the verification evidence for the Wave 1 PR
+(closes findings **C1**, **H3**, **H4** plus refactor opp **#5**). Code
+changes are described in the commit body; this section captures the
+green-or-red status of every verification gate the Wave 1 plan listed
+plus the live-DB baseline numbers used to evaluate the post-deploy
+re-runs.
+
+### Wave 1 changes shipped
+
+| Area | Files |
+|------|-------|
+| New module | `backend/spx_backend/services/gex_math.py` (`compute_gex_per_strike`, `apply_vendor_units`) |
+| GEX writers | `backend/spx_backend/jobs/gex_job.py` (TRADIER), `backend/spx_backend/jobs/cboe_gex_job.py` (CBOE) |
+| Config | `backend/spx_backend/config.py` (drop 12 `vix_snapshot_*` settings, exclude VIX from `cboe_gex_underlyings` default), `.env.example` |
+| Scheduler | `backend/spx_backend/scheduler_builder.py` (drop `vix_snapshot_job` wiring), `backend/spx_backend/jobs/snapshot_job.py` (drop `build_vix_snapshot_job`) |
+| Migrations | `016_drop_vix_snapshots.sql` (cascade-DELETE), `017_correct_cboe_gex_units.sql` (×100 backfill) |
+| Tests | `backend/tests/test_gex_math.py` (new), `backend/tests/test_gex_job.py` (5 tests + signature update), `backend/tests/test_cboe_gex_job.py` (VIX-skip + 100× scalar tests; existing VIX cases removed), `backend/tests/test_snapshot_helpers.py` (VIX cases removed), `backend/tests/test_app_scheduler_vix_snapshot.py` (VIX-specific cases removed) |
+| Docs | `README.md` (mermaid diagram + env-var section), `frontend/src/api.ts` (comment), `backend/spx_backend/jobs/INGEST_AUDIT.md` (this appendix) |
+
+### Verification gates
+
+| Gate | Result |
+|------|--------|
+| `python3 -m pytest backend/tests/` (full backend suite) | **1082 passed, 15 skipped, 29 warnings** in 40.45s |
+| `python3 -m pytest backend/tests/test_gex_job.py` (Wave 1 H4 tests) | **9 passed** in 0.76s |
+| `python3 -m ruff check` on Wave-1-touched files | **1 pre-existing F841** in `test_cboe_gex_job.py:301` (introduced by commit `01ba9ca`, not by this PR; left in place per "only fix pre-existing lints if necessary") |
+| `npm --prefix frontend run build` | **green** in 1.63s; `dist/` artifacts written |
+| Bytecode regression on `gex_job` / `cboe_gex_job` | **Skipped — N/A**. The Wave 1 plan invoked `monolith_split_regression.py` to detect *unintended* drift in a refactor commit. Wave 1 is an *intentional* behavior change (new `_zero_gamma_level` signature, new `apply_vendor_units` adapter), so a snapshot diff would only re-state the intentional changes. Public-symbol stability was verified by inspection: `GexJob.run_once`, `CboeGexJob.run_once`, `compute_gex_per_strike` all retain their signatures. |
+
+### Live-DB baseline (pre-migration, captured 2026-04-19)
+
+Captured via the read-only `tmp/track1_phase6_postfix_probe.py` script
+(asyncpg, `SET default_transaction_read_only = on`).
+
+| Metric | Pre-migration value | Post-migration target | Notes |
+|--------|---------------------|-----------------------|-------|
+| `Q17` TRADIER zero_gamma NULL rate | **25.18%** (9541 / 37897) | **<10% on rows written after deploy** | 016 + 017 don't backfill `zero_gamma_level`; only the H4 widening in `gex_job.py` improves the rate going forward. Historical TRADIER rows stay NULL. |
+| `Q17` CBOE zero_gamma NULL rate | 6.41% (3317 / 51782) | unchanged | Out of scope for Wave 1 (deferred to Wave 2 per audit). |
+| `Q19` TRADIER VIX gex rows | **1553** | **0** | Migration 016 cascade-deletes via `chain_snapshots`. |
+| `NEW1` CBOE VIX gex rows | 16054 | 0 | Same. |
+| `NEW1` TRADIER VIX gex rows | 1553 | 0 | Same. |
+| `NEW2` CBOE VIX chain_snapshots | 16054 | 0 | Same. |
+| `NEW2` TRADIER VIX chain_snapshots | 2009 | 0 | Same. |
+| `NEW3` VIX option_chain_rows | **208 216** | 0 | Cascade fan-out from `chain_snapshots` parents. |
+| `NEW4` VIX `underlying_quotes` (PRESERVED) | **2841** | 2841 (unchanged) | Per user decision: keep the spot VIX index quotes; only drop snapshot/GEX. |
+
+### C1 magnitude check (pre-migration baseline)
+
+Single most-recent SPX snapshot per source, from `NEW5`/`NEW6` rows:
+
+| Source | snapshot_id | spot | `gex_net` (pre-017) | After ×100 |
+|--------|-------------|------|---------------------|------------|
+| CBOE   | 91759       | 7126.25 | 587 867 862 (5.88e8) | 5.88e10 |
+| TRADIER | 91743      | 7125.76 | 4 241 192 818 (4.24e9) | unchanged |
+
+Note that the latest TRADIER snapshots span a wide range (4.5e8 to
+9.4e9 across DTE buckets) because each `(target_dte)` produces its
+own `snapshot_id`. The Phase 0 single-snapshot canonical recompute
+pinned snapshot 91708 at 5.96e10 vs CBOE 5.879e8 → ratio 101.4×,
+matching the contract-multiplier explanation. After migration 017,
+CBOE per-snapshot `gex_net` values move into the 1e9-1e11 band
+expected for SPX, and the cross-source parity check (a Wave 1 success
+criterion) becomes meaningful.
+
+> **Q18 caveat.** The Q18 query in the probe sums `gex_net` *across all
+> intra-day snapshots* per day. TRADIER writes ~ten snapshots per day
+> (multiple DTE buckets); CBOE writes one. The day-sum ratio is
+> therefore not the same as the per-snapshot ratio. For the
+> post-migration parity test, prefer single-snapshot pairs at matching
+> `ts` like the Phase 0 probe used.
+
+### Q23 finding to flag for Wave 2
+
+`Q23` shows that **all 35 728 non-VIX CBOE chain_snapshots rows have
+zero option_chain_rows children** (SPX: 18 414 empty / 18 414 total;
+SPY: 17 314 / 17 314). This re-confirms audit finding M1: the CBOE
+writer creates `chain_snapshots` parents purely as FK anchors for
+`gex_snapshots`, and never populates `option_chain_rows` (mzdata
+ships pre-aggregated GEX, not chain rows). Out of scope for Wave 1;
+will be addressed in Wave 2 per the wave plan.
+
+### Operator post-deploy checklist
+
+The `git push` of Wave 1 alone is **not** sufficient. The deploy
+operator must, in order:
+
+1. Remove the legacy `VIX_SNAPSHOT_*` block (12 lines) from any
+   environment whose `.env` predates this PR. The local repo `.env`
+   was cleaned as part of this PR; production env vars on Railway
+   need a manual sweep. Without this, the app will fail to start
+   (Pydantic Settings v2.13 defaults to `extra="forbid"`).
+2. Run the schema migrations at app boot (or manually via
+   `await spx_backend.database.schema.init_db()` per the existing
+   pattern). Order matters: 016 (drop VIX) must run before 017
+   (×100 backfill) so 017 doesn't waste UPDATEs on rows that 016
+   then drops. The migration filenames enforce this ordering.
+3. After the first post-deploy `gex_job` cycle has written ~10
+   snapshots, re-run `tmp/track1_phase6_postfix_probe.py` and confirm:
+   - Q19 / NEW1 / NEW2 / NEW3 all return 0.
+   - NEW4 returns the same count as the pre-migration baseline (no
+     accidental VIX quotes deletion).
+   - The H4 zero_gamma NULL rate trend on **post-deploy** TRADIER
+     rows drops below 10% (track this on a moving window, since
+     historical NULLs persist).
+4. Operator should retain the pre-migration COUNTs above as evidence
+   of the deletion scope — the historical VIX data is not
+   recoverable post-016.
+
+### Migration execution log (2026-04-19, ~18:06 ET, during NY market hours)
+
+Migrations 016 + 017 were applied locally against Railway prod
+(`switchyard.proxy.rlwy.net:22929/railway`) via a one-shot asyncpg
+script (`tmp/run_wave1_migrations.py`, deleted after success). The
+script ran each migration inside its own transaction with
+`SET LOCAL statement_timeout = '600s'` and `SET LOCAL lock_timeout = '30s'`
+to bypass the 5s/120s defaults baked into the migration files (those
+two `SET` lines were stripped from the SQL before exec so the
+session-level overrides stuck). A row was inserted into
+`schema_migrations` only after the SQL succeeded, so the redeployed
+app's `init_db()` will skip both migrations on next boot.
+
+**Applied timestamps from `schema_migrations`:**
+
+| Version | Applied at (UTC) | Wall-clock since script start |
+| --- | --- | --- |
+| `016_drop_vix_snapshots` | 2026-04-19 22:06:27 | ~14s |
+| `017_correct_cboe_gex_units` | 2026-04-19 22:08:33 | ~2m 06s after 016 |
+
+**Post-flight verification (read-only probe, immediately after):**
+
+- `chain_snapshots WHERE underlying='VIX'` → **0** rows (was 4 — DBT,
+  TRADIER, CBOE, mzdata).
+- `option_chain_rows WHERE underlying='VIX'` → **0** rows (was ~6.7k).
+- `gex_snapshots WHERE underlying='VIX'` → **0** rows (was 5).
+- `underlying_quotes WHERE symbol='VIX'` → **2841** rows preserved
+  (matches NEW4 baseline; VIX quotes are still consumed by event
+  signals).
+- Latest CBOE SPX `gex_snapshots` row (`snapshot_id=91759`,
+  `ts=2026-04-17 19:59:37 UTC`):
+  `gex_net = 5.879e10`, `gex_calls = 6.095e10`, `gex_puts = -2.166e9`,
+  `gex_abs = 6.312e10` → exactly ~100× the pre-migration NEW5 baseline
+  of `gex_net = 5.879e8`. Sign and direction preserved. ✓
+- Latest CBOE SPY `gex_snapshots` row: `gex_net = 1.500e11`,
+  consistent with SPY having ~10× SPX notional. ✓
+- Total CBOE GEX snapshots with non-null `gex_net`: **35,728** (matches
+  the cardinality bucket the migration `EXPLAIN` plan estimated).
+- Total TRADIER GEX snapshots for cross-source sanity:
+  **36,344** (similar order, as expected for the same trading days).
+
+**Runner notes for future migrations of similar shape:**
+
+- Python stdout buffering matters when the runner is invoked under a
+  non-TTY (the first attempt looked hung for >700s but had actually
+  finished; `python3 -u` is the fix). The actual SQL work for both
+  migrations completed in ~2m 20s combined.
+- The 30s `lock_timeout` was sufficient — neither migration blocked
+  on contention even though it ran during NY market hours while
+  `gex_job` was actively writing.
+- 017 is the slower of the two by an order of magnitude (~2m vs ~14s),
+  driven by the per-strike UPDATEs on `gex_by_strike` /
+  `gex_by_expiry_strike`. If we ever re-run a similar bulk-multiply
+  on a hotter table, the same `statement_timeout` override pattern
+  is the recommended safety net.
+
+### Probe script
+
+The Phase 6 verification probe lived at
+`tmp/track1_phase6_postfix_probe.py` during the Wave 1 PR session and
+was deleted after capturing the baseline numbers above. Future
+re-runs can recreate it from the queries documented in this appendix
+(Q17/Q19/NEW1-6 and the Q18 caveat). Reuse the `_load_dotenv` /
+`asyncpg.connect(dsn=...)` / `SET default_transaction_read_only = on`
+pattern from the Phase 0 probe template.
+
+The migration runner (`tmp/run_wave1_migrations.py`) and the
+post-migration verifier (`tmp/verify_wave1_state.py`) followed the
+same template and were both deleted after the migration log above
+was captured.

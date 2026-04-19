@@ -15,6 +15,7 @@ from spx_backend.database import SessionLocal
 from spx_backend.dte import trading_dte_lookup
 from spx_backend.ingestion.mzdata_client import MzDataClient, get_mzdata_client
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services.gex_math import apply_vendor_units
 
 
 def _checksum_payload(payload: object) -> str:
@@ -300,6 +301,20 @@ class CboeGexJob:
     ) -> dict[str, Any]:
         """Fetch and persist one underlying's CBOE exposure payload."""
         result = self._empty_underlying_result(now_et=now_et, underlying=underlying)
+        # Defense-in-depth: VIX dealer-gamma snapshots were dropped in
+        # audit Wave 1 (finding H3) because mzdata coverage was 0% and
+        # the symbol's options aren't dealer-hedged the same way as SPX
+        # / SPY. We still need VIX *index* quotes (handled in
+        # quote_job), but never an exposure snapshot. Guard here so a
+        # config-only re-introduction can't write VIX rows.
+        if underlying.strip().upper() == "VIX":
+            logger.info(
+                "cboe_gex_job: skipping VIX exposure write (audit Wave 1 H3); "
+                "remove 'VIX' from CBOE_GEX_UNDERLYINGS to silence this log"
+            )
+            result["skipped"] = True
+            result["reason"] = "vix_excluded"
+            return result
         try:
             payload = await self.mzdata.get_live_option_exposure(underlying)
         except Exception as exc:
@@ -406,15 +421,39 @@ class CboeGexJob:
                     gex_puts_total = 0.0
                     gex_abs_total = 0.0
 
-                    # Keep MZData net gamma as canonical and sign puts negative so
-                    # charting behavior stays consistent with existing UI logic.
+                    # mzdata publishes per-strike exposures in dollars-per-
+                    # share-per-1%-move (omits the 100-share contract
+                    # multiplier). apply_vendor_units(...) scales each
+                    # series into the SqueezeMetrics convention so this
+                    # writer's gex_net is directly comparable to the
+                    # TRADIER writer (audit Wave 1, finding C1).
+                    spot_for_units = float(spot_price) if spot_price is not None else 0.0
+                    raw_net_gamma_series = item.net_gamma if isinstance(item.net_gamma, list) else []
                     for index, strike_value in enumerate(item.strikes):
                         if strike_value is None:
                             continue
                         strike = float(strike_value)
-                        call_gamma = _series_float(item.call_abs_gamma, index, default=0.0)
-                        put_gamma = -abs(_series_float(item.put_abs_gamma, index, default=0.0))
-                        net_gamma = _series_float(item.net_gamma, index, default=call_gamma + put_gamma)
+                        call_gamma = apply_vendor_units(
+                            _series_float(item.call_abs_gamma, index, default=0.0),
+                            spot=spot_for_units,
+                        )
+                        put_gamma = -abs(
+                            apply_vendor_units(
+                                _series_float(item.put_abs_gamma, index, default=0.0),
+                                spot=spot_for_units,
+                            )
+                        )
+                        # Use the vendor's net_gamma when present; otherwise
+                        # fall back to the call+put sum already in canonical
+                        # units. We avoid double-scaling by only piping raw
+                        # vendor values through apply_vendor_units.
+                        if 0 <= index < len(raw_net_gamma_series) and raw_net_gamma_series[index] is not None:
+                            net_gamma = apply_vendor_units(
+                                _series_float(raw_net_gamma_series, index, default=0.0),
+                                spot=spot_for_units,
+                            )
+                        else:
+                            net_gamma = call_gamma + put_gamma
                         call_oi = _series_int(item.call_open_interest, index, default=0)
                         put_oi = _series_int(item.put_open_interest, index, default=0)
                         oi_total = max(call_oi + put_oi, 0)
