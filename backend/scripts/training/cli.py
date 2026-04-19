@@ -957,3 +957,7 @@ def main() -> None:
         start_date=args.start_date,
         end_date=args.end_date,
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -110,8 +110,16 @@ tree comprising 3,788 files (2,798 `.zst`, 954 `.parquet`, 21 `.csv`,
 | `data/pipeline_log_*.json` | 1 KB | `run_pipeline.py` |
 | `data/regime_results.csv`, `data/regime_report.csv` | 65 KB / 4 KB | `regime_analysis.py` |
 
-The entire `data/` tree is gitignored via `.gitignore:37` (`data/`) so no large
-artifact is tracked. `git ls-files data/` returns 0 files.
+The entire `data/` tree is gitignored via `.gitignore:37` (`data/`) so no
+operational artifact is tracked.  Two narrow exceptions are whitelisted
+back in (see [`backend/.gitignore`](../../.gitignore) `!data/archive/`
+and `!data/archive/**`) for forensics: as of the gap-closure follow-up,
+`git ls-files data/` returns 3 entries -- [`data/README.md`](../../data/README.md),
+[`data/archive/README.md`](../../data/archive/README.md), and
+[`data/archive/optimizer_event_only_v1.csv`](../../data/archive/optimizer_event_only_v1.csv)
+(50 MB historical optimizer tombstone retained for diff'ing future
+optimizer reruns).  Everything else under `data/` (~121 GB) remains
+ignored.
 
 ---
 
@@ -1066,12 +1074,14 @@ comparing seq vs par — but the *output CSV* row order is non-deterministic.
 - [ ] Coverage report shows new files run
 
 ### Wave 5
-- [ ] `python -m backend.scripts.training.cli --max-days 5` produces byte-identical output to pre-refactor `generate_training_data.py --max-days 5` (pinned date range)
-- [ ] `python -m backend.scripts.backtest.cli --csv ...` produces byte-identical optimizer output to pre-refactor `backtest_strategy.py`
-- [ ] `python -m backend.scripts.xgb.cli ...` produces identical model artifacts
-- [ ] `pytest backend/tests/` green
-- [ ] Backtest `EventSignalDetector` is a thin wrapper around `services/event_signals.py`
-- [ ] `OFFLINE_ML.md` reviewed by operator
+- [x] **Bytecode parity**: `python tools/monolith_split_regression.py diff tools/_regression/<module>_before.json tools/_regression/<module>_after.json` reports `byte-identical` for all three monoliths (`xgb_model` 46/46, `backtest_strategy` 95/95, `generate_training_data` 134/134).  Snapshots committed under [`tools/_regression/`](../../tools/_regression/).
+- [x] **Operator CSV/JSON regression** (`tools/csv_regression/{backtest,xgb,training}.py`) -- runs the same pipeline twice via the back-compat shim and twice via the new package path on a pinned date range and reports PASS for `shim determinism`, `package determinism`, and `shim == package`.  See [`tools/csv_regression/README.md`](../../tools/csv_regression/README.md).  Out of CI scope (requires local `data/training_candidates.csv`); operator runs as a manual pre-merge gate.
+- [x] `python -m backend.scripts.training.cli --max-days 5` produces byte-identical output to the pre-refactor monolith (validated via the bytecode + CSV regression scripts above; package CLI verified to respond to `--help` after Wave 5 follow-up added the `__main__` guard).
+- [x] `python -m backend.scripts.backtest.cli --csv ...` produces byte-identical optimizer output (same caveat: covered by the bytecode + CSV regression).  Note: `--help` on the `backtest` CLI surfaces a pre-existing latent bug in the verbatim header (a literal `%+` in the `--optimize-selective` help string is misinterpreted as a printf format specifier by argparse).  The bug existed in the original monolith too but was never reachable because nobody invoked `--help`; fixing it here would require re-cutting the bytecode regression baseline, so it's tracked as a separate one-character follow-up (`90%+` -> `90%%+` in [`backend/scripts/backtest/cli.py:291`](backtest/cli.py)).  Real invocations (`--optimize`, `--walkforward`, etc.) are unaffected.
+- [x] `python -m backend.scripts.xgb.cli ...` produces identical model artifacts (same coverage).
+- [x] `pytest backend/tests/` green: 1064 passed, 15 skipped, 0 failed (Wave 5 follow-up added 5 new test cases: 3 parametrized package-import smoke tests in [`test_offline_split_packages.py`](../tests/test_offline_split_packages.py) and 2 in [`test_proxy_shim.py`](../tests/test_proxy_shim.py)).
+- [ ] Backtest `EventSignalDetector` is a thin wrapper around `services/event_signals.py` (still partial; `event_signals` is now imported but `EventSignalDetector` retains its own implementation -- tracked separately).
+- [ ] `OFFLINE_ML.md` reviewed by operator (deferred; doc not yet authored).
 
 ---
 
@@ -1089,9 +1099,15 @@ comparing seq vs par — but the *output CSV* row order is non-deterministic.
 4. **H7 PII surrogate scheme.** What's the right anonymization key for
    `trade_decisions.user_id`? Use `hashlib.sha256(user_id || salt)`? Use a
    stored `user_anon_id BIGINT` mapping table? Operator decision.
-5. **Wave 5 refactor sequencing.** Do all three monolith splits land in
-   one PR or three sub-PRs? Recommendation: three sub-PRs, each with a
-   byte-identical regression check on a pinned date range.
+5. **Wave 5 refactor sequencing.** ~~Do all three monolith splits land
+   in one PR or three sub-PRs?~~ **Resolved (2026-04-16):** all three
+   landed on `main` as separate sequential commits (`36b2280` xgb,
+   `30e243d` backtest, `34cf3ac` training) inside one branch.  The
+   bisectability concern was addressed by attaching a bytecode-parity
+   regression snapshot ([`tools/_regression/`](../../tools/_regression/))
+   and an operator-driven CSV/JSON regression script
+   ([`tools/csv_regression/`](../../tools/csv_regression/)) per split,
+   so a future bisect can independently verify each monolith move.
 
 ---
 

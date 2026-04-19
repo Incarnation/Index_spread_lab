@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import sl_recovery_analysis as sra  # noqa: E402  -- after sys.path edit
 from sl_recovery_analysis import (  # noqa: E402
     _fallback_pnl,
-    _isnan,
     compute_trade_pnl,
     evaluate_strategy,
     main,

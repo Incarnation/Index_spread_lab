@@ -600,3 +600,7 @@ def main() -> None:
         result = run_backtest(df, daily_signals, cfg, label)
         print_summary(result)
         print_monthly(result)
+
+
+if __name__ == "__main__":
+    main()

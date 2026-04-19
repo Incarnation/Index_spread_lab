@@ -180,7 +180,7 @@ def split(manifest_path: Path, dry_run: bool = False) -> int:
             "_sys.modules[__name__].__class__ = _ProxyShim\n"
         )
     shim_lines.append(
-        f"\n__all__ = [\n"
+        "\n__all__ = [\n"
         + "".join(f"    {n!r},\n" for n in sorted(m.REEXPORTS))
         + "]\n"
     )

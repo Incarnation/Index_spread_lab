@@ -50,10 +50,17 @@ PASS/FAIL line for `shim determinism`, `package determinism`, and
 | `xgb.py`       | pinned date slice of `training_candidates.csv` | full `walk_forward_rolling` results dict, JSON-serialised with floats rounded to 6 digits, sorted keys |
 | `training.py`  | synthetic options chain (seeded RNG)         | BS price vector + BS delta vector + IV bisection vector + `_evaluate_outcome` dict, JSON-serialised with floats rounded to 9 digits |
 
-XGBoost is forced into deterministic mode (`random_state=42`,
-`n_jobs=1`, `tree_method='hist'`) by `xgb.py` so two independent runs
-hash the same; without those overrides the histogram-binning thread
-order can drift and the parity check would be non-decidable.
+XGBoost is forced into deterministic mode by `xgb.py`
+(`random_state=42`, `n_jobs=1`, `tree_method='exact'`,
+`early_stopping_rounds=None`, low `n_estimators`, plus a monkey-patch
+of `DEFAULT_REG_PARAMS` so the regressor inherits the same pin) so two
+independent runs hash the same; without those overrides
+histogram-binning thread order and val-loss-tied early-stop rounds can
+drift and the parity check would be non-decidable.  Wall-clock fields
+(`train_time_s`, `wall_time_s`, `elapsed_s`) are stripped from the
+results dict before hashing for the same reason.  See the
+`DETERMINISTIC_PARAMS` constant and `_normalize` helper in
+[`xgb.py`](xgb.py) for the full pin spec.
 
 ## Adding a new regression script
 

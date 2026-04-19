@@ -397,3 +397,7 @@ def _run_entry_v2(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) ->
           f"best_cls={models['best_iteration_classifier']}, "
           f"best_reg={models['best_iteration_regressor']})")
     print("[ENTRY-V2] Done.")
+
+
+if __name__ == "__main__":
+    main()
