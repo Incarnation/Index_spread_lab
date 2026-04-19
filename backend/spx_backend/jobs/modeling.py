@@ -899,6 +899,21 @@ _XGB_CONTINUOUS = [
 _XGB_ORDINAL = ["dte_target", "entry_hour"]
 _XGB_BINARY = ["is_opex_day", "is_fomc_day", "is_triple_witching", "is_cpi_day", "is_nfp_day"]
 
+# Feature set tags consumed by extract_xgb_features.  Mirror the offline
+# train-time builders in backend/scripts/xgb_model.py:
+#   - ``v1`` matches build_entry_feature_matrix (and build_feature_matrix).
+#   - ``v2`` matches build_entry_v2_feature_matrix and adds the loss-avoidance
+#     extras: is_call, iv_skew_ratio, credit_to_max_loss, gex_abs,
+#     vix_change_1d, recent_loss_rate_5d.  See C5 in OFFLINE_PIPELINE_AUDIT.md.
+_XGB_V2_EXTRA_FEATURES: tuple[str, ...] = (
+    "is_call",
+    "iv_skew_ratio",
+    "credit_to_max_loss",
+    "gex_abs",
+    "vix_change_1d",
+    "recent_loss_rate_5d",
+)
+
 
 def extract_xgb_features(
     candidate_json: dict[str, Any],
@@ -906,6 +921,9 @@ def extract_xgb_features(
     max_loss_points: float | None = None,
     contract_multiplier: int = 100,
     candidate_ts: datetime | None = None,
+    feature_set: str = "v1",
+    vix_change_1d: float | None = None,
+    recent_loss_rate_5d: float | None = None,
 ) -> dict[str, Any]:
     """Extract continuous features for the XGBoost entry model.
 
@@ -929,6 +947,16 @@ def extract_xgb_features(
     candidate_ts:
         Candidate timestamp; used to derive ``entry_hour`` (ET).
         Falls back to ``candidate_json["entry_dt"]`` if not provided.
+    feature_set:
+        Which feature set to emit.  ``"v1"`` (default) matches the V1
+        entry model used by today's main path.  ``"v2"`` appends the V2
+        loss-avoidance extras required by ``xgb_entry_v2`` models.
+    vix_change_1d:
+        V2 feature: VIX change vs prior trading day.  Caller must supply
+        this from a recent VIX series; we default to NaN if absent.
+    recent_loss_rate_5d:
+        V2 feature: rolling 5-day loss rate from prior trade outcomes.
+        Caller supplies this from portfolio history; defaults to NaN.
 
     Returns
     -------
@@ -1022,7 +1050,7 @@ def extract_xgb_features(
             except (ValueError, TypeError):
                 pass
 
-    features = {
+    features: dict[str, Any] = {
         "vix": vix, "vix9d": vix9d, "term_structure": term_structure,
         "vvix": vvix, "skew": skew, "delta_target": delta_target,
         "credit_to_width": credit_to_width, "entry_credit": entry_credit,
@@ -1040,6 +1068,38 @@ def extract_xgb_features(
         "dte_x_credit": (target_dte or 0) * (credit_to_width or 0),
         "gex_sign": (1.0 if (gex_net or 0) > 0 else (-1.0 if (gex_net or 0) < 0 else 0.0)),
     }
+
+    fs = (feature_set or "v1").lower()
+    if fs == "v2":
+        # iv_skew_ratio guards divide-by-zero by defaulting to NaN when long_iv
+        # is missing or zero (matches xgb_model._add_v2_features behaviour).
+        if short_iv is not None and long_iv not in (None, 0, 0.0):
+            iv_skew_ratio: float | None = float(short_iv) / float(long_iv)
+        else:
+            iv_skew_ratio = None
+        if entry_credit is not None and max_loss not in (None, 0, 0.0):
+            credit_to_max_loss: float | None = float(entry_credit) / float(max_loss)
+        else:
+            credit_to_max_loss = None
+        gex_abs = abs(float(gex_net)) if gex_net is not None else None
+        features.update(
+            {
+                "is_call": 1 - is_put,
+                "iv_skew_ratio": iv_skew_ratio,
+                "credit_to_max_loss": credit_to_max_loss,
+                "gex_abs": gex_abs,
+                # vix_change_1d / recent_loss_rate_5d need history that
+                # is not available from a single candidate payload; the
+                # caller must supply these (e.g. from a recent VIX series
+                # and prior trade outcomes).  When missing we leave NaN
+                # so XGBoost can route them through its default path.
+                "vix_change_1d": vix_change_1d,
+                "recent_loss_rate_5d": recent_loss_rate_5d,
+            }
+        )
+    elif fs != "v1":
+        raise ValueError(f"Unknown feature_set {feature_set!r}; expected 'v1' or 'v2'")
+
     return features
 
 
@@ -1047,24 +1107,38 @@ def predict_xgb_entry(
     model_payload: dict[str, Any],
     features: dict[str, Any],
 ) -> dict[str, Any]:
-    """Score a candidate using an XGBoost entry model stored in model_payload.
+    """Score a candidate using an XGBoost entry model stored in ``model_payload``.
 
     Loads XGBoost Booster objects from the JSON strings stored in the
     payload, builds a DMatrix from the feature dict, and returns
-    probability_win / expected_pnl / utility_score matching the
+    ``probability_win`` / ``expected_pnl`` / ``utility_score`` matching the
     interface of ``predict_with_bucket_model``.
+
+    Dispatches on ``model_payload["model_type"]`` (see C5 in
+    OFFLINE_PIPELINE_AUDIT.md):
+
+    - ``xgb_v1`` / ``xgb_entry_v1`` (default): classifier output is the
+      hold-based hit-TP50 probability, so ``probability_win = clf(x)`` and
+      ``utility_score = probability_win * max(expected_pnl, 0)``.
+    - ``xgb_entry_v2``: classifier predicts ``P(big_loss)``; we invert the
+      probability to ``probability_win = 1 - p_big_loss`` and use
+      ``utility_score = (1 - p_big_loss) * max(expected_pnl, 0)``.
+      ``p_big_loss`` is also returned so callers can rank by loss
+      avoidance directly.
 
     Parameters
     ----------
     model_payload:
         Must contain ``classifier_json``, ``regressor_json``, and
-        ``feature_names``.  ``model_type`` should be ``"xgb_entry_v1"``.
+        ``feature_names``.  Should also contain ``model_type``.  Older
+        payloads without the field default to ``xgb_entry_v1``.
     features:
         Dict from ``extract_xgb_features``.
 
     Returns
     -------
-    dict with probability_win, expected_pnl, utility_score, and source.
+    dict with probability_win, expected_pnl, utility_score, source, and
+    (for V2) p_big_loss.
     """
     import numpy as np
     import xgboost as xgb
@@ -1079,13 +1153,36 @@ def predict_xgb_entry(
     reg_booster = xgb.Booster()
     reg_booster.load_model(bytearray(model_payload["regressor_json"].encode("utf-8")))
 
-    prob_win = float(cls_booster.predict(dmat)[0])
+    raw_prob = float(cls_booster.predict(dmat)[0])
     expected_pnl = float(reg_booster.predict(dmat)[0])
-    utility_score = prob_win * max(expected_pnl, 0.0)
 
+    model_type = str(model_payload.get("model_type") or "xgb_entry_v1")
+    if model_type == "xgb_entry_v2":
+        # Classifier predicts P(big loss); invert to derive a winning
+        # probability and rank by expected upside.
+        p_big_loss = raw_prob
+        probability_win = 1.0 - p_big_loss
+        utility_score = probability_win * max(expected_pnl, 0.0)
+        return {
+            "source": "xgb_entry_v2",
+            "probability_win": probability_win,
+            "p_big_loss": p_big_loss,
+            "expected_pnl": expected_pnl,
+            "utility_score": utility_score,
+            "bucket_key": None,
+            "bucket_level": None,
+            "bucket_count": 0,
+            "tail_loss_proxy": 0.0,
+            "pnl_std": 0.0,
+            "margin_usage": 0.0,
+        }
+
+    # Default V1 semantics: classifier output is P(hit_tp50).
+    probability_win = raw_prob
+    utility_score = probability_win * max(expected_pnl, 0.0)
     return {
-        "source": "xgb_entry_v1",
-        "probability_win": prob_win,
+        "source": model_type if model_type in ("xgb_v1", "xgb_entry_v1") else "xgb_entry_v1",
+        "probability_win": probability_win,
         "expected_pnl": expected_pnl,
         "utility_score": utility_score,
         "bucket_key": None,

@@ -65,20 +65,103 @@ def require_databento_api_key() -> str:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "databento"
+
+
+def _resolve_databento_dir() -> Path:
+    """Return the Databento data directory, env-driven when available.
+
+    L5 fix: prefer ``settings.databento_dir`` so operators can relocate
+    the 120 GB tree to dedicated storage without code changes.  Falls
+    back to the historical ``data/databento`` location when the
+    spx_backend package can't be imported (offline environments) or
+    the setting is left at its default.
+
+    Relative paths are anchored to the repo root; absolute paths are
+    used as-is so an external SSD / NFS mount can be specified directly
+    via env (``DATABENTO_DIR=/mnt/ssd/databento``).
+    """
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "backend"))
+        from spx_backend.config import settings as _live  # type: ignore
+        configured = Path(_live.databento_dir)
+    except Exception:  # pragma: no cover -- import optional offline
+        configured = Path("data/databento")
+    if not configured.is_absolute():
+        configured = PROJECT_ROOT / configured
+    return configured
+
+
+DATA_DIR = _resolve_databento_dir()
 META_DIR = DATA_DIR / "_meta"
 
-US_EQUITY_HOLIDAYS_2026 = {
-    date(2026, 1, 1),
-    date(2026, 1, 19),
-    date(2026, 2, 16),
-    date(2026, 4, 3),
-    date(2026, 5, 25),
-    date(2026, 7, 3),
-    date(2026, 9, 7),
-    date(2026, 11, 26),
+# Static NYSE holiday calendar covering 2020–2030.  Sourced from the
+# official NYSE holiday schedule and used both for forward downloads
+# (2026 production) and backfills (2020–2024 historical reruns).  See
+# L1 in OFFLINE_PIPELINE_AUDIT.md — the previous 2026-only set silently
+# treated all other-year holidays as trading days.
+#
+# Half-day early closes (day-after-Thanksgiving, Christmas Eve when
+# market opens, July 3rd in some years) are NOT included here because
+# Databento still has data for those days; the function only excludes
+# full-closure days.
+US_EQUITY_HOLIDAYS = frozenset({
+    # 2020
+    date(2020, 1, 1),  date(2020, 1, 20), date(2020, 2, 17),
+    date(2020, 4, 10), date(2020, 5, 25), date(2020, 7, 3),
+    date(2020, 9, 7),  date(2020, 11, 26), date(2020, 12, 25),
+    # 2021
+    date(2021, 1, 1),  date(2021, 1, 18), date(2021, 2, 15),
+    date(2021, 4, 2),  date(2021, 5, 31), date(2021, 7, 5),
+    date(2021, 9, 6),  date(2021, 11, 25), date(2021, 12, 24),
+    # 2022
+    date(2022, 1, 17), date(2022, 2, 21), date(2022, 4, 15),
+    date(2022, 5, 30), date(2022, 6, 20), date(2022, 7, 4),
+    date(2022, 9, 5),  date(2022, 11, 24), date(2022, 12, 26),
+    # 2023
+    date(2023, 1, 2),  date(2023, 1, 16), date(2023, 2, 20),
+    date(2023, 4, 7),  date(2023, 5, 29), date(2023, 6, 19),
+    date(2023, 7, 4),  date(2023, 9, 4),  date(2023, 11, 23),
+    date(2023, 12, 25),
+    # 2024
+    date(2024, 1, 1),  date(2024, 1, 15), date(2024, 2, 19),
+    date(2024, 3, 29), date(2024, 5, 27), date(2024, 6, 19),
+    date(2024, 7, 4),  date(2024, 9, 2),  date(2024, 11, 28),
+    date(2024, 12, 25),
+    # 2025
+    date(2025, 1, 1),  date(2025, 1, 9),  date(2025, 1, 20),
+    date(2025, 2, 17), date(2025, 4, 18), date(2025, 5, 26),
+    date(2025, 6, 19), date(2025, 7, 4),  date(2025, 9, 1),
+    date(2025, 11, 27), date(2025, 12, 25),
+    # 2026
+    date(2026, 1, 1),  date(2026, 1, 19), date(2026, 2, 16),
+    date(2026, 4, 3),  date(2026, 5, 25), date(2026, 6, 19),
+    date(2026, 7, 3),  date(2026, 9, 7),  date(2026, 11, 26),
     date(2026, 12, 25),
-}
+    # 2027
+    date(2027, 1, 1),  date(2027, 1, 18), date(2027, 2, 15),
+    date(2027, 3, 26), date(2027, 5, 31), date(2027, 6, 18),
+    date(2027, 7, 5),  date(2027, 9, 6),  date(2027, 11, 25),
+    date(2027, 12, 24),
+    # 2028
+    date(2028, 1, 17), date(2028, 2, 21), date(2028, 4, 14),
+    date(2028, 5, 29), date(2028, 6, 19), date(2028, 7, 4),
+    date(2028, 9, 4),  date(2028, 11, 23), date(2028, 12, 25),
+    # 2029
+    date(2029, 1, 1),  date(2029, 1, 15), date(2029, 2, 19),
+    date(2029, 3, 30), date(2029, 5, 28), date(2029, 6, 19),
+    date(2029, 7, 4),  date(2029, 9, 3),  date(2029, 11, 22),
+    date(2029, 12, 25),
+    # 2030
+    date(2030, 1, 1),  date(2030, 1, 21), date(2030, 2, 18),
+    date(2030, 4, 19), date(2030, 5, 27), date(2030, 6, 19),
+    date(2030, 7, 4),  date(2030, 9, 2),  date(2030, 11, 28),
+    date(2030, 12, 25),
+})
+
+# Backwards-compat alias preserved so any external scripts still
+# importing the old name continue to work; new code should use the
+# year-agnostic ``US_EQUITY_HOLIDAYS`` constant.
+US_EQUITY_HOLIDAYS_2026 = US_EQUITY_HOLIDAYS
 
 DOWNLOAD_JOBS: list[dict] = [
     {
@@ -189,8 +272,16 @@ def _ensure_dir(path: Path) -> Path:
 def get_trading_days(start_str: str, end_str: str) -> list[date]:
     """Return a sorted list of US equity trading days in [start, end).
 
-    Excludes weekends and known 2026 NYSE holidays. The end date is exclusive,
-    matching Databento's query convention.
+    Excludes weekends and the static NYSE holiday set in
+    ``US_EQUITY_HOLIDAYS`` (covers 2020–2030; see L1 in
+    OFFLINE_PIPELINE_AUDIT.md).  The end date is exclusive, matching
+    Databento's query convention.
+
+    Half-day early closes are treated as trading days because
+    Databento publishes data for the partial session.  Years outside
+    2020–2030 will only excludes weekends — extend
+    ``US_EQUITY_HOLIDAYS`` if you backfill earlier or later than that
+    window.
 
     Args:
         start_str: Start date as YYYY-MM-DD (inclusive).
@@ -201,10 +292,19 @@ def get_trading_days(start_str: str, end_str: str) -> list[date]:
     """
     start = date.fromisoformat(start_str)
     end = date.fromisoformat(end_str)
+    if start.year < 2020 or end.year > 2031:
+        # Surface a warning so an operator backfilling 2018 or
+        # forward-projecting 2032 doesn't silently get rows for
+        # holiday closures the static set doesn't cover yet.
+        print(f"WARNING: get_trading_days({start_str}, {end_str}) extends "
+              "outside the 2020-2030 holiday calendar — extend "
+              "US_EQUITY_HOLIDAYS in download_databento.py to cover "
+              "the requested range or expect spurious 'trading days' "
+              "on actual closures.", flush=True)
     days = []
     d = start
     while d < end:
-        if d.weekday() < 5 and d not in US_EQUITY_HOLIDAYS_2026:
+        if d.weekday() < 5 and d not in US_EQUITY_HOLIDAYS:
             days.append(d)
         d += timedelta(days=1)
     return days

@@ -29,10 +29,22 @@ logging.basicConfig(
 )
 
 
+_KNOWN_MODEL_TYPES: tuple[str, ...] = ("xgb_v1", "xgb_entry_v1", "xgb_entry_v2")
+
+
 def _load_model_artifacts(model_dir: Path) -> dict[str, Any]:
     """Read classifier.json, regressor.json, and metadata.json from disk.
 
-    Returns a dict suitable for embedding in model_versions.data_snapshot_json.
+    The ``model_type`` is taken from ``metadata.json`` (written by
+    ``xgb_model.save_model``).  When the field is absent we default to
+    ``xgb_entry_v1`` for backward compatibility with artifacts trained
+    before the metadata stamp was introduced (see C5 in
+    OFFLINE_PIPELINE_AUDIT.md).  An unrecognised stamp raises so the
+    operator never silently uploads a model under the wrong inference
+    contract.
+
+    Returns a dict suitable for embedding in
+    ``model_versions.data_snapshot_json``.
     """
     cls_path = model_dir / "classifier.json"
     reg_path = model_dir / "regressor.json"
@@ -46,8 +58,15 @@ def _load_model_artifacts(model_dir: Path) -> dict[str, Any]:
     regressor_json = reg_path.read_text()
     meta = json.loads(meta_path.read_text())
 
+    model_type = str(meta.get("model_type") or "xgb_entry_v1")
+    if model_type not in _KNOWN_MODEL_TYPES:
+        raise ValueError(
+            f"Unknown model_type {model_type!r} in {meta_path}. "
+            f"Expected one of {_KNOWN_MODEL_TYPES}."
+        )
+
     return {
-        "model_type": "xgb_entry_v1",
+        "model_type": model_type,
         "classifier_json": classifier_json,
         "regressor_json": regressor_json,
         "feature_names": meta.get("feature_names", []),
@@ -84,6 +103,10 @@ async def upload_model(
     version_tag = f"xgb_{now_utc.strftime('%Y%m%d%H%M%S')}"
     rollout = "active" if activate else "shadow"
 
+    # algorithm and data_snapshot share the same model_type so downstream
+    # selection (model_versions.algorithm) and inference (model_payload.model_type)
+    # cannot drift apart.
+    algorithm = payload["model_type"]
     data_snapshot: dict[str, Any] = {"model_payload": payload}
 
     async with SessionLocal() as session:
@@ -108,7 +131,7 @@ async def upload_model(
             {
                 "model_name": model_name,
                 "version": version_tag,
-                "algorithm": "xgb_entry_v1",
+                "algorithm": algorithm,
                 "rollout_status": rollout,
                 "is_active": activate,
                 "data_snapshot": json.dumps(data_snapshot, default=str),

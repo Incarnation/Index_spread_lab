@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from spx_backend.services.event_signals import EventSignalDetector
+from spx_backend.services.event_signals import (
+    EventSignalDetector,
+    compute_term_structure,
+)
 
 
 @pytest.fixture()
@@ -261,3 +264,69 @@ class TestSignalModeGating:
             "term_structure": 0.9,
         }
         assert det._evaluate(ctx) == []
+
+
+class TestTermStructure:
+    """Regression coverage for the term_structure orientation fix (C1).
+
+    The canonical formula across the codebase is ``vix9d / vix``; the
+    decision/event signal path used to compute the inverse, which caused
+    ``term_inversion`` to fire on contango (a low-vol structure) and
+    misclassify backwardation (a stress signal) as benign.  The helper
+    must now agree with the live ``_load_context`` path.
+    """
+
+    def test_compute_term_structure_canonical_orientation(self) -> None:
+        # vix9d > vix is backwardation (stress); ratio must be > 1.
+        result = compute_term_structure(20.0, 15.0)
+        assert result is not None
+        assert result == pytest.approx(20.0 / 15.0)
+        assert result > 1.0
+
+    def test_compute_term_structure_contango_below_one(self) -> None:
+        # vix9d < vix is contango; ratio must be < 1.
+        result = compute_term_structure(15.0, 20.0)
+        assert result is not None
+        assert result == pytest.approx(15.0 / 20.0)
+        assert result < 1.0
+
+    def test_compute_term_structure_handles_missing_inputs(self) -> None:
+        assert compute_term_structure(None, 15.0) is None
+        assert compute_term_structure(20.0, None) is None
+        assert compute_term_structure(None, None) is None
+        # Zero / negative vix is a divide-by-zero hazard; helper must
+        # return None instead of inf or a negative ratio.
+        assert compute_term_structure(20.0, 0.0) is None
+        assert compute_term_structure(20.0, -1.0) is None
+
+    def test_term_inversion_signal_only_fires_on_backwardation(self) -> None:
+        """Smoke test: with the canonical orientation, term_inversion fires
+        when vix9d > vix (ratio > threshold) and stays quiet on contango."""
+        det = EventSignalDetector(
+            spx_drop_threshold=-0.01,
+            spx_drop_2d_threshold=-0.02,
+            vix_spike_threshold=0.15,
+            vix_elevated_threshold=25.0,
+            term_inversion_threshold=1.0,
+            rally_avoidance=False,
+            rally_threshold=0.01,
+            signal_mode="any",
+        )
+        # contango: ratio < 1 -> no signal
+        contango_ctx = {
+            "prev_spx_return": 0.0,
+            "prev_spx_return_2d": 0.0,
+            "prev_vix_pct_change": 0.0,
+            "vix": 20.0,
+            "term_structure": compute_term_structure(15.0, 20.0),
+        }
+        assert "term_inversion" not in det._evaluate(contango_ctx)
+        # backwardation: ratio > 1 -> fires.
+        backwardation_ctx = {
+            "prev_spx_return": 0.0,
+            "prev_spx_return_2d": 0.0,
+            "prev_vix_pct_change": 0.0,
+            "vix": 15.0,
+            "term_structure": compute_term_structure(20.0, 15.0),
+        }
+        assert "term_inversion" in det._evaluate(backwardation_ctx)

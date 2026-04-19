@@ -23,6 +23,7 @@ from xgb_model import (  # noqa: E402
     _add_v2_features,
     _calibration_by_decile,
     _extract_entry_rules,
+    _fit_full_after_early_stopping,
     _max_drawdown,
     _resolve_targets,
     build_entry_feature_matrix,
@@ -31,6 +32,7 @@ from xgb_model import (  # noqa: E402
     load_model,
     predict_xgb,
     save_model,
+    train_final_model,
     train_xgb_models,
     walk_forward_rolling,
     walk_forward_validate_xgb,
@@ -833,3 +835,191 @@ class TestRunStrategies:
         results = run_strategies(df, is_v2=True)
         v2_names = [r.name for r in results if r.name.startswith("V2")]
         assert len(v2_names) >= 5
+
+
+# ===================================================================
+# C2 / C3 / save_model regression coverage
+# ===================================================================
+
+
+class TestTrainFinalModelFullData:
+    """C2 regression: ``train_final_model`` must refit on 100% of rows
+    after using a 90/10 split for early-stopping calibration.  The old
+    behaviour silently dropped the most recent decile from the shipped
+    booster."""
+
+    def test_trained_rows_equals_full_dataframe(self) -> None:
+        df = _make_synthetic_df(400)
+        out = train_final_model(df)
+        assert "trained_rows" in out
+        assert out["trained_rows"] == len(df)
+
+    def test_best_iteration_recorded(self) -> None:
+        df = _make_synthetic_df(400)
+        out = train_final_model(df)
+        # Both round counts must be present and positive so save_model can
+        # log them.
+        assert out["best_iteration_classifier"] >= 1
+        assert out["best_iteration_regressor"] >= 1
+
+    def test_helper_refits_on_full_matrix(self) -> None:
+        # Direct unit coverage of the helper to lock in the contract for
+        # callers other than train_final_model.
+        df = _make_synthetic_df(300)
+        df_sorted = df.sort_values("day").reset_index(drop=True)
+        X, y_cls, y_pnl = build_feature_matrix(df_sorted)
+        out = _fit_full_after_early_stopping(
+            X_full=X, y_cls_full=y_cls, y_pnl_full=y_pnl,
+            cls_params=None, reg_params=None,
+        )
+        assert out["trained_rows"] == len(X)
+        assert out["best_iteration_classifier"] >= 1
+
+
+class TestWalkForwardThresholdLeakage:
+    """C3 regression: ``recommended_threshold`` must be a function of
+    train+val data only.  Mutating the test rows' realised PnL must not
+    change the chosen threshold."""
+
+    @staticmethod
+    def _make_dense_df(n: int = 1200, seed: int = 42) -> pd.DataFrame:
+        rng = np.random.RandomState(seed)
+        days = pd.date_range("2025-03-01", periods=n // 4, freq="B")
+        chosen = pd.to_datetime(rng.choice(days, n)).sort_values()
+        df = _make_synthetic_df(n)
+        df["day"] = chosen.strftime("%Y-%m-%d").values
+        df["entry_dt"] = [f"{d.strftime('%Y-%m-%d')} 13:00:00+00:00" for d in chosen]
+        return df
+
+    def test_recommended_threshold_independent_of_test_pnl(self) -> None:
+        df_a = self._make_dense_df(1200)
+        result_a = walk_forward_rolling(df_a, train_months=4, test_months=2, step_months=2)
+        if "error" in result_a:
+            pytest.skip("Insufficient data for walk-forward")
+
+        # Build a perturbed copy where the LAST 25% of rows (the most
+        # recent test windows) get their realised PnL randomised.  This
+        # forces a different threshold-tuning answer if the function
+        # leaks test data into selection.
+        df_b = df_a.copy().sort_values("day").reset_index(drop=True)
+        cutoff = int(len(df_b) * 0.75)
+        rng = np.random.RandomState(99)
+        for col in ("realized_pnl", "hold_realized_pnl"):
+            if col in df_b.columns:
+                df_b.loc[cutoff:, col] = rng.uniform(-1000, 1000, len(df_b) - cutoff)
+
+        result_b = walk_forward_rolling(df_b, train_months=4, test_months=2, step_months=2)
+        if "error" in result_b:
+            pytest.skip("Insufficient data for walk-forward")
+
+        # The recommended threshold must NOT change when we mutate
+        # test-side PnL; selection is supposed to use val data only.
+        assert result_a["recommended_threshold"] == result_b["recommended_threshold"]
+        assert result_a["recommended_threshold_source"] == "val_pool"
+
+    def test_threshold_tuning_reports_both_val_and_test_pnl(self) -> None:
+        df = self._make_dense_df(1200)
+        result = walk_forward_rolling(df, train_months=4, test_months=2, step_months=2)
+        if "error" in result:
+            pytest.skip("Insufficient data for walk-forward")
+        for row in result["threshold_tuning"]:
+            for key in ("threshold", "val_total_pnl", "val_avg_pnl",
+                        "val_trades_taken", "total_pnl", "trades_taken"):
+                assert key in row
+
+    def test_threshold_byte_identical_when_only_pure_test_rows_change(self) -> None:
+        """Stronger C3 regression.
+
+        The previous test mutates the last 25% of rows.  Some of those
+        rows can land in the train/val windows of *later* sliding
+        steps, which means even the C3-fixed code can legitimately see
+        slightly different val PnLs (and could in principle pick a
+        different threshold).  This test isolates the contract:
+
+          * Identify the LAST walk-forward window's test days.
+          * Mutate ``realized_pnl`` / ``hold_realized_pnl`` for ONLY
+            those rows -- they are never re-used as train or val by
+            any future window because there is no future window.
+          * Assert ``recommended_threshold`` is byte-identical and
+            every per-threshold ``val_*`` statistic is unchanged.
+
+        If the fix ever regresses to selecting on test PnLs, this
+        test will fail loudly because the threshold tuning loop will
+        see different test pools across runs.
+        """
+        df_a = self._make_dense_df(1200)
+        result_a = walk_forward_rolling(
+            df_a, train_months=4, test_months=2, step_months=2,
+        )
+        if "error" in result_a:
+            pytest.skip("Insufficient data for walk-forward")
+
+        # ``test_days`` is formatted as "YYYY-MM-DD .. YYYY-MM-DD" by the
+        # walk_forward_rolling helper.  Pull the LAST window only --
+        # those rows are guaranteed pure-test (no later window exists).
+        last_window = result_a["windows"][-1]
+        test_days_str = last_window["test_days"]
+        test_start, test_end = [s.strip() for s in test_days_str.split("..")]
+
+        df_b = df_a.copy()
+        last_test_mask = (df_b["day"] >= test_start) & (df_b["day"] <= test_end)
+        if last_test_mask.sum() == 0:
+            pytest.skip("Could not isolate last-window test rows")
+
+        rng = np.random.RandomState(99)
+        for col in ("realized_pnl", "hold_realized_pnl"):
+            if col in df_b.columns:
+                df_b.loc[last_test_mask, col] = rng.uniform(
+                    -5000, 5000, int(last_test_mask.sum()),
+                )
+
+        result_b = walk_forward_rolling(
+            df_b, train_months=4, test_months=2, step_months=2,
+        )
+        if "error" in result_b:
+            pytest.skip("Insufficient data for walk-forward")
+
+        # Selection must be byte-identical.
+        assert result_a["recommended_threshold"] == result_b["recommended_threshold"]
+        # Every per-threshold val statistic must be byte-identical;
+        # the val pool was not touched.
+        a_rows = {r["threshold"]: r for r in result_a["threshold_tuning"]}
+        b_rows = {r["threshold"]: r for r in result_b["threshold_tuning"]}
+        assert sorted(a_rows.keys()) == sorted(b_rows.keys())
+        for thr, row_a in a_rows.items():
+            row_b = b_rows[thr]
+            for key in ("val_total_pnl", "val_avg_pnl", "val_win_rate",
+                        "val_trades_taken"):
+                # Use exact equality, not approx -- the C3 contract is
+                # "val pool is a function of train/val data only", so
+                # any drift indicates a leak.
+                assert row_a[key] == row_b[key], (
+                    f"val statistic {key} drifted at threshold {thr}: "
+                    f"{row_a[key]} vs {row_b[key]} -- C3 leak suspected"
+                )
+
+
+class TestSaveModelStampsModelType:
+    """C5 regression: ``save_model`` must write ``model_type`` into
+    metadata.json so upload_xgb_model.py can dispatch correctly."""
+
+    def test_default_model_type_is_v1(self, tmp_path: Path) -> None:
+        df = _make_synthetic_df(150)
+        X, y_cls, y_pnl = build_feature_matrix(df)
+        models = train_xgb_models(X, y_cls, y_pnl)
+        save_model(models, tmp_path / "default")
+        import json
+        meta = json.loads((tmp_path / "default" / "metadata.json").read_text())
+        assert meta["model_type"] == "xgb_entry_v1"
+
+    def test_explicit_model_type_v2(self, tmp_path: Path) -> None:
+        df = _make_synthetic_df(150)
+        X, y_cls, y_pnl = build_feature_matrix(df)
+        models = train_xgb_models(X, y_cls, y_pnl)
+        save_model(models, tmp_path / "v2", model_type="xgb_entry_v2")
+        import json
+        meta = json.loads((tmp_path / "v2" / "metadata.json").read_text())
+        assert meta["model_type"] == "xgb_entry_v2"
+        # load_model still round-trips even with the new metadata field.
+        loaded = load_model(tmp_path / "v2")
+        assert loaded["feature_names"] == models["feature_names"]

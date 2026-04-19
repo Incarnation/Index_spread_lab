@@ -28,6 +28,7 @@ from generate_training_data import (  # noqa: E402
     _determine_relabel_days,
     _downsample_marks,
     _evaluate_outcome,
+    _input_data_fingerprint,
     _load_cache_manifest,
     _load_cached_day,
     _load_gex_csv,
@@ -42,10 +43,12 @@ from generate_training_data import (  # noqa: E402
     build_instrument_map,
     build_training_rows,
     compute_offline_gex,
+    definitions_from_production,
     derive_spx_from_parity,
     find_expiry_for_dte,
     get_cbbo_snapshot_at,
     implied_vol_vec,
+    lag_daily_to_next_session,
     load_daily_parquet,
     load_economic_calendar,
     load_frd_quotes,
@@ -1807,3 +1810,147 @@ class TestDetermineRelabelDays:
             code_hash="hash1", force_regen=False, grid_hash="grid1",
         )
         assert result == {"2025-01-02"}
+
+
+# ===================================================================
+# Wave 2 regression coverage
+# ===================================================================
+
+
+class TestDefinitionsFromProductionDeterministic:
+    """H5 regression: ``definitions_from_production`` must NOT use
+    wall-clock for ``ts_recv``.  Two runs with the same inputs must
+    produce identical ``ts_recv`` values so the dedup tiebreak is
+    reproducible across re-runs."""
+
+    @staticmethod
+    def _sample_chain() -> pd.DataFrame:
+        return pd.DataFrame({
+            "option_symbol": ["SPXW250117P05000000", "SPXW250117C05000000"],
+            "strike": [5000.0, 5000.0],
+            "expiration": ["2025-01-17", "2025-01-17"],
+            "option_right": ["P", "C"],
+            "ts": pd.to_datetime(
+                ["2025-01-15T13:30:00Z", "2025-01-15T13:30:00Z"]
+            ),
+            "bid": [1.0, 2.0],
+            "ask": [1.5, 2.5],
+        })
+
+    def test_ts_recv_deterministic_with_day_str(self) -> None:
+        chain = self._sample_chain()
+        out_a = definitions_from_production(chain, day_str="20250115")
+        out_b = definitions_from_production(chain, day_str="20250115")
+        assert (out_a["ts_recv"] == out_b["ts_recv"]).all()
+        assert out_a["ts_recv"].iloc[0] == pd.Timestamp(
+            "2025-01-15T00:00:00", tz="UTC"
+        )
+
+    def test_ts_recv_falls_back_to_epoch_without_day_str(self) -> None:
+        chain = self._sample_chain()
+        out = definitions_from_production(chain, day_str=None)
+        assert out["ts_recv"].iloc[0] == pd.Timestamp(
+            "1970-01-01T00:00:00", tz="UTC"
+        )
+
+    def test_no_wall_clock_now(self) -> None:
+        # Smoke check: the value must be a fixed point in time, never the
+        # current second.  We compare against a wide tolerance to confirm
+        # we are NOT reading wall-clock.
+        chain = self._sample_chain()
+        out = definitions_from_production(chain, day_str="20250115")
+        delta = (pd.Timestamp.now(tz="UTC") - out["ts_recv"].iloc[0]).total_seconds()
+        assert delta > 60  # at least a minute old (in fact, far older)
+
+
+class TestLagDailyToNextSession:
+    """H6 regression: EOD-stamped daily SKEW must be lagged by one
+    trading-day-in-dataset before per-candidate lookup so that we never
+    peek at the same-day close at intraday decision time."""
+
+    def test_basic_lag(self) -> None:
+        from datetime import date as _date
+        src = {
+            _date(2025, 1, 14): 130.0,
+            _date(2025, 1, 15): 132.5,
+            _date(2025, 1, 16): 128.0,
+        }
+        out = lag_daily_to_next_session(src)
+        # Day D's value comes from the prior date in the dataset.
+        assert out[_date(2025, 1, 15)] == 130.0
+        assert out[_date(2025, 1, 16)] == 132.5
+        # Earliest source date drops out (no prior value exists).
+        assert _date(2025, 1, 14) not in out
+
+    def test_skips_weekends_implicitly(self) -> None:
+        # Source has Fri + Mon (no weekend rows).  Mon's lagged value
+        # must be Fri's close, not "previous calendar day".
+        from datetime import date as _date
+        src = {
+            _date(2025, 1, 17): 140.0,  # Friday
+            _date(2025, 1, 21): 145.0,  # Tuesday (Mon was MLK)
+        }
+        out = lag_daily_to_next_session(src)
+        assert out == {_date(2025, 1, 21): 140.0}
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert lag_daily_to_next_session({}) == {}
+
+
+class TestInputDataFingerprint:
+    """H3 regression: the per-day input fingerprint must change when the
+    source file content changes (size or mtime), so the candidate cache
+    can detect silent re-issues / re-exports of the underlying data."""
+
+    def test_returns_empty_when_no_files_present(self, tmp_path: Path, monkeypatch) -> None:
+        # Point all input dirs at a guaranteed-empty tmp dir so the
+        # fingerprint is empty no matter what's in the real data folder.
+        import generate_training_data as gtd
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        for attr in ("SPXW_DEFS", "SPX_DEFS", "SPXW_CBBO", "SPX_CBBO",
+                     "SPXW_STATS", "SPX_STATS", "PRODUCTION_CHAINS_DIR"):
+            monkeypatch.setattr(gtd, attr, empty)
+        assert _input_data_fingerprint("20250115") == {}
+
+    def test_changes_when_file_size_changes(self, tmp_path: Path, monkeypatch) -> None:
+        import generate_training_data as gtd
+        chains = tmp_path / "chains"
+        chains.mkdir()
+        # Stub the rest as empty so only `production_chain` matters.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        for attr in ("SPXW_DEFS", "SPX_DEFS", "SPXW_CBBO", "SPX_CBBO",
+                     "SPXW_STATS", "SPX_STATS"):
+            monkeypatch.setattr(gtd, attr, empty)
+        monkeypatch.setattr(gtd, "PRODUCTION_CHAINS_DIR", chains)
+
+        f = chains / "20250115.parquet"
+        f.write_bytes(b"a" * 100)
+        fp_a = _input_data_fingerprint("20250115")
+
+        # Re-write with different content + different size; size must
+        # change in the fingerprint.
+        f.write_bytes(b"a" * 200)
+        fp_b = _input_data_fingerprint("20250115")
+
+        assert fp_a != fp_b
+        assert fp_a["production_chain"][1] == 100  # size_bytes
+        assert fp_b["production_chain"][1] == 200
+
+    def test_unchanged_file_yields_identical_fingerprint(self, tmp_path: Path, monkeypatch) -> None:
+        import generate_training_data as gtd
+        chains = tmp_path / "chains"
+        chains.mkdir()
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        for attr in ("SPXW_DEFS", "SPX_DEFS", "SPXW_CBBO", "SPX_CBBO",
+                     "SPXW_STATS", "SPX_STATS"):
+            monkeypatch.setattr(gtd, attr, empty)
+        monkeypatch.setattr(gtd, "PRODUCTION_CHAINS_DIR", chains)
+
+        f = chains / "20250115.parquet"
+        f.write_bytes(b"x" * 50)
+        fp_a = _input_data_fingerprint("20250115")
+        fp_b = _input_data_fingerprint("20250115")
+        assert fp_a == fp_b

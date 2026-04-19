@@ -34,5 +34,9 @@ frontend/.vite/
 *.sqlite
 *.sqlite3
 *.parquet
-data/
+# Ignore everything inside data/ EXCEPT the README documentation
+# tombstone.  Use ``data/*`` (not ``data/``) so git still recurses
+# into the directory and the negation below can take effect.
+data/*
+!data/README.md
 

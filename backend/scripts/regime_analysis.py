@@ -57,9 +57,10 @@ DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     """Merge prior-day SPX return and VIX change onto every candidate row.
 
-    Computes per-day aggregates (last observation of spot/vix sorted by
-    entry_dt for determinism), derives lagged returns, and left-joins
-    back to the candidate DataFrame.
+    Computes per-day aggregates (first observation of spot/vix sorted by
+    entry_dt) so every analysis matches the snapshot the live decision
+    job sees at the day's first decision instant.  Derives lagged
+    returns and left-joins them back onto the candidate DataFrame.
 
     Parameters
     ----------
@@ -71,16 +72,27 @@ def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     ``prev_vix_pct_change``, ``vix_change_abs``.
 
     .. note::
-        Values are in **percentage units** (e.g. ``-1.0`` = a 1% drop).
-        This differs from ``backtest_strategy.precompute_daily_signals()``
-        which uses decimal fractions (``-0.01`` = a 1% drop).  When
-        translating regime analysis findings into EventConfig thresholds,
-        divide by 100.
+        **All percentage features are stored as decimal fractions** to
+        match ``backtest_strategy.precompute_daily_signals()`` and the
+        live ``EventConfig`` thresholds (e.g. ``-0.01`` = a 1% drop).
+        Earlier versions used percent units (``-1.0`` for a 1% drop)
+        which silently mismatched live thresholds; see M2 in
+        OFFLINE_PIPELINE_AUDIT.md.
+
+        The CLI ``--filter`` still accepts user-friendly **percent**
+        values (e.g. ``spx_drop<-0.5`` for "drop more than 0.5%"); the
+        ``FILTER_COLUMNS`` scale factor multiplies user input by 0.01
+        before comparing against the decimal column.
     """
     sorted_df = df.sort_values("entry_dt") if "entry_dt" in df.columns else df
+    # M1 fix: aggregate by FIRST entry per day (matches
+    # backtest_strategy.precompute_daily_signals + live behaviour where
+    # context is snapshotted at the first decision instant).  Using
+    # `last` would drift away from both backtest and live behaviour on
+    # days with multiple intraday entries.
     agg: dict[str, tuple] = {
-        "spot": ("spot", "last"),
-        "vix": ("vix", "last"),
+        "spot": ("spot", "first"),
+        "vix": ("vix", "first"),
     }
     daily = (
         sorted_df.groupby("day")
@@ -89,17 +101,32 @@ def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
         .sort_values("day")
         .reset_index(drop=True)
     )
-    daily["spx_return"] = daily["spot"].pct_change() * 100
-    daily["spx_return_2d"] = daily["spot"].pct_change(2) * 100
-    daily["vix_pct_change"] = daily["vix"].pct_change() * 100
+    # M2 fix: store as decimal fractions (no `* 100`) so the column
+    # matches live + backtest semantics.  Bucket labels in
+    # build_*_buckets keep their human-readable "%" form, but threshold
+    # comparisons are done against decimals.
+    daily["spx_return"] = daily["spot"].pct_change()
+    daily["spx_return_2d"] = daily["spot"].pct_change(2)
+    daily["vix_pct_change"] = daily["vix"].pct_change()
+
+    # Calendar gap (days) between the row 2 trading days back and current.
+    # Surfaced so downstream regime analysis can mirror the live
+    # event_signals adjacency guard for "2-day SPX drop" signals (see H1
+    # in OFFLINE_PIPELINE_AUDIT.md).  Without this, regime tables would
+    # bucket long-weekend / data-outage rows as if they were genuine
+    # 2-day moves and over-report 2d-drop frequency.
+    day_dt = pd.to_datetime(daily["day"], errors="coerce")
+    daily["spx_return_2d_gap_days"] = (day_dt - day_dt.shift(2)).dt.days
 
     daily["prev_spx_return"] = daily["spx_return"].shift(1)
     daily["prev_spx_return_2d"] = daily["spx_return_2d"].shift(1)
+    daily["prev_spx_return_2d_gap_days"] = daily["spx_return_2d_gap_days"].shift(1)
     daily["prev_vix_pct_change"] = daily["vix_pct_change"].shift(1)
     daily["vix_change_abs"] = daily["vix"].diff().shift(1)
 
     merge_cols = [
         "day", "prev_spx_return", "prev_spx_return_2d",
+        "prev_spx_return_2d_gap_days",
         "prev_vix_pct_change", "vix_change_abs",
     ]
     return df.merge(daily[merge_cols], on="day", how="left")
@@ -114,15 +141,17 @@ def enrich_with_daily_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_spx_drop_buckets(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Prior-day SPX return buckets (in %)."""
+    """Prior-day SPX return buckets (label in %, threshold in decimal)."""
+    # Column is decimal (e.g. -0.01 for a 1% drop) per M2 fix; thresholds
+    # below mirror that.  Labels keep "%" so report tables stay readable.
     r = df["prev_spx_return"]
     return {
-        "SPX < -2%":       r < -2,
-        "-2% <= SPX < -1%": (r >= -2) & (r < -1),
-        "-1% <= SPX < -0.5%": (r >= -1) & (r < -0.5),
-        "-0.5% <= SPX < 0%": (r >= -0.5) & (r < 0),
-        "0% <= SPX < 0.5%": (r >= 0) & (r < 0.5),
-        "SPX >= 0.5%":     r >= 0.5,
+        "SPX < -2%":       r < -0.02,
+        "-2% <= SPX < -1%": (r >= -0.02) & (r < -0.01),
+        "-1% <= SPX < -0.5%": (r >= -0.01) & (r < -0.005),
+        "-0.5% <= SPX < 0%": (r >= -0.005) & (r < 0.0),
+        "0% <= SPX < 0.5%": (r >= 0.0) & (r < 0.005),
+        "SPX >= 0.5%":     r >= 0.005,
     }
 
 
@@ -139,14 +168,15 @@ def build_vix_level_buckets(df: pd.DataFrame) -> dict[str, pd.Series]:
 
 
 def build_vix_spike_buckets(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Prior-day VIX % change buckets."""
+    """Prior-day VIX % change buckets (label in %, threshold in decimal)."""
+    # Column is decimal (e.g. 0.05 for a 5% VIX move) per M2 fix.
     v = df["prev_vix_pct_change"]
     return {
-        "VIX chg < 0%":      v < 0,
-        "0% <= VIX chg < 5%": (v >= 0) & (v < 5),
-        "5% <= VIX chg < 10%": (v >= 5) & (v < 10),
-        "10% <= VIX chg < 15%": (v >= 10) & (v < 15),
-        "VIX chg >= 15%":    v >= 15,
+        "VIX chg < 0%":      v < 0.0,
+        "0% <= VIX chg < 5%": (v >= 0.0) & (v < 0.05),
+        "5% <= VIX chg < 10%": (v >= 0.05) & (v < 0.10),
+        "10% <= VIX chg < 15%": (v >= 0.10) & (v < 0.15),
+        "VIX chg >= 15%":    v >= 0.15,
     }
 
 
@@ -308,13 +338,20 @@ def _empty_metrics(n_total: int = 0) -> dict[str, Any]:
 # ===================================================================
 
 
-# Maps user-facing names to (column, scale_factor).
-# scale_factor converts user units (%) to column units.
+# Maps user-facing filter names to (column, scale_factor).
+#
+# scale_factor converts the user-typed value into the units stored in
+# the underlying column.  After the M2 fix, percent-change columns are
+# stored as decimal fractions (e.g. -0.01 = -1%) but the CLI surface
+# remains user-friendly percent (e.g. ``--filter spx_drop<-0.5`` still
+# means "drop more than 0.5%"); the 0.01 scale below converts on the
+# fly so existing reports/scripts keep working.  Non-percent columns
+# (vix level, dte, delta, width, term_structure) use scale 1.0.
 FILTER_COLUMNS: dict[str, tuple[str, float]] = {
-    "spx_drop":     ("prev_spx_return", 1.0),
-    "spx_drop_2d":  ("prev_spx_return_2d", 1.0),
+    "spx_drop":     ("prev_spx_return", 0.01),
+    "spx_drop_2d":  ("prev_spx_return_2d", 0.01),
     "vix":          ("vix", 1.0),
-    "vix_spike":    ("prev_vix_pct_change", 1.0),
+    "vix_spike":    ("prev_vix_pct_change", 0.01),
     "vix_abs":      ("vix_change_abs", 1.0),
     "dte":          ("dte_target", 1.0),
     "delta":        ("delta_target", 1.0),
@@ -358,8 +395,22 @@ def parse_filter_expr(expr: str) -> list[tuple[str, str, float]]:
     return parsed
 
 
+# Maximum calendar gap (days) for which a "2-day" SPX return is treated as
+# a real 2-day move.  Mirrors the live event_signals adjacency guard so
+# regime tables don't bucket long-weekend / data-outage rows as genuine
+# 2-day drops.  See H1 in OFFLINE_PIPELINE_AUDIT.md.
+_SPX_2D_MAX_CALENDAR_GAP_DAYS = 4
+
+
 def apply_filters(df: pd.DataFrame, filters: list[tuple[str, str, float]]) -> pd.DataFrame:
     """Apply parsed filter conditions to a DataFrame.
+
+    Whenever any filter targets ``prev_spx_return_2d`` we additionally
+    AND in the live adjacency guard
+    ``prev_spx_return_2d_gap_days <= _SPX_2D_MAX_CALENDAR_GAP_DAYS`` so
+    the resulting bucket matches what the production event detector
+    would have evaluated on the same day (see H1 in
+    OFFLINE_PIPELINE_AUDIT.md).
 
     Parameters
     ----------
@@ -371,6 +422,7 @@ def apply_filters(df: pd.DataFrame, filters: list[tuple[str, str, float]]) -> pd
     Filtered DataFrame.
     """
     mask = pd.Series(True, index=df.index)
+    used_2d_filter = False
     for col, op, val in filters:
         if col not in df.columns:
             logger.warning("Filter column %r not found in data — skipping filter %s%s%s", col, col, op, val)
@@ -390,6 +442,17 @@ def apply_filters(df: pd.DataFrame, filters: list[tuple[str, str, float]]) -> pd
             mask &= s != val
         else:
             raise ValueError(f"Unknown operator: {op!r}")
+        if col == "prev_spx_return_2d":
+            used_2d_filter = True
+
+    if used_2d_filter and "prev_spx_return_2d_gap_days" in df.columns:
+        # Mirror live behaviour: a 2-day return whose underlying window
+        # spans more than 4 calendar days is suppressed.  Pandas
+        # comparisons against NaN return False, so rows with insufficient
+        # history are excluded from the resulting slice.
+        gap = df["prev_spx_return_2d_gap_days"]
+        mask &= gap.le(_SPX_2D_MAX_CALENDAR_GAP_DAYS).fillna(False)
+
     return df[mask]
 
 

@@ -137,6 +137,19 @@ class Settings(BaseSettings):
     retention_days: int = 60
     retention_batch_size: int = 500
 
+    # Offline pipeline data roots — keep app runtime untouched but let
+    # offline scripts (download_databento.py, generate_training_data.py,
+    # backtest_strategy.py) honour env-driven paths so the 120 GB
+    # databento tree can live on dedicated/external storage.  See L5
+    # in OFFLINE_PIPELINE_AUDIT.md.  Values are resolved relative to
+    # the repo root by the consuming scripts when not absolute.
+    databento_dir: str = "data/databento"
+    """Root directory for Databento `.dbn.zst` and Parquet artifacts.
+
+    Scripts may set this to an external SSD or NFS mount.  When the
+    value is a relative path the consuming script anchors it to the
+    repo root."""
+
     cors_origins: str = "http://localhost:5173"
 
     # Testing/ops controls

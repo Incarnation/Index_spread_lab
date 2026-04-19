@@ -5,9 +5,17 @@ day to one bucket per dimension (VIX level, SPX move, term structure).
 Used by both ``backtest_strategy.py`` (per-backtest regime metrics) and
 ``regime_analysis.py`` (standalone exploration).
 
-The classifiers here use the **decimal-fraction** convention for returns
-(matching ``precompute_daily_signals``), not the percent convention used
-in ``regime_analysis.enrich_with_daily_features``.
+All percentage-change inputs use the **decimal-fraction** convention
+(``-0.01`` = 1% drop) so this module is interchangeable across:
+
+- ``backtest_strategy.precompute_daily_signals`` (decimal)
+- ``regime_analysis.enrich_with_daily_features`` (decimal after the
+  M2 unification — see OFFLINE_PIPELINE_AUDIT.md)
+- ``services.event_signals`` runtime context (decimal)
+
+Pass ``prev_spx_return`` and ``term_structure`` directly from any of
+the above without unit conversion.  See OFFLINE_PIPELINE_AUDIT.md
+for the broader unit-consistency story.
 """
 from __future__ import annotations
 

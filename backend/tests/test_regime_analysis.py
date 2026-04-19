@@ -229,13 +229,23 @@ class TestMetrics:
 
 class TestFilterParsing:
     def test_simple_filter(self):
-        """Single condition parses correctly."""
+        """User-typed percent value is converted to decimal column units (M2)."""
+        # CLI surface stays in percent; column is now decimal.  A user
+        # typing "spx_drop<-0.5" means "drop > 0.5%", which in the
+        # decimal column maps to ``prev_spx_return < -0.005``.
         result = parse_filter_expr("spx_drop<-0.5")
         assert len(result) == 1
         col, op, val = result[0]
         assert col == "prev_spx_return"
         assert op == "<"
-        assert val == -0.5
+        assert val == pytest.approx(-0.005)
+
+    def test_vix_spike_scaled_to_decimal(self):
+        """VIX-spike percent input is scaled to decimal column units (M2)."""
+        result = parse_filter_expr("vix_spike>10")
+        col, op, val = result[0]
+        assert col == "prev_vix_pct_change"
+        assert val == pytest.approx(0.10)
 
     def test_multiple_filters(self):
         """Comma-separated conditions parse correctly."""
@@ -243,7 +253,7 @@ class TestFilterParsing:
         assert len(result) == 2
 
     def test_ge_operator(self):
-        """Greater-than-or-equal parses correctly."""
+        """Non-percent column (VIX level) keeps scale 1.0."""
         result = parse_filter_expr("vix>=30")
         assert result[0] == ("vix", ">=", 30.0)
 

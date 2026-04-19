@@ -91,14 +91,37 @@ logging.basicConfig(
 )
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_BACKEND_DIR = _SCRIPTS_DIR.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
+# Add backend root so ``spx_backend.config`` is importable for the
+# M10 alignment-warn helper.  Falls back gracefully when the package
+# is unavailable (e.g. minimal CI sandboxes).
+sys.path.insert(0, str(_BACKEND_DIR))
 
 from _constants import CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT
+from _pareto import extract_pareto_frontier as _pareto_extract
 from regime_utils import compute_regime_metrics
+
+# Shared event-signal evaluator (Wave 5 of OFFLINE_PIPELINE_AUDIT.md).
+# Both the live ``EventSignalDetector`` and the backtest's wrapper now
+# delegate to ``evaluate_event_signals`` so signal-firing rules stay
+# byte-identical between paths.  A failed import (e.g. a Python sandbox
+# without the spx_backend package on sys.path) is treated as a hard
+# error -- a divergent backtest is worse than a missing one.
+from spx_backend.services.event_signals import (
+    EventThresholds,
+    evaluate_event_signals,
+)
 
 DATA_DIR = _SCRIPTS_DIR.parents[1] / "data"
 DEFAULT_CSV = DATA_DIR / "training_candidates.csv"
 RESULTS_CSV = DATA_DIR / "backtest_results.csv"
+
+# Backtest-local mirror of the live ``_SPX_2D_MAX_CALENDAR_GAP_DAYS``.
+# Kept as a module constant for any non-detector code paths that want
+# to introspect or document the gap threshold; the actual gating now
+# lives in ``evaluate_event_signals`` (single source of truth).
+_SPX_2D_MAX_CALENDAR_GAP_DAYS = 4
 
 
 def _opt_val(v):
@@ -542,13 +565,37 @@ class PortfolioManager:
         return self._month_stopped
 
     def compute_lots(self) -> int:
-        """Lot count for the next trade, cached per day for consistency."""
+        """Lot count for the next trade, cached per day for consistency.
+
+        The lot count is the minimum of three caps:
+
+        1. ``lot_per_equity`` -- equity-bucketed sizing (e.g. one lot per
+           $10k of equity).
+        2. ``max_equity_risk_pct`` -- caps single-trade catastrophic loss
+           exposure (``equity * pct / margin_per_lot``).
+        3. ``max_margin_pct`` -- caps margin dollars committed for the
+           trade as a fraction of equity (``equity * pct / margin_per_lot``).
+
+        Cap 3 was previously declared on ``PortfolioConfig`` but never
+        enforced (M4 in OFFLINE_PIPELINE_AUDIT.md), making it a no-op
+        optimizer dimension.  It is now enforced symmetrically with cap 2
+        so the optimizer CSV reflects real behaviour.
+
+        Caps 2 and 3 are functionally similar for narrow credit spreads
+        where ``max_loss ≈ margin``; they diverge for wide spreads or
+        when ``max_margin_pct < max_equity_risk_pct``.
+        """
         if self._lots_today is not None:
             return self._lots_today
 
         raw = max(1, int(self.equity / self.cfg.lot_per_equity))
         max_by_risk = max(1, int(self.equity * self.cfg.max_equity_risk_pct / self.margin_per_lot))
-        self._lots_today = min(raw, max_by_risk)
+        # M4 fix: enforce max_margin_pct so the optimizer dimension is
+        # not silently inert.  Margin per trade = lots * margin_per_lot,
+        # so the lot cap from a margin-fraction cap is symmetric to the
+        # risk cap formula above.
+        max_by_margin = max(1, int(self.equity * self.cfg.max_margin_pct / self.margin_per_lot))
+        self._lots_today = min(raw, max_by_risk, max_by_margin)
         return self._lots_today
 
     def record_trade(self, pnl_per_lot: float, lots: int) -> float:
@@ -572,8 +619,14 @@ class PortfolioManager:
 class EventSignalDetector:
     """Evaluate market conditions and return active event signals.
 
-    Requires a ``day_signals`` DataFrame precomputed from the daily
-    aggregates (SPX return, VIX change, etc.).
+    Thin wrapper around the shared ``evaluate_event_signals`` evaluator
+    in ``spx_backend.services.event_signals``: the *integration*
+    responsibility (taking a precomputed ``pandas.Series`` row, packing
+    EventConfig fields into the shared ``EventThresholds`` carrier)
+    lives here, but the actual signal-firing rules live in one place
+    so the backtest can never silently drift from live.  See the C1,
+    H1, M3, M7, M9 finding cluster in OFFLINE_PIPELINE_AUDIT.md for
+    the divergence history that motivated this extraction.
 
     Parameters
     ----------
@@ -584,69 +637,46 @@ class EventSignalDetector:
         """Bind the detector to the given event configuration."""
         self.cfg = config
 
+    def _build_thresholds(self) -> "EventThresholds":
+        """Pack the EventConfig fields into a shared EventThresholds.
+
+        Local import keeps backtest_strategy importable without forcing
+        the live ``spx_backend`` package onto the path during minimal
+        test collection (the live package is already on the path in
+        normal usage; this is only insurance).
+        """
+        return EventThresholds(
+            spx_drop_threshold=self.cfg.spx_drop_threshold,
+            spx_drop_2d_threshold=self.cfg.spx_drop_2d_threshold,
+            vix_spike_threshold=self.cfg.vix_spike_threshold,
+            vix_elevated_threshold=self.cfg.vix_elevated_threshold,
+            term_inversion_threshold=self.cfg.term_inversion_threshold,
+            rally_avoidance=self.cfg.rally_avoidance,
+            rally_threshold=self.cfg.rally_threshold,
+            signal_mode=self.cfg.signal_mode,
+            spx_drop_min=self.cfg.spx_drop_min,
+            spx_drop_max=self.cfg.spx_drop_max,
+        )
+
     def detect(self, day_row: pd.Series) -> list[str]:
         """Return list of active signal names for today.
 
         Parameters
         ----------
         day_row : Series with keys ``prev_spx_return``, ``prev_spx_return_2d``,
-            ``prev_vix_pct_change``, ``vix``, ``term_structure``.
+            ``prev_vix_pct_change``, ``vix``, ``term_structure``,
+            ``prev_spx_return_2d_gap_days``.
         """
         if not self.cfg.enabled:
             return []
-
-        signals: list[str] = []
-        prev_ret = day_row.get("prev_spx_return")
-        prev_ret_2d = day_row.get("prev_spx_return_2d")
-        prev_vix_chg = day_row.get("prev_vix_pct_change")
-        vix = day_row.get("vix")
-        ts = day_row.get("term_structure")
-
-        if prev_ret is not None and prev_ret < self.cfg.spx_drop_threshold:
-            # Optional magnitude-range gate
-            dmin = self.cfg.spx_drop_min
-            dmax = self.cfg.spx_drop_max
-            in_range = True
-            if dmin is not None and prev_ret < dmin:
-                in_range = False
-            if dmax is not None and prev_ret > dmax:
-                in_range = False
-            if in_range:
-                signals.append("spx_drop_1d")
-
-        if prev_ret_2d is not None and prev_ret_2d < self.cfg.spx_drop_2d_threshold:
-            signals.append("spx_drop_2d")
-        if prev_vix_chg is not None and prev_vix_chg > self.cfg.vix_spike_threshold:
-            signals.append("vix_spike")
-        if vix is not None and vix > self.cfg.vix_elevated_threshold:
-            signals.append("vix_elevated")
-        if ts is not None and ts > self.cfg.term_inversion_threshold:
-            signals.append("term_inversion")
-        if self.cfg.rally_avoidance and prev_ret is not None and prev_ret > self.cfg.rally_threshold:
-            signals.append("rally")
-
-        # Apply signal_mode filtering (rally is always kept separately)
-        mode = self.cfg.signal_mode
-        non_rally = [s for s in signals if s != "rally"]
-        has_rally = "rally" in signals
-
-        if mode == "all":
-            # Require all three categories: SPX drop, VIX, and term structure
-            spx_ok = any(s.startswith("spx_drop") for s in non_rally)
-            vix_ok = any(s in ("vix_spike", "vix_elevated") for s in non_rally)
-            ts_ok = "term_inversion" in non_rally
-            if not (spx_ok and vix_ok and ts_ok):
-                non_rally = []
-        elif mode == "spx_and_vix":
-            spx_signals = [s for s in non_rally if s.startswith("spx_drop")]
-            vix_signals = [s for s in non_rally if s in ("vix_spike", "vix_elevated")]
-            if not spx_signals or not vix_signals:
-                non_rally = []
-
-        result = non_rally
-        if has_rally:
-            result.append("rally")
-        return result
+        # Convert the Series to a plain dict so the shared evaluator
+        # doesn't need to know about pandas.  ``.to_dict()`` preserves
+        # NaN values which the shared ``_is_nan_safe`` helper handles.
+        ctx = day_row.to_dict() if hasattr(day_row, "to_dict") else dict(day_row)
+        # Suppress the per-day "spx_drop_2d suppressed" warning -- the
+        # backtest sweeps thousands of days and the warning is more
+        # useful in live where the gap is unexpected.
+        return evaluate_event_signals(ctx, self._build_thresholds(), log_warnings=False)
 
 
 # ===================================================================
@@ -690,8 +720,17 @@ def precompute_daily_signals(df: pd.DataFrame) -> pd.DataFrame:
     daily["spx_return_2d"] = daily["spot"].pct_change(2)
     daily["vix_pct_change"] = daily["vix"].pct_change()
 
+    # Calendar gap (in days) between the row 2 trading days back and the
+    # current row.  Used downstream to suppress "2-day return" signals
+    # that actually span a long weekend or data outage; mirrors the live
+    # ``prev_spx_return_2d_gap_days`` field in event_signals.py
+    # (see H1 in OFFLINE_PIPELINE_AUDIT.md).
+    day_dt = pd.to_datetime(daily["day"], errors="coerce")
+    daily["spx_return_2d_gap_days"] = (day_dt - day_dt.shift(2)).dt.days
+
     daily["prev_spx_return"] = daily["spx_return"].shift(1)
     daily["prev_spx_return_2d"] = daily["spx_return_2d"].shift(1)
+    daily["prev_spx_return_2d_gap_days"] = daily["spx_return_2d_gap_days"].shift(1)
     daily["prev_vix_pct_change"] = daily["vix_pct_change"].shift(1)
 
     return daily.set_index("day")
@@ -1698,7 +1737,21 @@ def _run_grid(
     print(f"  [{stage_name}] Completed {len(configs):,} configs in {elapsed:.1f}s "
           f"({len(configs)/max(elapsed, 0.01):.0f}/sec)", flush=True)
 
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    # L10 fix: ``Pool.imap_unordered`` yields results in completion
+    # order, which depends on worker scheduling and therefore varies
+    # across runs.  Sort by the canonical config key so the output
+    # CSV is byte-identical for identical inputs (sequential vs
+    # parallel, run N vs run N+1).  Use mergesort for stability.
+    if not out.empty:
+        try:
+            out = out.assign(_sort_key=out.apply(_config_key, axis=1)) \
+                     .sort_values("_sort_key", kind="mergesort") \
+                     .drop(columns="_sort_key") \
+                     .reset_index(drop=True)
+        except Exception as exc:  # pragma: no cover -- defensive only
+            logger.warning("Skipping deterministic sort (config_key failed: %s)", exc)
+    return out
 
 
 def run_optimizer(
@@ -2078,6 +2131,10 @@ def _parameter_importance(rdf: pd.DataFrame) -> None:
 def extract_pareto_frontier(rdf: pd.DataFrame) -> pd.DataFrame:
     """Find Pareto-optimal configs: no other config has both higher Sharpe AND lower max DD.
 
+    Thin wrapper around :func:`_pareto.extract_pareto_frontier` (the
+    shared implementation that ``ingest_optimizer_results.py`` also
+    uses, see M6 in ``OFFLINE_PIPELINE_AUDIT.md``).
+
     Parameters
     ----------
     rdf : Optimizer results DataFrame with ``sharpe`` and ``max_dd_pct`` columns.
@@ -2086,23 +2143,7 @@ def extract_pareto_frontier(rdf: pd.DataFrame) -> pd.DataFrame:
     -------
     DataFrame with only Pareto-optimal rows, sorted by Sharpe descending.
     """
-    is_pareto = np.ones(len(rdf), dtype=bool)
-    sharpe_vals = rdf["sharpe"].values
-    dd_vals = rdf["max_dd_pct"].values
-
-    for i in range(len(rdf)):
-        if not is_pareto[i]:
-            continue
-        # A point is dominated if any other point has >= sharpe AND <= dd (and strictly better on at least one)
-        for j in range(len(rdf)):
-            if i == j or not is_pareto[j]:
-                continue
-            if sharpe_vals[j] >= sharpe_vals[i] and dd_vals[j] <= dd_vals[i]:
-                if sharpe_vals[j] > sharpe_vals[i] or dd_vals[j] < dd_vals[i]:
-                    is_pareto[i] = False
-                    break
-
-    return rdf[is_pareto].sort_values("sharpe", ascending=False).reset_index(drop=True)
+    return _pareto_extract(rdf)
 
 
 def _print_pareto(pareto: pd.DataFrame) -> None:
@@ -2829,6 +2870,62 @@ def run_holdout_evaluation(
 # ===================================================================
 
 
+def _alignment_warn_against_live_settings() -> None:
+    """Print a banner if backtest defaults diverge from live settings.
+
+    Backtest dataclasses (``TradingConfig``, ``PortfolioConfig``,
+    ``EventConfig``) intentionally fix their own defaults so the script
+    is reproducible without env vars; live behaviour is governed by
+    ``spx_backend.config.settings`` (env-driven).  Silent divergence
+    between the two is an attractive nuisance — the optimizer can sweep
+    a parameter that production never enables and pick a config that
+    looks great offline but is unreachable live.
+
+    This guard reads the live settings (best-effort; settings module
+    may not import in all CI sandboxes) and logs a single banner
+    listing every parameter whose backtest dataclass default differs
+    from the live setting default.  It does NOT raise — operators can
+    still intentionally diverge for ablation studies; the message just
+    surfaces what's happening.
+
+    See M10 in OFFLINE_PIPELINE_AUDIT.md for the originating finding.
+    """
+    try:
+        from spx_backend.config import settings as _live
+    except Exception as exc:  # pragma: no cover -- import guard, env-dep
+        logger.debug("Live-settings alignment skipped (settings unavailable: %s)", exc)
+        return
+
+    # (label, backtest-default-value, live-equivalent-value)
+    pairs: list[tuple[str, Any, Any]] = [
+        ("avoid_opex",         TradingConfig().avoid_opex,
+                               getattr(_live, "decision_avoid_opex", None)),
+        ("max_margin_pct",     PortfolioConfig().max_margin_pct,
+                               getattr(_live, "portfolio_max_margin_pct", None)),
+        ("max_equity_risk_pct", PortfolioConfig().max_equity_risk_pct,
+                                getattr(_live, "portfolio_max_equity_risk_pct", None)),
+        ("starting_capital",   PortfolioConfig().starting_capital,
+                               getattr(_live, "portfolio_starting_capital", None)),
+        ("monthly_drawdown_limit", PortfolioConfig().monthly_drawdown_limit,
+                                   getattr(_live, "portfolio_monthly_drawdown_limit", None)),
+    ]
+
+    diverged = [(name, bt, live) for name, bt, live in pairs
+                if live is not None and bt != live]
+    if not diverged:
+        return
+
+    banner = ["", "─" * 72,
+              "M10 alignment notice: backtest defaults diverge from live settings:"]
+    for name, bt, live in diverged:
+        banner.append(f"  {name:30s} backtest={bt!r:>10}   live={live!r}")
+    banner.append("(optimizer YAMLs may still override these; see M10 in "
+                  "OFFLINE_PIPELINE_AUDIT.md)")
+    banner.append("─" * 72)
+    for line in banner:
+        logger.info(line)
+
+
 def main() -> None:
     """Entry point for the backtest CLI."""
     parser = argparse.ArgumentParser(
@@ -2893,6 +2990,15 @@ def main() -> None:
                         help="Staged optimizer: top-N combined configs to carry into Stage 3 (default: 5)")
     parser.add_argument("--output-csv", type=str, default=str(RESULTS_CSV),
                         help="CSV output path for optimizer results")
+    parser.add_argument(
+        "--walkforward-output-csv", type=str, default=None,
+        help="Explicit CSV output path for walk-forward results. "
+             "Defaults to <output-csv parent>/walkforward_results.csv "
+             "for backward compat; pass an explicit per-run path "
+             "(e.g. data/<run_name>_walkforward.csv) to avoid clobbering "
+             "concurrent or sequential pipeline runs (see H4 in "
+             "OFFLINE_PIPELINE_AUDIT.md).",
+    )
     parser.add_argument("--backtest-workers", type=int,
                         default=max(1, (cpu_count() or 2) - 1),
                         help="Number of parallel workers for optimizer grid "
@@ -2920,6 +3026,15 @@ def main() -> None:
 
     args = parser.parse_args()
     args.backtest_workers = max(1, args.backtest_workers)
+
+    # M10 alignment guard: warn (don't fail) if backtest defaults
+    # diverge from the live decision job's behaviour.  The audit
+    # originally flagged a divergence in `avoid_opex` defaults; today
+    # both sides default to False, but the optimizer YAML grids
+    # frequently set it to True.  Surfacing this as a startup line
+    # makes it obvious to operators which calendar gating actually
+    # ran.  See M10 in OFFLINE_PIPELINE_AUDIT.md.
+    _alignment_warn_against_live_settings()
 
     # --analyze only needs the results CSV, not the full training data
     if args.analyze:
@@ -3006,7 +3121,10 @@ def main() -> None:
                 step_months=args.wf_step_months,
             )
             print(f"Auto-generated {len(wf_windows)} walk-forward windows from {min_day} to {max_day}")
-        wf_output = Path(args.output_csv).parent / "walkforward_results.csv"
+        if args.walkforward_output_csv:
+            wf_output = Path(args.walkforward_output_csv)
+        else:
+            wf_output = Path(args.output_csv).parent / "walkforward_results.csv"
         wf_results = run_walkforward(df, output_csv=wf_output, windows=wf_windows,
                                      config_path=args.config)
 

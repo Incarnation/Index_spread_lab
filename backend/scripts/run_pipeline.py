@@ -142,9 +142,12 @@ def main() -> None:
     phase = args.phase
 
     results_csv = _DATA_DIR / f"{run_name}_results.csv"
-    # training_candidates.csv and walkforward_results.csv are global (not run-scoped)
-    # because the sub-scripts produce fixed-name outputs; results_csv is run-scoped.
-    walkforward_csv = _DATA_DIR / "walkforward_results.csv"
+    # H4 fix: walkforward_results.csv used to be a single global file shared
+    # across runs; concurrent or sequential pipeline runs clobbered each
+    # other's WF outputs while their _results.csv files were correctly
+    # per-run.  We now scope WF per-run too and pass an explicit
+    # --walkforward-output-csv to backtest_strategy.py.
+    walkforward_csv = _DATA_DIR / f"{run_name}_walkforward.csv"
 
     log: dict = {
         "run_name": run_name,
@@ -249,6 +252,7 @@ def main() -> None:
                 python, "scripts/backtest_strategy.py",
                 "--walkforward", "--wf-auto",
                 "--output-csv", str(results_csv),
+                "--walkforward-output-csv", str(walkforward_csv),
                 "--backtest-workers", str(args.workers),
             ]
             if args.optimizer_config:

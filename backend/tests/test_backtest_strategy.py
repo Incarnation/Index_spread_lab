@@ -258,6 +258,68 @@ class TestEventSignalDetector:
         signals = det.detect(row)
         assert len(signals) >= 3
 
+    def test_spx_drop_2d_suppressed_when_calendar_gap_too_wide(self):
+        """A 2-day return computed across a long gap (e.g. holiday week
+        or data outage) should not fire spx_drop_2d.  Mirrors live
+        ``event_signals._SPX_2D_MAX_CALENDAR_GAP_DAYS`` (H1)."""
+        det = EventSignalDetector(EventConfig(enabled=True, spx_drop_2d_threshold=-0.02))
+        row = pd.Series({
+            "prev_spx_return": 0,
+            "prev_spx_return_2d": -0.05,
+            "prev_spx_return_2d_gap_days": 10,
+            "prev_vix_pct_change": 0,
+            "vix": 15,
+            "term_structure": 0.95,
+        })
+        assert "spx_drop_2d" not in det.detect(row)
+
+    def test_spx_drop_2d_fires_when_calendar_gap_within_threshold(self):
+        """Gap of 4 days (typical long weekend) is acceptable."""
+        det = EventSignalDetector(EventConfig(enabled=True, spx_drop_2d_threshold=-0.02))
+        row = pd.Series({
+            "prev_spx_return": 0,
+            "prev_spx_return_2d": -0.05,
+            "prev_spx_return_2d_gap_days": 4,
+            "prev_vix_pct_change": 0,
+            "vix": 15,
+            "term_structure": 0.95,
+        })
+        assert "spx_drop_2d" in det.detect(row)
+
+    def test_spx_drop_2d_fires_when_gap_metadata_missing(self):
+        """Backwards compat: legacy daily series without the gap column
+        should still fire (NaN treated as 'no information available')."""
+        det = EventSignalDetector(EventConfig(enabled=True, spx_drop_2d_threshold=-0.02))
+        row = pd.Series({
+            "prev_spx_return": 0,
+            "prev_spx_return_2d": -0.05,
+            "prev_vix_pct_change": 0,
+            "vix": 15,
+            "term_structure": 0.95,
+        })
+        assert "spx_drop_2d" in det.detect(row)
+
+
+class TestPrecomputeDailySignalsGap:
+    """Regression coverage for the precompute_daily_signals gap column (H1)."""
+
+    def test_gap_column_present_and_populated(self):
+        # Three trading days; the 2-day gap on row index 2 should be the
+        # calendar distance from row 0 to row 2.
+        df = pd.DataFrame([
+            {"day": "2025-06-02", "entry_dt": "09:45", "spot": 5500, "vix": 15, "vix9d": 14, "term_structure": 0.95},
+            {"day": "2025-06-03", "entry_dt": "09:45", "spot": 5510, "vix": 15, "vix9d": 14, "term_structure": 0.95},
+            {"day": "2025-06-09", "entry_dt": "09:45", "spot": 5500, "vix": 16, "vix9d": 14, "term_structure": 0.95},
+        ])
+        daily = precompute_daily_signals(df)
+        assert "prev_spx_return_2d_gap_days" in daily.columns
+        # Row "2025-06-09" is 7 calendar days after "2025-06-02"; the
+        # PREVIOUS-day shifted gap is the value seen by EventSignalDetector
+        # when evaluating the next trading day.  Just assert the per-row
+        # un-shifted gap on 2025-06-09 equals 7.
+        gap_2d = daily["spx_return_2d_gap_days"].loc["2025-06-09"]
+        assert gap_2d == 7
+
 
 # ── ScheduledSelector ────────────────────────────────────────────
 
@@ -1042,6 +1104,40 @@ class TestPortfolioManagerMargin:
         pm2 = PortfolioManager(PortfolioConfig(starting_capital=400), margin_per_lot=500)
         pm2.begin_day("2025-06-01")
         assert not pm2.can_trade()
+
+    def test_max_margin_pct_caps_lots(self):
+        """``max_margin_pct`` enforces an upper bound on lots (M4 fix).
+
+        With $20k equity and a 5% margin cap, the manager can commit at
+        most $1000 of margin; at $1000/lot that's exactly 1 lot — even
+        though lot_per_equity (10k) and max_equity_risk_pct (50%) both
+        permit 2 and 10 lots respectively.  Before the M4 fix the cap
+        was silently ignored and the optimizer treated this as a no-op.
+        """
+        pm = PortfolioManager(PortfolioConfig(
+            starting_capital=20_000,
+            lot_per_equity=10_000,
+            max_equity_risk_pct=0.50,
+            max_margin_pct=0.05,
+        ))
+        pm.begin_day("2025-06-01")
+        assert pm.compute_lots() == 1
+
+    def test_max_margin_pct_default_does_not_constrain_below_other_caps(self):
+        """Default 30% margin cap leaves the equity-risk + lot caps in charge.
+
+        Without the M4 fix the field was inert — assert that with the
+        default config the visible behaviour matches the pre-M4 state
+        (max_equity_risk_pct still drives sizing for typical configs).
+        """
+        pm = PortfolioManager(PortfolioConfig(
+            starting_capital=35_000,
+            lot_per_equity=10_000,
+            max_equity_risk_pct=0.10,
+            max_margin_pct=0.30,
+        ))
+        pm.begin_day("2025-06-01")
+        assert pm.compute_lots() == 3
 
 
 # ── EventConfig signal_mode ─────────────────────────────────────

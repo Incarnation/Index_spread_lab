@@ -56,7 +56,27 @@ from spx_backend.utils.pricing import mid_price
 # Paths
 # ---------------------------------------------------------------------------
 DATA_DIR = _BACKEND.parent / "data"
-DATABENTO_DIR = DATA_DIR / "databento"
+
+
+def _resolve_databento_dir() -> Path:
+    """Return the Databento data directory (env-driven; L5 fix).
+
+    Reads ``settings.databento_dir`` so the 120 GB tree can live on a
+    dedicated SSD or NFS mount without code changes.  Relative paths
+    are anchored to the repo root; absolute paths are used as-is.
+    Falls back to ``data/databento`` when settings is unavailable.
+    """
+    try:
+        from spx_backend.config import settings as _live  # type: ignore
+        configured = Path(_live.databento_dir)
+    except Exception:  # pragma: no cover -- import optional offline
+        configured = Path("data/databento")
+    if not configured.is_absolute():
+        configured = _BACKEND.parent / configured
+    return configured
+
+
+DATABENTO_DIR = _resolve_databento_dir()
 SPXW_CBBO = DATABENTO_DIR / "spxw" / "cbbo-1m"
 SPXW_DEFS = DATABENTO_DIR / "spxw" / "definition"
 SPXW_STATS = DATABENTO_DIR / "spxw" / "statistics"
@@ -111,6 +131,63 @@ def _get_grid_param(name: str) -> Any:
     if _ACTIVE_GRID is not None:
         return _ACTIVE_GRID[name]
     return globals()[name]
+
+
+def _assert_sl_alignment_with_live_settings() -> None:
+    """Fail loudly if the live SL config drifts from the training labeler's
+    hardcoded contract.  This is the C4 hybrid mitigation
+    (see ``OFFLINE_PIPELINE_AUDIT.md``).
+
+    The labeler in this script computes ``sl_thr = max_profit * STOP_LOSS_PCT``
+    and always treats SL as enabled.  If production overrides
+    ``trade_pnl_stop_loss_basis`` (e.g. to ``"max_loss"``), disables SL
+    via ``trade_pnl_stop_loss_enabled = False``, or changes
+    ``trade_pnl_stop_loss_pct`` away from the active grid's
+    ``STOP_LOSS_PCT``, training labels will silently misrepresent live
+    trade outcomes and any downstream model / optimizer run will be
+    calibrated to the wrong policy.
+
+    The helper deliberately raises ``SystemExit`` rather than logging a
+    warning so the pipeline cannot complete a labeling run with a stale
+    hardcoded contract.
+    """
+    try:
+        from spx_backend.config import settings as _live_settings
+    except Exception as exc:  # pragma: no cover - defensive
+        # If settings can't be loaded (e.g. pytest with mocked env) we'd
+        # rather skip the check than block tests.  Production runs always
+        # import this module successfully because the rest of this file
+        # already imports from spx_backend above.
+        logger.warning("Skipping SL-alignment assertion: %s", exc)
+        return
+
+    expected_basis = "max_profit"
+    if _live_settings.trade_pnl_stop_loss_basis != expected_basis:
+        raise SystemExit(
+            f"[C4] Training labeler hardcodes basis={expected_basis!r} but live "
+            f"trade_pnl_stop_loss_basis={_live_settings.trade_pnl_stop_loss_basis!r}. "
+            "Update _evaluate_outcome (or route through "
+            "_label_helpers.evaluate_candidate_outcome) before re-labeling. "
+            "See OFFLINE_PIPELINE_AUDIT.md C4."
+        )
+    if not _live_settings.trade_pnl_stop_loss_enabled:
+        raise SystemExit(
+            "[C4] Training labeler always simulates a stop-loss but live "
+            "trade_pnl_stop_loss_enabled=False. Disable the labeler's SL "
+            "branch (or hold-only labels) before continuing. "
+            "See OFFLINE_PIPELINE_AUDIT.md C4."
+        )
+
+    grid_pct = float(_get_grid_param("STOP_LOSS_PCT"))
+    live_pct = float(_live_settings.trade_pnl_stop_loss_pct)
+    if abs(live_pct - grid_pct) > 1e-9:
+        raise SystemExit(
+            f"[C4] Active training STOP_LOSS_PCT={grid_pct} != live "
+            f"trade_pnl_stop_loss_pct={live_pct}. If you intentionally "
+            "want a what-if SL multiplier, update the YAML and the live "
+            "config together (or temporarily comment out this assertion "
+            "with a tracking issue). See OFFLINE_PIPELINE_AUDIT.md C4."
+        )
 
 
 # ===================================================================
@@ -269,22 +346,43 @@ def load_production_chain(day_str: str) -> pd.DataFrame | None:
     return df
 
 
-def definitions_from_production(chain_df: pd.DataFrame) -> pd.DataFrame:
+def definitions_from_production(
+    chain_df: pd.DataFrame,
+    *,
+    day_str: str | None = None,
+) -> pd.DataFrame:
     """Convert a production chain DataFrame to Databento definitions shape.
 
     Extracts unique option symbols and maps them to the columns that
     ``build_instrument_map`` expects: ``instrument_id``, ``raw_symbol``,
     ``strike_price``, ``expiration``, ``instrument_class``.
 
+    H5 fix: ``ts_recv`` is filled with a **deterministic sentinel** rather
+    than ``Timestamp.now()``.  The downstream ``load_definitions`` caller
+    sorts by ``ts_recv`` then dedups by ``instrument_id`` (keep="last").
+    With wall-clock now, two runs over identical inputs would race against
+    each other and could pick a different "winning" row when an
+    instrument_id appears in both Databento .dbn.zst and the production
+    parquet.  A constant sentinel removes that nondeterminism: the row
+    order is decided by the upstream stable sort of ``chain_df``.
+
     Parameters
     ----------
     chain_df : pd.DataFrame
         Raw production chain data from ``load_production_chain``.
+    day_str : str | None
+        Optional ISO ``YYYYMMDD`` for the trading day; when provided, the
+        sentinel ``ts_recv`` is set to ``YYYY-MM-DDT00:00:00Z`` so the
+        dedup tiebreak still favours Databento data (which has real
+        intraday timestamps after market open).  Without ``day_str`` we
+        fall back to ``1970-01-01T00:00:00Z``.
 
     Returns
     -------
     pd.DataFrame
         Definitions-like DataFrame compatible with ``build_instrument_map``.
+        ``ts_recv`` is a deterministic constant; do **not** treat it as a
+        wall-clock timestamp.
     """
     unique = chain_df.drop_duplicates("option_symbol")[
         ["option_symbol", "strike", "expiration", "option_right"]
@@ -295,8 +393,14 @@ def definitions_from_production(chain_df: pd.DataFrame) -> pd.DataFrame:
         "strike": "strike_price",
         "option_right": "instrument_class",
     })
-    # build_instrument_map expects a ts_recv column for dedup sorting
-    unique["ts_recv"] = pd.Timestamp.now(tz="UTC")
+    if day_str is not None and len(day_str) == 8 and day_str.isdigit():
+        sentinel = pd.Timestamp(
+            f"{day_str[:4]}-{day_str[4:6]}-{day_str[6:]}T00:00:00",
+            tz="UTC",
+        )
+    else:
+        sentinel = pd.Timestamp("1970-01-01T00:00:00", tz="UTC")
+    unique["ts_recv"] = sentinel
     return unique
 
 
@@ -386,7 +490,7 @@ def load_definitions(day_str: str) -> pd.DataFrame | None:
     if not frames:
         chain_df = load_production_chain(day_str)
         if chain_df is not None and not chain_df.empty:
-            return definitions_from_production(chain_df)
+            return definitions_from_production(chain_df, day_str=day_str)
         return None
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     if "instrument_id" in df.columns:
@@ -546,6 +650,15 @@ def load_daily_parquet(parquet_path: Path) -> dict[date, float]:
     Reads ``ts`` and ``close`` columns, groups by calendar date, takes the
     last close per day.  Returns an empty dict when the file is missing.
 
+    .. WARNING ::
+        The returned mapping is **end-of-session** for every trading day.
+        Looking up ``daily[D]`` at an intraday decision instant on day
+        ``D`` is **same-day lookahead** -- you are reading a value that
+        was not knowable at the decision time.  Use
+        :func:`lag_daily_to_next_session` to convert into a
+        decision-safe (point-in-time) mapping before per-candidate
+        lookups.
+
     Parameters
     ----------
     parquet_path : Path
@@ -555,7 +668,7 @@ def load_daily_parquet(parquet_path: Path) -> dict[date, float]:
     Returns
     -------
     dict[date, float]
-        Mapping from trading date to the day's closing value.
+        Mapping from trading date to the day's closing value (EOD).
     """
     if not parquet_path.exists():
         return {}
@@ -563,6 +676,36 @@ def load_daily_parquet(parquet_path: Path) -> dict[date, float]:
     df["date"] = df["ts"].dt.date
     daily = df.groupby("date")["close"].last()
     return daily.to_dict()
+
+
+def lag_daily_to_next_session(daily: dict[date, float]) -> dict[date, float]:
+    """Shift an EOD daily-close mapping by one trading day so each entry
+    becomes the value most recently observable **before** that date.
+
+    H6 fix: the FRD SKEW parquet (and any production EOD aggregation)
+    stamps each day's value at the session close.  Using ``daily[D]``
+    during an intraday decision on day ``D`` therefore peeks at a value
+    that is not yet known.  This helper rebuilds the mapping so that
+    looking up day ``D`` returns the EOD value from the previous date in
+    the source dataset (i.e. the previous trading day, since holidays
+    are absent from the EOD dataset).
+
+    Parameters
+    ----------
+    daily : dict[date, float]
+        Output of :func:`load_daily_parquet` (EOD-stamped).
+
+    Returns
+    -------
+    dict[date, float]
+        Decision-safe mapping where ``out[D]`` equals
+        ``daily[previous_trading_day]``.  The earliest source date is
+        absent from the result because no prior value exists.
+    """
+    if not daily:
+        return {}
+    sorted_dates = sorted(daily.keys())
+    return {sorted_dates[i]: daily[sorted_dates[i - 1]] for i in range(1, len(sorted_dates))}
 
 
 def load_economic_calendar(csv_path: Path) -> dict[date, dict]:
@@ -2410,6 +2553,82 @@ def _compute_code_version() -> str:
     return hasher.hexdigest()[:16]
 
 
+def _atomic_write_csv(df: "pd.DataFrame", dest: Path) -> None:
+    """Write a DataFrame to ``dest`` atomically (L9 fix).
+
+    Pandas' ``to_csv`` writes incrementally to the destination path; a
+    KeyboardInterrupt or OOM halfway through leaves a truncated file
+    that downstream consumers (the run_pipeline orchestrator,
+    backtest_strategy.py) treat as complete and silently train/backtest
+    on partial data.
+
+    The helper writes to ``dest.with_suffix(dest.suffix + ".tmp")``
+    first and then ``os.replace()``s into place, which is atomic on
+    POSIX/macOS/NTFS — readers either see the old file or the new
+    one, never a half-written file.
+
+    The caller is responsible for ensuring ``dest`` lives in a writable
+    directory; the temp lives next to ``dest`` so the rename is
+    same-filesystem (a cross-filesystem ``os.replace()`` would fall
+    back to copy+remove and lose atomicity).
+    """
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    df.to_csv(str(tmp), index=False)
+    os.replace(str(tmp), str(dest))
+
+
+def _input_data_fingerprint(day_str: str) -> dict[str, list[float | int]]:
+    """Return ``{input_file_name: [mtime_seconds, size_bytes]}`` for every
+    input file ``_generate_candidates_for_day(day_str)`` may consume.
+
+    H3 fix: the candidate cache previously only invalidated on
+    ``code_version`` and ``grid_hash`` changes.  If a day's underlying
+    .dbn.zst (or production parquet) was silently corrected or
+    re-issued (Databento sometimes re-publishes corrected daily files,
+    and the production parquet is rerun ad hoc), the cached candidates
+    persisted into training rows.  Storing per-day file fingerprints
+    in the manifest lets us detect content changes and re-generate just
+    the affected days.
+
+    The fingerprint is intentionally lightweight: ``(mtime, size)`` is
+    cheap to compute and adequate for catching the failure modes we
+    care about (file replaced, file truncated, file extended).  If
+    bit-identical re-saves become a concern in the future, the helper
+    can be extended to a full content hash without changing callers.
+
+    Parameters
+    ----------
+    day_str : str
+        Compact ``YYYYMMDD`` trading day.
+
+    Returns
+    -------
+    dict[str, list[float | int]]
+        Mapping from a stable identifier (``"<source>/<filename>"``) to
+        ``[mtime_rounded, size_bytes]``.  Files that don't exist are
+        omitted; an empty dict therefore means "no inputs found", which
+        is a legitimate cache state for days where generation produces
+        zero candidates.
+    """
+    candidates = [
+        ("databento_spxw_def", SPXW_DEFS / f"{day_str}.dbn.zst"),
+        ("databento_spx_def", SPX_DEFS / f"{day_str}.dbn.zst"),
+        ("databento_spxw_cbbo", SPXW_CBBO / f"{day_str}.dbn.zst"),
+        ("databento_spx_cbbo", SPX_CBBO / f"{day_str}.dbn.zst"),
+        ("databento_spxw_stats", SPXW_STATS / f"{day_str}.dbn.zst"),
+        ("databento_spx_stats", SPX_STATS / f"{day_str}.dbn.zst"),
+        ("production_chain", PRODUCTION_CHAINS_DIR / f"{day_str}.parquet"),
+    ]
+    fp: dict[str, list[float | int]] = {}
+    for tag, p in candidates:
+        if p.exists():
+            st = p.stat()
+            # Round mtime to milliseconds so trivial filesystem-induced
+            # nanosecond drift does not invalidate caches.
+            fp[tag] = [round(st.st_mtime, 3), int(st.st_size)]
+    return fp
+
+
 def _load_cache_manifest(cache_dir: Path) -> dict:
     """Load the cache manifest file, or return an empty dict."""
     manifest_path = cache_dir / "manifest.json"
@@ -2514,6 +2733,10 @@ def run_pipeline(
               f"(hash={training_config.content_hash()})", flush=True)
     else:
         _ACTIVE_GRID = None
+
+    # Hybrid C4 mitigation: fail fast if live SL config diverges from the
+    # labeler's hardcoded policy.  See OFFLINE_PIPELINE_AUDIT.md.
+    _assert_sl_alignment_with_live_settings()
     t0 = time.time()
 
     # -- 1. Discover trading days --
@@ -2557,12 +2780,17 @@ def run_pipeline(
 
     # Daily SKEW from parquet (one value per trading day).
     # FRD is the primary source; production DB export extends forward.
-    skew_daily = load_daily_parquet(FRD_SKEW)
+    # H6 fix: both sources stamp values at session close, so we lag the
+    # merged dict by one trading day before handing it to candidate
+    # generation.  Looking up `skew_daily[day_date]` at an intraday
+    # decision time was previously same-day lookahead.
+    skew_eod = load_daily_parquet(FRD_SKEW)
     prod_skew_path = PRODUCTION_UNDERLYING_DIR / "SKEW_1min.parquet"
     if prod_skew_path.exists():
         prod_skew = load_daily_parquet(prod_skew_path)
         for d, v in prod_skew.items():
-            skew_daily.setdefault(d, v)
+            skew_eod.setdefault(d, v)
+    skew_daily = lag_daily_to_next_session(skew_eod)
 
     # Economic calendar (OPEX / FOMC / triple witching)
     cal_map = load_economic_calendar(ECONOMIC_CALENDAR_CSV)
@@ -2599,8 +2827,37 @@ def run_pipeline(
         print(f"[PIPELINE] Cache invalidated ({reason}), regenerating all days", flush=True)
 
     cached_days_info = manifest.get("days", {}) if cache_valid else {}
-    days_to_generate = [d for d in trading_days if d not in cached_days_info]
-    days_from_cache = [d for d in trading_days if d in cached_days_info]
+
+    # H3 fix: per-day input fingerprint check.  A day is "cached" only if
+    # its stored {input_file: (mtime, size)} fingerprint matches the
+    # current state on disk.  Mismatch -> regenerate just that day.
+    invalidated_by_inputs: list[str] = []
+    days_from_cache: list[str] = []
+    days_to_generate: list[str] = []
+    for d in trading_days:
+        info = cached_days_info.get(d)
+        if info is None:
+            days_to_generate.append(d)
+            continue
+        stored_fp = info.get("inputs")
+        current_fp = _input_data_fingerprint(d)
+        # Older manifests have no "inputs" key.  Treat that as "unknown"
+        # rather than mismatch so we don't force a 100% regeneration on
+        # the first run after this change ships -- the cache will heal
+        # itself organically as days get re-cached.
+        if stored_fp is None or stored_fp == current_fp:
+            days_from_cache.append(d)
+        else:
+            invalidated_by_inputs.append(d)
+            days_to_generate.append(d)
+
+    if invalidated_by_inputs:
+        print(
+            f"[PIPELINE] H3: {len(invalidated_by_inputs)} day(s) "
+            f"invalidated by input-file fingerprint change "
+            f"(first 5: {invalidated_by_inputs[:5]})",
+            flush=True,
+        )
 
     print(f"[PIPELINE] Cache: {len(days_from_cache)} days cached, "
           f"{len(days_to_generate)} days to generate", flush=True)
@@ -2647,6 +2904,7 @@ def run_pipeline(
                     new_manifest_days[day_str] = {
                         "rows": n_cached,
                         "file": f"{day_str}.parquet",
+                        "inputs": _input_data_fingerprint(day_str),
                     }
                     if verbose:
                         print(
@@ -2673,6 +2931,7 @@ def run_pipeline(
                 new_manifest_days[day_str] = {
                     "rows": n_cached,
                     "file": f"{day_str}.parquet",
+                    "inputs": _input_data_fingerprint(day_str),
                 }
                 if verbose:
                     print(
@@ -2834,7 +3093,20 @@ def run_pipeline(
             "Filtered %d near-zero credit candidates",
             before_filter - len(flat_records),
         )
-    pd.DataFrame(flat_records).to_csv(str(OUTPUT_CSV), index=False)
+    out_df = pd.DataFrame(flat_records)
+    # L8 fix: sort by (day, entry_dt, spread_id) so re-runs with
+    # different cache-hit ratios produce byte-identical CSVs.  Without
+    # this, freshly-labeled rows (cands_to_label) precede cached rows
+    # (cached_labeled) and the order shifts whenever the cache shape
+    # changes.  Missing tiebreaker columns are tolerated.
+    sort_keys = [c for c in ("day", "entry_dt", "spread_id") if c in out_df.columns]
+    if sort_keys:
+        out_df = out_df.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+    # L9 fix (extended): write to <path>.tmp then atomically replace,
+    # so a crash mid-write doesn't leave a truncated CSV that downstream
+    # consumers (run_pipeline.py, backtest_strategy.py) might treat as
+    # a complete dataset.
+    _atomic_write_csv(out_df, OUTPUT_CSV)
 
     # -- 7. Walk-forward validation --
     print("[PIPELINE] Walk-forward validation ...", flush=True)
@@ -3041,6 +3313,10 @@ def relabel_from_csv(
     """
     if output_path is None:
         output_path = csv_path
+
+    # Hybrid C4 mitigation: relabeling reuses the same _evaluate_outcome
+    # contract as the main pipeline, so the live SL config must agree.
+    _assert_sl_alignment_with_live_settings()
 
     t0 = time.time()
     df = pd.read_csv(str(csv_path))

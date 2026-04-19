@@ -24,7 +24,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 
@@ -38,6 +37,16 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _DATA_DIR = _SCRIPTS_DIR.parents[1] / "data"
 DEFAULT_RESULTS_CSV = _DATA_DIR / "backtest_results.csv"
 DEFAULT_WF_CSV = _DATA_DIR / "walkforward_results.csv"
+
+# Make the local scripts dir importable so we can pull in the shared
+# Pareto helper (M6 in OFFLINE_PIPELINE_AUDIT.md). This script can be
+# invoked either as ``python -m scripts.ingest_optimizer_results`` (in
+# which case ``_pareto`` is already on the package path) or as a plain
+# script, which is why we add the directory explicitly.
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from _pareto import compute_pareto_mask  # noqa: E402  (path setup above)
 
 
 def _to_sync_url(url: str) -> str:
@@ -84,25 +93,12 @@ def _get_database_url() -> str:
 def _compute_pareto(df: pd.DataFrame) -> pd.Series:
     """Return a boolean Series marking Pareto-optimal rows (Sharpe vs max DD).
 
-    A config is Pareto-optimal if no other config has both higher Sharpe
-    AND lower (less negative) max drawdown.
+    Thin wrapper around :func:`_pareto.compute_pareto_mask` (the single
+    canonical implementation, see M6 in ``OFFLINE_PIPELINE_AUDIT.md``).
+    The wrapper is preserved so existing callers and tests that import
+    ``_compute_pareto`` continue to work.
     """
-    is_pareto = np.ones(len(df), dtype=bool)
-    sharpe = df["sharpe"].values
-    dd = df["max_dd_pct"].values
-
-    for i in range(len(df)):
-        if not is_pareto[i]:
-            continue
-        for j in range(len(df)):
-            if i == j or not is_pareto[j]:
-                continue
-            if sharpe[j] >= sharpe[i] and dd[j] <= dd[i]:
-                if sharpe[j] > sharpe[i] or dd[j] < dd[i]:
-                    is_pareto[i] = False
-                    break
-
-    return pd.Series(is_pareto, index=df.index)
+    return compute_pareto_mask(df)
 
 
 # Column name mappings from CSV to DB
@@ -182,44 +178,17 @@ def ingest_results(
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_id = f"run_{ts}_{uuid.uuid4().hex[:6]}"
 
-    # Insert optimizer_runs row
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO optimizer_runs
-                (run_id, run_name, optimizer_mode, started_at, finished_at,
-                 num_configs, status, metadata)
-            VALUES
-                (:run_id, :run_name, :mode, now(), now(),
-                 :num_configs, 'completed', :metadata)
-        """), {
-            "run_id": run_id,
-            "run_name": run_name,
-            "mode": optimizer_mode,
-            "num_configs": len(df),
-            "metadata": json.dumps({"content_hash": content_hash}),
-        })
-
-    # Prepare results rows
+    # Prepare results rows up-front so a parsing error aborts BEFORE we
+    # write anything to PostgreSQL.
     all_cols = _CONFIG_COLUMNS + _METRIC_COLUMNS + ["is_pareto"]
     present_cols = [c for c in all_cols if c in df.columns]
     insert_df = df[present_cols].copy()
     insert_df["run_id"] = run_id
-
-    # Replace NaN with None for DB
     insert_df = insert_df.where(pd.notna(insert_df), None)
 
-    # Bulk insert using pandas
-    print(f"Inserting {len(insert_df):,} results into optimizer_results ...", flush=True)
-    insert_df.to_sql(
-        "optimizer_results",
-        engine,
-        if_exists="append",
-        index=False,
-        method="multi",
-        chunksize=1000,
-    )
-
-    # Ingest walk-forward results if provided
+    # Optionally prepare walk-forward rows BEFORE opening the transaction
+    # so any parsing failure aborts cleanly without touching the DB.
+    wf_df_to_insert: pd.DataFrame | None = None
     if walkforward_csv and Path(walkforward_csv).exists():
         wf_df = pd.read_csv(walkforward_csv)
         print(f"Ingesting {len(wf_df):,} walk-forward results ...", flush=True)
@@ -258,9 +227,46 @@ def ingest_results(
             "train_trades", "test_trades", "decay_ratio",
         }]
         if wf_db_cols:
-            wf_df[wf_db_cols].to_sql(
+            wf_df_to_insert = wf_df[wf_db_cols]
+
+    # H2 fix: wrap optimizer_runs INSERT, optimizer_results bulk insert,
+    # and optional optimizer_walkforward insert in a SINGLE transaction so
+    # we never end up with a parent run row whose children are missing.
+    # If any of the three writes raises, the whole tree is rolled back and
+    # the duplicate-detection guard at the top of this function will not
+    # block a retry (no run row exists).
+    print(f"Inserting {len(insert_df):,} results into optimizer_results ...", flush=True)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO optimizer_runs
+                (run_id, run_name, optimizer_mode, started_at, finished_at,
+                 num_configs, status, metadata)
+            VALUES
+                (:run_id, :run_name, :mode, now(), now(),
+                 :num_configs, 'completed', :metadata)
+        """), {
+            "run_id": run_id,
+            "run_name": run_name,
+            "mode": optimizer_mode,
+            "num_configs": len(df),
+            "metadata": json.dumps({"content_hash": content_hash}),
+        })
+
+        # to_sql accepts a SQLAlchemy Connection so the inserts share the
+        # same in-flight transaction as the optimizer_runs INSERT above.
+        insert_df.to_sql(
+            "optimizer_results",
+            conn,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=1000,
+        )
+
+        if wf_df_to_insert is not None:
+            wf_df_to_insert.to_sql(
                 "optimizer_walkforward",
-                engine,
+                conn,
                 if_exists="append",
                 index=False,
                 method="multi",

@@ -271,20 +271,39 @@ def predict_xgb(
 # SERIALIZATION
 # ===================================================================
 
-def save_model(models: dict[str, Any], path: Path) -> None:
+def save_model(
+    models: dict[str, Any],
+    path: Path,
+    *,
+    model_type: str = "xgb_entry_v1",
+) -> None:
     """Save XGBoost models to a directory (two .json booster files + metadata).
 
     Uses the native Booster serialization to avoid sklearn wrapper issues.
 
     Parameters
     ----------
-    models : dict returned by ``train_xgb_models``.
-    path   : directory to save into (created if absent).
+    models : dict
+        Output of ``train_xgb_models`` / ``_fit_full_after_early_stopping``.
+    path : Path
+        Directory to save into (created if absent).
+    model_type : str
+        Model type stamp written into ``metadata.json`` so live inference can
+        select the correct semantics.  Acceptable values:
+
+        - ``"xgb_v1"``: original ``hit_tp50`` classifier (legacy main path).
+        - ``"xgb_entry_v1"``: hold-based ``hit_tp50`` entry classifier.
+        - ``"xgb_entry_v2"``: loss-avoidance entry model where the
+          classifier predicts ``P(big_loss)`` (probability semantics are
+          inverted at inference time).
+
+    See C5 in OFFLINE_PIPELINE_AUDIT.md for why the stamp is required.
     """
     path.mkdir(parents=True, exist_ok=True)
     models["classifier"].get_booster().save_model(str(path / "classifier.json"))
     models["regressor"].get_booster().save_model(str(path / "regressor.json"))
     meta = {
+        "model_type": model_type,
         "feature_names": models["feature_names"],
         "cls_params": models["cls_params"],
         "reg_params": models["reg_params"],
@@ -476,10 +495,113 @@ def _max_drawdown(pnls: list[float]) -> float:
 # TRAIN FINAL MODEL (on all data)
 # ===================================================================
 
-def train_final_model(df: pd.DataFrame) -> dict[str, Any]:
-    """Train XGBoost on the full dataset (no holdout).
+def _fit_full_after_early_stopping(
+    *,
+    X_full: pd.DataFrame,
+    y_cls_full: pd.Series,
+    y_pnl_full: pd.Series,
+    cls_params: dict | None,
+    reg_params: dict | None,
+) -> dict[str, Any]:
+    """Train on 90% with early stopping, then refit on 100% with locked rounds.
 
-    Uses a 90/10 split internally for early stopping only.
+    The two-step recipe addresses C2 in OFFLINE_PIPELINE_AUDIT.md: the
+    legacy implementation trained only on the first 90% of chronology and
+    used the most-recent 10% as an early-stopping holdout that was never
+    re-incorporated.  The shipped booster therefore missed the most-recent
+    decile -- exactly the period whose distribution is most relevant to
+    live inference.
+
+    Step 1 fits with early stopping to discover ``best_iteration``.
+    Step 2 refits on the full dataset with ``n_estimators`` locked to the
+    best iteration and **no** ``eval_set`` (early stopping is disabled).
+
+    Parameters
+    ----------
+    X_full, y_cls_full, y_pnl_full:
+        Time-sorted full training matrix and targets.
+    cls_params, reg_params:
+        Optional overrides forwarded to ``train_xgb_models``.
+
+    Returns
+    -------
+    dict
+        Same shape as ``train_xgb_models`` output, but the returned
+        boosters were fit on every row in ``X_full``.  Adds
+        ``best_iteration_classifier`` / ``best_iteration_regressor`` keys
+        to record what early stopping chose; ``trained_rows`` records the
+        number of rows seen during the final fit so callers (and tests)
+        can verify no holdout was left out.
+    """
+    val_split = int(len(X_full) * 0.9)
+    X_train = X_full.iloc[:val_split]
+    y_cls_train = y_cls_full.iloc[:val_split]
+    y_pnl_train = y_pnl_full.iloc[:val_split]
+    X_val = X_full.iloc[val_split:]
+    y_cls_val = y_cls_full.iloc[val_split:]
+    y_pnl_val = y_pnl_full.iloc[val_split:]
+
+    # Step 1: discover best_iteration via early stopping on the 90/10 split.
+    es_models = train_xgb_models(
+        X_train, y_cls_train, y_pnl_train,
+        X_val, y_cls_val, y_pnl_val,
+        cls_params=cls_params,
+        reg_params=reg_params,
+    )
+
+    def _resolve_best(model: Any, default: int) -> int:
+        # XGBoost surfaces best_iteration after EarlyStopping fires; on
+        # tiny synthetic test data the callback may never trip and the
+        # attribute is absent.  Fall back to the configured n_estimators
+        # so the refit still trains on the full dataset.
+        booster = getattr(model, "get_booster", lambda: None)()
+        if booster is not None and hasattr(booster, "best_iteration"):
+            return int(booster.best_iteration) + 1
+        if hasattr(model, "best_iteration") and model.best_iteration is not None:
+            return int(model.best_iteration) + 1
+        return default
+
+    best_n_cls = _resolve_best(es_models["classifier"], DEFAULT_CLS_PARAMS["n_estimators"])
+    best_n_reg = _resolve_best(es_models["regressor"], DEFAULT_REG_PARAMS["n_estimators"])
+
+    # Step 2: refit on the full dataset with the discovered iteration count
+    # and *no* early stopping (no eval_set) -- this is the conventional
+    # XGBoost recipe for "use early stopping to choose hyperparams, train
+    # final model on all data".
+    final_cls_params = {
+        **DEFAULT_CLS_PARAMS,
+        **(cls_params or {}),
+        "n_estimators": best_n_cls,
+        "early_stopping_rounds": None,
+    }
+    final_reg_params = {
+        **DEFAULT_REG_PARAMS,
+        **(reg_params or {}),
+        "n_estimators": best_n_reg,
+        "early_stopping_rounds": None,
+    }
+    final_models = train_xgb_models(
+        X_full, y_cls_full, y_pnl_full,
+        cls_params=final_cls_params,
+        reg_params=final_reg_params,
+    )
+    final_models["best_iteration_classifier"] = best_n_cls
+    final_models["best_iteration_regressor"] = best_n_reg
+    final_models["trained_rows"] = len(X_full)
+    return final_models
+
+
+def train_final_model(df: pd.DataFrame) -> dict[str, Any]:
+    """Train XGBoost on the full dataset using the two-step recipe.
+
+    Step 1: 90% / 10% chronological split, train classifier + regressor with
+    early stopping to discover ``best_iteration`` for each booster.
+    Step 2: refit on **all 100%** of rows with ``n_estimators`` locked to the
+    discovered best iteration and no early-stopping callback.
+
+    The 10% holdout is therefore used only for hyperparameter (round-count)
+    selection; the shipped booster sees every training row.  See C2 in
+    OFFLINE_PIPELINE_AUDIT.md for context on the prior 90/10-only behaviour.
 
     Parameters
     ----------
@@ -487,24 +609,18 @@ def train_final_model(df: pd.DataFrame) -> dict[str, Any]:
 
     Returns
     -------
-    dict with trained models and metadata.
+    dict with trained models and metadata, including ``trained_rows`` and
+    the per-booster ``best_iteration_*`` values discovered in step 1.
     """
     df_sorted = df.sort_values("day").reset_index(drop=True)
     X_full, y_tp50, y_pnl = build_feature_matrix(df_sorted)
-
-    val_split = int(len(X_full) * 0.9)
-    X_train = X_full.iloc[:val_split]
-    y_tp50_train = y_tp50.iloc[:val_split]
-    y_pnl_train = y_pnl.iloc[:val_split]
-    X_val = X_full.iloc[val_split:]
-    y_tp50_val = y_tp50.iloc[val_split:]
-    y_pnl_val = y_pnl.iloc[val_split:]
-
-    models = train_xgb_models(
-        X_train, y_tp50_train, y_pnl_train,
-        X_val, y_tp50_val, y_pnl_val,
+    return _fit_full_after_early_stopping(
+        X_full=X_full,
+        y_cls_full=y_tp50,
+        y_pnl_full=y_pnl,
+        cls_params=None,
+        reg_params=None,
     )
-    return models
 
 
 # ===================================================================
@@ -698,6 +814,14 @@ def walk_forward_rolling(
     all_test_preds: list[pd.DataFrame] = []
     all_test_labels: list[pd.Series] = []
     all_test_pnls: list[pd.Series] = []
+    # Pool VAL predictions across windows; threshold tuning operates on
+    # val data only so the chosen threshold is independent of any test
+    # row.  See C3 in OFFLINE_PIPELINE_AUDIT.md -- the prior implementation
+    # picked the threshold that maximised pooled OOS test PnL, which is a
+    # textbook test-set selection bias.
+    all_val_preds: list[pd.DataFrame] = []
+    all_val_labels: list[pd.Series] = []
+    all_val_pnls: list[pd.Series] = []
     win_idx = 0
 
     train_start = first_day
@@ -735,6 +859,8 @@ def walk_forward_rolling(
         )
         elapsed = time.time() - t0
 
+        # Predict on both val (for threshold tuning) and test (for OOS metrics).
+        val_preds = predict_xgb(models, X_val)
         preds = predict_xgb(models, X_test)
         y_pred_prob = preds["prob_tp50"].values
         y_pred_pnl = preds["predicted_pnl"].values
@@ -756,6 +882,7 @@ def walk_forward_rolling(
             "window": win_idx,
             "train_count": len(train_df),
             "test_count": len(test_df),
+            "val_count": len(X_val),
             "train_days": f"{train_df['day'].iloc[0]} .. {train_df['day'].iloc[-1]}",
             "test_days": f"{test_df['day'].iloc[0]} .. {test_df['day'].iloc[-1]}",
             "train_time_s": elapsed,
@@ -770,6 +897,9 @@ def walk_forward_rolling(
         all_test_preds.append(preds)
         all_test_labels.append(y_cls_test)
         all_test_pnls.append(y_pnl_test)
+        all_val_preds.append(val_preds)
+        all_val_labels.append(y_cls_val)
+        all_val_pnls.append(y_pnl_val)
         win_idx += 1
         train_start += relativedelta(months=step_months)
 
@@ -780,15 +910,20 @@ def walk_forward_rolling(
     pooled_labels = np.concatenate([l.values for l in all_test_labels])
     pooled_pnls = np.concatenate([p.values for p in all_test_pnls])
 
+    pooled_val_probs = np.concatenate([p["prob_tp50"].values for p in all_val_preds])
+    pooled_val_labels = np.concatenate([l.values for l in all_val_labels])
+    pooled_val_pnls = np.concatenate([p.values for p in all_val_pnls])
+
     agg_brier = brier_score_loss(pooled_labels, pooled_probs)
     agg_mae = float(np.mean(np.abs(pooled_pnls - np.concatenate([p["predicted_pnl"].values for p in all_test_preds]))))
     agg_calibration = _calibration_by_decile(pooled_labels, pooled_probs)
 
-    # Threshold tuning on pooled test predictions.
+    # Threshold tuning runs on pooled VAL predictions only.
     # For V1 (TP50 classifier): take when prob >= thr (higher = better).
     # For V2 (loss classifier): take when prob < thr (lower = safer).
-    # Detect direction from mean label: if > 0.5, classifier predicts "good" (V1 style).
-    label_mean = float(pooled_labels.mean())
+    # Detect direction from val labels (not test) so that the entire
+    # threshold-selection pipeline is a function of train/val data only.
+    label_mean = float(pooled_val_labels.mean()) if len(pooled_val_labels) else 0.5
     higher_is_better = label_mean > 0.5
 
     if higher_is_better:
@@ -796,36 +931,73 @@ def walk_forward_rolling(
     else:
         thr_range = [0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50]
 
-    threshold_results = []
+    threshold_results: list[dict[str, Any]] = []
     for thr in thr_range:
-        mask = pooled_probs >= thr if higher_is_better else pooled_probs < thr
-        n_taken = int(mask.sum())
-        if n_taken == 0:
-            threshold_results.append({"threshold": thr, "trades_taken": 0, "win_rate": 0.0,
-                                      "avg_pnl": 0.0, "total_pnl": 0.0})
-            continue
-        win_rate = float((pooled_pnls[mask] > 0).mean())
-        avg_pnl = float(pooled_pnls[mask].mean())
-        total_pnl = float(pooled_pnls[mask].sum())
-        threshold_results.append({"threshold": thr, "trades_taken": n_taken, "win_rate": win_rate,
-                                  "avg_pnl": avg_pnl, "total_pnl": total_pnl})
+        # Per-threshold val statistics drive selection (NO test data here).
+        val_mask = pooled_val_probs >= thr if higher_is_better else pooled_val_probs < thr
+        n_val_taken = int(val_mask.sum())
+        if n_val_taken == 0:
+            val_total_pnl = 0.0
+            val_avg_pnl = 0.0
+            val_win_rate = 0.0
+        else:
+            val_pnl_subset = pooled_val_pnls[val_mask]
+            val_total_pnl = float(val_pnl_subset.sum())
+            val_avg_pnl = float(val_pnl_subset.mean())
+            val_win_rate = float((val_pnl_subset > 0).mean())
 
-    best_thr = max(threshold_results, key=lambda x: x["total_pnl"])
+        # Diagnostic test-side counters at the same threshold so operators
+        # can see how the locked threshold performs OOS.  These are NOT
+        # used for selection.
+        test_mask = pooled_probs >= thr if higher_is_better else pooled_probs < thr
+        n_test_taken = int(test_mask.sum())
+        if n_test_taken == 0:
+            test_avg_pnl = 0.0
+            test_total_pnl = 0.0
+            test_win_rate = 0.0
+        else:
+            test_pnl_subset = pooled_pnls[test_mask]
+            test_total_pnl = float(test_pnl_subset.sum())
+            test_avg_pnl = float(test_pnl_subset.mean())
+            test_win_rate = float((test_pnl_subset > 0).mean())
+
+        threshold_results.append({
+            "threshold": thr,
+            # Selection-relevant (val-only) numbers.
+            "val_trades_taken": n_val_taken,
+            "val_win_rate": val_win_rate,
+            "val_avg_pnl": val_avg_pnl,
+            "val_total_pnl": val_total_pnl,
+            # Diagnostic test-side numbers reported back at the same threshold.
+            "trades_taken": n_test_taken,
+            "win_rate": test_win_rate,
+            "avg_pnl": test_avg_pnl,
+            "total_pnl": test_total_pnl,
+        })
+
+    # Selection: maximise val total PnL (NOT test).  Ties go to the lower
+    # threshold for determinism.
+    best_thr = max(
+        threshold_results,
+        key=lambda x: (x["val_total_pnl"], -x["threshold"]),
+    )
 
     return {
         "windows": windows,
         "n_windows": len(windows),
         "pooled_test_count": len(pooled_labels),
+        "pooled_val_count": len(pooled_val_labels),
         "aggregated_metrics": {
             "brier_score": agg_brier,
             "mae_pnl": agg_mae,
-            "tp50_rate": float(pooled_labels.mean()),
-            "expectancy": float(pooled_pnls.mean()),
+            "tp50_rate": float(pooled_labels.mean()) if len(pooled_labels) else 0.0,
+            "expectancy": float(pooled_pnls.mean()) if len(pooled_pnls) else 0.0,
             "max_drawdown": _max_drawdown(pooled_pnls.tolist()),
             "calibration_by_decile": agg_calibration,
         },
         "threshold_tuning": threshold_results,
         "recommended_threshold": best_thr["threshold"],
+        "recommended_threshold_source": "val_pool",
     }
 
 
@@ -1308,7 +1480,7 @@ def _run_tp50(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> Non
     final = train_final_model(df)
 
     save_dir = Path(save_dir_arg) if save_dir_arg else csv_path.parent / "xgb_model"
-    save_model(final, save_dir)
+    save_model(final, save_dir, model_type="xgb_v1")
     print(f"[XGB] Model saved to {save_dir}/")
     print("[XGB] Done.")
 
@@ -1447,18 +1619,28 @@ def _run_entry(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) -> No
 
     print(f"\n{'=' * 70}")
 
-    # Train final model on all data and save
+    # Train final model on all data and save.  Two-step recipe (see
+    # train_final_model docstring): early-stopping calibration on 90/10 to
+    # discover best_iteration, then refit on the full 100% with the round
+    # count locked.  Previously this fit only on the first 90%, leaving the
+    # most-recent decile out of the shipped booster (see C2 in
+    # OFFLINE_PIPELINE_AUDIT.md).
     print("\n[ENTRY] Training final model on all data ...")
     df_sorted_all = df.sort_values("day").reset_index(drop=True)
     X_full, y_cls, y_pnl = build_entry_feature_matrix(df_sorted_all)
-    val_split = int(len(X_full) * 0.9)
-    models = train_xgb_models(
-        X_full.iloc[:val_split], y_cls.iloc[:val_split], y_pnl.iloc[:val_split],
-        X_full.iloc[val_split:], y_cls.iloc[val_split:], y_pnl.iloc[val_split:],
+    models = _fit_full_after_early_stopping(
+        X_full=X_full,
+        y_cls_full=y_cls,
+        y_pnl_full=y_pnl,
+        cls_params=None,
+        reg_params=None,
     )
     save_dir = Path(save_dir_arg) if save_dir_arg else csv_path.parent / "xgb_entry_model"
-    save_model(models, save_dir)
-    print(f"[ENTRY] Model saved to {save_dir}/")
+    save_model(models, save_dir, model_type="xgb_entry_v1")
+    print(f"[ENTRY] Model saved to {save_dir}/ "
+          f"(trained_rows={models['trained_rows']}, "
+          f"best_cls={models['best_iteration_classifier']}, "
+          f"best_reg={models['best_iteration_regressor']})")
     print("[ENTRY] Done.")
 
 
@@ -1542,19 +1724,25 @@ def _run_entry_v2(df: pd.DataFrame, csv_path: Path, save_dir_arg: str | None) ->
 
     print(f"\n{'=' * 70}")
 
-    # Train final model and save
+    # Train final model and save using the two-step recipe (see C2 in
+    # OFFLINE_PIPELINE_AUDIT.md).  v2_cls_params is forwarded so the
+    # asymmetric scale_pos_weight is preserved on the refit.
     print("\n[ENTRY-V2] Training final model on all data ...")
     df_sorted = df.sort_values("day").reset_index(drop=True)
     X_full, y_cls, y_pnl = build_entry_v2_feature_matrix(df_sorted)
-    val_split = int(len(X_full) * 0.9)
-    models = train_xgb_models(
-        X_full.iloc[:val_split], y_cls.iloc[:val_split], y_pnl.iloc[:val_split],
-        X_full.iloc[val_split:], y_cls.iloc[val_split:], y_pnl.iloc[val_split:],
+    models = _fit_full_after_early_stopping(
+        X_full=X_full,
+        y_cls_full=y_cls,
+        y_pnl_full=y_pnl,
         cls_params=v2_cls_params,
+        reg_params=None,
     )
     save_dir = Path(save_dir_arg) if save_dir_arg else csv_path.parent / "xgb_entry_v2_model"
-    save_model(models, save_dir)
-    print(f"[ENTRY-V2] Model saved to {save_dir}/")
+    save_model(models, save_dir, model_type="xgb_entry_v2")
+    print(f"[ENTRY-V2] Model saved to {save_dir}/ "
+          f"(trained_rows={models['trained_rows']}, "
+          f"best_cls={models['best_iteration_classifier']}, "
+          f"best_reg={models['best_iteration_regressor']})")
     print("[ENTRY-V2] Done.")
 
 
