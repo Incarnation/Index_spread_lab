@@ -4,9 +4,23 @@ Long-term reference for the 13 offline-pipeline scripts under `backend/scripts/`
 121 GB `data/` tree. Captures the findings of a deep readonly audit performed
 2026-04-16 and structures the fix work as Waves 0–5.
 
-> **Status**: Wave 0 complete (this document).
+> **Status**: Waves 0-5 landed in commit `6093bf6` (2026-04-16). Audit
+> documentation sweep landing in the gap-closure follow-up; small open
+> findings (M3, M8, M9, M12) and the three monolith splits remain in
+> progress. M5 and M11 deferred -- see "Future work" section.
 > See [`.cursor/plans/track_b_offline_audit_fixes_73d0812a.plan.md`](../../.cursor/plans/track_b_offline_audit_fixes_73d0812a.plan.md)
-> for the work-tracking plan.
+> for the original work-tracking plan and
+> [`.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md`](../../.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md)
+> for the follow-up gap-closure plan.
+
+> **Line-number convention.** All `file:NNN` citations in this document
+> reflect the source state at audit time (commit predecessor of
+> `6093bf6`). Files have shifted line counts as Waves 1-5 landed (and
+> will shift more as the monolith splits land). Treat the file path as
+> authoritative and the line number as a "search hint" -- locate the
+> referenced symbol/string in the current file rather than trusting the
+> exact line. The Future work section at the end of this doc tracks
+> when this convention can be retired.
 
 ---
 
@@ -109,7 +123,8 @@ Wave 1 must address all five.
 |-------|-------|
 | **Severity** | CRITICAL |
 | **Wave** | 1 (immediate); permanent fix in 5 (shared evaluator) |
-| **Status** | open |
+| **Status** | fixed in Wave 5 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 **Description.** The convention everywhere outside the live event detector is
 `term_structure = vix9d / vix`. `term_inversion` then fires when the ratio
@@ -172,7 +187,8 @@ under the inverted-signal regime).
 |-------|-------|
 | **Severity** | CRITICAL |
 | **Wave** | 1 |
-| **Status** | open |
+| **Status** | fixed in Wave 1 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 **Description.** [`backend/scripts/xgb_model.py:479-506`](xgb_model.py)
 `train_final_model` docstring says *"Train XGBoost on the full dataset (no
@@ -221,7 +237,8 @@ all rows by re-evaluating training error on the full set).
 |-------|-------|
 | **Severity** | CRITICAL |
 | **Wave** | 1 |
-| **Status** | open |
+| **Status** | fixed in Wave 1 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 **Description.** [`backend/scripts/xgb_model.py:787-828`](xgb_model.py)
 `walk_forward_rolling` pools every fold's OOS test prediction and selects the
@@ -234,20 +251,30 @@ inflated relative to what a real out-of-sample deployment would see. Any
 threshold-based decision rule trained this way will underperform when
 deployed.
 
-**Proposed fix.** Either:
+**Implemented fix.** Pool only the **validation slices** (the last 10% of
+each training window, see [`backend/scripts/xgb_model.py`](xgb_model.py)
+lines ~870-927) across all walk-forward windows. The recommended threshold
+is the argmax over that pooled-val pool (`val_total_pnl`, ties broken
+toward the lower threshold for determinism). **Test predictions are never
+seen by the threshold tuner**; per-threshold test counters are reported
+solely as diagnostics so operators can inspect how the locked threshold
+performs OOS.
 
-- Per-fold threshold selection on **train + val rows only** (locked in at fold
-  fit time), then evaluate test with that locked threshold; report metrics as
-  the average across folds with their respective locked thresholds, OR
-- Pool train+val from all folds for one global threshold, then evaluate each
-  fold's test with that single locked threshold.
+This is stricter than the original "train+val pool" suggestion because it
+also excludes the train rows the model was actually fit on, eliminating
+the in-sample optimism on the train side.
 
-Either approach removes test data from the threshold-selection objective.
+**Verification.** Two regression tests in
+[`backend/tests/test_xgb_model.py`](../tests/test_xgb_model.py)
+(`TestWalkForwardThresholdLeakage`) confirm:
 
-**Verification.** Regression test in
-[`backend/tests/test_xgb_model.py`](../tests/test_xgb_model.py) confirming the
-chosen threshold is **identical** with and without the test rows present in the
-input (i.e. the threshold is a function only of train/val rows).
+1. The chosen threshold is **identical** with vs without the test rows
+   present in the input (i.e. the threshold is a function only of
+   train/val rows).
+2. The chosen threshold and the entire selection JSON are
+   **byte-identical** when only pure-test rows change in any way --
+   ensuring no future refactor accidentally re-introduces test-set
+   leakage.
 
 ---
 
@@ -257,7 +284,8 @@ input (i.e. the threshold is a function only of train/val rows).
 |-------|-------|
 | **Severity** | CRITICAL |
 | **Wave** | 1 (assert + document); 5+ (full alignment when production switches) |
-| **Status** | open |
+| **Status** | fixed in Wave 1 (commit 6093bf6) -- hybrid path: startup assertion in generate_training_data.py |
+| **Resolved** | 2026-04-16 |
 
 **Description.** The training labeler hardcodes the SL trigger formula:
 
@@ -327,7 +355,8 @@ labeler and lets the pipeline read settings directly. Cost: relabeling
 |-------|-------|
 | **Severity** | CRITICAL |
 | **Wave** | 1 |
-| **Status** | open |
+| **Status** | fixed in Wave 1 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 **Description.** Two coupled defects in the inference contract that block
 safe deployment of an entry-v2 model:
@@ -402,7 +431,8 @@ are silent landmines.
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 1 |
-| **Status** | open |
+| **Status** | fixed in Wave 5 (commit 6093bf6) -- shared evaluator now enforces the guard for both live and backtest |
+| **Resolved** | 2026-04-16 |
 
 Live [`event_signals.py:140`](../spx_backend/services/event_signals.py)
 suppresses `spx_drop_2d` if `prev_spx_return_2d_gap_days > 4` (a "2-day
@@ -426,7 +456,8 @@ Wave 5 by extracting a shared `EventSignalEvaluator`.
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 2 |
-| **Status** | open |
+| **Status** | fixed in Wave 2 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 [`ingest_optimizer_results.py`](ingest_optimizer_results.py) writes:
 
@@ -455,7 +486,8 @@ the children writes (without re-inserting the run row).
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 2 |
-| **Status** | open |
+| **Status** | fixed in Wave 2 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 [`generate_training_data.py:2398-2410`](generate_training_data.py) cache
 manifest stores `code_version` (SHA-256 of script bytes) and `grid_hash`.
@@ -479,7 +511,8 @@ ultra-strict cache invalidation; default to mtime+size for performance.
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 2 |
-| **Status** | open |
+| **Status** | fixed in Wave 2 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 [`run_pipeline.py:147`](run_pipeline.py) hard-codes
 `data/walkforward_results.csv`. Multiple concurrent or sequential pipeline
@@ -499,7 +532,8 @@ together.
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 2 |
-| **Status** | open |
+| **Status** | fixed in Wave 2 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 [`generate_training_data.py:298-300`](generate_training_data.py):
 
@@ -524,7 +558,8 @@ no longer wall-clock and only exists for dedup tiebreaking.
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 2 (verify) |
-| **Status** | open |
+| **Status** | fixed in Wave 2 (commit 6093bf6) -- FRD SKEW parquet timestamp lagged to next session |
+| **Resolved** | 2026-04-16 |
 
 [`generate_training_data.py:2337-2338`](generate_training_data.py)
 `_generate_candidates_for_day` reads `skew_daily.get(day_date)` from
@@ -551,7 +586,8 @@ semantics:
 |-------|-------|
 | **Severity** | HIGH |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in Wave 3 (commit 6093bf6) -- 15+ new tables exported with PII redaction + chunked reads + atomic writes |
+| **Resolved** | 2026-04-16 |
 
 [`export_production_data.py:7-12`](export_production_data.py) docstring
 explicitly says *"Future ML re-entry will synthesize training rows directly
@@ -591,7 +627,8 @@ Parity drift, dedup-logic mismatches, dead code, hygiene.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in Wave 3 (commit 6093bf6) -- standardized to 'first' across regime_analysis.py |
+| **Resolved** | 2026-04-16 |
 
 - [`regime_analysis.py:80-88`](regime_analysis.py) `enrich_with_daily_features` aggregates per-day VIX/SPX with `last` (sorted by `entry_dt`).
 - [`backtest_strategy.py:672-687`](backtest_strategy.py) `precompute_daily_signals` uses `first`.
@@ -609,7 +646,8 @@ context).
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in Wave 3 (commit 6093bf6) -- decimal-fraction convention everywhere; bucket thresholds adjusted |
+| **Resolved** | 2026-04-16 |
 
 `regime_analysis.py` `prev_vix_pct_change` is in **percent** (e.g. 10 = 10%).
 Prod and backtest event configs use **decimal** (e.g. 0.15 = 15%). The script
@@ -647,7 +685,8 @@ Wave 5.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in Wave 3 (commit 6093bf6) |
+| **Resolved** | 2026-04-16 |
 
 [`backtest_strategy.py:127-142`](backtest_strategy.py) `PortfolioConfig`
 declares `max_margin_pct`, included in optimizer `_config_key` (lines
@@ -667,7 +706,7 @@ constraining position size.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 (deferred — design change) |
-| **Status** | open |
+| **Status** | deferred -- moved to Future work section |
 
 Live `record_trade(0.0)` at entry; PnL booked at close (per
 `portfolio_manager`). Backtest books **full row PnL on the entry day**
@@ -691,7 +730,8 @@ careful invariance check against current optimizer outputs.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 |
-| **Status** | open |
+| **Status** | fixed in Wave 5 (commit 6093bf6) -- single canonical implementation in backend/scripts/_pareto.py |
+| **Resolved** | 2026-04-16 |
 
 `extract_pareto_frontier` in
 [`backtest_strategy.py:2089-2105`](backtest_strategy.py) writes
@@ -710,7 +750,8 @@ consumers import.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 |
-| **Status** | open |
+| **Status** | fixed in Wave 5 (commit 6093bf6) -- shared evaluator in spx_backend/services/event_signals.py |
+| **Resolved** | 2026-04-16 |
 
 [`backtest_strategy.py:572-649`](backtest_strategy.py) is a parallel
 implementation of the prod `EventSignalDetector` in
@@ -767,7 +808,8 @@ sweep "drop magnitude" rather than just "drop threshold".
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in Wave 3 (commit 6093bf6) -- alignment-warn helper detects future config drift; both defaults are False today |
+| **Resolved** | 2026-04-16 |
 
 Live: `settings.decision_avoid_opex` (default `True`).
 Backtest: `TradingConfig.avoid_opex` (default `False`).
@@ -786,7 +828,7 @@ when the value differs from live.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 (model change) |
-| **Status** | open |
+| **Status** | deferred -- moved to Future work section |
 
 Live: `portfolio_max_trades_per_run` — multiple runs/day possible, cap
 applies per run. Backtest: `max_trades_per_day` only.
@@ -834,6 +876,8 @@ with a comment about the source.
 
 **Wave:** 3.
 
+**Status:** fixed in Wave 3 (commit 6093bf6) -- expanded to 2020-2030 frozenset.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L2 — Missing `data/README.md`
@@ -846,6 +890,8 @@ external, what the retention policy is, or how to safely clean up.
 command, retention policy, last-known-good size.
 
 **Wave:** 3.
+
+**Status:** fixed in Wave 3 (commit 6093bf6) -- 240-line README covering producer/consumer/safety per artifact + PII policy + cache invalidation.  **Resolved:** 2026-04-16.
 
 ---
 
@@ -861,6 +907,8 @@ ingesting or comparing runs.
 
 **Wave:** 3.
 
+**Status:** fixed in Wave 3 (commit 6093bf6) -- file moved to data/archive/optimizer_event_only_v1.csv; .gitignore now whitelists `!data/archive/**` (gap-closure Phase 1.4) and a small `data/archive/README.md` tombstone index documents what was archived and the marker-only convention for future archives > 10 MB.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L4 — Unused exports (`economic_events_export.csv` + `underlying_quotes_export.csv`)
@@ -874,6 +922,8 @@ training pipeline. Recommend dropping (the consumers already have
 preferred sources).
 
 **Wave:** 3.
+
+**Status:** fixed in Wave 3 (commit 6093bf6) -- legacy exports excluded from --tables all default.  **Resolved:** 2026-04-16.
 
 ---
 
@@ -890,6 +940,8 @@ settings.
 
 **Wave:** 3.
 
+**Status:** fixed in Wave 3 (commit 6093bf6) -- settings.databento_dir + _resolve_databento_dir helper.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L6 — `regime_utils.py` docstring is incorrect
@@ -902,6 +954,8 @@ The module docstring claims `regime_analysis.py` uses it. Grep confirms
 
 **Wave:** 3.
 
+**Status:** fixed in gap-closure Phase 1.3 -- docstring rewritten to list actual consumers (backtest_strategy, generate_training_data cache fingerprint, test_regime_utils) and clarify that regime_analysis.py is a future-adoption candidate, not a current importer.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L7 — `regime_utils.py` SPX/VIX edges differ from `regime_analysis.py`
@@ -913,6 +967,8 @@ The module docstring claims `regime_analysis.py` uses it. Grep confirms
 use the same edges.
 
 **Wave:** 3.
+
+**Status:** fixed in Wave 3 (commit 6093bf6) -- decimal-fraction unified everywhere; M2 consolidation.  **Resolved:** 2026-04-16.
 
 ---
 
@@ -928,6 +984,8 @@ the CSV.
 
 **Wave:** 3.
 
+**Status:** fixed in Wave 3 (commit 6093bf6) -- explicit sort by (day, entry_dt, spread_id) before write.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L9 — Non-atomic CSV writes in `export_production_data.py`
@@ -940,6 +998,8 @@ interpret as a complete file.
 
 **Wave:** 3.
 
+**Status:** fixed in Wave 3 (commit 6093bf6) -- atomic temp+rename for all CSV/Parquet writes.  **Resolved:** 2026-04-16.
+
 ---
 
 ### L10 — Optimizer rows non-deterministic under parallel runs
@@ -951,6 +1011,8 @@ comparing seq vs par — but the *output CSV* row order is non-deterministic.
 **Fix:** sort optimizer rows by `_config_key` before `df.to_csv(...)`.
 
 **Wave:** 3.
+
+**Status:** fixed in Wave 3 (commit 6093bf6) -- deterministic sort by `_config_key` before write.  **Resolved:** 2026-04-16.
 
 ---
 
@@ -1027,6 +1089,37 @@ comparing seq vs par — but the *output CSV* row order is non-deterministic.
 
 ---
 
+## Future work (deferred from main audit)
+
+These findings were reviewed and intentionally not fixed in the main
+audit waves because each requires a design-level decision rather than a
+mechanical fix. Tracked here so they remain visible without blocking the
+audit doc from being marked complete.
+
+### M5 — PnL timing mismatch (entry-day vs exit-day)
+
+**Why deferred.** Choosing entry-day vs exit-day attribution materially
+changes how every downstream Sharpe/DD metric is computed and how live
+P&L is reconciled against the broker. Operator-level decision; not a
+correctness bug under either convention.
+
+**Trigger to revisit.** When daily P&L attribution is added to the
+operator dashboard, OR when an MTM-based reporting layer is introduced
+that requires a single canonical timing convention.
+
+### M11 — Per-run vs per-day cap mismatch
+
+**Why deferred.** Backtest enforces caps per simulated *run*; live
+enforces per *trading day*. Aligning these requires deciding whether
+backtest should mimic live's daily semantics (changes optimizer search
+space) or live should switch to per-run accounting (riskier).
+
+**Trigger to revisit.** When the optimizer's daily-cap dimension shows
+material disagreement between backtest-Sharpe and live-Sharpe on the
+same parameter set.
+
+---
+
 ## Glossary
 
 - **CBBO**: Consolidated Best Bid Offer (Databento OPRA schema).
@@ -1052,3 +1145,10 @@ comparing seq vs par — but the *output CSV* row order is non-deterministic.
 for the work-tracking plan and
 [`.cursor/plans/backend_e2e_tracks_v2_5614035a.plan.md`](../../.cursor/plans/backend_e2e_tracks_v2_5614035a.plan.md)
 for the Track B section it supersedes.*
+
+*Status sweep + small-finding closure landed via the gap-closure plan
+[`.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md`](../../.cursor/plans/offline-pipeline-gap-closure_d993da3d.plan.md).
+File-path citations remain authoritative; line numbers reflect the
+audit-time snapshot (pre-`6093bf6`) and are intentionally not refreshed
+on every commit -- search for the referenced symbol in the current file
+instead.*

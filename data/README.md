@@ -15,7 +15,7 @@ exporter, cache, or pipeline output.
 
 | Path                                     | Producer (script)                                      | Consumer(s)                                                | Format            | Safe to delete?                                            |
 | ---------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------- | ----------------- | ---------------------------------------------------------- |
-| `archive/`                               | manual (one-time tombstones)                           | --                                                         | mixed             | yes (historical only)                                      |
+| `archive/`                               | manual (supersession tombstones; see `archive/README.md`) | --                                                       | mixed             | yes (historical only)                                      |
 | `backtest_results.csv`                   | `scripts/backtest_strategy.py`                         | `scripts/ingest_optimizer_results.py`, manual review       | CSV               | yes (rerun backtest to regenerate)                         |
 | `candidates_cache/<YYYYMMDD>.parquet`    | `scripts/generate_training_data.py` (per-day cache)    | same script (next run skips already-cached days)           | Parquet           | yes (slow rebuild — entire history will be re-ingested)    |
 | `context_snapshots_export.csv`           | `scripts/export_production_data.py --tables context_snapshots` | `scripts/generate_training_data.py`, regime + GEX joins   | CSV               | yes (rerun exporter)                                       |

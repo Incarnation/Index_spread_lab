@@ -34,9 +34,12 @@ frontend/.vite/
 *.sqlite
 *.sqlite3
 *.parquet
-# Ignore everything inside data/ EXCEPT the README documentation
-# tombstone.  Use ``data/*`` (not ``data/``) so git still recurses
-# into the directory and the negation below can take effect.
+# Ignore everything inside data/ EXCEPT the README documentation and
+# the ``archive/`` subtree of historical "tombstone" CSVs we still want
+# to track for forensics. Use ``data/*`` (not ``data/``) so git still
+# recurses into the directory and the negations below can take effect.
 data/*
 !data/README.md
+!data/archive/
+!data/archive/**
 

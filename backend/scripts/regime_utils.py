@@ -1,21 +1,35 @@
-"""Shared regime classification utilities for backtest and analysis tools.
+"""Shared regime classification utilities for backtest tooling.
 
 Provides a lightweight day-level regime tagger that assigns each trading
 day to one bucket per dimension (VIX level, SPX move, term structure).
-Used by both ``backtest_strategy.py`` (per-backtest regime metrics) and
-``regime_analysis.py`` (standalone exploration).
+
+**Current consumers** (verified via grep, last refreshed 2026-04-16):
+
+- ``backend/scripts/backtest_strategy.py`` -- imports
+  :func:`compute_regime_metrics` for per-backtest regime metric tables.
+- ``backend/scripts/generate_training_data.py`` -- only reads this file
+  for cache-key fingerprinting (it never imports the symbols), so a
+  bug-fix here invalidates the candidate cache for that day. See L6 in
+  ``OFFLINE_PIPELINE_AUDIT.md``.
+- ``backend/tests/test_regime_utils.py`` -- unit tests added in Wave 4.
+
+``regime_analysis.py`` was the historical second consumer and remains a
+**candidate** for adoption (the L6 follow-up in
+``OFFLINE_PIPELINE_AUDIT.md``), but it currently rolls its own
+classification logic. Aligning the two is intentionally out of scope
+until ``regime_analysis.py`` is part of an end-to-end pipeline.
 
 All percentage-change inputs use the **decimal-fraction** convention
-(``-0.01`` = 1% drop) so this module is interchangeable across:
+(``-0.01`` = 1% drop) so the helpers here are interchangeable across:
 
 - ``backtest_strategy.precompute_daily_signals`` (decimal)
 - ``regime_analysis.enrich_with_daily_features`` (decimal after the
-  M2 unification — see OFFLINE_PIPELINE_AUDIT.md)
+  M2 unification -- see ``OFFLINE_PIPELINE_AUDIT.md``)
 - ``services.event_signals`` runtime context (decimal)
 
-Pass ``prev_spx_return`` and ``term_structure`` directly from any of
-the above without unit conversion.  See OFFLINE_PIPELINE_AUDIT.md
-for the broader unit-consistency story.
+Pass ``prev_spx_return`` and ``term_structure`` directly from any of the
+above without unit conversion. See ``OFFLINE_PIPELINE_AUDIT.md`` for the
+broader unit-consistency story.
 """
 from __future__ import annotations
 
