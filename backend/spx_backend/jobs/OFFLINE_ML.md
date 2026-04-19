@@ -1,12 +1,12 @@
 # Offline ML Re-entry Contract
 
 > **Purpose.** Define the end-to-end contract between the offline ML
-> training pipeline and the live decision job (`_run_portfolio_managed`)
+> training pipeline and the live decision job (`_run`)
 > so a future XGBoost re-activation lands cleanly. Authored as part of
 > Wave 5 in [`backend/scripts/OFFLINE_PIPELINE_AUDIT.md`](../../scripts/OFFLINE_PIPELINE_AUDIT.md).
 > See C5 in that audit for the underlying defects this contract closes.
 
-The current production decision path (`decision_job._run_portfolio_managed`)
+The current production decision path (`decision_job._run`)
 is **portfolio-managed** with no ML scoring layer: candidates are ranked
 by `credit_to_width`, capped by `PortfolioManager`, and filtered by
 event signals from `services/event_signals.py`. ML re-entry is an
@@ -36,7 +36,7 @@ This contract covers the boundary between:
 > -- callers that still `from xgb_model import ...` keep working --
 > but new code should import from the package paths above.
 
-The decision job itself (`_run_portfolio_managed`) is **not** modified by
+The decision job itself (`_run`) is **not** modified by
 this contract today. The hooks below describe the smallest patch that
 re-activates ML scoring without changing the portfolio-management,
 event-signal, or dedupe semantics.
@@ -165,7 +165,7 @@ listed below (sourced from `xgb_model._add_v2_features`):
 
 The `vix_change_1d` and `recent_loss_rate_5d` values are **caller-supplied**
 because the inference path does not have direct access to history. The
-re-entry hook in `_run_portfolio_managed` (see §5) is where these
+re-entry hook in `_run` (see §5) is where these
 values must be sourced from.
 
 ### 4.2 Inference (`predict_xgb_entry`)
@@ -196,9 +196,9 @@ of "high score" differs across models.
 
 ---
 
-## 5. Re-entry hook in `_run_portfolio_managed`
+## 5. Re-entry hook in `_run`
 
-Today, `_run_portfolio_managed` ranks candidates by
+Today, `_run` ranks candidates by
 `credit_to_width` and skips ML entirely. The minimal patch to wire ML
 back in is:
 
@@ -252,7 +252,7 @@ Before flipping a new model to `is_active=TRUE` in production:
 - [ ] Upload was performed via `python -m scripts.upload_xgb_model …`
       (so `algorithm` and `model_payload.model_type` agree).
 - [ ] Shadow-mode review: with the model uploaded but
-      `is_active=FALSE`, run `_run_portfolio_managed` (or a forecast
+      `is_active=FALSE`, run `_run` (or a forecast
       job) for at least one full trading week and diff the proposed
       ranking against the credit-to-width ranking. Investigate any
       candidate whose ML rank differs by more than 3 positions.

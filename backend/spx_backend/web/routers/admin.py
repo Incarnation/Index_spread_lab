@@ -18,13 +18,6 @@ from spx_backend.jobs.quote_job import QuoteJob, build_quote_job
 from spx_backend.jobs.snapshot_job import SnapshotJob, _parse_expirations, build_snapshot_job
 from spx_backend.jobs.trade_pnl_job import TradePnlJob, build_trade_pnl_job
 
-# NOTE: imports for the five online ML jobs (FeatureBuilderJob, LabelerJob,
-# TrainerJob, ShadowInferenceJob, PromotionGateJob) and their corresponding
-# admin POST endpoints (run-feature-builder, run-labeler, run-trainer,
-# run-shadow-inference, run-promotion-gates) were removed when the online
-# ML pipeline was decommissioned.  Offline backtests/training live in
-# ``backend/scripts`` and are no longer exposed through the admin API.
-
 router = APIRouter()
 
 
@@ -321,12 +314,6 @@ async def admin_preflight(
         )
     ).fetchall()
 
-    # Online-ML keys (`trade_candidates`, `labeled_candidates`,
-    # `training_runs`, `model_predictions`, `feature_snapshots`,
-    # `candidate_ts`, `training_run_ts`, `prediction_ts`, `feature_ts`)
-    # were dropped from the preflight response when the online ML pipeline
-    # was decommissioned and the schema cleanup landed in migration 015.
-    # Frontend consumers no longer reference these counts/timestamps.
     counts = {
         "underlying_quotes": int(summary.quotes_count or 0),
         "chain_snapshots": int(summary.snapshots_count or 0),

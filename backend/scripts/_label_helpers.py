@@ -1,10 +1,7 @@
 """Pure label-evaluation helpers for offline backtesting and ML training.
 
-This module hosts the spread-mark TP/SL/expiry simulation helpers that were
-previously embedded in ``spx_backend.jobs.labeler_job``.  They were extracted
-as part of the online ML pipeline decommission (Track A) so the helpers can
-continue to power offline tooling without keeping the entire ``LabelerJob``
-class alive.
+This module hosts the spread-mark TP/SL/expiry simulation helpers that
+power offline tooling.
 
 Why ``backend/scripts`` and not ``spx_backend/services``?
     The only consumers of these helpers are now offline -- the spread-audit

@@ -47,7 +47,7 @@ flowchart LR
 
 ### Live pipeline (causal workflow)
 
-The live pipeline is rules-only. Candidates are constructed inline by `decision_job` from the latest chain snapshot using the portfolio-managed `credit_to_width` ranker. The online ML pipeline (feature builder, labeler, trainer, shadow inference, promotion gate) was decommissioned in Track A; the offline ML toolkit under `backend/scripts/` is preserved for future re-entry on the portfolio path.
+The live pipeline is rules-only. Candidates are constructed inline by `decision_job` from the latest chain snapshot using the portfolio-managed `credit_to_width` ranker. ML training tooling lives offline under `backend/scripts/` and registers artifacts in `model_versions`; re-entry onto the portfolio path is a configuration change.
 
 ```mermaid
 flowchart TB
@@ -177,7 +177,7 @@ What is implemented now:
 - `generate_training_data.py` exports production trades + simulated PnL trajectories.
 - `xgb_model.py` trains an XGBoost entry model with walk-forward validation.
 - `upload_xgb_model.py` registers a trained artifact into `model_versions`.
-- The `model_versions` table is preserved in DB schema; the previous online ML pipeline (feature builder, labeler, trainer, shadow inference, promotion gate) was decommissioned in Track A.
+- The `model_versions` table is the registration target for offline-trained artifacts and is the re-entry point onto the portfolio decision path.
 
 **Optimizer / Backtest System**
 - Offline capital-budgeted backtester with parallel execution (`backtest_strategy.py`).
@@ -389,7 +389,7 @@ Primary knobs:
   - `DECISION_DELTA_TARGETS`, `DECISION_PUT_DELTA_TARGETS`, `DECISION_CALL_DELTA_TARGETS`
   - `DECISION_SPREAD_WIDTH_POINTS`, `DECISION_SPREAD_SIDES`
   - `DECISION_MAX_TRADES_PER_SIDE_PER_DAY`, `DECISION_MAX_OPEN_TRADES_PER_SIDE`
-- Portfolio management (always on; `decision_job` is unconditionally portfolio-managed after the Track A decommission):
+- Portfolio management (always on; `decision_job` is unconditionally portfolio-managed):
   - `PORTFOLIO_STARTING_CAPITAL`
   - `PORTFOLIO_MAX_TRADES_PER_DAY`, `PORTFOLIO_MAX_TRADES_PER_RUN`
   - `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`, `PORTFOLIO_LOT_PER_EQUITY`

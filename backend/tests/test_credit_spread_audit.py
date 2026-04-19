@@ -20,9 +20,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-# LabelMark + evaluate_candidate_outcome live in backend/scripts/_label_helpers.py
-# (relocated when the online ML pipeline was decommissioned).  We mirror the
-# sys.path pattern used by test_xgb_model.py / test_backtest_strategy.py / etc.
+# LabelMark + evaluate_candidate_outcome live in backend/scripts/_label_helpers.py.
+# We mirror the sys.path pattern used by test_xgb_model.py / test_backtest_strategy.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from _label_helpers import LabelMark, evaluate_candidate_outcome  # noqa: E402

@@ -486,9 +486,6 @@ class TradePnlJob:
                 long_exit_price=long_exit,
             )
 
-            # Always run the portfolio closure path -- ``portfolio_enabled``
-            # was removed in the online-ML decommission and the system
-            # now has a single (portfolio-managed) live trading path.
             pm = await self._get_portfolio_manager(now_et)
             await self._close_with_portfolio(
                 pm=pm, trade_id=trade.trade_id, pnl=pnl, session=session,

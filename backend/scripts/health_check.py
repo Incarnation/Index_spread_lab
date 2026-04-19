@@ -131,9 +131,8 @@ def check_portfolio_config() -> tuple[str, str]:
     """Verify critical PORTFOLIO_* env vars are set.
 
     ``PORTFOLIO_ENABLED`` is no longer required: the live decision job is
-    always portfolio-managed after the online-ML decommission.  We still
-    surface a warning if any sizing knob is unset because those drive lot
-    sizing and capital allocation.
+    always portfolio-managed.  We still surface a warning if any sizing
+    knob is unset because those drive lot sizing and capital allocation.
     """
     required = [
         "PORTFOLIO_STARTING_CAPITAL",

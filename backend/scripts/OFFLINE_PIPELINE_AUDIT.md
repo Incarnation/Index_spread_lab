@@ -54,7 +54,7 @@ each owning a tightly scoped area:
 |----------|-------|------------------|
 | 1. Production-DB exporter | `export_production_data.py`, `generate_economic_calendar.py`, `_env.py`, `_constants.py` | `db_schema.sql` (tables read by exporter), `data/*_export.csv`, `data/production_exports/` |
 | 2. Training data generator | `generate_training_data.py` (3261 lines), `_label_helpers.py` | `db_schema.sql`, `pricing.py`, `options.py`, `modeling.extract_candidate_features`, `decision_job._create_trade_from_decision` |
-| 3. Backtest layer | `backtest_strategy.py` (3177 lines), `backtest_entry.py` | `decision_job._run_portfolio_managed`, `portfolio_manager`, `pricing.py`, `event_signals.py` |
+| 3. Backtest layer | `backtest_strategy.py` (3177 lines), `backtest_entry.py` | `decision_job._run`, `portfolio_manager`, `pricing.py`, `event_signals.py` |
 | 4. ML / optimizer | `xgb_model.py` (1568 lines), `upload_xgb_model.py`, `experiment_tracker.py`, `ingest_optimizer_results.py`, `run_pipeline.py` | `db_schema.sql` (`model_versions`, `optimizer_*`), `modeling.predict_xgb_entry` |
 | 5. Regime + SL analysis | `regime_analysis.py`, `regime_utils.py`, `sl_recovery_analysis.py` | `decision_job` regime gating, `event_signals.py`, `db_schema.sql` |
 | 6. External data + hygiene | `download_databento.py`, `data/` tree, `.gitignore` | none |
@@ -393,7 +393,7 @@ safe deployment of an entry-v2 model:
 **Impact.** Today, no production model is loaded so there's no live impact.
 But the *contract* is broken: any future `upload_xgb_model.py` of an
 entry-v2 artifact would silently mis-rank candidates. This blocks the ML
-re-entry path described in `decision_job._run_portfolio_managed`.
+re-entry path described in `decision_job._run`.
 
 **Proposed fix.**
 

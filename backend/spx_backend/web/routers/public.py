@@ -393,16 +393,6 @@ async def list_trades(
     }
 
 
-### REMOVED IN ONLINE-ML DECOMMISSION ###################################
-# ``GET /api/label-metrics`` and ``GET /api/strategy-metrics`` were
-# removed because both endpoints aggregated outcomes from the
-# decommissioned ``trade_candidates`` table (scheduled to be dropped in
-# the A.7 schema-cleanup migration).  Per-strategy / TP50-TP100 metrics
-# can be reconstructed from ``trades`` + ``trade_marks`` if needed for
-# the offline ML re-entry path.
-########################################################################
-
-
 @router.get("/api/performance-analytics")
 async def get_performance_analytics(
     lookback_days: int = 90,
@@ -606,18 +596,6 @@ async def get_performance_analytics(
         "equity_curve": equity_curve,
         "breakdowns": breakdowns,
     }
-
-
-### REMOVED IN ONLINE-ML DECOMMISSION ###################################
-# ``GET /api/model-ops`` was removed because it surfaced freshness/health
-# of the decommissioned ``training_runs`` and ``model_predictions``
-# tables (scheduled to be dropped in the A.7 schema-cleanup migration).
-# ``model_versions`` -- which is preserved for offline ML re-entry --
-# is still surfaced via ``/api/admin/preflight``'s ``model_versions``
-# count + ``model_version_ts``.
-########################################################################
-
-
 
 
 @router.get("/api/gex/snapshots")
@@ -893,23 +871,6 @@ async def get_gex_curve(
             for row in rows
         ],
     }
-
-
-### REMOVED IN ONLINE-ML DECOMMISSION ###################################
-# The following endpoints were removed because they read from the
-# decommissioned ``model_predictions`` and ``trade_candidates`` tables
-# (both scheduled to be dropped in the A.7 schema-cleanup migration):
-#
-#   GET /api/model-predictions     - paginated model predictions
-#   GET /api/model-accuracy        - precision/recall/accuracy windows
-#   GET /api/model-calibration     - calibration curve bins
-#   GET /api/model-pnl-attribution - model-vs-baseline PnL attribution
-#
-# The frontend ML monitoring page that consumed these endpoints
-# (``ModelMonitorPage``) is being removed in Track A.6.  Future ML
-# re-entry will plug into the portfolio path rather than restoring
-# this monitoring surface unchanged.
-########################################################################
 
 
 @router.get("/api/backtest-results")

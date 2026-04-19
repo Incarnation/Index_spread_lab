@@ -568,7 +568,7 @@ class PortfolioManager:
         ``begin_day`` via ``_load_month_stop_active`` whenever the
         ``PortfolioManager`` enters a new calendar month -- which in
         production includes every freshly-constructed instance, since
-        ``decision_job._run_portfolio_managed`` builds a new
+        ``decision_job._run`` builds a new
         ``ProdPortfolioManager`` per run and ``_current_month`` starts as
         ``None``.  Refreshing the flag from every equity-delta would
         couple two unrelated write paths and require additional retry

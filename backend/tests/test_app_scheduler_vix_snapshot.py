@@ -368,10 +368,6 @@ async def test_lifespan_holiday_guard_skips_hard_rth_and_entry_jobs(monkeypatch)
     """Verify holiday guards skip hard-RTH close ticks and entry-time ticks."""
     import apscheduler.schedulers.asyncio as aps_asyncio
 
-    # Online-ML jobs (FeatureBuilderJob etc.) were decommissioned, so
-    # this test now only covers the snapshot_close + decision_entry
-    # holiday-guard paths.  The previous ``feature_builder_job_1000``
-    # cron was removed from the scheduler builder.
     snapshot_job = _FakeJob()
     decision_job = _FakeJob()
 

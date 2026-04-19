@@ -17,10 +17,6 @@ from spx_backend.web.routers.public import (
     list_gex_expirations,
     list_trades,
 )
-# ``get_label_metrics``, ``get_model_ops``, and ``get_strategy_metrics`` were
-# removed when the online ML pipeline was decommissioned; the corresponding
-# routes (`/api/label-metrics`, `/api/model-ops`, `/api/strategy-metrics`)
-# no longer exist on ``public.router``.
 
 
 @asynccontextmanager

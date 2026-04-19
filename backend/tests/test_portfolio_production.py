@@ -3,7 +3,7 @@
 Covers:
 - PortfolioManager._count_trades_today (daily count persistence)
 - _create_trade_from_decision contracts_override parameter
-- Per-run stagger limit in _run_portfolio_managed
+- Per-run stagger limit in _run
 """
 from __future__ import annotations
 
@@ -206,7 +206,7 @@ class TestContractsOverride:
 
 
 class TestPerRunStagger:
-    """Verify the stagger limit logic used in _run_portfolio_managed."""
+    """Verify the stagger limit logic used in _run."""
 
     def test_run_limit_caps_scheduled(self):
         """Per-run limit should cap scheduled trades below daily max."""

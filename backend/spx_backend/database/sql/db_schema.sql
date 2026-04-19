@@ -233,11 +233,12 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_versions_name_version ON model_versions (model_name, version);
 CREATE INDEX IF NOT EXISTS idx_model_versions_rollout_status ON model_versions (rollout_status, created_at DESC);
 
--- The online ML pipeline (`feature_snapshots`, `trade_candidates`,
--- `model_predictions`, `training_runs`) was decommissioned in Track A.7.
--- See migration `015_decommission_online_ml_schema.sql`.  `model_versions`
--- is preserved so the offline ML path (e.g. `upload_xgb_model.py`) can
--- still register artifacts when ML is reintroduced on the portfolio path.
+-- The online ML schema lives in `model_versions` only; legacy
+-- `feature_snapshots`, `trade_candidates`, `model_predictions`, and
+-- `training_runs` were dropped by migration
+-- `015_decommission_online_ml_schema.sql`.  `model_versions` is the
+-- registration target for offline-trained artifacts (e.g.
+-- `upload_xgb_model.py`).
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
   run_id BIGSERIAL PRIMARY KEY,

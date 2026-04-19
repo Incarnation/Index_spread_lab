@@ -98,13 +98,9 @@ class Settings(BaseSettings):
     decision_ruleset_version: str = "rules_v1"
     decision_allow_outside_rth: bool = False
 
-    # NOTE: the online-ML pipeline (feature builder / labeler / trainer /
-    # shadow inference / promotion gate) and its hybrid execution policy
-    # were decommissioned in Track A.  All `*_enabled`, `trainer_*`,
-    # `labeler_*`, `shadow_inference_*`, `promotion_gate_*`, and
-    # `decision_hybrid_*` settings were removed at the same time.  The
-    # offline ML toolkit (`backend/scripts/`) and `model_versions` table
-    # remain so ML can be re-introduced later on the portfolio path.
+    # ML training tooling lives offline under `backend/scripts/` and
+    # registers artifacts in `model_versions`; re-entry onto the
+    # portfolio path is purely a configuration change.
 
     # EOD economic-events seeder
     eod_events_enabled: bool = True

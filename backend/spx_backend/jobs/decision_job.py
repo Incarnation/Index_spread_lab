@@ -164,7 +164,7 @@ class DecisionJob:
             "selection_meta": selection_meta,
         }
 
-    async def _run_portfolio_managed(self, *, now_et: datetime, force: bool) -> dict:
+    async def _run(self, *, now_et: datetime, force: bool) -> dict:
         """Portfolio-managed decision path using capital budgeting.
 
         Replaces the legacy ML-gated scoring with credit_to_width ranking,
@@ -474,9 +474,7 @@ class DecisionJob:
         Notes
         -----
         Live trading is portfolio-managed by ``credit_to_width`` ranking
-        (see :meth:`_run_portfolio_managed`).  The legacy hybrid ML/rules
-        path was removed when the online ML pipeline was decommissioned;
-        future ML re-entry plugs into ``_run_portfolio_managed`` rather
+        (see :meth:`_run`); future ML re-entry hooks into ``_run`` rather
         than restoring a parallel branch.
         """
         tz = ZoneInfo(settings.tz)
@@ -490,7 +488,7 @@ class DecisionJob:
             if not await self._market_open(now_et):
                 return self._build_run_result(now_et=now_et, skipped=True, reason="market_closed")
 
-        return await self._run_portfolio_managed(now_et=now_et, force=force)
+        return await self._run(now_et=now_et, force=force)
 
     async def _get_latest_snapshot_for_dte(
         self,
@@ -763,18 +761,13 @@ class DecisionJob:
     ) -> int:
         """Persist a decision row to ``trade_decisions``.
 
-        After the online ML pipeline was decommissioned (Track A) the only
-        live producer of decision rows is :meth:`_run_portfolio_managed`.
-        Migration ``015_decommission_online_ml_schema.sql`` then dropped
-        the always-NULL legacy columns (``model_score``, ``expected_value``,
-        ``prediction_id``, ``feature_snapshot_id``, ``candidate_id``,
-        ``policy_version``, ``risk_gate_json``, ``experiment_tag``).
+        The only live producer of decision rows is :meth:`_run`.
         ``model_version_id`` is preserved on the schema for offline ML
         re-entry but is not populated by the rules-based path.
 
-        The legacy ``decision_source="rules"`` default has been removed in
-        favour of ``"portfolio_managed"`` so an accidental call with no
-        ``decision_source`` annotates correctly in audit logs.
+        ``decision_source`` defaults to ``"portfolio_managed"`` so an
+        accidental call with no ``decision_source`` annotates correctly
+        in audit logs.
         """
         result = await session.execute(
             text(

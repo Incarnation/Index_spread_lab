@@ -232,13 +232,6 @@ class _RouterAwareSession:
                 ]
             )
 
-        # Online-ML SQL handlers removed: ``/api/label-metrics``,
-        # ``/api/strategy-metrics``, and ``/api/model-ops`` were
-        # decommissioned along with the ``trade_candidates``,
-        # ``training_runs``, ``model_predictions`` tables.  No fake
-        # rows are needed for those queries because the endpoints
-        # themselves no longer exist.
-
         if "DELETE FROM trade_decisions" in sql:
             if int(query_params.get("decision_id", 0)) == 1:
                 return _FakeExecResult([SimpleNamespace(decision_id=1)])
@@ -411,9 +404,6 @@ def _build_test_client(monkeypatch):
     test_app.state.decision_job = _FakeJob("decision")
     test_app.state.trade_pnl_job = _FakeJob("trade_pnl")
     test_app.state.performance_analytics_job = _FakeJob("performance_analytics")
-    # Online-ML jobs (feature_builder/labeler/trainer/shadow_inference/
-    # promotion_gate) and their corresponding admin run-* endpoints were
-    # decommissioned, so we no longer wire them into ``app.state``.
     test_app.state.tradier = _FakeTradier()
 
     return TestClient(test_app), fake_session
@@ -450,11 +440,6 @@ def test_e2e_public_api_surface(monkeypatch) -> None:
     assert trades.status_code == 200
     assert trades.json()["items"][0]["status"] == "OPEN"
     assert len(trades.json()["items"][0]["legs"]) == 2
-
-    # Decommissioned online-ML endpoints (``/api/label-metrics``,
-    # ``/api/strategy-metrics``, ``/api/model-ops``) were removed from
-    # ``public.py``; no e2e coverage is needed once the routes no
-    # longer exist.
 
     gex_snapshots = client.get("/api/gex/snapshots?limit=1", headers=headers)
     assert gex_snapshots.status_code == 200

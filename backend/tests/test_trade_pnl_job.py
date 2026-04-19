@@ -776,11 +776,6 @@ class TestPortfolioClosure:
         call_args = mock_pm.record_closure.await_args
         assert call_args[0][0] == 61
 
-# NOTE: ``test_portfolio_disabled_skips_record_closure`` was deleted along
-# with the ``portfolio_enabled`` flag in the online-ML decommission -- the
-# closure path is unconditional now and there is no "disabled" branch to
-# assert against.
-
 
 # ---------------------------------------------------------------------------
 # Multi-contract PnL scaling

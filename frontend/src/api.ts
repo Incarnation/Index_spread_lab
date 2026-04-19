@@ -176,12 +176,6 @@ export async function runGexNow(): Promise<GenericAdminRunResult> {
   return safeJson<GenericAdminRunResult>(r);
 }
 
-// runFeatureBuilderNow / runLabelerNow / runTrainerNow /
-// runShadowInferenceNow / runPromotionGatesNow were removed when the
-// online ML pipeline was decommissioned.  Their corresponding backend
-// routes (/api/admin/run-feature-builder, /run-labeler, /run-trainer,
-// /run-shadow-inference, /run-promotion-gates) no longer exist.
-
 /**
  * Trigger a manual performance-analytics refresh.
  */
@@ -315,9 +309,6 @@ export type TradeLeg = {
 export type TradeRow = {
   trade_id: number;
   decision_id: number | null;
-  // `candidate_id` and `feature_snapshot_id` were removed from the response
-  // when their backing columns on `trades` were dropped by Track A.7
-  // migration 015 (online ML schema decommission).
   status: string;
   trade_source: string;
   strategy_type: string;
@@ -440,23 +431,12 @@ export async function fetchPerformanceAnalytics(
   return safeJson<PerformanceAnalyticsResponse>(r);
 }
 
-// ModelOpsGate / ModelOpsModelVersion / ModelOpsTrainingRun / ModelOpsResponse
-// + fetchModelOps were removed when the online ML pipeline was decommissioned.
-// The backend route /api/model-ops no longer exists.  ``model_versions`` is
-// preserved on the backend for offline ML re-entry but currently has no
-// dedicated frontend surface.
-
 export type AdminPreflightCounts = {
   underlying_quotes: number;
   chain_snapshots: number;
   option_chain_rows: number;
   gex_snapshots: number;
   trade_decisions: number;
-  // ``trade_candidates``, ``labeled_candidates``, ``training_runs``,
-  // ``model_predictions``, ``feature_snapshots`` were dropped from the
-  // admin preflight payload when the online ML pipeline was decommissioned
-  // and migration 015 (Track A.7) removed the underlying tables.
-  // ``model_versions`` is preserved (offline ML re-entry).
   model_versions: number;
   trades: number;
   open_trades: number;
@@ -593,31 +573,16 @@ export async function fetchAuthAudit(
 }
 
 // ---------------------------------------------------------------------------
-// Model monitoring endpoints (REMOVED -- Phase 3 deletion)
-// ---------------------------------------------------------------------------
-// The Phase 3 model-monitoring API surface (ModelPredictionRow,
-// ModelPredictionsResponse, AccuracyWindow, ModelAccuracyResponse,
-// CalibrationBin, ModelCalibrationResponse, ModelPnlAttributionResponse,
-// fetchModelPredictions, fetchModelAccuracy, fetchModelCalibration,
-// fetchModelPnlAttribution) was removed when the online ML pipeline was
-// decommissioned.  The corresponding backend routes
-// (/api/model-predictions, /api/model-accuracy, /api/model-calibration,
-// /api/model-pnl-attribution) and the underlying ``model_predictions``
-// table no longer exist.
-
-// ---------------------------------------------------------------------------
 // Portfolio management endpoints
 // ---------------------------------------------------------------------------
 
 /**
  * Live portfolio status snapshot returned by `/api/portfolio/status`.
  *
- * Note: the legacy `portfolio_enabled` field was removed when the
- * `PORTFOLIO_ENABLED` flag was deleted (the live decision job is always
- * portfolio-managed after the online ML decommission).  Consumers that
- * previously branched on `portfolio_enabled` should now treat the
- * presence of a non-null `PortfolioStatus` as "portfolio data is
- * available" and fall back to legacy metrics only on fetch error.
+ * The live decision job is always portfolio-managed; consumers should
+ * treat the presence of a non-null `PortfolioStatus` as "portfolio
+ * data is available" and fall back to legacy metrics only on fetch
+ * error.
  */
 export type PortfolioStatus = {
   date: string;

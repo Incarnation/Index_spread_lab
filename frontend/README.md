@@ -33,8 +33,6 @@ flowchart LR
   Shell --> AuthAudit["Auth Audit"]
 ```
 
-The `/model` route (`ModelMonitorPage`) was removed in Track A when the online ML pipeline was decommissioned.
-
 | Route | Page | Description |
 |-------|------|-------------|
 | `/login` | LoginPage | Username/password form; JWT login via AuthContext |

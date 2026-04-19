@@ -12,9 +12,6 @@ import { RefreshCw } from "lucide-react";
 const OverviewPage = React.lazy(() => import("./pages/OverviewPage").then((m) => ({ default: m.OverviewPage })));
 const TradesPage = React.lazy(() => import("./pages/TradesPage").then((m) => ({ default: m.TradesPage })));
 const DecisionsPage = React.lazy(() => import("./pages/DecisionsPage").then((m) => ({ default: m.DecisionsPage })));
-// ModelMonitorPage was removed when the online ML pipeline was decommissioned;
-// the `/model` route + `/api/model-ops`, `/api/label-metrics`, and
-// `/api/strategy-metrics` endpoints no longer exist.
 const PerformancePage = React.lazy(() => import("./pages/PerformancePage").then((m) => ({ default: m.PerformancePage })));
 const GexPage = React.lazy(() => import("./pages/GexPage").then((m) => ({ default: m.GexPage })));
 const AdminPage = React.lazy(() => import("./pages/AdminPage").then((m) => ({ default: m.AdminPage })));
@@ -50,7 +47,6 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               <Route path="portfolio" element={<Suspense fallback={<PageLoader />}><PortfolioPage /></Suspense>} />
               <Route path="trades" element={<Suspense fallback={<PageLoader />}><TradesPage /></Suspense>} />
               <Route path="decisions" element={<Suspense fallback={<PageLoader />}><DecisionsPage /></Suspense>} />
-              {/* `/model` route removed -- ModelMonitorPage was decommissioned with the online ML pipeline. */}
               <Route path="performance" element={<Suspense fallback={<PageLoader />}><PerformancePage /></Suspense>} />
               <Route path="gex" element={<Suspense fallback={<PageLoader />}><GexPage /></Suspense>} />
               <Route path="admin" element={<Suspense fallback={<PageLoader />}><AdminPage /></Suspense>} />

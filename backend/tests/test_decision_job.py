@@ -32,10 +32,8 @@ class _FakeSession:
 def _set_default_decision_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch common decision settings defaults used across unit tests.
 
-    The ``portfolio_enabled`` pin was removed when the legacy non-portfolio
-    code path was deleted in the online-ML decommission.  All decision
-    runs are portfolio-managed; tests that need to bypass that should
-    monkeypatch ``DecisionJob._run_portfolio_managed`` directly.
+    All decision runs are portfolio-managed; tests that need to bypass
+    that should monkeypatch ``DecisionJob._run`` directly.
     """
     monkeypatch.setattr(settings, "snapshot_underlying", "SPX")
     monkeypatch.setattr(settings, "decision_contracts", 1)

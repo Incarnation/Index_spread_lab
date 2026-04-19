@@ -17,11 +17,6 @@ import {
 } from "@/api";
 import { AlertTriangle, Play } from "lucide-react";
 
-// Online-ML run buttons (Feature Builder, Labeler, Trainer, Shadow
-// Inference, Promotion Gate) were removed from this list when the
-// online ML pipeline was decommissioned -- the corresponding admin
-// endpoints (/api/admin/run-feature-builder, /run-labeler, /run-trainer,
-// /run-shadow-inference, /run-promotion-gates) no longer exist.
 const JOBS = [
   { label: "Quotes", fn: runQuotesNow },
   { label: "Snapshot", fn: runSnapshotNow },

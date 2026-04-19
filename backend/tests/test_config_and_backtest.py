@@ -118,7 +118,7 @@ class TestEventSidePreference:
 
     @staticmethod
     def _resolve_event_sides(drop_signals: list[str], side_preference: str, spread_sides: list[str]) -> list[str]:
-        """Replicate the has_drop -> event_sides logic from _run_portfolio_managed.
+        """Replicate the has_drop -> event_sides logic from _run.
 
         This mirrors lines 204-217 of decision_job.py so we can test
         the signal-to-side mapping without spinning up the full job.

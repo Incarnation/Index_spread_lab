@@ -1,6 +1,6 @@
 # IndexSpreadLab -- Backend
 
-FastAPI + APScheduler service that captures SPX/SPY/VIX option data, computes GEX, runs a rules-based capital-budgeted decision engine for paper-trade execution with portfolio budgeting, and serves the optimizer dashboard. An offline ML toolkit (`backend/scripts/` + `model_versions` table) is preserved for future re-introduction of model-driven entries on the portfolio path; the previous online ML pipeline (feature builder, labeler, trainer, shadow inference, promotion gate) was decommissioned in Track A.
+FastAPI + APScheduler service that captures SPX/SPY/VIX option data, computes GEX, runs a rules-based capital-budgeted decision engine for paper-trade execution with portfolio budgeting, and serves the optimizer dashboard. ML training tooling lives offline under `backend/scripts/` and registers artifacts in `model_versions`; re-entry onto the portfolio decision path is a configuration change.
 
 ---
 
@@ -38,8 +38,6 @@ spx_backend/
     eod_events_job.py        End-of-day signal capture + economic calendar
     retention_job.py         Batch purge of old chain/GEX data
     modeling.py              XGBoost model utilities (offline; used by backend/scripts/)
-    # NOTE: feature_builder_job, labeler_job, trainer_job, shadow_inference_job,
-    # and promotion_gate_job were deleted in Track A (online ML decommission).
 
   services/
     portfolio_manager.py  Capital budgeting, lot scaling, drawdown stops
@@ -198,9 +196,9 @@ All jobs are registered in `scheduler_builder.py`. The scheduler uses these patt
 
 **Term inversion disabled**: Backtesting showed term-structure inversion was not a profitable signal on its own — it triggered put credit spreads on non-drop days that underperformed. The C3 configuration disables it by setting the threshold to 99.0 (unreachable).
 
-**Portfolio management**: The decision job is unconditionally portfolio-managed -- the `PORTFOLIO_ENABLED` flag was removed when the online ML pipeline was decommissioned. The `PortfolioManager` performs capital budgeting: lot sizing scales with equity (`PORTFOLIO_LOT_PER_EQUITY`), monthly drawdown stops halt new trades when cumulative monthly loss exceeds `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`, and event-driven trades share or have separate budget depending on `EVENT_BUDGET_MODE`.
+**Portfolio management**: The decision job is unconditionally portfolio-managed. The `PortfolioManager` performs capital budgeting: lot sizing scales with equity (`PORTFOLIO_LOT_PER_EQUITY`), monthly drawdown stops halt new trades when cumulative monthly loss exceeds `PORTFOLIO_MONTHLY_DRAWDOWN_LIMIT`, and event-driven trades share or have separate budget depending on `EVENT_BUDGET_MODE`.
 
-**Live trading paths**: There is exactly one live decision path -- `DecisionJob._run_portfolio_managed`. Offline ML training tooling lives in `backend/scripts/` (`generate_training_data.py`, `xgb_model.py`, `upload_xgb_model.py`) and registers artifacts in `model_versions`; this is the re-entry path for ML on the portfolio decision when it is reintroduced.
+**Live trading paths**: There is exactly one live decision path -- `DecisionJob._run`. Offline ML training tooling lives in `backend/scripts/` (`generate_training_data.py`, `xgb_model.py`, `upload_xgb_model.py`) and registers artifacts in `model_versions`; this is the re-entry path for ML on the portfolio decision when it is reintroduced.
 
 **SMS notifications**: `SmsNotifier` sends Twilio SMS on trade open and close events. Errors never block the pipeline (fire-and-forget with logging). Configurable per source via `SMS_NOTIFY_SOURCES`.
 
@@ -484,6 +482,6 @@ make test-e2e-down      # Stop test DB
 ## Known Limitations
 
 - Live broker order/fill automation is scaffolded (`orders`, `fills` tables) but not wired to a real broker yet.
-- The live decision path is rules-only after the Track A decommission. The `model_versions` table is preserved so the offline ML toolkit (`backend/scripts/upload_xgb_model.py`) can register artifacts; wiring those artifacts back into `decision_job` is future work. `no_model_versions` warnings on a fresh DB are expected and not actionable for the rules path.
+- The live decision path is rules-only. The `model_versions` table is the registration target for offline-trained artifacts (`backend/scripts/upload_xgb_model.py`); wiring those artifacts back into `decision_job` is future work. `no_model_versions` warnings on a fresh DB are expected and not actionable for the rules path.
 - CBOE GEX data availability depends on the vendor API; outages are logged but do not block other pipeline stages.
 - Walk-forward validation mode (`--walkforward`) uses a hardcoded grid from `_build_optimizer_grid()`; it does not read YAML configs. For YAML-driven walk-forward, use a custom script that calls `run_backtest` directly.

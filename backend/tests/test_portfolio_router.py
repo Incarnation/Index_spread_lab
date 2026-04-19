@@ -26,13 +26,7 @@ def _fake_user():
 
 
 def _make_app(monkeypatch) -> FastAPI:
-    """Create a minimal FastAPI app with portfolio router and no-auth override.
-
-    Note: ``settings.portfolio_enabled`` was removed when the online ML
-    pipeline was decommissioned -- the live decision job is always
-    portfolio-managed, so the flag (and the test monkeypatch for it) no
-    longer exist.
-    """
+    """Create a minimal FastAPI app with portfolio router and no-auth override."""
     monkeypatch.setattr(settings, "portfolio_starting_capital", 20_000.0)
     monkeypatch.setattr(settings, "portfolio_max_trades_per_day", 2)
     monkeypatch.setattr(settings, "portfolio_max_trades_per_run", 1)

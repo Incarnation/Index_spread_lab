@@ -39,7 +39,7 @@ ALTER TABLE trades          DROP CONSTRAINT IF EXISTS trades_feature_snapshot_id
 
 -- Step 2: drop legacy ML columns from `trade_decisions`.  These were
 -- only populated by the deprecated online inference path and are always
--- NULL now that the live producer (`_run_portfolio_managed`) writes only
+-- NULL now that the live producer (`_run`) writes only
 -- the rules-based decision columns.
 ALTER TABLE trade_decisions DROP COLUMN IF EXISTS candidate_id;
 ALTER TABLE trade_decisions DROP COLUMN IF EXISTS prediction_id;
