@@ -664,7 +664,7 @@ Operators using existing reports may need a one-line note.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 (extracted to shared evaluator) |
-| **Status** | open |
+| **Status** | fixed in gap-closure Phase 2.1 -- shared `candidate_dedupe_key` in `backend/spx_backend/services/candidate_dedupe.py`; live wraps via thin method, backtest checks `seen_leg_keys` per day-window. 14-test parity suite in `backend/tests/test_candidate_dedupe.py`.  **Resolved:** 2026-04-16. |
 
 Live [`decision_job.py:302-362`](../spx_backend/jobs/decision_job.py) uses
 `seen_keys = {_candidate_dedupe_key(c) for c in event_candidates}` — i.e.

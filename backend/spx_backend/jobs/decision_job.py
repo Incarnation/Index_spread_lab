@@ -11,6 +11,10 @@ from sqlalchemy import text
 from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services.candidate_dedupe import (
+    CandidateKey,
+    candidate_dedupe_key as _shared_candidate_dedupe_key,
+)
 from spx_backend.services.portfolio_manager import PortfolioManager as ProdPortfolioManager
 from spx_backend.services.event_signals import EventSignalDetector as ProdEventSignalDetector
 from spx_backend.utils.pricing import mid_price
@@ -729,18 +733,17 @@ class DecisionJob:
             "strategy_params_json": strategy_params_json,
         }
 
-    def _candidate_dedupe_key(self, candidate: dict) -> tuple[str, str, str, str]:
+    def _candidate_dedupe_key(self, candidate: dict) -> CandidateKey:
         """Return a stable identity key used to dedupe repeated spread legs.
 
-        The key captures spread side, expiration, short symbol, and long symbol
-        so one exact leg pair is only executed once per run.
+        Thin wrapper around
+        :func:`spx_backend.services.candidate_dedupe.candidate_dedupe_key`
+        so live and backtest use the **same** dedup logic (audit M3 in
+        ``backend/scripts/OFFLINE_PIPELINE_AUDIT.md``). The wrapper is
+        preserved as an instance method so existing call sites and any
+        subclass overrides keep working without changes.
         """
-        chosen_legs = candidate.get("chosen_legs_json") or {}
-        short_symbol = str(((chosen_legs.get("short") or {}).get("symbol")) or "")
-        long_symbol = str(((chosen_legs.get("long") or {}).get("symbol")) or "")
-        spread_side = str(chosen_legs.get("spread_side") or "")
-        expiration = str(candidate.get("expiration") or chosen_legs.get("expiration") or "")
-        return (spread_side, expiration, short_symbol, long_symbol)
+        return _shared_candidate_dedupe_key(candidate)
 
     async def _insert_decision(
         self,
