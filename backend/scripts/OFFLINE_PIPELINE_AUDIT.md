@@ -789,7 +789,7 @@ sidecar manifest.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 5 |
-| **Status** | open |
+| **Status** | fixed in gap-closure Phase 2.3 -- added `event_spx_drop_min` / `event_spx_drop_max` to `Settings` (both default `None` so legacy live behaviour is preserved); wired through `EventSignalDetector.__init__` and `_build_thresholds`; surfaced in `/portfolio/config` and `.env.example`. 8 new tests in `test_event_signals.py::TestSpxDropMagnitudeWindow`.  **Resolved:** 2026-04-16. |
 
 `backtest_strategy.py` `EventSignalDetector` (lines 605–615) supports
 `spx_drop_min` / `spx_drop_max` (range filter). Prod `event_signals.py`

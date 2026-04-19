@@ -193,6 +193,23 @@ class Settings(BaseSettings):
     event_max_trades: int = 1
     event_spx_drop_threshold: float = -0.01
     event_spx_drop_2d_threshold: float = -0.02
+    event_spx_drop_min: float | None = None
+    """Optional floor of the 1-day SPX-drop magnitude window (decimal,
+    e.g. ``-0.02`` = 2%).  When set, ``spx_drop_1d`` only fires if
+    ``prev_spx_return >= spx_drop_min`` -- i.e. the drop must not be *more*
+    severe than this floor.  ``None`` (default) disables the floor and
+    preserves legacy behaviour where ``event_spx_drop_threshold`` is the
+    only gate.  Mirrors the backtest's ``EventConfig.spx_drop_min``
+    optimizer knob.  See OFFLINE_PIPELINE_AUDIT.md M9."""
+    event_spx_drop_max: float | None = None
+    """Optional ceiling of the 1-day SPX-drop magnitude window (decimal,
+    e.g. ``-0.005`` = 0.5%).  When set, ``spx_drop_1d`` only fires if
+    ``prev_spx_return <= spx_drop_max`` -- i.e. the drop must be at least
+    this large.  ``None`` (default) disables the ceiling and preserves
+    legacy behaviour.  Combined with ``event_spx_drop_min`` this lets
+    operators isolate firing on a specific drop-magnitude band (e.g.
+    "0.5%--2%" drops only).  Mirrors the backtest's
+    ``EventConfig.spx_drop_max``.  See OFFLINE_PIPELINE_AUDIT.md M9."""
     event_vix_spike_threshold: float = 0.15
     event_vix_elevated_threshold: float = 25.0
     event_term_inversion_threshold: float = 1.0

@@ -188,6 +188,8 @@ async def get_portfolio_config(
             "max_trades": settings.event_max_trades,
             "spx_drop_threshold": settings.event_spx_drop_threshold,
             "spx_drop_2d_threshold": settings.event_spx_drop_2d_threshold,
+            "spx_drop_min": settings.event_spx_drop_min,
+            "spx_drop_max": settings.event_spx_drop_max,
             "vix_spike_threshold": settings.event_vix_spike_threshold,
             "vix_elevated_threshold": settings.event_vix_elevated_threshold,
             "term_inversion_threshold": settings.event_term_inversion_threshold,

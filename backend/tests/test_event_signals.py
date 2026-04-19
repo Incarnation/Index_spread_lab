@@ -330,3 +330,116 @@ class TestTermStructure:
             "term_structure": compute_term_structure(20.0, 15.0),
         }
         assert "term_inversion" in det._evaluate(backwardation_ctx)
+
+
+class TestSpxDropMagnitudeWindow:
+    """Audit M9 -- live + backtest now share ``spx_drop_min`` / ``spx_drop_max``.
+
+    These tests intentionally go through the public ``EventSignalDetector``
+    constructor (rather than the lower-level ``EventThresholds`` dataclass)
+    so the wiring from ``Settings`` -> instance attr -> ``_build_thresholds``
+    -> ``evaluate_event_signals`` is covered end to end.
+    """
+
+    @staticmethod
+    def _make(
+        spx_drop_min: float | None = None,
+        spx_drop_max: float | None = None,
+    ) -> EventSignalDetector:
+        # signal_mode="any" so the gate doesn't drop the spx_drop_1d
+        # signal when no VIX signal co-fires.  Other thresholds are set
+        # so high they can never trigger; we are only exercising the
+        # spx_drop_1d path here.
+        return EventSignalDetector(
+            spx_drop_threshold=-0.005,
+            spx_drop_2d_threshold=-0.05,
+            vix_spike_threshold=10.0,
+            vix_elevated_threshold=10_000.0,
+            term_inversion_threshold=10.0,
+            rally_avoidance=False,
+            rally_threshold=10.0,
+            signal_mode="any",
+            spx_drop_min=spx_drop_min,
+            spx_drop_max=spx_drop_max,
+        )
+
+    @staticmethod
+    def _ctx(prev_ret: float) -> dict[str, float | None]:
+        return {
+            "prev_spx_return": prev_ret,
+            "prev_spx_return_2d": 0.0,
+            "prev_vix_pct_change": 0.0,
+            "vix": 15.0,
+            "term_structure": 0.9,
+        }
+
+    def test_no_window_preserves_legacy_behaviour(self) -> None:
+        det = self._make()
+        # Drop crosses spx_drop_threshold (-0.005); no window => fire.
+        assert "spx_drop_1d" in det._evaluate(self._ctx(-0.02))
+
+    def test_drop_inside_window_fires(self) -> None:
+        det = self._make(spx_drop_min=-0.02, spx_drop_max=-0.005)
+        # -0.01 lies inside [-0.02, -0.005] -> fire.
+        assert "spx_drop_1d" in det._evaluate(self._ctx(-0.01))
+
+    def test_drop_more_severe_than_min_suppressed(self) -> None:
+        # spx_drop_min=-0.02 is the floor (most-negative); -0.03 is more
+        # severe and should be filtered out (M9 magnitude window).
+        det = self._make(spx_drop_min=-0.02, spx_drop_max=-0.005)
+        assert "spx_drop_1d" not in det._evaluate(self._ctx(-0.03))
+
+    def test_drop_smaller_than_max_suppressed(self) -> None:
+        # spx_drop_max=-0.01 is the ceiling (least-negative); -0.006
+        # crosses the base spx_drop_threshold (-0.005) but is still above
+        # the ceiling, so the window must suppress it.
+        det = self._make(spx_drop_min=-0.05, spx_drop_max=-0.01)
+        assert "spx_drop_1d" not in det._evaluate(self._ctx(-0.006))
+
+    def test_only_min_set_uses_floor_only(self) -> None:
+        det = self._make(spx_drop_min=-0.02)
+        # Inside floor -> fire.
+        assert "spx_drop_1d" in det._evaluate(self._ctx(-0.01))
+        # More severe than floor -> suppressed.
+        assert "spx_drop_1d" not in det._evaluate(self._ctx(-0.05))
+
+    def test_only_max_set_uses_ceiling_only(self) -> None:
+        det = self._make(spx_drop_max=-0.01)
+        # At/under ceiling -> fire.
+        assert "spx_drop_1d" in det._evaluate(self._ctx(-0.05))
+        # Above ceiling -> suppressed.
+        assert "spx_drop_1d" not in det._evaluate(self._ctx(-0.006))
+
+    def test_settings_provide_default_when_not_overridden(self, monkeypatch) -> None:
+        # Verify the wiring through ``settings.event_spx_drop_min`` --
+        # patch the live settings and construct without overrides for
+        # those two fields.
+        from spx_backend import config as cfg
+        monkeypatch.setattr(cfg.settings, "event_spx_drop_min", -0.02)
+        monkeypatch.setattr(cfg.settings, "event_spx_drop_max", -0.005)
+        det = EventSignalDetector(
+            spx_drop_threshold=-0.005,
+            spx_drop_2d_threshold=-0.05,
+            vix_spike_threshold=10.0,
+            vix_elevated_threshold=10_000.0,
+            term_inversion_threshold=10.0,
+            rally_avoidance=False,
+            rally_threshold=10.0,
+            signal_mode="any",
+        )
+        assert det.spx_drop_min == pytest.approx(-0.02)
+        assert det.spx_drop_max == pytest.approx(-0.005)
+        # Inside window -> fire; outside -> suppressed.  This proves the
+        # settings flow all the way to ``_build_thresholds``.
+        assert "spx_drop_1d" in det._evaluate(self._ctx(-0.01))
+        assert "spx_drop_1d" not in det._evaluate(self._ctx(-0.05))
+
+    def test_default_settings_leave_window_disabled(self) -> None:
+        """Regression: with stock settings the magnitude window must be
+        ``None`` so legacy live behaviour is preserved (fail-safe default)."""
+        from spx_backend import config as cfg
+        # The defaults defined in ``Settings`` must both be ``None``;
+        # otherwise we would silently change live behaviour for every
+        # existing deployment.
+        assert cfg.settings.event_spx_drop_min is None
+        assert cfg.settings.event_spx_drop_max is None

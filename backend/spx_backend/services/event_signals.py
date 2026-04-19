@@ -119,9 +119,11 @@ class EventThresholds:
     * ``spx_drop_min`` / ``spx_drop_max`` (optional) -- M9 magnitude
       window: when set, ``spx_drop_1d`` only fires when the prev-day
       return *also* lies in ``[min, max]``.  ``None`` disables the gate.
-      Live's ``Settings`` does not yet expose these fields, so the live
-      detector always passes ``None`` here -- the gate is currently a
-      backtest-only optimizer knob (see M9 in OFFLINE_PIPELINE_AUDIT.md).
+      Live exposes these via ``settings.event_spx_drop_min`` and
+      ``settings.event_spx_drop_max`` (both default to ``None`` so legacy
+      behaviour is preserved); the backtest exposes them on
+      ``EventConfig`` as optimizer knobs.  Audit M9 -- live + backtest
+      now share this gate.
     """
 
     spx_drop_threshold: float
@@ -343,6 +345,8 @@ class EventSignalDetector:
         rally_avoidance: bool | None = None,
         rally_threshold: float | None = None,
         signal_mode: str | None = None,
+        spx_drop_min: float | None = None,
+        spx_drop_max: float | None = None,
     ) -> None:
         self.spx_drop_threshold = spx_drop_threshold if spx_drop_threshold is not None else settings.event_spx_drop_threshold
         self.spx_drop_2d_threshold = spx_drop_2d_threshold if spx_drop_2d_threshold is not None else settings.event_spx_drop_2d_threshold
@@ -357,6 +361,20 @@ class EventSignalDetector:
         # caller-supplied values safe too.
         mode_raw = signal_mode if signal_mode is not None else settings.event_signal_mode
         self.signal_mode = (mode_raw or "any").strip().lower()
+        # M9 magnitude-window knobs.  ``None`` -> disabled (legacy
+        # behaviour); a numeric value bounds the drop magnitude that the
+        # ``spx_drop_1d`` signal fires on.  We deliberately allow callers
+        # to pass an explicit ``None`` to disable, and only fall back to
+        # settings when the parameter was omitted entirely (which we
+        # detect via the sentinel-default pattern: callers that want to
+        # force-disable should construct with ``spx_drop_min=None`` AND
+        # also have settings unset, which is the default.)
+        self.spx_drop_min = (
+            spx_drop_min if spx_drop_min is not None else settings.event_spx_drop_min
+        )
+        self.spx_drop_max = (
+            spx_drop_max if spx_drop_max is not None else settings.event_spx_drop_max
+        )
 
     async def detect(self, today: date | None = None) -> list[str]:
         """Return active signal names by reading recent underlying_quotes.
@@ -388,8 +406,11 @@ class EventSignalDetector:
     def _build_thresholds(self) -> EventThresholds:
         """Pack the detector's instance fields into an ``EventThresholds``.
 
-        Centralised here so any future settings additions (e.g. an
-        ``event_spx_drop_min`` knob) only need to be wired in one place.
+        Centralised here so future settings additions only need wiring in
+        one place.  The M9 magnitude window (``spx_drop_min`` /
+        ``spx_drop_max``) is populated from the constructor / settings;
+        leaving them at their defaults (``None``) preserves legacy
+        behaviour where the gate is inert.
         """
         return EventThresholds(
             spx_drop_threshold=self.spx_drop_threshold,
@@ -400,11 +421,8 @@ class EventSignalDetector:
             rally_avoidance=self.rally_avoidance,
             rally_threshold=self.rally_threshold,
             signal_mode=self.signal_mode,
-            # Live settings do not yet expose the M9 magnitude window;
-            # leave None so the live path matches its pre-refactor
-            # behaviour exactly.
-            spx_drop_min=None,
-            spx_drop_max=None,
+            spx_drop_min=self.spx_drop_min,
+            spx_drop_max=self.spx_drop_max,
         )
 
     def _evaluate(self, ctx: dict[str, Any]) -> list[str]:
