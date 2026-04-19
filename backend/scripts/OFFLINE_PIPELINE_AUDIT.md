@@ -845,7 +845,7 @@ document the simplification explicitly.
 |-------|-------|
 | **Severity** | MEDIUM |
 | **Wave** | 3 |
-| **Status** | open |
+| **Status** | fixed in gap-closure Phase 2.4 -- module docstring now spells out the per-mode layout: streaming (`--phase sample` + DBEQ jobs) writes `{start}_{end}.parquet`; batch (OPRA via `--phase full`) writes per-day `YYYYMMDD.dbn.zst`. Operators inspecting `data/databento/spy/cbbo-1m/` after a sample run will no longer be surprised by Parquet.  **Resolved:** 2026-04-16. |
 
 The module docstring describes the **full** mode layout
 (`data/databento/<subdir>/YYYYMMDD.dbn.zst`). `--phase sample` actually

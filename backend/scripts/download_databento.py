@@ -1,20 +1,82 @@
 """Download historical options data from Databento for SPX and SPY.
 
-Supports multiple modes:
-  --phase sample   Download 1 day to verify schema/columns (fast, ~1 GB)
-  --phase full     Download the full date range via batch API (~10 GB)
-  --verify         Load Parquet files and print summary stats
-  --verify-dbn     Scan .dbn.zst files and check for date gaps vs trading calendar
+Modes
+-----
 
-Data is stored as per-day .dbn.zst files under:
-    data/databento/{spx,spy}/{cbbo-1m,definition,statistics}/YYYYMMDD.dbn.zst
-    data/databento/underlying/spy_equity_1m.parquet
+``--phase sample``
+    Download 1 day of every configured job via the **streaming** API to
+    verify schema/columns (fast, ~1 GB).  Streaming returns a Pandas
+    DataFrame in-memory, so the output is **always Parquet**, regardless
+    of dataset (OPRA, DBEQ, etc.).
 
-Usage:
+``--phase full``
+    Download the full date range.  OPRA jobs go through the **batch**
+    API (split-by-day ``.dbn.zst`` files, ~10 GB total); the small
+    supporting DBEQ job (SPY equity OHLCV) uses streaming and writes a
+    single Parquet covering the whole range.
+
+``--verify``
+    Load every Parquet file under ``data/databento/`` and print summary
+    stats (record counts, column names, date ranges).  Useful after a
+    sample run to sanity-check the layout before kicking off ``full``.
+
+``--verify-dbn``
+    Scan ``.dbn.zst`` files and check for date gaps versus the trading
+    calendar (L1 holiday list).  Only relevant after ``--phase full``.
+
+On-disk layout
+--------------
+
+The exact file format and naming **depends on which mode produced the
+data**, because the streaming and batch APIs serialize differently.
+``--verify`` glob-walks both, but operators inspecting a subdirectory by
+hand should expect the following:
+
+* ``--phase full`` (OPRA via batch, M12 audit fix) ::
+
+      data/databento/{spx,spy}/{cbbo-1m,definition,statistics}/YYYYMMDD.dbn.zst
+      data/databento/{spx,spy}/{...}/_jobs/<job_id>.json   # batch metadata
+
+  One ``.dbn.zst`` per *trading day*; ``YYYYMMDD`` is the session date.
+
+* ``--phase sample`` (any dataset via streaming, M12 audit fix) ::
+
+      data/databento/{spx,spy}/{cbbo-1m,definition,statistics}/{start}_{end}.parquet
+
+  A **single Parquet** spanning the sample window (``SAMPLE_START`` to
+  ``SAMPLE_END`` -- a one-trading-day range by default).  The filename
+  uses ``YYYY-MM-DD_YYYY-MM-DD.parquet``, *not* the per-day
+  ``YYYYMMDD.dbn.zst`` layout that ``--phase full`` produces.  This is
+  intentional: streaming returns DataFrames, so writing Parquet here
+  avoids a needless ``.dbn.zst`` round-trip.
+
+* DBEQ underlying (SPY equity OHLCV) -- always streaming, in **either**
+  mode ::
+
+      data/databento/underlying/spy_equity_1m.parquet
+
+  A single Parquet spanning the full requested range; the filename comes
+  from the job's ``filename`` override rather than the ``start_end``
+  template.
+
+Operators inspecting ``data/databento/spy/cbbo-1m/`` after a ``--phase
+sample`` run will therefore see a Parquet (e.g.
+``2025-01-15_2025-01-16.parquet``), **not** a ``.dbn.zst``.  Both
+layouts are intentional and supported by ``--verify``.
+
+Usage
+-----
+
+::
+
     python -m backend.scripts.download_databento --phase sample
     python -m backend.scripts.download_databento --phase full
     python -m backend.scripts.download_databento --verify
     python -m backend.scripts.download_databento --verify-dbn
+
+See ``OFFLINE_PIPELINE_AUDIT.md`` (M12) for the rationale behind the
+per-mode layout and why we did not unify on ``.dbn.zst`` for sample
+mode.
 """
 
 from __future__ import annotations
