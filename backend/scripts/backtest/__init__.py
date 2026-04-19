@@ -1,13 +1,11 @@
-"""Back-compat shim.
+"""Auto-generated package re-exports.
 
-The implementation moved to ``scripts.backtest`` --
-this module simply re-exports the public surface so existing
-``from xxx import yyy`` callers keep working without changes.
+Produced by ``tools/split_monolith.py`` from ``backend/scripts/backtest_strategy.py``.
+Edit the underlying submodules, not this file.
 """
 from __future__ import annotations
 
-from backtest import (  # noqa: F401
-    ANALYSIS_PARAMS,
+from .engine import (
     Any,
     BacktestResult,
     CONTRACTS,
@@ -15,60 +13,29 @@ from backtest import (  # noqa: F401
     DATA_DIR,
     DEFAULT_CSV,
     DayRecord,
-    EVENT_ONLY_SL_VALUES,
-    EVENT_ONLY_TP_VALUES,
     EventConfig,
     EventSignalDetector,
     EventThresholds,
     FullConfig,
     MARGIN_PER_LOT,
-    OPTIMIZER_SL_VALUES,
-    OPTIMIZER_TP_VALUES,
-    PARETO_CSV,
     Path,
     Pool,
     PortfolioConfig,
     PortfolioManager,
     RESULTS_CSV,
     RegimeThrottle,
-    SELECTIVE_SL_VALUES,
-    SELECTIVE_TP_VALUES,
     TradingConfig,
-    WALKFORWARD_CSV,
-    WALKFORWARD_WINDOWS,
     _BACKEND_DIR,
-    _BACKTEST_WORKER_REF,
     _SCRIPTS_DIR,
     _SPX_2D_MAX_CALENDAR_GAP_DAYS,
-    _StagedTradingWinner,
-    _alignment_warn_against_live_settings,
-    _backtest_worker,
-    _build_comparison_configs,
-    _build_event_only_grid,
-    _build_optimizer_grid,
-    _build_precomp_cache,
-    _build_selective_grid,
-    _build_staged_grid_stage1,
-    _build_staged_grid_stage2,
-    _build_staged_grid_stage3,
-    _config_key,
-    _config_signature,
-    _deduplicate_results,
     _fast_event_select,
     _fast_sched_select,
-    _init_backtest_worker,
     _isnan,
     _locate_scripts_dir,
     _opt_str,
     _opt_val,
-    _parameter_importance,
     _pareto_extract,
     _precompute_day_selections,
-    _print_pareto,
-    _robustness_check,
-    _row_to_config,
-    _run_grid,
-    _run_window_optimizer,
     _safe_bool,
     _should_skip_day,
     annotations,
@@ -80,28 +47,66 @@ from backtest import (  # noqa: F401
     cpu_count,
     dataclass,
     evaluate_event_signals,
-    extract_pareto_frontier,
     field,
-    generate_auto_windows,
     logger,
-    main,
     pnl_column_name,
     precompute_daily_signals,
     precompute_pnl_columns,
+    run_backtest,
+    timedelta,
+)
+from .optimizer import (
+    EVENT_ONLY_SL_VALUES,
+    EVENT_ONLY_TP_VALUES,
+    OPTIMIZER_SL_VALUES,
+    OPTIMIZER_TP_VALUES,
+    SELECTIVE_SL_VALUES,
+    SELECTIVE_TP_VALUES,
+    _BACKTEST_WORKER_REF,
+    _StagedTradingWinner,
+    _backtest_worker,
+    _build_event_only_grid,
+    _build_optimizer_grid,
+    _build_precomp_cache,
+    _build_selective_grid,
+    _build_staged_grid_stage1,
+    _build_staged_grid_stage2,
+    _build_staged_grid_stage3,
+    _init_backtest_worker,
+    _run_grid,
+    run_event_only_optimizer,
+    run_optimizer,
+    run_selective_optimizer,
+    run_staged_optimizer,
+)
+from .analysis import (
+    ANALYSIS_PARAMS,
+    PARETO_CSV,
+    WALKFORWARD_CSV,
+    WALKFORWARD_WINDOWS,
+    _build_comparison_configs,
+    _config_key,
+    _config_signature,
+    _deduplicate_results,
+    _parameter_importance,
+    _print_pareto,
+    _robustness_check,
+    _row_to_config,
+    _run_window_optimizer,
+    extract_pareto_frontier,
+    generate_auto_windows,
     print_comparison_table,
     print_monthly,
     print_optimizer_top,
     print_summary,
     run_analysis,
-    run_backtest,
-    run_event_only_optimizer,
     run_holdout_evaluation,
-    run_optimizer,
-    run_selective_optimizer,
-    run_staged_optimizer,
     run_walkforward,
-    timedelta,
     walkforward_split,
+)
+from .cli import (
+    _alignment_warn_against_live_settings,
+    main,
 )
 
 __all__ = [
@@ -201,15 +206,3 @@ __all__ = [
     'timedelta',
     'walkforward_split',
 ]
-
-
-if __name__ == "__main__":
-    import sys
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception as exc:  # noqa: BLE001
-        import logging
-        logging.getLogger(__name__).error("Fatal: %s", exc, exc_info=True)
-        sys.exit(1)

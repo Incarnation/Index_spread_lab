@@ -1,0 +1,385 @@
+{
+  "module": "backtest_strategy",
+  "symbols": {
+    "ANALYSIS_PARAMS": {
+      "hash": "cb3fbcd42cfab866",
+      "kind": "value"
+    },
+    "Any": {
+      "hash": "1eba772d8733d0e9",
+      "kind": "class"
+    },
+    "BacktestResult": {
+      "hash": "ec54009c39660324",
+      "kind": "class"
+    },
+    "CONTRACTS": {
+      "hash": "6b86b273ff34fce1",
+      "kind": "value"
+    },
+    "CONTRACT_MULT": {
+      "hash": "ad57366865126e55",
+      "kind": "value"
+    },
+    "DATA_DIR": {
+      "hash": "7bacf41ff31bcc7e",
+      "kind": "value"
+    },
+    "DEFAULT_CSV": {
+      "hash": "93748a7dcbe785c9",
+      "kind": "value"
+    },
+    "DayRecord": {
+      "hash": "93ddfe080fca268f",
+      "kind": "class"
+    },
+    "EVENT_ONLY_SL_VALUES": {
+      "hash": "604d64e6a2f9ed67",
+      "kind": "value"
+    },
+    "EVENT_ONLY_TP_VALUES": {
+      "hash": "d902ac1d7e88fbb1",
+      "kind": "value"
+    },
+    "EventConfig": {
+      "hash": "8cabc71cdf22caaa",
+      "kind": "class"
+    },
+    "EventSignalDetector": {
+      "hash": "2458cad502ec0621",
+      "kind": "class"
+    },
+    "EventThresholds": {
+      "hash": "8a0034152834d257",
+      "kind": "class"
+    },
+    "FullConfig": {
+      "hash": "68a177da4cba98ec",
+      "kind": "class"
+    },
+    "MARGIN_PER_LOT": {
+      "hash": "40510175845988f1",
+      "kind": "value"
+    },
+    "OPTIMIZER_SL_VALUES": {
+      "hash": "7e6a781f7f4106b0",
+      "kind": "value"
+    },
+    "OPTIMIZER_TP_VALUES": {
+      "hash": "87dc0892d0997847",
+      "kind": "value"
+    },
+    "PARETO_CSV": {
+      "hash": "bfad6586b257f3cf",
+      "kind": "value"
+    },
+    "Path": {
+      "hash": "0acfad4a96df48fc",
+      "kind": "class"
+    },
+    "Pool": {
+      "hash": "872c84729657e0ec",
+      "kind": "value"
+    },
+    "PortfolioConfig": {
+      "hash": "fdae517af719a899",
+      "kind": "class"
+    },
+    "PortfolioManager": {
+      "hash": "fbcfd0ae34f5e6f9",
+      "kind": "class"
+    },
+    "RESULTS_CSV": {
+      "hash": "c1b7521c3c9fe22b",
+      "kind": "value"
+    },
+    "RegimeThrottle": {
+      "hash": "fb94324626f41d9c",
+      "kind": "class"
+    },
+    "SELECTIVE_SL_VALUES": {
+      "hash": "604d64e6a2f9ed67",
+      "kind": "value"
+    },
+    "SELECTIVE_TP_VALUES": {
+      "hash": "5b2a801399921166",
+      "kind": "value"
+    },
+    "TradingConfig": {
+      "hash": "80bcfe7ed439b907",
+      "kind": "class"
+    },
+    "WALKFORWARD_CSV": {
+      "hash": "06beef1d25dd4899",
+      "kind": "value"
+    },
+    "WALKFORWARD_WINDOWS": {
+      "hash": "2ed0610d6deb0d09",
+      "kind": "value"
+    },
+    "_BACKEND_DIR": {
+      "hash": "78279289b51f84c6",
+      "kind": "value"
+    },
+    "_BACKTEST_WORKER_REF": {
+      "hash": "44136fa355b3678a",
+      "kind": "value"
+    },
+    "_SCRIPTS_DIR": {
+      "hash": "252b7baca758db88",
+      "kind": "value"
+    },
+    "_SPX_2D_MAX_CALENDAR_GAP_DAYS": {
+      "hash": "4b227777d4dd1fc6",
+      "kind": "value"
+    },
+    "_StagedTradingWinner": {
+      "hash": "2057f493ca993c8d",
+      "kind": "value"
+    },
+    "_alignment_warn_against_live_settings": {
+      "hash": "3590e0e7cabdaec6",
+      "kind": "function"
+    },
+    "_backtest_worker": {
+      "hash": "f2a9773b7ba82686",
+      "kind": "function"
+    },
+    "_build_comparison_configs": {
+      "hash": "4dd6206c13a095ce",
+      "kind": "function"
+    },
+    "_build_event_only_grid": {
+      "hash": "e331186b7afce617",
+      "kind": "function"
+    },
+    "_build_optimizer_grid": {
+      "hash": "2a3af2f782fae549",
+      "kind": "function"
+    },
+    "_build_precomp_cache": {
+      "hash": "15712d396a3d516d",
+      "kind": "function"
+    },
+    "_build_selective_grid": {
+      "hash": "78b7dd26a04e82fb",
+      "kind": "function"
+    },
+    "_build_staged_grid_stage1": {
+      "hash": "9c01e1096669c4b3",
+      "kind": "function"
+    },
+    "_build_staged_grid_stage2": {
+      "hash": "2440a9dc3549a27a",
+      "kind": "function"
+    },
+    "_build_staged_grid_stage3": {
+      "hash": "dd21f6943fe54235",
+      "kind": "function"
+    },
+    "_config_key": {
+      "hash": "d44366625b89674c",
+      "kind": "function"
+    },
+    "_config_signature": {
+      "hash": "0a1bddab75051f36",
+      "kind": "function"
+    },
+    "_deduplicate_results": {
+      "hash": "9cd9664c2c212dec",
+      "kind": "function"
+    },
+    "_fast_event_select": {
+      "hash": "d1979aa8f040e8fa",
+      "kind": "function"
+    },
+    "_fast_sched_select": {
+      "hash": "7e9126e5a745b76f",
+      "kind": "function"
+    },
+    "_init_backtest_worker": {
+      "hash": "165150f72bd428f7",
+      "kind": "function"
+    },
+    "_isnan": {
+      "hash": "6e498ec5ec362840",
+      "kind": "function"
+    },
+    "_locate_scripts_dir": {
+      "hash": "25ed33b8d44abadf",
+      "kind": "function"
+    },
+    "_opt_str": {
+      "hash": "a0430199307042fd",
+      "kind": "function"
+    },
+    "_opt_val": {
+      "hash": "041fc97a3f906b07",
+      "kind": "function"
+    },
+    "_parameter_importance": {
+      "hash": "3d5b7c653ecf6648",
+      "kind": "function"
+    },
+    "_pareto_extract": {
+      "hash": "c23485e94322bb79",
+      "kind": "function"
+    },
+    "_precompute_day_selections": {
+      "hash": "aebe476935092fc0",
+      "kind": "function"
+    },
+    "_print_pareto": {
+      "hash": "2517613939d54f0a",
+      "kind": "function"
+    },
+    "_robustness_check": {
+      "hash": "efa4e04b39e22d1b",
+      "kind": "function"
+    },
+    "_row_to_config": {
+      "hash": "1d4653d4e2bbb7d0",
+      "kind": "function"
+    },
+    "_run_grid": {
+      "hash": "875cd855e72d05f9",
+      "kind": "function"
+    },
+    "_run_window_optimizer": {
+      "hash": "bd20996f4c73ad9b",
+      "kind": "function"
+    },
+    "_safe_bool": {
+      "hash": "75c4933449e3d834",
+      "kind": "function"
+    },
+    "_should_skip_day": {
+      "hash": "3755027fa59b1961",
+      "kind": "function"
+    },
+    "annotations": {
+      "hash": "697387a71e174328",
+      "kind": "value"
+    },
+    "asdict": {
+      "hash": "027dfc363f6cd242",
+      "kind": "function"
+    },
+    "candidate_dedupe_key": {
+      "hash": "59651148cd476c19",
+      "kind": "function"
+    },
+    "compute_effective_pnl": {
+      "hash": "000cc979dbc6508f",
+      "kind": "function"
+    },
+    "compute_regime_metrics": {
+      "hash": "83cc7cae6290a6a3",
+      "kind": "function"
+    },
+    "compute_regime_multiplier": {
+      "hash": "69f16ca84e9d4094",
+      "kind": "function"
+    },
+    "cpu_count": {
+      "hash": "a49b381680d4ac69",
+      "kind": "value"
+    },
+    "dataclass": {
+      "hash": "46808e937c70165c",
+      "kind": "function"
+    },
+    "evaluate_event_signals": {
+      "hash": "baffb54da39a913b",
+      "kind": "function"
+    },
+    "extract_pareto_frontier": {
+      "hash": "7c4c3b323905c796",
+      "kind": "function"
+    },
+    "field": {
+      "hash": "320e8ae86c8fe1c8",
+      "kind": "function"
+    },
+    "generate_auto_windows": {
+      "hash": "5c66b4901f571444",
+      "kind": "function"
+    },
+    "logger": {
+      "hash": "b522a96e335f13e8",
+      "kind": "value"
+    },
+    "main": {
+      "hash": "31ba6401749f91f4",
+      "kind": "function"
+    },
+    "pnl_column_name": {
+      "hash": "36fb79e9e4ccef39",
+      "kind": "function"
+    },
+    "precompute_daily_signals": {
+      "hash": "79e7531e2d2ad1e2",
+      "kind": "function"
+    },
+    "precompute_pnl_columns": {
+      "hash": "8e750dc4aaacae24",
+      "kind": "function"
+    },
+    "print_comparison_table": {
+      "hash": "7bbe860159be92b7",
+      "kind": "function"
+    },
+    "print_monthly": {
+      "hash": "608cd686c40dcea8",
+      "kind": "function"
+    },
+    "print_optimizer_top": {
+      "hash": "274d69af8e92fce2",
+      "kind": "function"
+    },
+    "print_summary": {
+      "hash": "4db12c5d4207de1d",
+      "kind": "function"
+    },
+    "run_analysis": {
+      "hash": "e99a8e627734e5c8",
+      "kind": "function"
+    },
+    "run_backtest": {
+      "hash": "481ca641d7ed9083",
+      "kind": "function"
+    },
+    "run_event_only_optimizer": {
+      "hash": "9d17fa73465333eb",
+      "kind": "function"
+    },
+    "run_holdout_evaluation": {
+      "hash": "2c4b7fa78b6d86e1",
+      "kind": "function"
+    },
+    "run_optimizer": {
+      "hash": "b82d4b07958396b1",
+      "kind": "function"
+    },
+    "run_selective_optimizer": {
+      "hash": "03fd46a7d22277a2",
+      "kind": "function"
+    },
+    "run_staged_optimizer": {
+      "hash": "768ca20f3e390e9b",
+      "kind": "function"
+    },
+    "run_walkforward": {
+      "hash": "4df48a1c7106be01",
+      "kind": "function"
+    },
+    "timedelta": {
+      "hash": "e3b0c44298fc1c14",
+      "kind": "class"
+    },
+    "walkforward_split": {
+      "hash": "cf2005baf9ac2b49",
+      "kind": "function"
+    }
+  }
+}
