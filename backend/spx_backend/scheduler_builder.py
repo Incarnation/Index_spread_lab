@@ -230,8 +230,12 @@ def build_market_open_guarded_runner(
         guarded run observes ``is_open=True``, which allows close-force jobs to
         run at 16:00 only on real trading days.
     allow_outside_rth:
-        When ``True``, the guard lets the job through even when the market is
-        closed.  The job's internal RTH check still applies.
+        When ``True``, the scheduler guard lets the job through even when
+        the market is closed. Note (L2 audit): each job decides for
+        itself whether to honor a separate internal RTH check;
+        ``quote_job`` for example skips its own RTH gate when
+        ``settings.allow_quotes_outside_rth`` is true. Read the target
+        job's ``run_once`` for the per-job semantics.
 
     Returns
     -------

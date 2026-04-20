@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     gex_allow_outside_rth: bool = False
     gex_store_by_expiry: bool = True
     gex_spot_max_age_seconds: int = 600
+    # M11 (audit): cap age of chain_snapshots eligible for GEX recompute.
+    # gex_job.run_once skips (and logs loudly) any snapshot older than
+    # this threshold so a backlog of stale chains doesn't quietly seed
+    # context_snapshots with wrong-day spot prices. ``force=True`` (one-
+    # shot CLI overrides) bypasses the gate. Default 30min; set to 0 to
+    # disable the gate entirely.
+    gex_chain_max_age_seconds: int = 1800
     gex_contract_multiplier: int = 100
     gex_puts_negative: bool = True
     # Keep this >= number of expirations captured per snapshot cycle (e.g., 0-10 DTE => up to 11 snapshots).
@@ -76,6 +83,19 @@ class Settings(BaseSettings):
     cboe_gex_underlying: str = "SPX"
     cboe_gex_interval_minutes: int = 5
     cboe_gex_allow_outside_rth: bool = False
+    # M10 (audit): cooldown for `cboe_vendor_anomaly` alerts emitted when
+    # mzdata returns HTTP 200 with empty / malformed `data`. Keeps a
+    # vendor outage from paging on every cycle.
+    cboe_vendor_alert_cooldown_minutes: int = 60
+    # M13 (audit): consecutive-failure threshold before quote_job re-raises
+    # to APScheduler so the job-failure handler / page fires. <threshold
+    # transient errors are absorbed silently with a warning log; the
+    # counter resets on the first success.
+    quote_consecutive_failure_threshold: int = 3
+    # H1 (audit): cooldown for `snapshot_job partial run` alerts (per
+    # underlying); keeps recurring partial-batch ingestions from
+    # paging the operator on every cycle.
+    snapshot_partial_alert_cooldown_minutes: int = 30
 
     decision_entry_times: str = "10:01,11:01,12:01"
     decision_dte_targets: str = "3,5,7,10"
@@ -102,6 +122,12 @@ class Settings(BaseSettings):
 
     # EOD economic-events seeder
     eod_events_enabled: bool = True
+    # L7 (audit): scheduler fires the *static* economic_events seeder
+    # at 16:30 ET, ~30 min after the cash close. There is no dependency
+    # on a clean cash-session close because this job seeds a hard-coded
+    # FOMC/CPI/NFP/OPEX calendar -- not vendor-derived close data --
+    # so 16:30 vs 16:00 is purely a cosmetic scheduling choice (puts
+    # the seed after the noisier close-window jobs and avoids pile-up).
     eod_events_hour: int = 16
     eod_events_minute: int = 30
 
@@ -158,6 +184,12 @@ class Settings(BaseSettings):
     staleness_snapshots_max_minutes: int = 120
     staleness_gex_max_minutes: int = 120
     staleness_decisions_max_minutes: int = 480
+    # M12 (audit): CBOE-source staleness threshold (`MAX(ts) WHERE
+    # source='CBOE'`). Separate from `staleness_gex_max_minutes` so a
+    # mzdata vendor outage pages independently from the Tradier GEX
+    # path; otherwise CBOE staleness is silently masked by Tradier
+    # freshness on the same gex_snapshots table.
+    staleness_cboe_gex_max_minutes: int = 120
     staleness_cooldown_minutes: int = 360
     job_failure_alert_enabled: bool = True
     job_failure_alert_cooldown_minutes: int = 30

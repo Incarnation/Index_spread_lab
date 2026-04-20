@@ -34,6 +34,50 @@ def _quotes_by_symbol(quotes: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _parse_tradier_epoch_ms(value: object) -> datetime | None:
+    """Convert one Tradier ms-since-epoch field into a tz-aware UTC datetime.
+
+    Tradier publishes ``trade_date``, ``bid_date``, and ``ask_date`` as integer
+    milliseconds since the Unix epoch. Returns ``None`` for missing, non-numeric,
+    or non-positive values so callers can write the column as NULL without
+    extra branching. Used by H6 (audit) to populate ``underlying_quotes.vendor_ts``
+    from ``trade_date`` so downstream as-of joins can move off ingest-time.
+    """
+    if value is None:
+        return None
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000.0, tz=ZoneInfo("UTC"))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+class _FetchFailureCounter:
+    """Module-level counter for consecutive get_quotes failures.
+
+    Used by M13 (audit) to escalate a sustained outage past the per-tick
+    "swallow into log" path so APScheduler's job-failure email fires.
+    A small mutable holder rather than a global int so dataclass(frozen=True)
+    callers can still mutate it without ``global`` declarations.
+    """
+
+    def __init__(self) -> None:
+        self.consecutive: int = 0
+
+
+_fetch_failures = _FetchFailureCounter()
+
+
+def reset_fetch_failure_counter() -> None:
+    """Test-only helper to clear the in-process counter between scenarios."""
+    _fetch_failures.consecutive = 0
+
+
 @dataclass(frozen=True)
 class QuoteJob:
     """Periodic underlying quote capture job."""
@@ -74,12 +118,34 @@ class QuoteJob:
         if not quote_symbols:
             return {"skipped": True, "reason": "no_symbols", "now_et": now_et.isoformat(), "quotes_inserted": 0}
 
+        # M13 (audit): swallow transient fetch failures up to a threshold so
+        # one-off Tradier 5xx blips don't spam APScheduler email, but escalate
+        # past the threshold so a sustained outage raises into the scheduler's
+        # job-failure path. The counter resets to zero on the first successful
+        # fetch.
         try:
             quote_resp = await self.tradier.get_quotes(quote_symbols)
             quotes = _parse_quotes(quote_resp)
         except Exception as exc:
-            logger.exception("quote_job: failed to fetch quotes symbols={} error={}", quote_symbols, exc)
+            _fetch_failures.consecutive += 1
+            threshold = int(getattr(settings, "quote_consecutive_failure_threshold", 3))
+            logger.exception(
+                "quote_job: failed to fetch quotes consecutive_failures={}/{} symbols={} error={}",
+                _fetch_failures.consecutive,
+                threshold,
+                quote_symbols,
+                exc,
+            )
+            if _fetch_failures.consecutive >= threshold:
+                # Re-raise so APScheduler emails the operator. Reset the
+                # counter on raise so the next run starts a fresh window
+                # rather than instantly re-escalating on a flapping outage.
+                _fetch_failures.consecutive = 0
+                raise
             return {"skipped": True, "reason": "quote_fetch_failed", "now_et": now_et.isoformat(), "quotes_inserted": 0}
+
+        # Successful fetch: clear the consecutive-failure window.
+        _fetch_failures.consecutive = 0
 
         if not quotes:
             return {"skipped": True, "reason": "no_quotes", "now_et": now_et.isoformat(), "quotes_inserted": 0}
@@ -87,6 +153,7 @@ class QuoteJob:
         by_symbol = _quotes_by_symbol(quotes)
         quotes_inserted = 0
         quotes_failed = 0
+        quotes_dedup_skipped = 0
 
         async with SessionLocal() as session:
             try:
@@ -95,21 +162,41 @@ class QuoteJob:
                 for q in quotes:
                     try:
                         async with session.begin_nested():
-                            await session.execute(
+                            # H6 (audit): persist Tradier vendor timestamp from
+                            # ``trade_date`` (ms epoch) into the new vendor_ts
+                            # column. Falls through to NULL when Tradier omits
+                            # it; downstream consumers use COALESCE(vendor_ts, ts)
+                            # so historical rows keep working.
+                            vendor_ts = _parse_tradier_epoch_ms(q.get("trade_date"))
+                            # H5 (audit): ON CONFLICT against the
+                            # uq_underlying_quotes_symbol_ts_minute expression
+                            # index makes retries idempotent at minute
+                            # granularity. ``ts`` here is ingest time
+                            # (now_et.astimezone(utc)) which the dedup window
+                            # is keyed on; vendor_ts can NULL through.
+                            # NOTE: PG forbids STABLE functions in unique
+                            # indexes, so the index uses date_bin (IMMUTABLE)
+                            # rather than date_trunc. The ON CONFLICT
+                            # expression must match the index expression
+                            # EXACTLY for the planner to recognize it.
+                            insert_result = await session.execute(
                                 text(
                                     """
                                     INSERT INTO underlying_quotes (
-                                      ts, symbol, last, bid, ask, open, high, low, close,
+                                      ts, vendor_ts, symbol, last, bid, ask, open, high, low, close,
                                       volume, change, change_percent, prevclose, source, raw_json
                                     )
                                     VALUES (
-                                      :ts, :symbol, :last, :bid, :ask, :open, :high, :low, :close,
+                                      :ts, :vendor_ts, :symbol, :last, :bid, :ask, :open, :high, :low, :close,
                                       :volume, :change, :change_percent, :prevclose, :source, CAST(:raw_json AS jsonb)
                                     )
+                                    ON CONFLICT (symbol, (date_bin('1 minute', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00'))) DO NOTHING
+                                    RETURNING quote_id
                                     """
                                 ),
                                 {
                                     "ts": now_et.astimezone(utc),
+                                    "vendor_ts": vendor_ts,
                                     "symbol": q.get("symbol"),
                                     "last": q.get("last"),
                                     "bid": q.get("bid"),
@@ -126,7 +213,14 @@ class QuoteJob:
                                     "raw_json": json.dumps(q, default=str),
                                 },
                             )
-                            quotes_inserted += 1
+                            inserted_row = insert_result.fetchone()
+                            if inserted_row is None:
+                                # Conflict path -- another writer (or this
+                                # process on retry) already landed a row in
+                                # the same (symbol, minute) bucket.
+                                quotes_dedup_skipped += 1
+                            else:
+                                quotes_inserted += 1
                     except Exception as exc:
                         quotes_failed += 1
                         logger.exception(
@@ -147,6 +241,12 @@ class QuoteJob:
                 if vix and vix9d and vix > 0:
                     term_structure = vix9d / vix
 
+                # M2 (audit): the canonical context_snapshots.gex_net is now a
+                # GENERATED column (migration 020) computed from
+                # COALESCE(gex_net_cboe, gex_net_tradier), so quote_job no
+                # longer touches gex_net / zero_gamma_level here. Keeping the
+                # COALESCE on the source-tagged columns preserves the "first
+                # writer wins" semantics for those.
                 await session.execute(
                     text(
                         """
@@ -162,8 +262,6 @@ class QuoteJob:
                           term_structure = EXCLUDED.term_structure,
                           vvix = EXCLUDED.vvix,
                           skew = EXCLUDED.skew,
-                          gex_net = COALESCE(context_snapshots.gex_net, EXCLUDED.gex_net),
-                          zero_gamma_level = COALESCE(context_snapshots.zero_gamma_level, EXCLUDED.zero_gamma_level),
                           gex_net_tradier = COALESCE(context_snapshots.gex_net_tradier, EXCLUDED.gex_net_tradier),
                           zero_gamma_level_tradier = COALESCE(context_snapshots.zero_gamma_level_tradier, EXCLUDED.zero_gamma_level_tradier),
                           gex_net_cboe = COALESCE(context_snapshots.gex_net_cboe, EXCLUDED.gex_net_cboe),
@@ -194,23 +292,31 @@ class QuoteJob:
                     "now_et": now_et.isoformat(),
                     "quotes_inserted": quotes_inserted,
                     "quotes_failed": quotes_failed,
+                    "quotes_dedup_skipped": quotes_dedup_skipped,
                 }
 
-        if quotes_inserted == 0 and quotes_failed > 0:
+        if quotes_inserted == 0 and quotes_failed > 0 and quotes_dedup_skipped == 0:
             return {
                 "skipped": True,
                 "reason": "all_quote_inserts_failed",
                 "now_et": now_et.isoformat(),
                 "quotes_inserted": quotes_inserted,
                 "quotes_failed": quotes_failed,
+                "quotes_dedup_skipped": quotes_dedup_skipped,
             }
-        logger.info("quote_job: inserted_quotes={} failed_quotes={}", quotes_inserted, quotes_failed)
+        logger.info(
+            "quote_job: inserted_quotes={} failed_quotes={} dedup_skipped={}",
+            quotes_inserted,
+            quotes_failed,
+            quotes_dedup_skipped,
+        )
         return {
             "skipped": False,
             "reason": None,
             "now_et": now_et.isoformat(),
             "quotes_inserted": quotes_inserted,
             "quotes_failed": quotes_failed,
+            "quotes_dedup_skipped": quotes_dedup_skipped,
         }
 
 

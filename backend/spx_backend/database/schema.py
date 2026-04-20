@@ -35,6 +35,7 @@ ALL_APP_TABLES = [
     "trade_performance_breakdowns",
     "trade_performance_equity_curve",
     "economic_events",
+    "alert_cooldowns",
     "portfolio_state",
     "portfolio_trades",
     "optimizer_runs",
@@ -73,6 +74,17 @@ def _sql_dir() -> Path:
     return Path(__file__).resolve().parent / "sql"
 
 
+# Header marker that opts a migration into a non-transactional autocommit
+# code path.  Required for DDL statements like ``CREATE INDEX CONCURRENTLY``
+# which PostgreSQL forbids inside a transaction block.  The marker MUST
+# appear within the first ``_NON_TRANSACTIONAL_HEADER_LINES`` lines of the
+# SQL file (i.e. as a top-of-file directive); markers buried mid-file are
+# ignored so a stray reference inside a comment block does not flip the
+# whole runner.
+_NON_TRANSACTIONAL_MARKER = "+migrate-no-transaction"
+_NON_TRANSACTIONAL_HEADER_LINES = 5
+
+
 def _strip_sql_comments(sql: str) -> str:
     """Remove ``--`` line comments and ``/* */`` block comments from raw SQL.
 
@@ -86,6 +98,18 @@ def _strip_sql_comments(sql: str) -> str:
     return sql
 
 
+def _has_non_transactional_marker(raw_sql: str) -> bool:
+    """Return True iff the SQL file opts into the autocommit runner path.
+
+    The marker is recognised only in the first
+    :data:`_NON_TRANSACTIONAL_HEADER_LINES` lines so a stray mention of the
+    string inside a documentation comment block further down cannot flip
+    the runner mode for the whole file.
+    """
+    header = raw_sql.splitlines()[:_NON_TRANSACTIONAL_HEADER_LINES]
+    return any(_NON_TRANSACTIONAL_MARKER in line for line in header)
+
+
 async def _execute_sql_file(path: Path) -> None:
     """Execute SQL file statement-by-statement for asyncpg compatibility.
 
@@ -94,11 +118,42 @@ async def _execute_sql_file(path: Path) -> None:
     path:
         Filesystem path to a ``.sql`` file.  Comments are stripped before
         splitting on ``;`` so comment-only fragments never reach the driver.
+
+    Notes
+    -----
+    Most migrations run inside a single ``engine.begin()`` transaction so
+    a partial failure rolls the file back as one unit.  Files whose
+    *header* (first :data:`_NON_TRANSACTIONAL_HEADER_LINES` lines) contains
+    the :data:`_NON_TRANSACTIONAL_MARKER` directive are routed through an
+    autocommit connection instead.  This is required for statements like
+    ``CREATE INDEX CONCURRENTLY`` that PostgreSQL refuses to run inside a
+    transaction (see migration 024 for an example).  In that mode each
+    statement commits independently, so a failure leaves any earlier
+    statements applied -- the caller (``_run_migrations``) records the
+    file as applied only after the whole body succeeds.
     """
     raw_sql = path.read_text(encoding="utf-8")
     sql = _strip_sql_comments(raw_sql)
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    if _has_non_transactional_marker(raw_sql):
+        # Autocommit mode: open a single connection, set isolation level
+        # to AUTOCOMMIT, execute each statement standalone.  No
+        # ``engine.begin()`` wrapper because that would start a tx and
+        # invalidate ``CREATE INDEX CONCURRENTLY``.
+        logger.info("sql_exec_autocommit file={} statements={}", path.name, len(statements))
+        async with engine.connect() as conn:
+            ac_conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            for stmt in statements:
+                try:
+                    await ac_conn.exec_driver_sql(stmt)
+                except Exception:
+                    logger.error(
+                        "sql_exec_failed file={} statement={!r} (autocommit mode)",
+                        path.name, stmt[:120],
+                    )
+                    raise
+        return
     async with engine.begin() as conn:
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
         for stmt in statements:
             try:
                 await conn.exec_driver_sql(stmt)

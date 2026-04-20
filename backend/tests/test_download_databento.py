@@ -101,28 +101,34 @@ class TestGetTradingDays:
 
 class TestGetExistingDates:
     def test_reads_dbn_zst_names(self, tmp_path: Path):
-        """Correctly parses YYYYMMDD.dbn.zst filenames."""
+        """Correctly parses YYYYMMDD.dbn.zst filenames.
+
+        Uses ``decode_probe=False`` because these are zero-byte stub
+        files; the H9 decode-probe path would (correctly) treat them
+        as corrupt and unlink them, which is the desired production
+        behavior but not what this presence-only test is asserting.
+        """
         (tmp_path / "20260102.dbn.zst").touch()
         (tmp_path / "20260105.dbn.zst").touch()
         (tmp_path / "readme.txt").touch()
-        result = get_existing_dates(tmp_path)
+        result = get_existing_dates(tmp_path, decode_probe=False)
         assert result == {"20260102", "20260105"}
 
     def test_ignores_non_matching(self, tmp_path: Path):
         """Files not matching YYYYMMDD.dbn.zst are ignored."""
         (tmp_path / "opra-pillar-20260102.cbbo-1m.dbn.zst").touch()
         (tmp_path / "data.parquet").touch()
-        result = get_existing_dates(tmp_path)
+        result = get_existing_dates(tmp_path, decode_probe=False)
         assert result == set()
 
     def test_nonexistent_dir(self, tmp_path: Path):
         """Returns empty set for a directory that doesn't exist."""
-        result = get_existing_dates(tmp_path / "nonexistent")
+        result = get_existing_dates(tmp_path / "nonexistent", decode_probe=False)
         assert result == set()
 
     def test_empty_dir(self, tmp_path: Path):
         """Returns empty set for an empty directory."""
-        result = get_existing_dates(tmp_path)
+        result = get_existing_dates(tmp_path, decode_probe=False)
         assert result == set()
 
 

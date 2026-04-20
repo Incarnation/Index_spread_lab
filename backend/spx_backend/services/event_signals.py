@@ -49,7 +49,9 @@ def compute_term_structure(vix9d: float | None, vix: float | None) -> float | No
     (true backwardation / near-term vol stress), and < 1.0 in normal
     contango.  Every other component of the system uses this convention:
     DB writers (``quote_job.compute_market_context`` and
-    ``cboe_gex_job._latest_vols``), the offline training pipeline
+    ``cboe_gex_job._aggregate_underlying_results`` -- the L6 audit fix
+    corrects the previously-named ``_latest_vols`` reference, which has
+    never existed in this codebase), the offline training pipeline
     (``generate_training_data._build_underlying_quote_frame``), and the
     backtest detector that reads ``term_structure`` directly from the
     candidate row.
@@ -454,12 +456,18 @@ class EventSignalDetector:
         """
         lookback = today - timedelta(days=5)
         upper = today + timedelta(days=1)
+        # H6 (audit): partition / order by COALESCE(vendor_ts, ts) so the
+        # "close-of-day" we pick reflects the vendor's observation
+        # timestamp (Tradier ``trade_date``), not our ingest delay.
+        # Backward compatible: rows where vendor_ts IS NULL fall through
+        # to ingest ts. Functional index from migration 019 supports the
+        # ORDER BY without a sequential scan.
         async with engine.connect() as conn:
             rows = await conn.execute(text(
-                "SELECT symbol, date_trunc('day', ts)::date AS d, "
-                "  (array_agg(last ORDER BY ts DESC))[1] AS close "
+                "SELECT symbol, date_trunc('day', COALESCE(vendor_ts, ts))::date AS d, "
+                "  (array_agg(last ORDER BY COALESCE(vendor_ts, ts) DESC))[1] AS close "
                 "FROM underlying_quotes "
-                "WHERE ts >= :lb AND ts < :upper "
+                "WHERE COALESCE(vendor_ts, ts) >= :lb AND COALESCE(vendor_ts, ts) < :upper "
                 "  AND symbol IN ('SPX', 'VIX', 'VIX9D') "
                 "GROUP BY symbol, d "
                 "ORDER BY d"

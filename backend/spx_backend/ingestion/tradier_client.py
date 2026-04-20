@@ -39,7 +39,10 @@ class TradierClient:
     """
 
     base_url: str
-    token: str
+    # L1 (audit): hide bearer token from repr() / structured logs so an
+    # accidental ``logger.info(client)`` or pytest assertion-introspect
+    # never leaks the secret.
+    token: str = field(repr=False)
     _client: httpx.AsyncClient = field(init=False, repr=False, default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:

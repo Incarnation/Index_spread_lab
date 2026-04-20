@@ -18,7 +18,19 @@ from spx_backend.dte import (
     trading_dte_lookup,
 )
 from spx_backend.ingestion.tradier_client import TradierClient, get_tradier_client
+from spx_backend.jobs._chain_snapshot_dao import (
+    PAYLOAD_KIND_OPTIONS_CHAIN,
+    get_or_insert_anchor,
+)
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services import alerts
+from spx_backend.services.option_row_sanitizer import (
+    normalize_option_right as _sanitizer_normalize_option_right,
+    sanitize_chain_options,
+)
+
+
+_OPTION_ROW_INSERT_PAGE_SIZE = 200  # M3 (audit) executemany page size
 
 
 def _checksum(payload: object) -> str:
@@ -71,25 +83,15 @@ def _parse_chain_options(chain: dict) -> list[dict]:
 
 
 def _normalize_option_right(opt: dict) -> str | None:
-    """Normalize option right to 'C' or 'P'."""
-    val = opt.get("option_type") or opt.get("put_call") or opt.get("right")
-    if isinstance(val, str):
-        v = val.strip().upper()
-        if v in {"CALL", "C"}:
-            return "C"
-        if v in {"PUT", "P"}:
-            return "P"
-    return None
+    """Normalize option right to 'C' or 'P'.
 
-
-def _to_int(value: object) -> int | None:
-    """Convert value to int when possible."""
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except Exception:
-        return None
+    Refactor #4 (audit): the canonical implementation now lives in
+    ``services.option_row_sanitizer.normalize_option_right`` and is
+    re-exported here as a thin wrapper so existing imports of
+    ``snapshot_job._normalize_option_right`` (notably the unit tests)
+    keep working bytecode-identically.
+    """
+    return _sanitizer_normalize_option_right(opt)
 
 
 def _to_float(value: object) -> float | None:
@@ -390,24 +392,21 @@ class SnapshotJob:
                     # Use per-expiration savepoints so one bad chain payload or DB
                     # write does not roll back successful snapshots from this run.
                     async with session.begin_nested():
-                        result = await session.execute(
-                            text(
-                                """
-                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, :checksum)
-                                RETURNING snapshot_id
-                                """
-                            ),
-                            {
-                                "ts": now_et.astimezone(utc),
-                                "underlying": underlying,
-                                "source": "TRADIER",
-                                "target_dte": target_dte,
-                                "expiration": exp,
-                                "checksum": chk,
-                            },
+                        # Refactor #2 + M4 + M1 (audit): centralized DAO
+                        # writes the (ts, underlying, source, expiration)
+                        # anchor with ON CONFLICT DO NOTHING and stamps
+                        # payload_kind='options_chain' (full chain follows
+                        # in option_chain_rows below).
+                        snapshot_id, _was_inserted = await get_or_insert_anchor(
+                            session=session,
+                            ts=now_et.astimezone(utc),
+                            underlying=underlying,
+                            source="TRADIER",
+                            target_dte=target_dte,
+                            expiration=exp,
+                            checksum=chk,
+                            payload_kind=PAYLOAD_KIND_OPTIONS_CHAIN,
                         )
-                        snapshot_id = result.scalar_one()
 
                         # Extract per-option rows with open_interest + greeks if present.
                         selected_strikes: set[float] | None = None
@@ -425,64 +424,62 @@ class SnapshotJob:
                                     spot,
                                     exp.isoformat(),
                                 )
-                        for opt in options:
-                            # Tradier occasionally emits malformed list items;
-                            # skip non-dict entries to keep ingestion resilient.
-                            if not isinstance(opt, dict):
-                                continue
-                            symbol = opt.get("symbol")
-                            if not symbol:
-                                continue
-                            greeks = opt.get("greeks") or {}
-                            strike_val = _to_float(opt.get("strike"))
-                            if selected_strikes is not None:
-                                if strike_val is None or strike_val not in selected_strikes:
-                                    continue
-                            await session.execute(
-                                text(
-                                    """
-                                    INSERT INTO option_chain_rows (
-                                      snapshot_id, option_symbol, underlying, expiration, strike, option_right,
-                                      bid, ask, last, volume, open_interest, contract_size,
-                                      delta, gamma, theta, vega, rho,
-                                      bid_iv, mid_iv, ask_iv, greeks_updated_at,
-                                      raw_json
-                                    )
-                                    VALUES (
-                                      :snapshot_id, :option_symbol, :underlying, :expiration, :strike, :option_right,
-                                      :bid, :ask, :last, :volume, :open_interest, :contract_size,
-                                      :delta, :gamma, :theta, :vega, :rho,
-                                      :bid_iv, :mid_iv, :ask_iv, :greeks_updated_at,
-                                      CAST(:raw_json AS jsonb)
-                                    )
-                                    """
-                                ),
-                                {
-                                    "snapshot_id": snapshot_id,
-                                    "option_symbol": symbol,
-                                    "underlying": underlying,
-                                    "expiration": (_to_date(opt.get("expiration_date")) or exp),
-                                    "strike": strike_val,
-                                    "option_right": _normalize_option_right(opt),
-                                    "bid": _to_float(opt.get("bid")),
-                                    "ask": _to_float(opt.get("ask")),
-                                    "last": _to_float(opt.get("last")),
-                                    "volume": _to_int(opt.get("volume")),
-                                    "open_interest": _to_int(opt.get("open_interest")),
-                                    "contract_size": _to_int(opt.get("contract_size")),
-                                    "delta": _to_float(greeks.get("delta")),
-                                    "gamma": _to_float(greeks.get("gamma")),
-                                    "theta": _to_float(greeks.get("theta")),
-                                    "vega": _to_float(greeks.get("vega")),
-                                    "rho": _to_float(greeks.get("rho")),
-                                    "bid_iv": _to_float(greeks.get("bid_iv")),
-                                    "mid_iv": _to_float(greeks.get("mid_iv")),
-                                    "ask_iv": _to_float(greeks.get("ask_iv")),
-                                    "greeks_updated_at": greeks.get("updated_at"),
-                                    "raw_json": json.dumps(opt, default=str),
-                                },
+                            else:
+                                # H2 (audit): _select_strikes_near_spot returned an empty set
+                                # (sparse chain, malformed strikes, etc.) despite a non-None
+                                # spot. Treating ``set()`` as "filter to nothing" silently
+                                # produces an empty-but-FK-valid chain_snapshot (Q23 evidence
+                                # showed 222 such rows). Convert to None so we fall through
+                                # to the full-chain ingest with a loud warning.
+                                logger.warning(
+                                    "{}: empty_strike_filter underlying={} exp={} spot={}; "
+                                    "ingesting full chain (H2 fallback)",
+                                    self.config.job_name,
+                                    underlying,
+                                    exp.isoformat(),
+                                    spot,
+                                )
+                                selected_strikes = None
+                        # Refactor #4 + M18 + M3 (audit): centralised
+                        # sanitiser filters non-dict / missing-symbol /
+                        # null-strike / null-option_right rows up front
+                        # and emits one structured log per snapshot.
+                        # Insert is then issued via executemany in
+                        # _OPTION_ROW_INSERT_PAGE_SIZE-row pages so a
+                        # 600-row chain fires 3 round trips instead of
+                        # 600 (M3).
+                        sanitized = sanitize_chain_options(
+                            options,
+                            snapshot_id=snapshot_id,
+                            underlying=underlying,
+                            fallback_expiration=exp,
+                            selected_strikes=selected_strikes,
+                            job_name=self.config.job_name,
+                        )
+                        bound_rows = sanitized.rows
+                        if bound_rows:
+                            insert_stmt = text(
+                                """
+                                INSERT INTO option_chain_rows (
+                                  snapshot_id, option_symbol, underlying, expiration, strike, option_right,
+                                  bid, ask, last, volume, open_interest, contract_size,
+                                  delta, gamma, theta, vega, rho,
+                                  bid_iv, mid_iv, ask_iv, greeks_updated_at,
+                                  raw_json
+                                )
+                                VALUES (
+                                  :snapshot_id, :option_symbol, :underlying, :expiration, :strike, :option_right,
+                                  :bid, :ask, :last, :volume, :open_interest, :contract_size,
+                                  :delta, :gamma, :theta, :vega, :rho,
+                                  :bid_iv, :mid_iv, :ask_iv, :greeks_updated_at,
+                                  CAST(:raw_json AS jsonb)
+                                )
+                                """
                             )
-                            item_chain_rows_inserted += 1
+                            for page_start in range(0, len(bound_rows), _OPTION_ROW_INSERT_PAGE_SIZE):
+                                page = bound_rows[page_start : page_start + _OPTION_ROW_INSERT_PAGE_SIZE]
+                                await session.execute(insert_stmt, page)
+                            item_chain_rows_inserted += len(bound_rows)
                     chain_rows_inserted += item_chain_rows_inserted
                     inserted.append(
                         {
@@ -532,11 +529,60 @@ class SnapshotJob:
                     "fallback_used": fallback_used,
                     "failed_items": failed_items,
                 }
+        # H1 (audit): per-expiration savepoints commit independently inside one
+        # outer transaction. A failure on expiration N does NOT roll back the
+        # already-savepoint-committed expirations 1..N-1, and decision_job
+        # cannot see "this run was incomplete" from the snapshot table alone.
+        # Emit a structured log + best-effort SendGrid alert (cooldown-gated)
+        # so the operator notices a partial run quickly.
+        expected_expirations = len(selected)
+        inserted_count = len(inserted)
+        if expected_expirations > 0 and inserted_count < expected_expirations:
+            failed_stages = sorted({str(fi.get("stage", "?")) for fi in failed_items})
+            logger.warning(
+                "{}: partial_snapshot_run underlying={} expected={} inserted={} "
+                "failed={} stages={}",
+                self.config.job_name,
+                underlying,
+                expected_expirations,
+                inserted_count,
+                len(failed_items),
+                failed_stages,
+            )
+            try:
+                await alerts.send_alert(
+                    subject=f"[IndexSpreadLab] snapshot_job partial run -- {underlying}",
+                    body_html=(
+                        f"<p><b>{self.config.job_name}</b> partial-batch run.</p>"
+                        f"<ul>"
+                        f"<li>underlying: {underlying}</li>"
+                        f"<li>expected expirations: {expected_expirations}</li>"
+                        f"<li>inserted expirations: {inserted_count}</li>"
+                        f"<li>failed expirations: {len(failed_items)}</li>"
+                        f"<li>failed stages: {', '.join(failed_stages) or 'none'}</li>"
+                        f"<li>now_et: {now_et.isoformat()}</li>"
+                        f"</ul>"
+                        f"<p>See logs for per-expiration failure detail.</p>"
+                    ),
+                    cooldown_key=f"snapshot_partial:{self.config.job_name}:{underlying}",
+                    cooldown_minutes=int(
+                        getattr(settings, "snapshot_partial_alert_cooldown_minutes", 30)
+                    ),
+                )
+            except Exception as alert_exc:
+                # Never let the alert path bring down the snapshot job.
+                logger.warning(
+                    "{}: partial_snapshot_alert_failed underlying={} error={}",
+                    self.config.job_name,
+                    underlying,
+                    alert_exc,
+                )
         logger.info(
-            "{}: inserted_chains={} chain_rows={} failed_items={}",
+            "{}: inserted_chains={} chain_rows={} expected_chains={} failed_items={}",
             self.config.job_name,
             len(inserted),
             chain_rows_inserted,
+            expected_expirations,
             len(failed_items),
         )
         return {
@@ -545,19 +591,30 @@ class SnapshotJob:
             "now_et": now_et.isoformat(),
             "inserted": inserted,
             "chain_rows_inserted": chain_rows_inserted,
+            "expected_expirations": expected_expirations,
+            "inserted_count": inserted_count,
             "fallback_used": fallback_used,
             "failed_items": failed_items,
         }
 
     async def _get_spot_price(self, session, ts: datetime, underlying: str) -> float | None:
-        """Fetch latest spot price at or before ts."""
+        """Fetch latest spot price at or before ts.
+
+        H6 (audit): switched to ``COALESCE(vendor_ts, ts)`` so as-of lookups
+        prefer the vendor's observation timestamp (Tradier ``trade_date``)
+        when present. Backward-compatible: historical rows where
+        vendor_ts IS NULL fall back to ingest ts. The functional index
+        ``idx_underlying_quotes_symbol_vendor_or_ts`` (migration 019)
+        supports the ORDER BY without a sequential scan.
+        """
         row = await session.execute(
             text(
                 """
-                SELECT last, ts
+                SELECT last, COALESCE(vendor_ts, ts) AS effective_ts
                 FROM underlying_quotes
-                WHERE symbol = :symbol AND ts <= :ts
-                ORDER BY ts DESC
+                WHERE symbol = :symbol
+                  AND COALESCE(vendor_ts, ts) <= :ts
+                ORDER BY COALESCE(vendor_ts, ts) DESC
                 LIMIT 1
                 """
             ),

@@ -372,23 +372,100 @@ def get_trading_days(start_str: str, end_str: str) -> list[date]:
     return days
 
 
-def get_existing_dates(directory: Path) -> set[str]:
+def get_existing_dates(directory: Path, *, decode_probe: bool = True) -> set[str]:
     """Scan a directory for YYYYMMDD.dbn.zst files and return the date strings.
+
+    Audit H9 fix: when ``decode_probe`` is True (default), each candidate
+    file is decoded via ``databento.DBNStore.from_file`` before its date
+    is reported as present. Files that fail decoding are deleted (so the
+    next batch run will re-fetch them) and excluded from the returned
+    set. Pass ``decode_probe=False`` for cheap presence-only scans (e.g.
+    the ``--verify-dbn`` flow that reports per-day sizes from disk).
 
     Args:
         directory: Path to scan for .dbn.zst files.
+        decode_probe: When True, run a one-shot DBN decode on each file
+            and treat decode failures as "missing" + delete the file.
 
     Returns:
         Set of date strings like {'20260102', '20260103', ...}.
     """
-    dates = set()
+    dates: set[str] = set()
     if not directory.exists():
         return dates
     for f in directory.iterdir():
         m = re.match(r"^(\d{8})\.dbn\.zst$", f.name)
-        if m:
-            dates.add(m.group(1))
+        if not m:
+            continue
+        if decode_probe and not _is_dbn_decodable(f):
+            try:
+                f.unlink()
+                logger.info(
+                    "H9 (audit): removed corrupt file %s; will re-download on next batch",
+                    f,
+                )
+            except OSError as exc:
+                logger.error("H9 (audit): failed to unlink corrupt %s: %s", f, exc)
+            continue
+        dates.add(m.group(1))
     return dates
+
+
+def _is_parquet_decodable(path: Path) -> bool:
+    """Return True iff ``path`` can be re-read as a structurally valid Parquet file.
+
+    H9 (audit) adjacent fix: a partial ``df.to_parquet`` (interrupt mid-
+    flush, disk-full, network drop mid-stream) leaves a present-but-
+    corrupt file that ``out_path.exists()`` would happily skip on rerun.
+    A one-shot decode probe via ``pyarrow`` resolves the question of
+    "is this file still semantically valid?" cheaply (metadata read,
+    not full table load) so we can ``rm + re-download`` corrupt files
+    transparently rather than poisoning offline training silently.
+
+    The ``num_rows >= 0`` predicate intentionally accepts a structurally
+    valid empty Parquet file (an early-day session with zero rows). The
+    caller treats "decodable" as "do not re-download"; a valid empty
+    file should not trigger a re-download because there is nothing to
+    fix on the source side.
+    """
+    try:
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(str(path))
+        return pf.metadata is not None and pf.metadata.num_rows >= 0
+    except Exception as exc:
+        logger.warning(
+            "H9 (audit): parquet decode probe failed for %s: %s; treating as corrupt",
+            path,
+            exc,
+        )
+        return False
+
+
+def _is_dbn_decodable(path: Path) -> bool:
+    """Return True iff ``path`` can be decoded by ``databento.DBNStore``.
+
+    H9 (audit) primary fix: ``get_existing_dates`` previously skipped any
+    ``YYYYMMDD.dbn.zst`` whose name pattern matched, even when the file
+    was a 0-byte stub from a killed batch download. A one-shot decode
+    probe via the ``databento`` Python client raises if the zstd stream
+    or DBN header is corrupt; catching that gives us a deterministic
+    "skippable vs needs-redownload" gate.
+    """
+    try:
+        import databento as _db
+
+        store = _db.DBNStore.from_file(str(path))
+        # Touch a cheap attribute to force the metadata read.
+        _ = store.metadata.dataset
+        return True
+    except Exception as exc:
+        logger.warning(
+            "H9 (audit): dbn decode probe failed for %s: %s; treating as corrupt",
+            path,
+            exc,
+        )
+        return False
 
 
 def _download_streaming(
@@ -400,6 +477,11 @@ def _download_streaming(
     """Download via streaming API and save as Parquet.
 
     Best for small requests like SPY equity OHLCV or single-day samples.
+
+    Audit H9 fix: writes go through ``<out>.tmp`` + ``os.replace`` so a
+    crash mid-flush cannot leave a half-written Parquet. Existing
+    files are decode-probed before the skip path triggers; a corrupt
+    cached Parquet is removed and re-downloaded on the same run.
 
     Args:
         client: Authenticated Databento Historical client.
@@ -415,11 +497,24 @@ def _download_streaming(
     out_path = out_dir / f"{fname}.parquet"
 
     if out_path.exists():
-        size_mb = out_path.stat().st_size / 1e6
-        print(f"    [skip] {out_path.name} already exists ({size_mb:.1f} MB)")
-        return out_path
+        if _is_parquet_decodable(out_path):
+            size_mb = out_path.stat().st_size / 1e6
+            print(f"    [skip] {out_path.name} already exists ({size_mb:.1f} MB)")
+            return out_path
+        # H9 (audit): corrupt cached file -- delete and re-download.
+        print(
+            f"    [redo] {out_path.name} was present but failed decode probe; "
+            f"deleting and re-downloading"
+        )
+        out_path.unlink()
 
     print(f"    Downloading via streaming API...", flush=True)
+    # L10 (audit): retry / backoff for HTTP-level failures is delegated
+    # to the ``databento`` client (currently uses ``urllib3.Retry`` with
+    # default 3 tries + exponential backoff for 5xx, and ``requests``-
+    # style transport-level retry for connection drops). We do NOT
+    # double-wrap with ``tenacity`` here because the client already
+    # surfaces a retry-exhausted exception we propagate to the caller.
     data = client.timeseries.get_range(
         dataset=job["dataset"],
         symbols=job["symbols"],
@@ -434,7 +529,22 @@ def _download_streaming(
         logger.warning("No records returned for %s (%s to %s)", job["label"], start, end)
         return out_path
 
-    df.to_parquet(out_path, engine="pyarrow")
+    # H9 (audit): atomic write -- stream into a tmp file in the same
+    # directory (so os.replace stays atomic on POSIX) and only swap
+    # into the canonical name once the bytes are flushed.
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        df.to_parquet(tmp_path, engine="pyarrow")
+        os.replace(tmp_path, out_path)
+    except Exception:
+        # Best-effort cleanup of the tmp before re-raising so a retry
+        # does not see the half-written file.
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
     size_mb = out_path.stat().st_size / 1e6
     print(f"    [done] {out_path.name}: {len(df):,} records, {size_mb:.1f} MB")
     return out_path
@@ -473,12 +583,64 @@ def _download_batch(
         print(f"    [skip] All {len(expected)} dates already present in {job['subdir']}")
         return out_dir
 
+    # M15 (audit): rerun cost amplification fix. Previously we passed
+    # the full ``start``/``end`` window to ``submit_job`` even when only
+    # a few days were missing; cached days didn't re-download but the
+    # operator still paid for the full-range batch job. We now derive a
+    # tight contiguous window from the missing-days set so the bill
+    # matches what we actually need to fetch. ``submit_job_end`` is
+    # exclusive, matching Databento's convention.
+    missing_days = sorted(date.fromisoformat(f"{m[:4]}-{m[4:6]}-{m[6:8]}") for m in missing)
+    submit_job_start = missing_days[0].isoformat()
+    submit_job_end = (missing_days[-1] + timedelta(days=1)).isoformat()
+
+    # M16 (audit): pre-flight disk-space guardrail. Each missing OPRA
+    # day for SPX cbbo-1m is ~3 GB on disk after zstd; we use 4 GB as a
+    # conservative per-day floor for OPRA datasets and 50 MB for
+    # smaller schemas (definition / statistics). DBEQ jobs go through
+    # the streaming path which does its own guard implicitly via the
+    # streaming framework, so they are not gated here.
+    is_opra_cbbo = job.get("dataset") == "OPRA.PILLAR" and job.get("schema") == "cbbo-1m"
+    per_day_floor_gb = 4.0 if is_opra_cbbo else 0.05
+    estimated_required_gb = per_day_floor_gb * len(missing_days)
+    free_bytes = shutil.disk_usage(DATA_DIR).free
+    free_gb = free_bytes / 1e9
     print(
-        f"    {len(existing)} dates cached, {len(missing)} missing. "
-        f"Submitting batch job...",
+        f"    Missing days: {len(missing_days)} ({submit_job_start} to {submit_job_end}); "
+        f"est. disk required ~{estimated_required_gb:.1f} GB; "
+        f"free ~{free_gb:.1f} GB",
+        flush=True,
+    )
+    if free_bytes < estimated_required_gb * 1e9:
+        raise SystemExit(
+            f"M16 (audit): aborting -- estimated disk required ({estimated_required_gb:.1f} GB) "
+            f"exceeds free space ({free_gb:.1f} GB) on {DATA_DIR}. "
+            f"Free up space or relocate DATABENTO_DIR before retrying."
+        )
+
+    # M15 (audit): print the cost-shape estimate so operators see the
+    # billable surface BEFORE the batch lands. Real $ pricing is dataset
+    # / schema dependent; we print the days-to-fetch and the byte
+    # estimate so the operator can correlate with their Databento
+    # billing dashboard.
+    print(
+        f"    [M15] estimated batch cost surface: {len(missing_days)} days, "
+        f"~{estimated_required_gb:.1f} GB; check Databento dashboard for $ rate",
         flush=True,
     )
 
+    print(
+        f"    {len(existing)} dates cached, {len(missing)} missing. "
+        f"Submitting batch job for {submit_job_start}..{submit_job_end}...",
+        flush=True,
+    )
+
+    # L10 (audit): retry / backoff for the submit_job + poll loop is
+    # delegated to the ``databento`` Python client (urllib3.Retry on
+    # 5xx + connection-drop retry on the underlying ``requests``
+    # transport). We do NOT wrap with a second ``tenacity`` decorator
+    # here -- the client's retries already surface a single terminal
+    # exception that our ``main()`` try/except logs.
     batch_result = client.batch.submit_job(
         dataset=job["dataset"],
         symbols=job["symbols"],
@@ -486,8 +648,8 @@ def _download_batch(
         schema=job["schema"],
         encoding="dbn",
         compression="zstd",
-        start=start,
-        end=end,
+        start=submit_job_start,
+        end=submit_job_end,
         split_duration="day",
     )
 
@@ -753,7 +915,11 @@ def verify_dbn(start: str, end: str) -> dict[str, dict]:
 
     for subdir in subdirs:
         dir_path = DATA_DIR / subdir
-        actual = get_existing_dates(dir_path)
+        # H9 (audit): in --verify-dbn we want a presence-only scan so
+        # the report doesn't silently delete files as a side effect; a
+        # corrupt file shows up as "present" here and an operator can
+        # decide whether to rerun the download phase.
+        actual = get_existing_dates(dir_path, decode_probe=False)
         missing = sorted(expected_strs - actual)
         extra = sorted(actual - expected_strs)
 
@@ -821,6 +987,31 @@ def main() -> None:
 
     args = parser.parse_args()
     skip_groups = set(args.skip) if args.skip else None
+
+    # M17 (audit): argparse-time date-range validation. Bad ranges
+    # (start >= end, or end in the future where Databento has no
+    # records yet) previously failed *softly* -- empty trading-day
+    # lists or odd batch behavior depending on the day of the week --
+    # so they were easy to miss in operator runs. We hard-fail at
+    # parse time with a clear message instead. ``end`` is exclusive in
+    # Databento's convention so we require ``end <= today`` (today is
+    # acceptable because it requests rows strictly before today).
+    try:
+        start_d = date.fromisoformat(args.start)
+        end_d = date.fromisoformat(args.end)
+    except ValueError as exc:
+        parser.error(f"M17 (audit): --start/--end must be YYYY-MM-DD ({exc})")
+    if start_d >= end_d:
+        parser.error(
+            f"M17 (audit): --start ({args.start}) must be strictly before --end "
+            f"({args.end}); Databento end date is exclusive"
+        )
+    today = date.today()
+    if end_d > today:
+        parser.error(
+            f"M17 (audit): --end ({args.end}) must be <= today ({today.isoformat()}); "
+            f"Databento has no records past today's session"
+        )
 
     if args.verify:
         verify()

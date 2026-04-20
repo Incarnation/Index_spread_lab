@@ -15,6 +15,7 @@ from spx_backend.services.candidate_dedupe import (
     CandidateKey,
     candidate_dedupe_key as _shared_candidate_dedupe_key,
 )
+from spx_backend.services.option_row_sanitizer import is_quote_valid
 from spx_backend.services.portfolio_manager import PortfolioManager as ProdPortfolioManager
 from spx_backend.services.event_signals import EventSignalDetector as ProdEventSignalDetector
 from spx_backend.utils.pricing import mid_price
@@ -595,9 +596,12 @@ class DecisionJob:
             ask = r.ask
             delta = r.delta
             strike = r.strike
-            if bid is None or ask is None or delta is None or strike is None:
-                continue
-            if ask <= 0 or bid < 0:
+            # Refactor #4 (audit): single source of truth for "is this row
+            # a usable two-sided quote with a known delta and strike?"
+            # lives in services.option_row_sanitizer.is_quote_valid so the
+            # ingest binder (sanitize_chain_options) and this read-side
+            # filter can never drift apart.
+            if not is_quote_valid(bid, ask, delta, strike):
                 continue
             entry: dict = {
                 "symbol": r.option_symbol,
@@ -976,14 +980,21 @@ class DecisionJob:
         )
 
     async def _get_spot_price(self, session, ts: datetime, underlying: str) -> float | None:
-        """Fetch latest spot price at or before ts."""
+        """Fetch latest spot price at or before ts.
+
+        H6 (audit): switched to ``COALESCE(vendor_ts, ts)`` so as-of lookups
+        prefer the vendor's observation timestamp (Tradier ``trade_date``)
+        when available. Backward-compatible: rows where vendor_ts IS NULL
+        fall through to ingest ts.
+        """
         row = await session.execute(
             text(
                 """
-                SELECT last, ts
+                SELECT last, COALESCE(vendor_ts, ts) AS effective_ts
                 FROM underlying_quotes
-                WHERE symbol = :symbol AND ts <= :ts
-                ORDER BY ts DESC
+                WHERE symbol = :symbol
+                  AND COALESCE(vendor_ts, ts) <= :ts
+                ORDER BY COALESCE(vendor_ts, ts) DESC
                 LIMIT 1
                 """
             ),

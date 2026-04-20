@@ -39,6 +39,30 @@ async def run_once(*, force: bool = False) -> dict:
     batch_size = max(1, settings.retention_batch_size)
     total_deleted = 0
 
+    # L5 (audit): observe per-table cascade row counts before/after the
+    # purge so logs document the cascade rather than just the parent
+    # delete count. The pre-counts are an estimate from pg_class.reltuples
+    # (stat-only, no full table scan) so this stays cheap on the 9.6 GB
+    # gex_by_expiry_strike table.
+    cascade_tables = (
+        "option_chain_rows",
+        "gex_snapshots",
+        "gex_by_strike",
+        "gex_by_expiry_strike",
+    )
+    pre_counts: dict[str, int] = {}
+    async with engine.begin() as conn:
+        for table_name in cascade_tables:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT reltuples::bigint AS approx FROM pg_class WHERE relname = :tname"
+                    ),
+                    {"tname": table_name},
+                )
+            ).fetchone()
+            pre_counts[table_name] = int(row.approx) if row and row.approx is not None else 0
+
     while True:
         async with engine.begin() as conn:
             result = await conn.execute(
@@ -67,12 +91,43 @@ async def run_once(*, force: bool = False) -> dict:
         if deleted < batch_size:
             break
 
+    # L5 (audit): post-purge cascade snapshot. ANALYZE first (L4) so
+    # pg_class.reltuples is fresh on the affected children.
+    post_counts: dict[str, int] = {}
+    async with engine.begin() as conn:
+        for table_name in cascade_tables:
+            # L4 (audit): explicit ANALYZE on the cascaded children.
+            # Autovacuum will eventually catch up, but on the 15.4M-row
+            # gex_by_expiry_strike table that "eventually" can be hours;
+            # we want planner stats fresh for downstream readers right
+            # after a large delete.
+            await conn.execute(text(f"ANALYZE {table_name}"))
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT reltuples::bigint AS approx FROM pg_class WHERE relname = :tname"
+                    ),
+                    {"tname": table_name},
+                )
+            ).fetchone()
+            post_counts[table_name] = int(row.approx) if row and row.approx is not None else 0
+
+    cascade_deltas = {
+        table_name: pre_counts[table_name] - post_counts[table_name]
+        for table_name in cascade_tables
+    }
     logger.info(
-        "retention_job: deleted {} chain_snapshots older than {} (cutoff={})",
-        total_deleted, f"{settings.retention_days}d", cutoff.isoformat(),
+        "retention_job: deleted {} chain_snapshots older than {} (cutoff={}); "
+        "cascade approx-deltas={}",
+        total_deleted, f"{settings.retention_days}d", cutoff.isoformat(), cascade_deltas,
     )
     return {
         "skipped": False,
         "deleted_snapshots": total_deleted,
         "cutoff": cutoff.isoformat(),
+        # L5 (audit): expose per-table cascade approximations for
+        # observability dashboards / job-history overlays.
+        "cascade_pre_counts": pre_counts,
+        "cascade_post_counts": post_counts,
+        "cascade_approx_deltas": cascade_deltas,
     }

@@ -66,7 +66,15 @@ class TestRunOnce:
             s.allow_quotes_outside_rth = True
             s.quote_symbols = "SPX,VIX"
             s.quote_symbols_list = MagicMock(return_value=["SPX", "VIX"])
+            # M13 (audit): explicit int so the consecutive-failure
+            # threshold check uses a real comparison instead of a
+            # MagicMock auto-attr that always evaluates truthy.
+            s.quote_consecutive_failure_threshold = 3
             self.mock_settings = s
+            # Reset module-level counter so per-test failure tallies
+            # start from zero regardless of run order.
+            from spx_backend.jobs.quote_job import reset_fetch_failure_counter
+            reset_fetch_failure_counter()
             yield
 
     @pytest.mark.asyncio

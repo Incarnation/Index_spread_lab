@@ -29,6 +29,7 @@ DROP TABLE IF EXISTS context_snapshots;
 DROP TABLE IF EXISTS underlying_quotes;
 DROP TABLE IF EXISTS market_clock_audit;
 DROP TABLE IF EXISTS economic_events;
+DROP TABLE IF EXISTS alert_cooldowns;
 
 DROP TABLE IF EXISTS optimizer_walkforward;
 DROP TABLE IF EXISTS optimizer_results;

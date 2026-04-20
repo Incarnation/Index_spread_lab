@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
   source TEXT NOT NULL DEFAULT 'TRADIER',
   target_dte INTEGER NOT NULL,
   expiration DATE NOT NULL,
-  checksum TEXT NOT NULL
+  checksum TEXT NOT NULL,
+  -- Audit Wave 4 M1: discriminate full chain payloads (snapshot_job)
+  -- from FK-anchor-only rows (cboe_gex_job). See migration 023.
+  payload_kind TEXT NOT NULL DEFAULT 'options_chain'
+    CHECK (payload_kind IN ('options_chain', 'gex_anchor'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_snapshots_ts ON chain_snapshots (ts DESC);
@@ -87,6 +91,14 @@ CREATE INDEX IF NOT EXISTS idx_option_chain_rows_underlying_exp_strike
   ON option_chain_rows (underlying, expiration, strike, option_right);
 CREATE INDEX IF NOT EXISTS idx_option_chain_rows_underlying_snapshot
   ON option_chain_rows (underlying, snapshot_id);
+-- Audit Wave 4 M8: small partial indexes for incident-response diagnostics.
+-- See migration 024 for rationale.
+CREATE INDEX IF NOT EXISTS idx_option_chain_rows_null_right
+  ON option_chain_rows (snapshot_id) WHERE option_right IS NULL;
+CREATE INDEX IF NOT EXISTS idx_option_chain_rows_null_delta
+  ON option_chain_rows (snapshot_id) WHERE delta IS NULL;
+CREATE INDEX IF NOT EXISTS idx_option_chain_rows_null_bidask
+  ON option_chain_rows (snapshot_id) WHERE bid IS NULL AND ask IS NULL;
 
 CREATE TABLE IF NOT EXISTS gex_snapshots (
   snapshot_id BIGINT PRIMARY KEY REFERENCES chain_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -141,19 +153,28 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
   term_structure DOUBLE PRECISION NULL,
   vvix DOUBLE PRECISION NULL,
   skew DOUBLE PRECISION NULL,
-  gex_net DOUBLE PRECISION NULL,
+  -- Audit Wave 2 M2: gex_net is derived from the source-tagged columns
+  -- so concurrent writers can't race on which one wins. See migration 020.
+  -- Writers MUST NOT touch this column directly (PG rejects with 428C9).
   zero_gamma_level DOUBLE PRECISION NULL,
   gex_net_tradier DOUBLE PRECISION NULL,
   zero_gamma_level_tradier DOUBLE PRECISION NULL,
   gex_net_cboe DOUBLE PRECISION NULL,
   zero_gamma_level_cboe DOUBLE PRECISION NULL,
   notes_json JSONB NULL,
+  gex_net DOUBLE PRECISION
+    GENERATED ALWAYS AS (COALESCE(gex_net_cboe, gex_net_tradier)) STORED,
   PRIMARY KEY (ts, underlying)
 );
 
 CREATE TABLE IF NOT EXISTS underlying_quotes (
   quote_id BIGSERIAL PRIMARY KEY,
+  -- ts is INGEST time (set by quote_job from datetime.now). vendor_ts holds
+  -- the vendor's reported observation timestamp (Tradier trade_date) when
+  -- available. Audit Wave 2 H6 -- monitoring uses MAX(ts), as-of consumers
+  -- use COALESCE(vendor_ts, ts).
   ts TIMESTAMPTZ NOT NULL,
+  vendor_ts TIMESTAMPTZ NULL,
   symbol TEXT NOT NULL,
   last DOUBLE PRECISION NULL,
   bid DOUBLE PRECISION NULL,
@@ -171,6 +192,18 @@ CREATE TABLE IF NOT EXISTS underlying_quotes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_underlying_quotes_symbol_ts ON underlying_quotes (symbol, ts DESC);
+-- Audit Wave 2 H5: idempotency for quote_job retries via UNIQUE on
+-- (symbol, minute_bucket). Targeted by ON CONFLICT (symbol,
+-- (date_bin('1 minute', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00')))
+-- DO NOTHING. We use date_bin rather than date_trunc because PG
+-- requires unique-index expressions to be IMMUTABLE; date_trunc on
+-- timestamptz is STABLE. See migration 018.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_underlying_quotes_symbol_ts_minute
+  ON underlying_quotes (symbol, (date_bin('1 minute', ts, TIMESTAMPTZ '2000-01-01 00:00:00+00')));
+-- Audit Wave 2 H6: functional index supporting
+-- ORDER BY COALESCE(vendor_ts, ts) DESC for as-of spot lookups.
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_symbol_vendor_or_ts
+  ON underlying_quotes (symbol, (COALESCE(vendor_ts, ts)) DESC);
 
 CREATE TABLE IF NOT EXISTS market_clock_audit (
   clock_id BIGSERIAL PRIMARY KEY,
@@ -461,7 +494,21 @@ CREATE TABLE IF NOT EXISTS economic_events (
     event_type         TEXT    NOT NULL,
     has_projections    BOOLEAN NOT NULL DEFAULT false,
     is_triple_witching BOOLEAN NOT NULL DEFAULT false,
+    -- Audit Wave 2 M7: written by eod_events_job's ON CONFLICT DO UPDATE
+    -- so a corrected has_projections / is_triple_witching value can land
+    -- and the operator can audit which rows were rewritten. NULL for
+    -- pre-M7 rows. See migration 021. Defensive DEFAULT now() added by
+    -- migration 025 so out-of-band INSERTs cannot silently land NULL.
+    updated_at         TIMESTAMPTZ NULL DEFAULT now(),
     PRIMARY KEY (date, event_type)
+);
+
+-- Audit Wave 3 H7: DB-backed cooldown registry for services.alerts.send_alert
+-- so multi-replica deployments share one cooldown window per alert key.
+-- See migration 022.
+CREATE TABLE IF NOT EXISTS alert_cooldowns (
+    cooldown_key TEXT PRIMARY KEY,
+    last_alert_ts TIMESTAMPTZ NOT NULL
 );
 
 -- Portfolio state and trade tracking for the capital-budgeted strategy.

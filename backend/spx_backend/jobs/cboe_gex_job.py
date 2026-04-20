@@ -14,139 +14,41 @@ from spx_backend.config import settings
 from spx_backend.database import SessionLocal
 from spx_backend.dte import trading_dte_lookup
 from spx_backend.ingestion.mzdata_client import MzDataClient, get_mzdata_client
+# Refactor #1 (audit): pure parsers were extracted to
+# ``spx_backend.ingestion.parsers``. The underscored aliases below
+# preserve every existing internal call-site / test import unchanged
+# (bytecode-equivalent thin wrappers); new code should import the
+# public names directly from ``ingestion.parsers``.
+from spx_backend.ingestion.parsers import (
+    CboeExposureItem,
+    normalize_cboe_exposure_items as _normalize_exposure_items,
+    parse_iso_date as _parse_iso_date,
+    parse_payload_timestamp as _parse_payload_timestamp,
+    series_float as _series_float,
+    series_int as _series_int,
+    to_float as _to_float,
+    to_float_list as _to_float_list,
+    to_int as _to_int,
+    to_int_list as _to_int_list,
+)
+from spx_backend.jobs._chain_snapshot_dao import (
+    PAYLOAD_KIND_GEX_ANCHOR,
+    get_or_insert_anchor,
+)
 from spx_backend.market_clock import MarketClockCache, is_rth
+from spx_backend.services import alerts
 from spx_backend.services.gex_math import apply_vendor_units
 
 
 def _checksum_payload(payload: object) -> str:
-    """Compute a deterministic checksum for one JSON-like payload."""
+    """Compute a deterministic checksum for one JSON-like payload.
+
+    Kept in this module (not promoted to ``ingestion.parsers``)
+    because the canonical payload shape is owned by ``cboe_gex_job``;
+    other parsers should not assume the same field ordering.
+    """
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _to_float(value: Any) -> float | None:
-    """Convert an arbitrary value to float when possible."""
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def _to_int(value: Any) -> int | None:
-    """Convert an arbitrary value to int when possible."""
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except Exception:
-        return None
-
-
-def _to_float_list(value: Any) -> list[float | None]:
-    """Normalize JSON arrays into a float-or-None list."""
-    if not isinstance(value, list):
-        return []
-    return [_to_float(item) for item in value]
-
-
-def _to_int_list(value: Any) -> list[int | None]:
-    """Normalize JSON arrays into an int-or-None list."""
-    if not isinstance(value, list):
-        return []
-    return [_to_int(item) for item in value]
-
-
-def _parse_iso_date(value: Any) -> date | None:
-    """Parse ISO date text into a date object when valid."""
-    if isinstance(value, date):
-        return value
-    if not isinstance(value, str):
-        return None
-    try:
-        return date.fromisoformat(value.strip())
-    except Exception:
-        return None
-
-
-def _parse_payload_timestamp(value: Any, *, fallback: datetime) -> datetime:
-    """Parse exposure timestamp into timezone-aware UTC datetime."""
-    if isinstance(value, datetime):
-        return value.astimezone(ZoneInfo("UTC")) if value.tzinfo else value.replace(tzinfo=ZoneInfo("UTC"))
-    if isinstance(value, str):
-        raw = value.strip()
-        if raw:
-            try:
-                normalized = raw.replace("Z", "+00:00")
-                parsed = datetime.fromisoformat(normalized)
-                return parsed.astimezone(ZoneInfo("UTC")) if parsed.tzinfo else parsed.replace(tzinfo=ZoneInfo("UTC"))
-            except Exception:
-                pass
-    return fallback
-
-
-def _series_float(values: list[float | None], index: int, *, default: float = 0.0) -> float:
-    """Return one float series value by index with safe default fallback."""
-    if index < 0 or index >= len(values):
-        return default
-    value = values[index]
-    return default if value is None else float(value)
-
-
-def _series_int(values: list[int | None], index: int, *, default: int = 0) -> int:
-    """Return one integer series value by index with safe default fallback."""
-    if index < 0 or index >= len(values):
-        return default
-    value = values[index]
-    return default if value is None else int(value)
-
-
-@dataclass(frozen=True)
-class CboeExposureItem:
-    """Normalized one-expiration exposure row from MZData."""
-
-    expiration: date
-    dte_days: int | None
-    strikes: list[float | None]
-    net_gamma: list[float | None]
-    call_abs_gamma: list[float | None]
-    put_abs_gamma: list[float | None]
-    call_open_interest: list[int | None]
-    put_open_interest: list[int | None]
-    raw_item: dict[str, Any]
-
-
-def _normalize_exposure_items(payload: dict[str, Any]) -> list[CboeExposureItem]:
-    """Convert one exposure payload into normalized per-expiration items."""
-    items_raw = payload.get("data")
-    if not isinstance(items_raw, list):
-        return []
-
-    normalized: list[CboeExposureItem] = []
-    for item in items_raw:
-        if not isinstance(item, dict):
-            continue
-        expiration = _parse_iso_date(item.get("expiration"))
-        if expiration is None:
-            continue
-        call_payload = item.get("call") if isinstance(item.get("call"), dict) else {}
-        put_payload = item.get("put") if isinstance(item.get("put"), dict) else {}
-        strikes = _to_float_list(item.get("strikes"))
-        normalized.append(
-            CboeExposureItem(
-                expiration=expiration,
-                dte_days=_to_int(item.get("dte")),
-                strikes=strikes,
-                net_gamma=_to_float_list(item.get("netGamma")),
-                call_abs_gamma=_to_float_list(call_payload.get("absGamma")),
-                put_abs_gamma=_to_float_list(put_payload.get("absGamma")),
-                call_open_interest=_to_int_list(call_payload.get("openInterest")),
-                put_open_interest=_to_int_list(put_payload.get("openInterest")),
-                raw_item=item,
-            )
-        )
-    return normalized
 
 
 @dataclass(frozen=True)
@@ -208,35 +110,6 @@ class CboeGexJob:
             expiration is not eligible in the current trading-date window.
         """
         return trading_slot_dte_by_expiration.get(item.expiration)
-
-    async def _get_existing_snapshot_id(
-        self,
-        *,
-        session,
-        batch_ts_utc: datetime,
-        underlying: str,
-        expiration: date,
-    ) -> int | None:
-        """Fetch existing CBOE snapshot id for one batch/expiration when present."""
-        row = await session.execute(
-            text(
-                """
-                SELECT snapshot_id
-                FROM chain_snapshots
-                WHERE ts = :ts
-                  AND underlying = :underlying
-                  AND source = 'CBOE'
-                  AND expiration = :expiration
-                ORDER BY snapshot_id DESC
-                LIMIT 1
-                """
-            ),
-            {"ts": batch_ts_utc, "underlying": underlying, "expiration": expiration},
-        )
-        result = row.fetchone()
-        if result is None:
-            return None
-        return int(result.snapshot_id)
 
     def _zero_gamma_level(self, per_strike: dict[float, dict[str, float]]) -> float | None:
         """Estimate zero-gamma strike from cumulative net GEX crossing.
@@ -327,8 +200,47 @@ class CboeGexJob:
         spot_price = _to_float(payload.get("spotPrice"))
         batch_ts_utc = _parse_payload_timestamp(payload.get("timestamp"), fallback=now_et.astimezone(ZoneInfo("UTC")))
         result["batch_ts_utc"] = batch_ts_utc.isoformat()
+
+        # M10 (audit): distinguish "HTTP 200 + empty data" (vendor schema
+        # drift OR vendor outage) from "HTTP 200 + well-formed data" so
+        # the operator gets paged on the former. Without this branch
+        # both shapes silently no-op via the ``no_exposure_items`` skip.
+        raw_data = payload.get("data")
+        if not isinstance(raw_data, list) or len(raw_data) == 0:
+            result["skipped"] = True
+            result["reason"] = "vendor_empty_data" if isinstance(raw_data, list) else "vendor_schema_drift"
+            try:
+                await alerts.send_alert(
+                    subject=f"[IndexSpreadLab] cboe_gex_job vendor anomaly -- {underlying}",
+                    body_html=(
+                        f"<p>mzdata returned HTTP 200 with anomalous payload for "
+                        f"<b>{underlying}</b>.</p>"
+                        f"<ul>"
+                        f"<li>shape: {result['reason']}</li>"
+                        f"<li>data type: {type(raw_data).__name__}</li>"
+                        f"<li>data length: "
+                        f"{len(raw_data) if isinstance(raw_data, list) else 'n/a'}</li>"
+                        f"<li>batch_ts_utc: {batch_ts_utc.isoformat()}</li>"
+                        f"<li>now_et: {now_et.isoformat()}</li>"
+                        f"</ul>"
+                        f"<p>Check mzdata's API contract; this previously surfaced "
+                        f"as a silent no-op snapshot.</p>"
+                    ),
+                    cooldown_key=f"cboe_vendor_anomaly:{underlying}:{result['reason']}",
+                    cooldown_minutes=int(getattr(settings, "cboe_vendor_alert_cooldown_minutes", 60)),
+                )
+            except Exception as alert_exc:
+                logger.warning(
+                    "cboe_gex_job: vendor_alert_failed underlying={} error={}",
+                    underlying, alert_exc,
+                )
+            return result
+
         exposure_items = _normalize_exposure_items(payload)
         if not exposure_items:
+            # Reach here only if the data list is non-empty but every item
+            # failed normalization (e.g. malformed expirations). Different
+            # signal from M10's empty-data shape; keep the legacy reason.
             result["skipped"] = True
             result["reason"] = "no_exposure_items"
             return result
@@ -387,31 +299,22 @@ class CboeGexJob:
                         "item": item.raw_item,
                     }
                     checksum = _checksum_payload(snapshot_payload)
-                    snapshot_id = await self._get_existing_snapshot_id(
+                    # Refactor #2 + M4 + M1 (audit): centralized DAO replaces
+                    # the prior SELECT-then-INSERT race window. payload_kind
+                    # is mandatory and set to ``gex_anchor`` so retention /
+                    # backfill can distinguish CBOE FK-anchor rows (no
+                    # option_chain_rows) from snapshot_job's full chains.
+                    snapshot_id, was_inserted = await get_or_insert_anchor(
                         session=session,
-                        batch_ts_utc=batch_ts_utc,
+                        ts=batch_ts_utc,
                         underlying=underlying,
+                        source="CBOE",
+                        target_dte=target_dte,
                         expiration=item.expiration,
+                        checksum=checksum,
+                        payload_kind=PAYLOAD_KIND_GEX_ANCHOR,
                     )
-                    if snapshot_id is None:
-                        insert_result = await session.execute(
-                            text(
-                                """
-                                INSERT INTO chain_snapshots (ts, underlying, source, target_dte, expiration, checksum)
-                                VALUES (:ts, :underlying, :source, :target_dte, :expiration, :checksum)
-                                RETURNING snapshot_id
-                                """
-                            ),
-                            {
-                                "ts": batch_ts_utc,
-                                "underlying": underlying,
-                                "source": "CBOE",
-                                "target_dte": target_dte,
-                                "expiration": item.expiration,
-                                "checksum": checksum,
-                            },
-                        )
-                        snapshot_id = int(insert_result.scalar_one())
+                    if was_inserted:
                         inserted_snapshots += 1
                     else:
                         reused_snapshots += 1
@@ -494,6 +397,19 @@ class CboeGexJob:
                     gex_net_total = sum(strike_data["gex_net"] for strike_data in per_strike.values())
 
                     await session.execute(
+                        # M6 (audit) ON CONFLICT policy:
+                        # ``DO UPDATE`` is intentional and asymmetric
+                        # with gex_job's ``DO NOTHING``.
+                        # Rationale: mzdata occasionally republishes
+                        # an exposure with revised numbers for the same
+                        # ``(ts, underlying, expiration)`` -- e.g. when
+                        # a late-arriving OPRA strike is added to the
+                        # vendor's book. We want the latest revision to
+                        # win in place rather than stale-stamp a snapshot
+                        # the consumer already cached. The ``snapshot_id``
+                        # is shared via _chain_snapshot_dao.get_or_insert_anchor
+                        # so a vendor revision lands on the same row
+                        # without creating a duplicate anchor.
                         text(
                             """
                             INSERT INTO gex_snapshots (
@@ -531,7 +447,42 @@ class CboeGexJob:
                     )
                     gex_snapshots_upserted += 1
 
+                    # L9 (audit) + paired with M3: bind every strike row
+                    # for this expiration up front, then issue one
+                    # ``executemany`` per child table. A 600-strike chain
+                    # used to fire 1200 round trips (one per
+                    # gex_by_strike + one per gex_by_expiry_strike); now
+                    # it fires 2 (regardless of strike count). The
+                    # ON CONFLICT semantics are unchanged.
+                    by_strike_rows: list[dict] = []
+                    by_expiry_strike_rows: list[dict] = []
                     for strike, strike_data in per_strike.items():
+                        by_strike_rows.append(
+                            {
+                                "snapshot_id": snapshot_id,
+                                "strike": strike,
+                                "gex_net": strike_data["gex_net"],
+                                "gex_calls": strike_data["gex_calls"],
+                                "gex_puts": strike_data["gex_puts"],
+                                "oi_total": int(strike_data["oi_total"]),
+                                "method": method,
+                            }
+                        )
+                        by_expiry_strike_rows.append(
+                            {
+                                "snapshot_id": snapshot_id,
+                                "expiration": item.expiration,
+                                "dte_days": target_dte,
+                                "strike": strike,
+                                "gex_net": strike_data["gex_net"],
+                                "gex_calls": strike_data["gex_calls"],
+                                "gex_puts": strike_data["gex_puts"],
+                                "oi_total": int(strike_data["oi_total"]),
+                                "method": method,
+                            }
+                        )
+
+                    if by_strike_rows:
                         await session.execute(
                             text(
                                 """
@@ -545,17 +496,9 @@ class CboeGexJob:
                                   method = EXCLUDED.method
                                 """
                             ),
-                            {
-                                "snapshot_id": snapshot_id,
-                                "strike": strike,
-                                "gex_net": strike_data["gex_net"],
-                                "gex_calls": strike_data["gex_calls"],
-                                "gex_puts": strike_data["gex_puts"],
-                                "oi_total": int(strike_data["oi_total"]),
-                                "method": method,
-                            },
+                            by_strike_rows,
                         )
-                        strike_rows_upserted += 1
+                        strike_rows_upserted += len(by_strike_rows)
 
                         await session.execute(
                             text(
@@ -575,19 +518,9 @@ class CboeGexJob:
                                   method = EXCLUDED.method
                                 """
                             ),
-                            {
-                                "snapshot_id": snapshot_id,
-                                "expiration": item.expiration,
-                                "dte_days": target_dte,
-                                "strike": strike,
-                                "gex_net": strike_data["gex_net"],
-                                "gex_calls": strike_data["gex_calls"],
-                                "gex_puts": strike_data["gex_puts"],
-                                "oi_total": int(strike_data["oi_total"]),
-                                "method": method,
-                            },
+                            by_expiry_strike_rows,
                         )
-                        expiry_strike_rows_upserted += 1
+                        expiry_strike_rows_upserted += len(by_expiry_strike_rows)
             except Exception as exc:
                 failed_items.append(
                     {
@@ -608,32 +541,40 @@ class CboeGexJob:
             agg_gex_net = sum(s["gex_net"] for s in agg_per_strike.values())
             agg_zero_gamma = self._zero_gamma_level(agg_per_strike)
             try:
+                # M2 (audit): gex_net is a GENERATED column (migration 020)
+                # derived from COALESCE(gex_net_cboe, gex_net_tradier);
+                # writing it directly raises PG 428C9. We populate
+                # gex_net_cboe and zero_gamma_level_cboe; gex_net is
+                # auto-derived. zero_gamma_level (the legacy aggregate
+                # column) keeps the "CBOE wins" precedence at app level
+                # for now -- migration 020 only promoted gex_net.
+                # H6 (audit): inline spot subqueries use COALESCE(vendor_ts, ts)
+                # so as-of lookups prefer vendor observation time.
                 await session.execute(
                     text(
                         """
                         INSERT INTO context_snapshots
                             (ts, underlying, gex_net_cboe, zero_gamma_level_cboe,
-                             gex_net, zero_gamma_level,
+                             zero_gamma_level,
                              spx_price, spy_price, vix, vix9d, term_structure,
                              vvix, skew, notes_json)
                         VALUES (
                             :ts, :underlying, :gex_net, :zero_gamma_level,
-                            :gex_net, :zero_gamma_level,
-                            (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                            (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                            (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                            (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                            :zero_gamma_level,
+                            (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                            (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                            (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                            (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
                             (SELECT CASE WHEN v.last > 0 THEN v9.last / v.last END
-                             FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v,
-                                  (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v9),
-                            (SELECT last FROM underlying_quotes WHERE symbol='VVIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                            (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                             FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1) v,
+                                  (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1) v9),
+                            (SELECT last FROM underlying_quotes WHERE symbol='VVIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                            (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
                             CAST(:notes AS jsonb)
                         )
                         ON CONFLICT (ts, underlying) DO UPDATE SET
                           gex_net_cboe = EXCLUDED.gex_net_cboe,
                           zero_gamma_level_cboe = EXCLUDED.zero_gamma_level_cboe,
-                          gex_net = EXCLUDED.gex_net_cboe,
                           zero_gamma_level = EXCLUDED.zero_gamma_level_cboe,
                           spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
                           spy_price = COALESCE(context_snapshots.spy_price, EXCLUDED.spy_price),

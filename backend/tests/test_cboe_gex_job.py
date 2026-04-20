@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,22 +58,42 @@ class _RecordingSession:
         return self._NestedTx()
 
     async def execute(self, stmt, params=None):  # noqa: ANN001
-        """Capture SQL writes and return canned results for reads."""
+        """Capture SQL writes and return canned results for reads.
+
+        ``params`` is either a ``dict`` (single-row execute) or a
+        ``list[dict]`` (executemany). L9 (audit) batches per-strike
+        writes to gex_by_strike / gex_by_expiry_strike via executemany,
+        so we normalize both shapes into the per-row capture buckets so
+        downstream assertions on row counts continue to work
+        unchanged.
+        """
         sql = str(stmt)
-        payload = dict(params or {})
         if "SELECT snapshot_id" in sql and "FROM chain_snapshots" in sql:
-            return _FakeExecResult(fetchone_result=None)
+            return _FakeExecResult(
+                fetchone_result=SimpleNamespace(snapshot_id=501)
+            )
         if "INSERT INTO chain_snapshots" in sql:
+            payload = dict(params or {})
             self.chain_snapshot_inserts.append(payload)
-            return _FakeExecResult(scalar_result=501)
+            return _FakeExecResult(
+                fetchone_result=SimpleNamespace(snapshot_id=501),
+                scalar_result=501,
+            )
         if "INSERT INTO gex_snapshots" in sql:
+            payload = dict(params or {})
             self.gex_snapshot_upserts.append(payload)
             return _FakeExecResult()
         if "INSERT INTO gex_by_strike" in sql:
-            self.gex_by_strike_upserts.append(payload)
+            if isinstance(params, list):
+                self.gex_by_strike_upserts.extend(dict(row) for row in params)
+            else:
+                self.gex_by_strike_upserts.append(dict(params or {}))
             return _FakeExecResult()
         if "INSERT INTO gex_by_expiry_strike" in sql:
-            self.gex_by_expiry_strike_upserts.append(payload)
+            if isinstance(params, list):
+                self.gex_by_expiry_strike_upserts.extend(dict(row) for row in params)
+            else:
+                self.gex_by_expiry_strike_upserts.append(dict(params or {}))
             return _FakeExecResult()
         raise AssertionError(f"Unexpected SQL in test: {sql}")
 

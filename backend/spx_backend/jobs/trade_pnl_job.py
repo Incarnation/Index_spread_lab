@@ -98,14 +98,21 @@ class TradePnlJob:
         }
 
     async def _latest_spot(self, session, *, now_utc: datetime) -> float | None:
-        """Return the latest underlying quote price for intrinsic settlement."""
+        """Return the latest underlying quote price for intrinsic settlement.
+
+        H6 (audit): switched to ``COALESCE(vendor_ts, ts)`` so as-of lookups
+        prefer the vendor's observation timestamp when available.
+        Backward-compatible: rows where vendor_ts IS NULL fall through to
+        ingest ts.
+        """
         row = await session.execute(
             text(
                 """
                 SELECT last
                 FROM underlying_quotes
-                WHERE symbol = :symbol AND ts <= :now_ts
-                ORDER BY ts DESC
+                WHERE symbol = :symbol
+                  AND COALESCE(vendor_ts, ts) <= :now_ts
+                ORDER BY COALESCE(vendor_ts, ts) DESC
                 LIMIT 1
                 """
             ),

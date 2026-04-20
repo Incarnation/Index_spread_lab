@@ -38,11 +38,30 @@ from spx_backend.services.alerts import send_alert
 
 
 @pytest.fixture(autouse=True)
-def _reset_cooldowns():
-    """Clear cooldown registry around every test to avoid bleed."""
+def _reset_cooldowns(monkeypatch):
+    """Clear cooldown registry around every test to avoid bleed.
+
+    H7 (audit) made ``send_alert`` consult the ``alert_cooldowns`` DB
+    table BEFORE the in-process dict so cooldowns survive deploys.
+    These tests don't spin up a DB and we don't want them to gate on
+    real prod state, so we stub the DB-side helpers to no-op (read
+    returns None, write swallows). The dedicated DB-backed contract
+    tests live in ``test_alert_cooldowns_db.py``.
+    """
     alerts.reset_cooldowns()
+    monkeypatch.setattr(
+        alerts, "_read_db_cooldown", lambda key: _async_none()
+    )
+    monkeypatch.setattr(
+        alerts, "_write_db_cooldown", lambda key, ts: _async_none()
+    )
     yield
     alerts.reset_cooldowns()
+
+
+async def _async_none():
+    """Awaitable that returns None; used as a no-op DB stub for the cooldown tests."""
+    return None
 
 
 @pytest.fixture

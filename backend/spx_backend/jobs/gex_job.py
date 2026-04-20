@@ -120,6 +120,26 @@ class GexJob:
                     # Isolate each snapshot in a savepoint to keep processing
                     # the rest of the batch after one malformed snapshot fails.
                     async with session.begin_nested():
+                        # M11 (audit): chain_snapshots older than the
+                        # configured threshold are skipped with a loud warning.
+                        # Force=True bypasses the gate for explicit backfills.
+                        # ``ts`` is already UTC-aware from the SELECT; convert
+                        # now_et to UTC for an apples-to-apples diff.
+                        max_age_seconds = int(getattr(settings, "gex_chain_max_age_seconds", 0) or 0)
+                        if not force and max_age_seconds > 0:
+                            now_utc = now_et.astimezone(ZoneInfo("UTC"))
+                            chain_age_seconds = (now_utc - ts).total_seconds()
+                            if chain_age_seconds > max_age_seconds:
+                                skipped_snapshots += 1
+                                logger.warning(
+                                    "gex_job: chain_too_old snapshot_id={} underlying={} "
+                                    "age_seconds={:.0f} threshold_seconds={} -- skipping (use force=True to override)",
+                                    snapshot_id,
+                                    underlying,
+                                    chain_age_seconds,
+                                    max_age_seconds,
+                                )
+                                continue
                         spot = await self._get_spot_price(session, ts, underlying)
                         if spot is None:
                             skipped_snapshots += 1
@@ -276,6 +296,21 @@ class GexJob:
 
                         method = f"oi_gamma_spot_top{settings.gex_strike_limit}_dte{settings.gex_max_dte_days}"
 
+                        # M6 (audit) ON CONFLICT policy:
+                        # ``DO NOTHING`` is intentional and asymmetric
+                        # with cboe_gex_job's ``DO UPDATE``.
+                        # Rationale: a Tradier-derived snapshot is a
+                        # *function of an immutable* chain_snapshots
+                        # row (the chain text was already frozen by
+                        # snapshot_job + chain_snapshot_dao). Re-running
+                        # gex_job for the same ``snapshot_id`` should
+                        # therefore produce the same numbers (modulo
+                        # bug-fixes, which we always backfill via a
+                        # migration, not a silent UPDATE). If you ever
+                        # need to rewrite Tradier GEX in place, do it
+                        # via an explicit migration so the change is
+                        # audit-loggable -- not via a quiet
+                        # ``DO UPDATE`` on the hot path.
                         await session.execute(
                             text(
                                 """
@@ -362,32 +397,43 @@ class GexJob:
                         # Update context_snapshots with gex fields, carrying
                         # forward quote values from underlying_quotes when
                         # inserting a new row so spx_price/vix/etc. aren't NULL.
+                        #
+                        # M2 (audit): gex_net is now a GENERATED column
+                        # (migration 020) computed from
+                        # COALESCE(gex_net_cboe, gex_net_tradier); writing it
+                        # directly would raise PG error 428C9. Same for the
+                        # ON CONFLICT path -- only the source-tagged columns
+                        # are touched here.
+                        # H6 (audit): the inline spot-quote subqueries use
+                        # COALESCE(vendor_ts, ts) so as-of lookups prefer the
+                        # vendor's observation timestamp when available;
+                        # idx_underlying_quotes_symbol_vendor_or_ts (migration
+                        # 019) supports the new ORDER BY shape.
                         await session.execute(
                             text(
                                 """
                                 INSERT INTO context_snapshots
                                     (ts, underlying, gex_net_tradier, zero_gamma_level_tradier,
-                                     gex_net, zero_gamma_level,
+                                     zero_gamma_level,
                                      spx_price, spy_price, vix, vix9d, term_structure,
                                      vvix, skew, notes_json)
                                 VALUES (
                                     :ts, :underlying, :gex_net, :zero_gamma_level,
-                                    :gex_net, :zero_gamma_level,
-                                    (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                                    (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                    :zero_gamma_level,
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SPX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SPY' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
                                     (SELECT CASE WHEN v.last > 0 THEN v9.last / v.last END
-                                     FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v,
-                                          (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND ts <= :ts ORDER BY ts DESC LIMIT 1) v9),
-                                    (SELECT last FROM underlying_quotes WHERE symbol='VVIX' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
-                                    (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND ts <= :ts ORDER BY ts DESC LIMIT 1),
+                                     FROM (SELECT last FROM underlying_quotes WHERE symbol='VIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1) v,
+                                          (SELECT last FROM underlying_quotes WHERE symbol='VIX9D' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1) v9),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='VVIX' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
+                                    (SELECT last FROM underlying_quotes WHERE symbol='SKEW' AND COALESCE(vendor_ts, ts) <= :ts ORDER BY COALESCE(vendor_ts, ts) DESC LIMIT 1),
                                     CAST(:notes AS jsonb)
                                 )
                                 ON CONFLICT (ts, underlying) DO UPDATE SET
                                   gex_net_tradier = EXCLUDED.gex_net_tradier,
                                   zero_gamma_level_tradier = EXCLUDED.zero_gamma_level_tradier,
-                                  gex_net = COALESCE(context_snapshots.gex_net_cboe, EXCLUDED.gex_net_tradier),
                                   zero_gamma_level = COALESCE(context_snapshots.zero_gamma_level_cboe, EXCLUDED.zero_gamma_level_tradier),
                                   spx_price = COALESCE(context_snapshots.spx_price, EXCLUDED.spx_price),
                                   spy_price = COALESCE(context_snapshots.spy_price, EXCLUDED.spy_price),
@@ -452,15 +498,23 @@ class GexJob:
         }
 
     async def _get_spot_price(self, session, ts, underlying: str) -> float | None:
-        """Fetch latest spot price at or before ts with staleness guard."""
-        # Find the most recent quote <= snapshot time.
+        """Fetch latest spot price at or before ts with staleness guard.
+
+        H6 (audit): switched the WHERE / ORDER BY to ``COALESCE(vendor_ts, ts)``
+        so as-of lookups prefer the vendor's observation timestamp when
+        present; the staleness guard then measures snapshot-to-vendor delay
+        instead of snapshot-to-ingest delay (more accurate).
+        ``idx_underlying_quotes_symbol_vendor_or_ts`` (migration 019)
+        supports the new index-only scan.
+        """
         row = await session.execute(
             text(
                 """
-                SELECT last, ts
+                SELECT last, COALESCE(vendor_ts, ts) AS effective_ts
                 FROM underlying_quotes
-                WHERE symbol = :symbol AND ts <= :ts
-                ORDER BY ts DESC
+                WHERE symbol = :symbol
+                  AND COALESCE(vendor_ts, ts) <= :ts
+                ORDER BY COALESCE(vendor_ts, ts) DESC
                 LIMIT 1
                 """
             ),
@@ -472,7 +526,6 @@ class GexJob:
         last, quote_ts = result
         if last is None:
             return None
-        # Enforce staleness guard
         age = (ts - quote_ts).total_seconds()
         if age > settings.gex_spot_max_age_seconds:
             return None

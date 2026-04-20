@@ -186,7 +186,14 @@ All jobs are registered in `scheduler_builder.py`. The scheduler uses these patt
 
 **DTE semantics**: Trading-session based, not calendar-day. Weekends and exchange holidays are skipped. See `dte.py` and the root README for examples.
 
-**GEX dual-source**: Both Tradier-computed and CBOE precomputed GEX are stored with `source` discrimination. CBOE is preferred for canonical `gex_net`; Tradier is the fallback. `context_snapshots` has separate `gex_net_tradier` / `gex_net_cboe` columns to avoid overwrite races.
+**GEX dual-source**: Both Tradier-computed and CBOE precomputed GEX are stored with `source` discrimination. CBOE is preferred for canonical `gex_net`; Tradier is the fallback. `context_snapshots` has separate `gex_net_tradier` / `gex_net_cboe` columns to avoid overwrite races, and (per Wave 2 audit M2) the canonical `context_snapshots.gex_net` is a `GENERATED ALWAYS AS COALESCE(gex_net_cboe, gex_net_tradier) STORED` column so writers cannot drift.
+
+**GEX windowing — *which* GEX did I just read?** (audit M5): `gex_job` (the Tradier-computed source) does **not** report a market-wide aggregate. It deliberately restricts its aggregate to a near-spot, short-dated window controlled by:
+
+- `gex_max_dte_days` (default `10`) — only expirations within ~2 trading weeks are aggregated, so 0-DTE / front-month flow dominates the headline number;
+- `gex_strike_limit` (default `150`) — only the 150 strikes nearest spot enter the aggregate, so deep-OTM tails do not contribute.
+
+This windowing is encoded in the `gex_snapshots.method` column (e.g. `oi_gamma_spot_top150_dte10`) so downstream consumers can tell at read time *which* GEX they are reading. **`cboe_gex_job`** (the precomputed CBOE source) is **not** windowed — it ingests the full vendor exposure book and is therefore the apples-to-apples comparable to a vendor "headline GEX" number. As a rule of thumb: query `gex_snapshots WHERE source='CBOE'` for headline GEX, and `WHERE source='Tradier'` for near-spot/short-dated dealer flow only.
 
 **Decision policy**: Hard risk guardrails run first (day caps, open-trade caps, per-side caps). If all pass, candidates are constructed inline from the latest `chain_snapshots` + `option_chain_rows`, ranked by `credit_to_width`, and one is selected per side under portfolio constraints. The legacy hybrid-ML branch was removed in Track A; future ML re-entry will plug into this same portfolio path rather than restoring a parallel branch.
 

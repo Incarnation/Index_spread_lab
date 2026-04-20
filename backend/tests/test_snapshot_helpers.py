@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -87,9 +88,27 @@ class _CaptureSession:
             return _FakeExecResult(fetchone_result=None)
         if "INSERT INTO chain_snapshots" in sql:
             self.chain_insert_params.append(dict(params or {}))
-            return _FakeExecResult(scalar_result=501)
+            # Refactor #2 (audit): DAO uses INSERT ... RETURNING with
+            # fetchone(), not scalar_one(); return a SimpleNamespace
+            # row so the new path works.
+            return _FakeExecResult(
+                fetchone_result=SimpleNamespace(snapshot_id=501),
+                scalar_result=501,
+            )
+        if "SELECT snapshot_id" in sql and "FROM chain_snapshots" in sql:
+            # DAO fallback SELECT path; never reached in this test
+            # because the INSERT branch always returns a row, but
+            # included for safety.
+            return _FakeExecResult(fetchone_result=SimpleNamespace(snapshot_id=501))
         if "INSERT INTO option_chain_rows" in sql:
-            self.option_insert_params.append(dict(params or {}))
+            # Refactor #4 + M3 (audit): snapshot_job now issues
+            # executemany with a list-of-dicts page; record each row
+            # individually for backwards-compatible assertions.
+            if isinstance(params, list):
+                for row in params:
+                    self.option_insert_params.append(dict(row or {}))
+            else:
+                self.option_insert_params.append(dict(params or {}))
             return _FakeExecResult(scalar_result=None)
         raise AssertionError(f"Unexpected SQL in test: {sql}")
 

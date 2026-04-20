@@ -1,0 +1,25 @@
+-- Audit follow-up to migration 021 (M7 / eco_do_update).
+--
+-- Migration 021 added ``economic_events.updated_at TIMESTAMPTZ NULL``
+-- without a DB-level DEFAULT on the assumption that the only writer
+-- is ``eod_events_job``, which always sets the column via
+-- ``ON CONFLICT DO UPDATE``.
+--
+-- Risk this closes
+-- ----------------
+-- Any out-of-band INSERT (admin tools, ad-hoc backfills, manual
+-- psql sessions, future scripts) that omits ``updated_at`` would
+-- silently write NULL and thereafter compare unfavourably to rows
+-- the app touched.  Adding ``DEFAULT now()`` is purely defensive --
+-- the runtime job continues to set the column explicitly so this
+-- change is a no-op for the existing write path.
+--
+-- Lock budget
+-- -----------
+-- ``ALTER COLUMN ... SET DEFAULT`` is a metadata-only catalog change
+-- in PostgreSQL: it does NOT rewrite existing rows and only takes a
+-- brief ACCESS EXCLUSIVE lock on the catalog row for the table.
+-- Sub-second on a table this size; safe to apply during market
+-- hours.
+
+ALTER TABLE economic_events ALTER COLUMN updated_at SET DEFAULT now();
