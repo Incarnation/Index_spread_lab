@@ -133,7 +133,17 @@ DELTA_TARGETS = [0.10, 0.15, 0.20, 0.25]
 SPREAD_SIDES = ["put", "call"]
 WIDTH_TARGETS = [5.0, 10.0, 15.0, 20.0]
 WIDTH_POINTS = 10.0  # legacy default for single-width callers
-TAKE_PROFIT_PCT = 0.60
+# Restored to 0.50 in the Tier-2 TP-drift revert.  Commit 767f19a had
+# raised this to 0.60 under the assumption that live
+# ``trade_pnl_take_profit_pct`` was already 0.60 -- it was not, and
+# has been 0.50 since the setting was introduced (commit 61b2eb8).
+# The labels on disk (data/training_candidates.csv) and the deployed
+# XGB model were both produced at 0.50, so the labeler constant was
+# the only outlier.  Do not raise this to 0.60 (or any other level)
+# without the coordinated Track F live-settings change; the C4 guard
+# in ``_assert_sl_alignment_with_live_settings`` will block any
+# mismatched re-labeling run.
+TAKE_PROFIT_PCT = 0.50
 STOP_LOSS_PCT = 2.00
 LABEL_MARK_INTERVAL_MINUTES = 5
 MIN_MID_PRICE = 0.05
@@ -182,6 +192,19 @@ def _assert_sl_alignment_with_live_settings() -> None:
     was checked.  Take-profit drift produces the same class of label
     bias (labels exit at a TP that production never hits, or vice
     versa) so we now mirror the SL check for TAKE_PROFIT_PCT.
+
+    Tier 2 TP-drift revert (investigation 2026-04-16): commit 767f19a
+    bumped the labeler's ``TAKE_PROFIT_PCT`` 0.50 -> 0.60 on the
+    assumption that live ``trade_pnl_take_profit_pct`` was already
+    0.60.  An audit found live has in fact been 0.50 since the
+    setting was introduced (commit 61b2eb8), and the labels on disk
+    plus the deployed XGB model were both produced at 0.50.  So the
+    labeler constant was the only outlier and the correct fix was a
+    1-line revert, not a multi-hour regen + retrain.  This guard
+    remains the enforcement surface: if a future Track F decision
+    moves live to 0.60 (or any other TP), raise ``TAKE_PROFIT_PCT``
+    here in lockstep so this assertion continues to prevent silent
+    label bias.
     """
     try:
         from spx_backend.config import settings as _live_settings

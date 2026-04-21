@@ -2183,6 +2183,92 @@ class TestSlAlignmentGuard:
         _cli_mod._assert_sl_alignment_with_live_settings()
 
 
+class TestTakeProfitDriftRevert:
+    """Tier 2 TP-drift revert regressions.
+
+    Locks in the post-revert contract: the labeler's module-level
+    ``TAKE_PROFIT_PCT`` is expected to stay at 0.50 (matching live
+    ``trade_pnl_take_profit_pct``) across all 5 ProxyShim copies.
+    If a future change lifts any of them back to 0.60 without a
+    coordinated Track F live-settings bump, these tests make the
+    breakage visible before the C4 guard blocks a full regen run.
+    """
+
+    _PROXY_MODULES = [
+        "training.labeling",
+        "training.bs_gex_spot",
+        "training.io_loaders",
+        "training.candidates",
+        "training.cli",
+    ]
+
+    def test_all_proxy_modules_pin_tp_to_050(self) -> None:
+        """All 5 ProxyShim modules must declare TAKE_PROFIT_PCT = 0.50.
+
+        The ``scripts/training/`` split from commit 34cf3ac duplicated
+        this constant across 5 files.  The TP-drift revert must touch
+        every copy -- leaving even one at 0.60 reintroduces the
+        misalignment under whichever call-path uses that module's
+        globals via ``_get_grid_param``."""
+        import importlib
+
+        for mod_name in self._PROXY_MODULES:
+            mod = importlib.import_module(mod_name)
+            assert hasattr(mod, "TAKE_PROFIT_PCT"), (
+                f"{mod_name} is expected to expose TAKE_PROFIT_PCT as a "
+                "module-level constant (ProxyShim duplicate)."
+            )
+            assert mod.TAKE_PROFIT_PCT == 0.50, (
+                f"{mod_name}.TAKE_PROFIT_PCT is {mod.TAKE_PROFIT_PCT} but "
+                "must be 0.50 to stay aligned with live "
+                "trade_pnl_take_profit_pct.  See commit 767f19a's drift "
+                "incident in the C4 guard docstring."
+            )
+
+    def test_guard_passes_when_live_is_050(self, monkeypatch) -> None:
+        """Pin the specific numeric contract: live=0.50 + labeler=0.50
+        must be silent.  This is the current on-disk / deployed state
+        and any accidental bump away from 0.50 in either side will
+        trip this test."""
+        from training import cli as _cli_mod
+
+        class _FakeSettings:
+            trade_pnl_stop_loss_basis = "max_profit"
+            trade_pnl_stop_loss_enabled = True
+            trade_pnl_stop_loss_pct = float(_cli_mod.STOP_LOSS_PCT)
+            trade_pnl_take_profit_pct = 0.50
+
+        import sys as _sys
+        import types as _types
+        fake_module = _types.SimpleNamespace(settings=_FakeSettings())
+        monkeypatch.setitem(_sys.modules, "spx_backend.config", fake_module)
+
+        # Must not raise -- labeler is 0.50 post-revert, live is 0.50.
+        _cli_mod._assert_sl_alignment_with_live_settings()
+
+    def test_guard_raises_when_live_is_060(self, monkeypatch) -> None:
+        """Pin the inverse contract: live=0.60 against labeler=0.50
+        must still be loud.  Codifies the exact direction-of-drift
+        that shipped in commit 767f19a (labeler ahead of live) in case
+        a future change flips the asymmetry."""
+        from training import cli as _cli_mod
+
+        class _FakeSettings:
+            trade_pnl_stop_loss_basis = "max_profit"
+            trade_pnl_stop_loss_enabled = True
+            trade_pnl_stop_loss_pct = float(_cli_mod.STOP_LOSS_PCT)
+            # Live out of lockstep at 0.60 while labeler remains at 0.50.
+            trade_pnl_take_profit_pct = 0.60
+
+        import sys as _sys
+        import types as _types
+        fake_module = _types.SimpleNamespace(settings=_FakeSettings())
+        monkeypatch.setitem(_sys.modules, "spx_backend.config", fake_module)
+
+        with pytest.raises(SystemExit, match=r"TAKE_PROFIT_PCT=0\.5.*live.*0\.6"):
+            _cli_mod._assert_sl_alignment_with_live_settings()
+
+
 # ── Tier 1 backtest export regressions ────────────────────────────
 
 
