@@ -132,6 +132,17 @@ def main() -> None:
                         help="End date for export (YYYY-MM-DD)")
     parser.add_argument("--holdout-months", type=int, default=0,
                         help="Reserve N months for holdout evaluation (default: 0)")
+    parser.add_argument(
+        "--holdout-min-pass-windows", type=int, default=None,
+        help="Override the cli.py cross-window consistency filter for "
+             "the holdout picker.  When unset, cli.py uses its phase-"
+             "aware default (2 for walk-forward, 1 for plain optimize).  "
+             "Set to 1 to disable the S2 regularizer when operating on "
+             "a pre-filtered grid (empirical D.b finding: tight grids "
+             "transfer better with the legacy top-N-by-test_sharpe "
+             "picker).  Set higher to demand more cross-window "
+             "consistency on noisy/wide grids like v3_explore.",
+    )
     parser.add_argument("--ingest-mode", type=str, default="yaml-config",
                         choices=["staged", "event-only", "selective",
                                  "exhaustive", "yaml-config"],
@@ -251,6 +262,15 @@ def main() -> None:
                     "--holdout-months", str(args.holdout_months),
                     "--holdout-output-csv", str(holdout_csv),
                 ])
+                # Track B: forward the override only when the operator
+                # set one.  Forwarding a sentinel when unset would
+                # override cli.py's phase-aware default (1 here), so
+                # we deliberately only extend the argv when requested.
+                if args.holdout_min_pass_windows is not None:
+                    cmd.extend([
+                        "--holdout-min-pass-windows",
+                        str(args.holdout_min_pass_windows),
+                    ])
 
             if not _run_phase(
                 "Run optimizer", cmd,
@@ -280,6 +300,18 @@ def main() -> None:
                     "--holdout-months", str(args.holdout_months),
                     "--holdout-output-csv", str(holdout_csv),
                 ])
+                # Track B: forward the override only when explicitly
+                # set.  The D.b experiment (v2-puts, min_pass_windows=3
+                # fell back to legacy picker and outperformed mpw=2 on
+                # holdout) showed that tight pre-filtered grids can
+                # benefit from dialing the S2 regularizer back.  Keep
+                # the default as 2 (preserves the v3-overfit safety
+                # rail) and make operators opt-in to 1 or 3+ per run.
+                if args.holdout_min_pass_windows is not None:
+                    cmd.extend([
+                        "--holdout-min-pass-windows",
+                        str(args.holdout_min_pass_windows),
+                    ])
 
             if not _run_phase(
                 "Walk-forward validation", cmd,
