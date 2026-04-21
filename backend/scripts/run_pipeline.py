@@ -148,6 +148,12 @@ def main() -> None:
     # per-run.  We now scope WF per-run too and pass an explicit
     # --walkforward-output-csv to backtest_strategy.py.
     walkforward_csv = _DATA_DIR / f"{run_name}_walkforward.csv"
+    # S1b fix (Tier-2 follow-up): holdout_results.csv had the same global-
+    # single-file problem as walkforward_results.csv, and when A1/A2 were
+    # run back-to-back the second run silently overwrote the first run's
+    # holdout history.  Every pipeline run now gets a per-run holdout CSV
+    # so we can compare runs side-by-side.
+    holdout_csv = _DATA_DIR / f"{run_name}_holdout.csv"
 
     log: dict = {
         "run_name": run_name,
@@ -237,7 +243,14 @@ def main() -> None:
             if args.optimizer_config:
                 cmd.extend(["--config", args.optimizer_config])
             if args.holdout_months > 0:
-                cmd.extend(["--holdout-months", str(args.holdout_months)])
+                # Per-run holdout CSV (S1b).  For plain --optimize the
+                # cross-window filter is a no-op (min_pass_windows=1 by
+                # default), so we just need the per-run path to avoid
+                # stomping on previous runs' holdout history.
+                cmd.extend([
+                    "--holdout-months", str(args.holdout_months),
+                    "--holdout-output-csv", str(holdout_csv),
+                ])
 
             if not _run_phase(
                 "Run optimizer", cmd,
@@ -258,7 +271,15 @@ def main() -> None:
             if args.optimizer_config:
                 cmd.extend(["--config", args.optimizer_config])
             if args.holdout_months > 0:
-                cmd.extend(["--holdout-months", str(args.holdout_months)])
+                # Per-run holdout CSV (S1b).  cli.py's
+                # --holdout-min-pass-windows defaults to 2 in the
+                # walkforward branch, activating the S2 cross-window
+                # consistency picker automatically so the pipeline never
+                # silently reverts to single-window-by-sharpe.
+                cmd.extend([
+                    "--holdout-months", str(args.holdout_months),
+                    "--holdout-output-csv", str(holdout_csv),
+                ])
 
             if not _run_phase(
                 "Walk-forward validation", cmd,

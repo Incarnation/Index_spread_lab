@@ -243,6 +243,34 @@ def _alignment_warn_against_live_settings() -> None:
     banner.append("─" * 72)
     for line in banner:
         logger.info(line)
+
+
+def _resolve_holdout_output_csv(
+    explicit: str | None,
+    output_csv: str,
+) -> Path:
+    """Decide where the holdout results CSV should be written.
+
+    When the user (or ``run_pipeline.py``) supplies ``--holdout-output-csv``
+    we honour it verbatim; otherwise we derive a per-run-scoped default
+    from ``--output-csv`` by replacing the ``_results`` suffix with
+    ``_holdout``.  Example: ``data/2026-04-v2-puts_results.csv`` ->
+    ``data/2026-04-v2-puts_holdout.csv``.
+
+    This is the S1b fix from the Tier-2 review: two sequential runs
+    previously shared a single ``holdout_results.csv`` and the second
+    run silently clobbered the first (so A1/A2 history was lost).
+    """
+    if explicit:
+        return Path(explicit)
+    base = Path(output_csv)
+    stem = base.stem
+    # ``removesuffix`` is a no-op when the suffix is absent, so paths
+    # like ``data/foo.csv`` still get a sensible ``data/foo_holdout.csv``.
+    derived_stem = stem.removesuffix("_results") + "_holdout"
+    return base.with_name(f"{derived_stem}.csv")
+
+
 def main() -> None:
     """Entry point for the backtest CLI."""
     parser = argparse.ArgumentParser(
@@ -340,6 +368,22 @@ def main() -> None:
                              "Defaults to the last day in the data.")
     parser.add_argument("--holdout-top-n", type=int, default=5,
                         help="Number of top configs to evaluate on the holdout set (default: 5)")
+    parser.add_argument("--holdout-output-csv", type=str, default=None,
+                        help="Explicit path for the holdout results CSV.  When "
+                             "omitted, derives a per-run path from --output-csv "
+                             "(e.g. ``data/2026-04-v2-puts_results.csv`` -> "
+                             "``data/2026-04-v2-puts_holdout.csv``).  Fixes the "
+                             "Tier-2 issue where back-to-back runs clobbered a "
+                             "single shared ``holdout_results.csv``.")
+    parser.add_argument("--holdout-min-pass-windows", type=int, default=None,
+                        help="Cross-window consistency filter for the holdout "
+                             "picker.  Requires a config to earn verdict=PASS "
+                             "in at least N walkforward windows before it is "
+                             "eligible for holdout evaluation; eligible configs "
+                             "are ranked by mean test_sharpe across their PASS "
+                             "windows, favouring robustness over lucky one-window "
+                             "spikes.  Defaults to 2 for --walkforward and 1 "
+                             "(legacy top-N-by-sharpe) for plain --optimize runs.")
 
     # Tier 2: walk-forward verdict gates (tightened PASS criteria)
     parser.add_argument("--wf-min-test-trades", type=int, default=5,
@@ -483,10 +527,22 @@ def main() -> None:
         )
 
         if not df_holdout.empty and not wf_results.empty:
+            # Walkforward path: default to requiring cross-window PASS in
+            # >= 2 windows unless the operator explicitly overrides.  This
+            # is the S2 fix for the A1/A2 overfit (one ``Auto-W23`` spike
+            # dominated the single-window picker; see S1b+S1+S2+S3 plan).
+            wf_min_pass = (
+                args.holdout_min_pass_windows
+                if args.holdout_min_pass_windows is not None
+                else 2
+            )
             run_holdout_evaluation(
                 wf_results, df_holdout,
-                output_dir=Path(args.output_csv).parent,
+                output_csv=_resolve_holdout_output_csv(
+                    args.holdout_output_csv, args.output_csv
+                ),
                 top_n=args.holdout_top_n,
+                min_pass_windows=wf_min_pass,
             )
 
     elif args.optimize_staged or args.optimize_event_only or args.optimize_selective or args.optimize:
@@ -557,10 +613,21 @@ def main() -> None:
                     print_optimizer_top(results_df, metric)
 
             if not df_holdout.empty and not results_df.empty:
+                # Plain --optimize path: there are no walkforward windows,
+                # so cross-window consistency is meaningless.  Default to
+                # 1 (legacy top-N-by-sharpe) unless the operator overrides.
+                opt_min_pass = (
+                    args.holdout_min_pass_windows
+                    if args.holdout_min_pass_windows is not None
+                    else 1
+                )
                 run_holdout_evaluation(
                     results_df, df_holdout,
-                    output_dir=Path(args.output_csv).parent,
+                    output_csv=_resolve_holdout_output_csv(
+                        args.holdout_output_csv, args.output_csv
+                    ),
                     top_n=args.holdout_top_n,
+                    min_pass_windows=opt_min_pass,
                 )
 
             # Finalize experiment tracking

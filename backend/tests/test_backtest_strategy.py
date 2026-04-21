@@ -42,10 +42,12 @@ from backtest_strategy import (
     _deduplicate_results,
     _parameter_importance,
     _row_to_config,
+    run_holdout_evaluation,
     run_walkforward,
     walkforward_split,
     run_analysis,
 )
+from backtest.cli import _resolve_holdout_output_csv
 
 
 # ── Fixtures ─────────────────────────────────────────────────────
@@ -1943,4 +1945,247 @@ class TestWalkforwardVerdictGates:
             assert r in valid_reasons, (
                 f"Unexpected verdict_reason '{r}' -- update test or fix prod"
             )
+
+
+# ── Holdout evaluation (Tier-2 S1b + S2) ─────────────────────────
+
+
+def _make_wf_row(
+    *,
+    window: str,
+    tp_pct: float,
+    verdict: str,
+    train_sharpe: float,
+    test_sharpe: float,
+    test_return_pct: float = 2.0,
+    test_max_dd_pct: float = 5.0,
+    test_trades: int = 20,
+    sharpe: float | None = None,
+) -> dict:
+    """Build one synthetic walkforward-results row.
+
+    The holdout picker only reads a small subset of columns to do its
+    job (``_config_key`` inputs + ``verdict`` + ``test_sharpe``), so we
+    emit only what's needed and let ``_row_to_config`` fill the rest
+    with defaults.  Keeping the fixture tight makes the tests easy to
+    audit.
+    """
+    return {
+        "window": window,
+        # Only ``t_tp_pct`` varies between the two synthetic configs so
+        # ``_config_key`` produces two distinct tuples.  Every other
+        # config column is left blank -> NaN -> None, collapsing to a
+        # shared tail in the key.
+        "t_tp_pct": tp_pct,
+        "verdict": verdict,
+        "train_sharpe": train_sharpe,
+        "test_sharpe": test_sharpe,
+        "test_return_pct": test_return_pct,
+        "test_max_dd_pct": test_max_dd_pct,
+        "test_trades": test_trades,
+        # ``sharpe`` is the rank_col fallback when ``test_sharpe`` is
+        # missing; include it for completeness.
+        "sharpe": sharpe if sharpe is not None else test_sharpe,
+    }
+
+
+class TestResolveHoldoutOutputCsv:
+    """S1b: the cli helper that scopes the holdout CSV per run."""
+
+    def test_explicit_path_wins(self):
+        """An explicit ``--holdout-output-csv`` is honoured verbatim,
+        regardless of what ``--output-csv`` points at."""
+        out = _resolve_holdout_output_csv(
+            "/tmp/explicit_holdout.csv",
+            "data/2026-04-foo_results.csv",
+        )
+        assert out == Path("/tmp/explicit_holdout.csv")
+
+    def test_derives_from_results_csv(self):
+        """Canonical case: strip the ``_results`` suffix and append
+        ``_holdout``.  This is how ``run_pipeline.py`` generates a
+        per-run holdout path by default."""
+        out = _resolve_holdout_output_csv(
+            None,
+            "data/2026-04-v2-puts_results.csv",
+        )
+        assert out == Path("data/2026-04-v2-puts_holdout.csv")
+
+    def test_derives_when_no_results_suffix(self):
+        """When ``--output-csv`` doesn't follow the ``_results.csv``
+        convention, the derivation still produces a sensible filename
+        rather than raising."""
+        out = _resolve_holdout_output_csv(None, "data/foo.csv")
+        assert out == Path("data/foo_holdout.csv")
+
+
+class TestHoldoutEvaluation:
+    """S1b + S2: run_holdout_evaluation output path and cross-window
+    consistency filter regression tests."""
+
+    def test_output_csv_override(self, walkforward_df, tmp_path):
+        """S1b: when ``output_csv`` is supplied explicitly, the holdout
+        CSV lands at that path and the legacy
+        ``<output_dir>/holdout_results.csv`` is NOT created."""
+        results_df = pd.DataFrame([
+            _make_wf_row(
+                window="W1", tp_pct=0.50, verdict="PASS",
+                train_sharpe=2.0, test_sharpe=1.5,
+            ),
+        ])
+        # Use a contiguous 10-day slice as the holdout so run_backtest
+        # has data to score.  The specific slice does not matter for
+        # this test -- we only check file-writing behaviour.
+        days = sorted(walkforward_df["day"].unique())
+        df_holdout = walkforward_df[walkforward_df["day"].isin(days[:10])].copy()
+
+        custom_csv = tmp_path / "my_run_holdout.csv"
+        legacy_csv = tmp_path / "holdout_results.csv"
+
+        run_holdout_evaluation(
+            results_df, df_holdout,
+            output_csv=custom_csv,
+            top_n=1,
+            min_pass_windows=1,
+        )
+
+        assert custom_csv.exists(), "explicit output_csv must be written"
+        assert not legacy_csv.exists(), (
+            "legacy holdout_results.csv must NOT be written when "
+            "output_csv is supplied"
+        )
+        df_out = pd.read_csv(custom_csv)
+        assert len(df_out) == 1
+
+    def test_per_run_default_output_csv(self, walkforward_df, tmp_path):
+        """S1b backward-compat: when only ``output_dir`` is supplied,
+        fall back to writing ``<output_dir>/holdout_results.csv`` so
+        older callers (and the plain ``--optimize`` path) keep working."""
+        results_df = pd.DataFrame([
+            _make_wf_row(
+                window="W1", tp_pct=0.50, verdict="PASS",
+                train_sharpe=2.0, test_sharpe=1.5,
+            ),
+        ])
+        days = sorted(walkforward_df["day"].unique())
+        df_holdout = walkforward_df[walkforward_df["day"].isin(days[:10])].copy()
+
+        run_holdout_evaluation(
+            results_df, df_holdout,
+            output_dir=tmp_path,
+            top_n=1,
+            min_pass_windows=1,
+        )
+
+        default_csv = tmp_path / "holdout_results.csv"
+        assert default_csv.exists(), (
+            "output_dir fallback must still land at holdout_results.csv"
+        )
+
+    def test_min_pass_windows_filters_single_window_configs(
+        self, walkforward_df, tmp_path,
+    ):
+        """S2: with min_pass_windows=2, a config that only PASSes in
+        one lucky window must be filtered out, leaving only the robust
+        config that PASSes in 2+ windows.
+
+        This is the direct regression guard for the A1/A2 overfit
+        where a single ``Auto-W23`` PASS dominated the top-N picker
+        despite -100% degradation on the real holdout.
+        """
+        # Config A (tp=0.50) PASSes in W1/W2/W3 (robust).
+        # Config B (tp=0.60) FAILs in W1/W2, spikes PASS in W3 only
+        # (mirrors the W23 overfit pattern).
+        results_df = pd.DataFrame([
+            _make_wf_row(window="W1", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.5),
+            _make_wf_row(window="W2", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.2),
+            _make_wf_row(window="W3", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.0),
+            _make_wf_row(window="W1", tp_pct=0.60, verdict="FAIL",
+                         train_sharpe=1.0, test_sharpe=-1.0,
+                         test_return_pct=-5.0),
+            _make_wf_row(window="W2", tp_pct=0.60, verdict="FAIL",
+                         train_sharpe=1.0, test_sharpe=-0.5,
+                         test_return_pct=-2.0),
+            _make_wf_row(window="W3", tp_pct=0.60, verdict="PASS",
+                         train_sharpe=1.0, test_sharpe=12.0,
+                         test_return_pct=40.0),
+        ])
+
+        days = sorted(walkforward_df["day"].unique())
+        df_holdout = walkforward_df[walkforward_df["day"].isin(days[:10])].copy()
+
+        out_csv = tmp_path / "filtered_holdout.csv"
+        # Deliberately choose top_n=1 so the strict filter path stays
+        # active; if top_n > survivor count the fallback branch would
+        # fire (that's the separate test below).
+        run_holdout_evaluation(
+            results_df, df_holdout,
+            output_csv=out_csv,
+            top_n=1,
+            min_pass_windows=2,
+        )
+
+        out = pd.read_csv(out_csv)
+        # Only the robust config (tp=0.50) should survive the filter.
+        assert len(out) == 1, (
+            f"Expected 1 survivor, got {len(out)} rows:\n{out}"
+        )
+        assert float(out["t_tp_pct"].iloc[0]) == pytest.approx(0.50)
+        # Cross-window statistics populated on every row.
+        assert int(out["pass_window_count"].iloc[0]) == 3
+        assert out["mean_test_sharpe_over_pass"].iloc[0] == pytest.approx(
+            (1.5 + 1.2 + 1.0) / 3, rel=1e-6,
+        )
+        assert out["holdout_picker_mode"].iloc[0] == "cross_window_consistency"
+
+    def test_min_pass_windows_fallback_when_no_survivor(
+        self, walkforward_df, tmp_path,
+    ):
+        """S2 safety net: when the min_pass_windows filter eliminates
+        every config, fall back to the legacy top-N-by-sharpe picker
+        so the pipeline never silently ships an empty holdout CSV.
+
+        This is important because the caller (run_pipeline.py) treats
+        a missing holdout CSV as a hard failure.  Requiring humans to
+        choose between 'strict filter that may kill everything' and
+        'always have output' is resolved by surfacing the fallback
+        via a log warning + ``holdout_picker_mode=top_n_by_rank`` flag
+        in the CSV so downstream review knows the picker degraded.
+        """
+        # Nobody PASSes in 5+ windows when only 3 windows exist.
+        results_df = pd.DataFrame([
+            _make_wf_row(window="W1", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.5),
+            _make_wf_row(window="W2", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.2),
+            _make_wf_row(window="W3", tp_pct=0.50, verdict="PASS",
+                         train_sharpe=2.0, test_sharpe=1.0),
+            _make_wf_row(window="W3", tp_pct=0.60, verdict="PASS",
+                         train_sharpe=1.0, test_sharpe=12.0,
+                         test_return_pct=40.0),
+        ])
+
+        days = sorted(walkforward_df["day"].unique())
+        df_holdout = walkforward_df[walkforward_df["day"].isin(days[:10])].copy()
+
+        out_csv = tmp_path / "fallback_holdout.csv"
+        run_holdout_evaluation(
+            results_df, df_holdout,
+            output_csv=out_csv,
+            top_n=2,
+            min_pass_windows=5,
+        )
+
+        out = pd.read_csv(out_csv)
+        # Legacy top-N-by-test_sharpe picker returns up to top_n rows
+        # from the deduplicated input (2 unique configs here).
+        assert len(out) == 2, (
+            f"Fallback should emit top-N rows, got {len(out)}"
+        )
+        # Holdout picker mode must flag the degradation so downstream
+        # tooling knows the strict filter was bypassed.
+        assert (out["holdout_picker_mode"] == "top_n_by_rank").all()
 

@@ -1057,11 +1057,36 @@ def run_walkforward(
         print(f"\n  Walk-forward results exported to {output_csv}")
 
     return results_df
+def _legacy_top_n_by_rank(
+    results_df: pd.DataFrame,
+    rank_col: str,
+    top_n: int,
+) -> pd.DataFrame:
+    """Legacy top-N holdout picker (dedupe + sort by rank_col).
+
+    Extracted so that the Tier-2 ``run_holdout_evaluation`` filter can
+    fall back to the historical behaviour when the cross-window
+    consistency filter eliminates too many candidates.  Deduplicates
+    using ``_dedup_key`` (pre-populated by the caller) so the same
+    config is not tested twice on the holdout slice.
+    """
+    deduped = (
+        results_df
+        .sort_values(rank_col, ascending=False)
+        .drop_duplicates(subset=["_dedup_key"], keep="first")
+        .drop(columns=["_dedup_key"])
+    )
+    return deduped.nlargest(top_n, rank_col)
+
+
 def run_holdout_evaluation(
     results_df: pd.DataFrame,
     df_holdout: pd.DataFrame,
-    output_dir: Path,
+    output_dir: Path | None = None,
     top_n: int = 5,
+    *,
+    output_csv: Path | None = None,
+    min_pass_windows: int = 1,
 ) -> pd.DataFrame:
     """Evaluate top optimizer configs on a held-out data slice.
 
@@ -1074,12 +1099,36 @@ def run_holdout_evaluation(
     realistic ranking than in-sample ``sharpe``.  When ``test_sharpe`` is
     absent (e.g. plain ``--optimize`` runs), ``sharpe`` is used instead.
 
+    Tier-2 follow-up from the A1/A2 walkforward review: the single-window
+    ranking above allowed lucky ``Auto-W23`` overfits to dominate the top
+    of the holdout evaluation (Sharpe ~48 on one window, -100% on the real
+    holdout).  The ``min_pass_windows`` parameter adds a cross-window
+    consistency filter: when >= 2, only configs that earn ``verdict=PASS``
+    in that many windows are eligible, and eligible configs are ranked by
+    *mean* ``test_sharpe`` across their PASS windows.  This favours
+    configs whose edge appears in multiple market regimes over spikes
+    driven by a single favourable window.  If the filter leaves fewer
+    than ``top_n`` survivors, we log a warning and fall back to the
+    legacy top-N-by-``rank_col`` picker so the pipeline never silently
+    ships an empty holdout CSV.
+
     Parameters
     ----------
     results_df : Optimizer results (from --optimize or --walkforward).
     df_holdout : Held-out candidates DataFrame (never seen during optimization).
-    output_dir : Directory to write ``holdout_results.csv``.
+    output_dir : Directory to write the default holdout CSV (back-compat).
+        Ignored when ``output_csv`` is provided.  Must be supplied when
+        ``output_csv`` is ``None``.
     top_n : Number of top configs to evaluate.
+    output_csv : Explicit path for the holdout CSV output.  When set,
+        overrides the ``output_dir / "holdout_results.csv"`` default so
+        callers can produce per-run files (e.g. ``{run_name}_holdout.csv``)
+        that don't clobber each other across sequential pipeline runs.
+    min_pass_windows : Tier-2 cross-window consistency filter.  ``1``
+        preserves legacy behaviour (no filter).  ``2+`` requires a config
+        to earn ``verdict=PASS`` in at least that many walkforward
+        windows; ignored when ``results_df`` lacks a ``verdict`` column
+        (i.e. plain ``--optimize`` results).
 
     Returns
     -------
@@ -1088,6 +1137,18 @@ def run_holdout_evaluation(
     if results_df.empty or df_holdout.empty:
         print("  Holdout: skipped (empty results or holdout data)")
         return pd.DataFrame()
+
+    # Resolve the output CSV path up front so failures surface before any
+    # heavy lifting.  output_csv takes precedence over output_dir.
+    if output_csv is None:
+        if output_dir is None:
+            raise ValueError(
+                "run_holdout_evaluation: either output_csv or output_dir "
+                "must be provided."
+            )
+        output_csv = Path(output_dir) / "holdout_results.csv"
+    else:
+        output_csv = Path(output_csv)
 
     holdout_signals = precompute_daily_signals(df_holdout)
     holdout_days = df_holdout["day"].nunique()
@@ -1100,18 +1161,83 @@ def run_holdout_evaluation(
     # fall back to sharpe (train/full-sample) for optimizer results
     rank_col = "test_sharpe" if "test_sharpe" in results_df.columns else "sharpe"
 
-    # Deduplicate: when walk-forward produces the same config across multiple
-    # windows, keep only the row with the best ranking metric per unique config.
-    # Uses _config_key (NaN-normalized tuple) for consistent identity.
+    # Annotate every row with its canonical config identity so we can do
+    # both dedup-by-best-metric and cross-window PASS counting off the
+    # same key.  ``_config_key`` NaN-normalizes the tuple.
     results_df = results_df.copy()
     results_df["_dedup_key"] = results_df.apply(_config_key, axis=1)
-    deduped = (
-        results_df
-        .sort_values(rank_col, ascending=False)
-        .drop_duplicates(subset=["_dedup_key"], keep="first")
-        .drop(columns=["_dedup_key"])
-    )
-    top = deduped.nlargest(top_n, rank_col)
+
+    # --- Tier-2 cross-window consistency filter -------------------------
+    # Only applies to walkforward results (have ``verdict`` column).  For
+    # plain ``--optimize`` results, min_pass_windows has no meaning since
+    # there is only one "window" in the data (the full sample).
+    has_verdict = "verdict" in results_df.columns
+    use_consistency_filter = has_verdict and min_pass_windows >= 2
+
+    # Per-config cross-window PASS statistics, computed once and reused
+    # for both the filter and the emitted ``pass_window_count`` /
+    # ``mean_test_sharpe_over_pass`` columns.
+    per_config_stats: dict[Any, dict[str, float]] = {}
+    if has_verdict:
+        pass_mask = results_df["verdict"].eq("PASS")
+        if pass_mask.any():
+            pass_rows = results_df.loc[pass_mask]
+            grouped = pass_rows.groupby("_dedup_key")
+            for key, group in grouped:
+                per_config_stats[key] = {
+                    "pass_window_count": int(len(group)),
+                    "mean_test_sharpe_over_pass": float(
+                        group["test_sharpe"].mean()
+                    ) if "test_sharpe" in group.columns else float("nan"),
+                }
+
+    fallback_reason = ""
+    if use_consistency_filter:
+        survivor_keys = [
+            k for k, s in per_config_stats.items()
+            if s["pass_window_count"] >= min_pass_windows
+        ]
+        if len(survivor_keys) >= top_n:
+            # Build a dedup frame of survivors only, ranked by MEAN
+            # test_sharpe across their PASS windows (not the best single
+            # window).  This rewards consistency over lucky spikes.
+            deduped = (
+                results_df.loc[results_df["_dedup_key"].isin(survivor_keys)]
+                .sort_values(rank_col, ascending=False)
+                .drop_duplicates(subset=["_dedup_key"], keep="first")
+                .drop(columns=["_dedup_key"])
+                .copy()
+            )
+            deduped["_mean_test_sharpe"] = deduped.apply(
+                lambda r: per_config_stats[_config_key(r)][
+                    "mean_test_sharpe_over_pass"
+                ],
+                axis=1,
+            )
+            top = (
+                deduped.sort_values("_mean_test_sharpe", ascending=False)
+                .head(top_n)
+                .drop(columns=["_mean_test_sharpe"])
+            )
+            print(
+                f"  Cross-window picker: {len(survivor_keys)} configs PASS "
+                f">= {min_pass_windows} windows, top {top_n} by mean "
+                "test_sharpe across PASS windows."
+            )
+        else:
+            # Not enough robust survivors: warn and fall through to the
+            # legacy picker so we never emit an empty holdout.
+            fallback_reason = (
+                f"only {len(survivor_keys)} configs PASS in "
+                f">= {min_pass_windows} windows "
+                f"(need {top_n}); falling back to top-N by {rank_col}"
+            )
+            logger.warning("Holdout picker fallback: %s", fallback_reason)
+            print(f"  Holdout picker fallback: {fallback_reason}")
+            top = _legacy_top_n_by_rank(results_df, rank_col, top_n)
+    else:
+        top = _legacy_top_n_by_rank(results_df, rank_col, top_n)
+
     precomp_cache: dict[tuple, dict] = {}
     rows: list[dict[str, Any]] = []
 
@@ -1167,6 +1293,13 @@ def run_holdout_evaluation(
               f"{dev_ret:>+7.0f}% {ho_ret:>+7.0f}% {degradation:>+7.0f}%")
 
         row_out = trow.to_dict()
+        # Strip the internal dedup key before exporting; it's an
+        # implementation detail, not a useful downstream column.
+        row_out.pop("_dedup_key", None)
+        # Look up the cross-window PASS statistics for this config.  For
+        # plain --optimize results (no ``verdict`` column) or configs
+        # that never earned a PASS verdict, these default to 0 / NaN.
+        stats = per_config_stats.get(_config_key(trow), {})
         row_out.update({
             "dev_sharpe": dev_sharpe,
             "dev_return_pct": dev_ret,
@@ -1178,12 +1311,24 @@ def run_holdout_evaluation(
             "holdout_trades": ho_result.total_trades,
             "holdout_days": holdout_days,
             "degradation_pct": round(degradation, 1),
+            # Tier-2 cross-window consistency columns.  Present on every
+            # row so downstream analysis can filter/rank by robustness
+            # regardless of whether the consistency filter was active.
+            "pass_window_count": int(stats.get("pass_window_count", 0)),
+            "mean_test_sharpe_over_pass": float(
+                stats.get("mean_test_sharpe_over_pass", float("nan"))
+            ),
+            "holdout_picker_mode": (
+                "cross_window_consistency"
+                if use_consistency_filter and not fallback_reason
+                else "top_n_by_rank"
+            ),
         })
         row_out.update({f"ho_{k}": v for k, v in ho_result.regime_metrics.items()})
         rows.append(row_out)
 
     holdout_df = pd.DataFrame(rows)
-    ho_csv = output_dir / "holdout_results.csv"
-    holdout_df.to_csv(ho_csv, index=False)
-    print(f"\n  Holdout results exported to {ho_csv}")
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    holdout_df.to_csv(output_csv, index=False)
+    print(f"\n  Holdout results exported to {output_csv}")
     return holdout_df

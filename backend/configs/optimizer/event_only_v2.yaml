@@ -1,13 +1,15 @@
 name: event-only-v2
 description: >
-  Tier 3 production candidate (E2E pipeline review): focused grid that
-  bakes in the winning levers from the v2_explore (62,208-config) walk-
-  forward.  Locked: width_filter=20.0 (best WF Sharpe), side_preference
-  =best (consistently top across windows), term_inversion=99.0
-  (disabled; loses every Phase-1 head-to-head).  Swept: SL on/off (null
-  vs 3.0), entry_count (3 vs 7), TP, SPX/VIX thresholds, max_event_trades.
-  Designed to walk-forward in <2 min with --backtest-workers 8 (Tier 4
-  parallelization), so iterating on the next tweak is cheap.
+  Tier 3 production candidate, refreshed from the v3_explore (18,432-
+  config) walk-forward + A1/A2 holdout review.  Findings re-baked in:
+  (1) side_preference=puts dominated 100% of PASS rows (locked "best"
+  was a historical miscalibration); (2) sl_mult=4.0 surfaces alongside
+  null/3.0 in multi-window PASS configs so we re-open the SL ladder;
+  (3) entry_count=5 is competitive with {3, 7} on the multi-window
+  picker.  Still locked from v2_explore: width_filter=20.0 (best WF
+  Sharpe), term_inversion=99.0 (disabled; loses every Phase-1 head-to-
+  head).  Grid size: 864 configs — walk-forwards in <3 min with
+  --backtest-workers 8 (Tier 4 parallelization).
 
 portfolio:
   starting_capital: [20000]
@@ -20,10 +22,10 @@ portfolio:
 
 trading:
   tp_pct: [0.50, 0.60]
-  sl_mult: [null, 3.0]
+  sl_mult: [null, 3.0, 4.0]
   avoid_opex: [true]
   width_filter: [20.0]
-  entry_count: [3, 7]
+  entry_count: [3, 5, 7]
 
 event:
   enabled: [true]
@@ -36,7 +38,7 @@ event:
   vix_spike_threshold: [0.15]
   vix_elevated_threshold: [25.0]
   term_inversion_threshold: [99.0]
-  side_preference: ["best"]
+  side_preference: ["puts"]
   min_dte: [3, 5]
   max_dte: [7, 10]
   min_delta: [0.10]
