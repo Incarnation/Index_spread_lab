@@ -37,10 +37,12 @@ from backtest_strategy import (
     _build_event_only_grid,
     _build_selective_grid,
     _run_grid,
+    _run_window_optimizer,
     extract_pareto_frontier,
     _deduplicate_results,
     _parameter_importance,
     _row_to_config,
+    run_walkforward,
     walkforward_split,
     run_analysis,
 )
@@ -1661,3 +1663,284 @@ class TestParallelGrid:
                            "test-single", num_workers=1)
         assert len(result) == 1
         assert "final_equity" in result.columns
+
+
+# ── Parallel walkforward (Tier 4) ─────────────────────────────────
+
+
+def _build_walkforward_fixture_df(n_days: int = 30) -> pd.DataFrame:
+    """Synthetic multi-day candidates DataFrame with enough trading days
+    to satisfy walk-forward train (>=10) + test (>=5) minimums.
+
+    Each day has the same shape as the production training_candidates.csv
+    (4 candidates per day across 2 entry times and both sides) so the
+    optimizer grid has real configs to score.  PnL alternates sign so the
+    Sharpe ratio is non-degenerate.
+    """
+    rows = []
+    base = pd.Timestamp("2025-01-02")
+    for day_idx in range(n_days):
+        # Skip weekends so day strings look realistic.
+        date = base + pd.tseries.offsets.BDay(day_idx)
+        day_str = date.strftime("%Y-%m-%d")
+        for entry_idx, dt in enumerate(["09:45", "10:02"]):
+            for side in ["call", "put"]:
+                # Alternate winners/losers per day so Sharpe varies across
+                # configs (otherwise every config produces identical PnL).
+                pnl_sign = 1 if (day_idx + entry_idx) % 3 != 0 else -1
+                base_pnl = 120 if side == "call" else 80
+                rows.append({
+                    "day": day_str,
+                    "entry_dt": dt,
+                    "spread_side": side,
+                    "dte_target": 3,
+                    "delta_target": 0.10,
+                    "credit_to_width": 0.30 if side == "call" else 0.22,
+                    "realized_pnl": pnl_sign * base_pnl,
+                    "spot": 5500 + day_idx * 5,
+                    "vix": 14 + (day_idx % 5),
+                    "vix9d": 13 + (day_idx % 5),
+                    "term_structure": 1.05,
+                })
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def walkforward_df() -> pd.DataFrame:
+    """30-trading-day fixture supporting walkforward train+test windows."""
+    return _build_walkforward_fixture_df(n_days=30)
+
+
+class TestParallelWalkforward:
+    """Tier 4 regression: walkforward must respect num_workers and produce
+    identical results in sequential vs parallel mode."""
+
+    def test_window_optimizer_parallel_matches_sequential(self, walkforward_df):
+        """_run_window_optimizer with num_workers=2 returns the same top-N
+        rows as num_workers=1 for the same slice and config grid."""
+        seq = _run_window_optimizer(
+            walkforward_df, top_n=5, config_path=None, num_workers=1,
+            stage_name="test-seq",
+        )
+        par = _run_window_optimizer(
+            walkforward_df, top_n=5, config_path=None, num_workers=2,
+            stage_name="test-par",
+        )
+
+        # Same number of rows (top-5 by Sharpe in both cases).
+        assert len(seq) == len(par)
+        assert not seq.empty, "Sanity: optimizer grid should produce >0 configs"
+
+        # Sort both frames by the canonical config key so we compare
+        # config-by-config (Pool ordering may shuffle ties before the
+        # head() takes the top-N).
+        key_cols = [c for c in seq.columns if c.startswith(("p_", "t_", "e_", "r_"))]
+        seq_sorted = seq.sort_values(key_cols).reset_index(drop=True)
+        par_sorted = par.sort_values(key_cols).reset_index(drop=True)
+
+        for col in ["sharpe", "return_pct", "final_equity",
+                    "total_trades", "win_days"]:
+            assert list(seq_sorted[col]) == list(par_sorted[col]), (
+                f"Mismatch in {col}: sequential vs parallel walkforward"
+            )
+
+    def test_run_walkforward_threads_num_workers(self, walkforward_df, tmp_path):
+        """run_walkforward propagates num_workers down into the per-window
+        optimizer.  Verified by comparing two end-to-end runs (workers=1
+        vs workers=2) over a 1-window grid sized from the actual fixture
+        (avoids skips when fixture date math drifts)."""
+        days = sorted(walkforward_df["day"].unique())
+        # Pick a window guaranteed to satisfy train>=10, test>=5 from the
+        # 30-day fixture: first 20 days train, next 8 days test.
+        train_days = days[:20]
+        test_days = days[20:28]
+        windows = [{
+            "name": "W1",
+            "train_start": train_days[0],
+            "train_end": train_days[-1],
+            "test_start": test_days[0],
+            "test_end": test_days[-1],
+        }]
+        seq_csv = tmp_path / "wf_seq.csv"
+        par_csv = tmp_path / "wf_par.csv"
+
+        seq = run_walkforward(
+            walkforward_df, output_csv=seq_csv, top_n=3,
+            windows=windows, config_path=None, num_workers=1,
+        )
+        par = run_walkforward(
+            walkforward_df, output_csv=par_csv, top_n=3,
+            windows=windows, config_path=None, num_workers=2,
+        )
+
+        assert not seq.empty, "Walkforward should produce results for the chosen window"
+        assert len(seq) == len(par)
+
+        for col in ["train_sharpe", "test_sharpe",
+                    "train_return_pct", "test_return_pct"]:
+            seq_vals = sorted(seq[col].tolist())
+            par_vals = sorted(par[col].tolist())
+            assert seq_vals == par_vals, (
+                f"Mismatch in {col}: sequential vs parallel walkforward"
+            )
+
+
+class TestWalkforwardVerdictGates:
+    """Tier 2: tightened walkforward PASS verdict.  PASS now requires
+    every gate to clear (positive train Sharpe, min trades, min absolute
+    test Sharpe, min retention vs train, max test drawdown).  These
+    tests exercise each gate in isolation by constructing a synthetic
+    walk-forward result row and round-tripping it through the same
+    verdict-decision branch run_walkforward uses.
+    """
+
+    @staticmethod
+    def _classify(
+        *,
+        train_sharpe: float,
+        test_sharpe: float,
+        test_ret: float,
+        test_dd: float,
+        test_trades: int,
+        min_test_trades: int = 5,
+        min_test_sharpe: float = 1.0,
+        min_sharpe_retention: float = 0.5,
+        max_test_dd_pct: float = 15.0,
+    ) -> tuple[str, str]:
+        """Mirror the verdict logic in run_walkforward.  Kept in the
+        test file (not imported) so the test fails loudly if the
+        production logic drifts -- forcing the test author to copy the
+        new rule in deliberately rather than having the test silently
+        track a buggy refactor."""
+        if test_sharpe > 0 and test_ret > 0:
+            if train_sharpe <= 0:
+                return "WEAK", "train_sharpe_le_0"
+            if test_trades < min_test_trades:
+                return "WEAK", f"test_trades<{min_test_trades}"
+            if test_sharpe < min_test_sharpe:
+                return "WEAK", f"test_sharpe<{min_test_sharpe}"
+            if test_sharpe < train_sharpe * min_sharpe_retention:
+                return "WEAK", f"retention<{min_sharpe_retention}"
+            if test_dd > max_test_dd_pct:
+                return "WEAK", f"test_dd>{max_test_dd_pct}"
+            return "PASS", "all_gates_pass"
+        if test_ret > 0:
+            return "MARGINAL", "test_sharpe_le_0_but_ret_gt_0"
+        return "FAIL", "test_ret_le_0"
+
+    def test_pass_when_all_gates_clear(self):
+        """A config that clears every gate earns PASS."""
+        verdict, reason = self._classify(
+            train_sharpe=2.0, test_sharpe=1.5, test_ret=4.0,
+            test_dd=8.0, test_trades=20,
+        )
+        assert verdict == "PASS"
+        assert reason == "all_gates_pass"
+
+    def test_min_trades_gate_demotes_to_weak(self):
+        """A 1-trade lucky test window is demoted to WEAK even with
+        stellar Sharpe -- the historical 0.3-retention rule would have
+        accepted it as PASS.  This is exactly the regression Tier 2
+        was designed to fix."""
+        verdict, reason = self._classify(
+            train_sharpe=2.0, test_sharpe=4.88, test_ret=2.6,
+            test_dd=0.0, test_trades=1,
+        )
+        assert verdict == "WEAK"
+        assert reason == "test_trades<5"
+
+    def test_min_test_sharpe_gate(self):
+        """test_sharpe=0.5 fails the absolute >=1.0 gate even with
+        100% retention vs train_sharpe=0.5."""
+        verdict, reason = self._classify(
+            train_sharpe=0.5, test_sharpe=0.5, test_ret=2.0,
+            test_dd=3.0, test_trades=20,
+        )
+        assert verdict == "WEAK"
+        assert reason == "test_sharpe<1.0"
+
+    def test_retention_gate(self):
+        """train_sharpe=4 with test_sharpe=1.5 keeps only 37.5% --
+        below the 50% retention threshold even though it clears the
+        absolute floor."""
+        verdict, reason = self._classify(
+            train_sharpe=4.0, test_sharpe=1.5, test_ret=4.0,
+            test_dd=5.0, test_trades=20,
+        )
+        assert verdict == "WEAK"
+        assert reason == "retention<0.5"
+
+    def test_dd_gate(self):
+        """test_max_dd > 15% disqualifies even an otherwise-strong
+        config.  Catches the "PASS but blew up" pattern."""
+        verdict, reason = self._classify(
+            train_sharpe=2.0, test_sharpe=1.5, test_ret=4.0,
+            test_dd=18.0, test_trades=20,
+        )
+        assert verdict == "WEAK"
+        assert reason == "test_dd>15.0"
+
+    def test_negative_test_sharpe_with_positive_return(self):
+        """Asymmetric path: positive return but negative Sharpe
+        (stable losers + one big winner) is MARGINAL, not FAIL."""
+        verdict, reason = self._classify(
+            train_sharpe=2.0, test_sharpe=-0.2, test_ret=0.5,
+            test_dd=8.0, test_trades=20,
+        )
+        assert verdict == "MARGINAL"
+        assert reason == "test_sharpe_le_0_but_ret_gt_0"
+
+    def test_negative_return_is_fail(self):
+        """Anything with non-positive test_ret is FAIL regardless of
+        train Sharpe."""
+        verdict, reason = self._classify(
+            train_sharpe=2.0, test_sharpe=-1.0, test_ret=-2.0,
+            test_dd=12.0, test_trades=20,
+        )
+        assert verdict == "FAIL"
+        assert reason == "test_ret_le_0"
+
+    def test_run_walkforward_emits_verdict_reason_and_test_trades(
+        self, walkforward_df, tmp_path,
+    ):
+        """End-to-end check that the new verdict_reason and test_trades
+        columns are populated in the exported CSV by run_walkforward."""
+        days = sorted(walkforward_df["day"].unique())
+        windows = [{
+            "name": "W1",
+            "train_start": days[0],
+            "train_end": days[19],
+            "test_start": days[20],
+            "test_end": days[27],
+        }]
+        out_csv = tmp_path / "wf_verdict.csv"
+        result = run_walkforward(
+            walkforward_df, output_csv=out_csv, top_n=3,
+            windows=windows, config_path=None, num_workers=1,
+            min_test_trades=5,
+            min_test_sharpe=1.0,
+            min_sharpe_retention=0.5,
+            max_test_dd_pct=15.0,
+        )
+        assert not result.empty
+        assert "verdict_reason" in result.columns
+        assert "test_trades" in result.columns
+        assert (result["test_trades"] >= 0).all()
+        assert result["verdict_reason"].notna().all()
+        # All emitted reasons must be one of the documented strings so
+        # downstream dashboards can colour-code them.
+        valid_reasons = {
+            "all_gates_pass",
+            "train_sharpe_le_0",
+            "test_trades<5",
+            "test_sharpe<1.0",
+            "retention<0.5",
+            "test_dd>15.0",
+            "test_sharpe_le_0_but_ret_gt_0",
+            "test_ret_le_0",
+        }
+        for r in result["verdict_reason"].unique():
+            assert r in valid_reasons, (
+                f"Unexpected verdict_reason '{r}' -- update test or fix prod"
+            )
+

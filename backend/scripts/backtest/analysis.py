@@ -158,6 +158,7 @@ from .engine import (
     TradingConfig,
     _opt_str,
     _opt_val,
+    _precompute_day_selections,
     _safe_bool,
     compute_effective_pnl,
     precompute_daily_signals,
@@ -711,8 +712,18 @@ def _run_window_optimizer(
     df_slice: pd.DataFrame,
     top_n: int = 10,
     config_path: str | None = None,
+    num_workers: int = 1,
+    stage_name: str = "WF-Train",
 ) -> pd.DataFrame:
     """Run the full optimizer grid on a data slice and return top-N rows.
+
+    Delegates the per-config backtest loop to :func:`_run_grid`, which
+    already implements a ``multiprocessing.Pool`` parallelization pattern
+    identical to the one used by the standalone ``--optimize`` mode.
+    Walk-forward windows are independent slices, so reusing the same grid
+    runner gives walkforward identical performance characteristics to
+    standalone optimization while keeping the per-window context (top-N
+    by Sharpe) intact.
 
     Parameters
     ----------
@@ -720,52 +731,56 @@ def _run_window_optimizer(
     top_n : Number of top configs to return.
     config_path : Optional YAML grid config. Uses YAML grid when provided,
         falls back to the hardcoded ``_build_optimizer_grid()`` otherwise.
+    num_workers : Number of worker processes for parallel grid execution.
+        ``1`` (default) keeps the deterministic sequential code path used
+        by smaller debug runs; values >1 fan out across a process pool.
+    stage_name : Human-readable label included in progress logs (defaults
+        to ``"WF-Train"`` for backwards compatibility).  Walkforward
+        callers should pass a window-specific label (e.g. ``"WF-W1-Train"``).
 
     Returns
     -------
     DataFrame with top-N rows by Sharpe, including all config columns.
     """
-    daily_signals = precompute_daily_signals(df_slice)
+    # Build / load configs first so we can short-circuit empty grids
+    # before paying the cost of precomputing daily signals.
     if config_path is not None:
         from configs.optimizer.schema import build_configs_from_yaml
         configs = build_configs_from_yaml(config_path)
         if not configs:
             logger.warning("YAML grid %s produced zero configs — returning empty DataFrame", config_path)
             return pd.DataFrame()
+        # PnL precomputation MUST happen on the slice before we pickle it
+        # to worker processes, because workers run a forked copy and any
+        # mutations they perform after fork are not visible to the parent.
         tp_vals = sorted({c.trading.tp_pct for c in configs})
         sl_vals = sorted({c.trading.sl_mult for c in configs}, key=lambda x: x or 0)
         precompute_pnl_columns(df_slice, tp_vals, sl_vals)
     else:
         configs = _build_optimizer_grid()
 
-    precomp_cache: dict[tuple, dict] = {}
-    rows: list[dict[str, Any]] = []
-    for cfg in configs:
-        key = (cfg.trading.width_filter, cfg.trading.entry_count)
-        if key not in precomp_cache:
-            precomp_cache[key] = _precompute_day_selections(
-                df_slice, width_filter=key[0], entry_count=key[1],
-            )
-        result = run_backtest(df_slice, daily_signals, cfg, day_precomp=precomp_cache[key])
-        row = cfg.flat_dict()
-        row.update({
-            "final_equity": result.final_equity,
-            "return_pct": result.total_return_pct,
-            "ann_return_pct": result.annualised_return_pct,
-            "max_dd_pct": result.max_drawdown_pct,
-            "trough": result.trough,
-            "sharpe": result.sharpe,
-            "total_trades": result.total_trades,
-            "days_traded": result.days_traded,
-            "days_stopped": result.days_stopped,
-            "win_days": result.win_days,
-            "win_rate": result.win_days / max(result.days_traded, 1),
-        })
-        row.update(result.regime_metrics)
-        rows.append(row)
+    daily_signals = precompute_daily_signals(df_slice)
 
-    results_df = pd.DataFrame(rows)
-    return results_df.sort_values("sharpe", ascending=False).head(top_n).reset_index(drop=True)
+    # Delegate the heavy lifting to _run_grid.  It handles:
+    #   * eager build of the (width_filter, entry_count) precomp cache
+    #   * pickling df/signals/cache into the Pool initializer once
+    #   * progress logging every 500 configs
+    #   * deterministic config_key sort of the result rows
+    results_df = _run_grid(
+        configs,
+        df_slice,
+        daily_signals,
+        stage_name=stage_name,
+        num_workers=num_workers,
+    )
+    if results_df.empty:
+        return results_df
+
+    return (
+        results_df.sort_values("sharpe", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
 def _config_signature(row: pd.Series) -> str:
     """Build a short human-readable label for a config row."""
     trades = int(row.get("p_max_trades_per_day", 0))
@@ -810,6 +825,11 @@ def run_walkforward(
     *,
     windows: list[dict[str, str]] | None = None,
     config_path: str | None = None,
+    num_workers: int = 1,
+    min_test_trades: int = 5,
+    min_test_sharpe: float = 1.0,
+    min_sharpe_retention: float = 0.5,
+    max_test_dd_pct: float = 15.0,
 ) -> pd.DataFrame:
     """Run rolling walk-forward validation across all windows.
 
@@ -827,6 +847,30 @@ def run_walkforward(
     config_path : Optional YAML grid config for the optimizer. When
         provided, walk-forward uses the same YAML grid as ``--optimize
         --config``. When ``None``, uses the hardcoded exhaustive grid.
+    num_workers : Number of worker processes for the per-window grid
+        sweep.  Forwarded to :func:`_run_window_optimizer`.  The OOS
+        test-phase loop (only ``top_n`` configs) stays sequential since
+        Pool startup overhead would dominate that small workload.
+
+    min_test_trades : Tier-2 verdict gate.  A config must execute at
+        least this many trades on the test slice before it can be
+        labelled ``PASS``.  Filters out lucky 1- or 2-trade windows
+        whose stellar OOS Sharpe is sample-noise rather than signal.
+        Default 5 (still permissive on a 1-month test slice).
+    min_test_sharpe : Tier-2 verdict gate.  Absolute floor for OOS
+        Sharpe before a config can earn ``PASS``.  Default 1.0 — below
+        this, even 100% retention of train Sharpe is not interesting
+        for live deployment.
+    min_sharpe_retention : Tier-2 verdict gate.  Required fraction of
+        train Sharpe retained on test (``test_sharpe >= retention *
+        train_sharpe``).  Tightened from the historical 0.3 to 0.5
+        because anything below 50% retention is more likely to be
+        overfit than robust.
+    max_test_dd_pct : Tier-2 verdict gate.  Max acceptable test-slice
+        max-drawdown percentage.  PASS configs must stay under this
+        cap; configs that hit a deep drawdown on test are demoted to
+        ``WEAK`` even if their Sharpe looks fine.  Default 15.0 (i.e.
+        15%, twice the typical monthly drawdown on the live system).
 
     Returns
     -------
@@ -869,9 +913,18 @@ def run_walkforward(
             continue
 
         config_source = f"yaml:{Path(config_path).name}" if config_path else "exhaustive"
-        print(f"  Optimizing on train set (source={config_source}) ...")
+        print(f"  Optimizing on train set (source={config_source}, workers={num_workers}) ...")
         t0 = time.time()
-        top_train = _run_window_optimizer(train_df, top_n=top_n, config_path=config_path)
+        # Stage label includes the window name so per-window progress
+        # messages from _run_grid are easy to attribute when watching
+        # the live log of a long walkforward run.
+        top_train = _run_window_optimizer(
+            train_df,
+            top_n=top_n,
+            config_path=config_path,
+            num_workers=num_workers,
+            stage_name=f"WF-{wname}-Train",
+        )
         train_elapsed = time.time() - t0
         print(f"  Train optimization done in {train_elapsed:.0f}s")
 
@@ -897,17 +950,51 @@ def run_walkforward(
             test_ret = test_result.total_return_pct
             train_dd = float(trow["max_dd_pct"])
             test_dd = test_result.max_drawdown_pct
+            test_trades = int(test_result.total_trades)
 
-            # Verdict: how well does train performance predict test
+            # Tier 2 verdict: tightened from the historical
+            # ``test_sharpe >= train_sharpe * 0.3`` rule.  A config now
+            # earns PASS only if it clears every gate:
+            #
+            #   * positive test Sharpe AND positive test return
+            #   * positive train Sharpe (we want a coherent train
+            #     signal, not a coin-flip that happened to win OOS)
+            #   * test_trades >= ``min_test_trades`` (filter out 1- or
+            #     2-trade lucky windows)
+            #   * test_sharpe >= ``min_test_sharpe`` (absolute floor)
+            #   * test_sharpe >= ``min_sharpe_retention`` * train_sharpe
+            #     (relative retention vs train, raised from 0.3 -> 0.5)
+            #   * test_dd <= ``max_test_dd_pct`` (drawdown gate)
+            #
+            # Anything that has a positive test Sharpe but trips one of
+            # the gates is demoted to WEAK so it still shows up in the
+            # CSV but doesn't count as a deployment-ready config.
+            verdict_reason = ""
             if test_sharpe > 0 and test_ret > 0:
                 if train_sharpe <= 0:
                     verdict = "WEAK"
+                    verdict_reason = "train_sharpe_le_0"
+                elif test_trades < min_test_trades:
+                    verdict = "WEAK"
+                    verdict_reason = f"test_trades<{min_test_trades}"
+                elif test_sharpe < min_test_sharpe:
+                    verdict = "WEAK"
+                    verdict_reason = f"test_sharpe<{min_test_sharpe}"
+                elif test_sharpe < train_sharpe * min_sharpe_retention:
+                    verdict = "WEAK"
+                    verdict_reason = f"retention<{min_sharpe_retention}"
+                elif test_dd > max_test_dd_pct:
+                    verdict = "WEAK"
+                    verdict_reason = f"test_dd>{max_test_dd_pct}"
                 else:
-                    verdict = "PASS" if test_sharpe >= train_sharpe * 0.3 else "WEAK"
+                    verdict = "PASS"
+                    verdict_reason = "all_gates_pass"
             elif test_ret > 0:
                 verdict = "MARGINAL"
+                verdict_reason = "test_sharpe_le_0_but_ret_gt_0"
             else:
                 verdict = "FAIL"
+                verdict_reason = "test_ret_le_0"
 
             sig = _config_signature(trow)
             key = _config_key(trow)
@@ -929,7 +1016,10 @@ def run_walkforward(
                 "test_return_pct": test_ret,
                 "train_max_dd_pct": train_dd,
                 "test_max_dd_pct": test_dd,
+                "test_trades": test_trades,
+                "test_total_trades": test_trades,  # alias used by holdout
                 "verdict": verdict,
+                "verdict_reason": verdict_reason,
                 "config_source": config_source,
             })
             all_rows.append(row_out)
@@ -1029,6 +1119,21 @@ def run_holdout_evaluation(
           f"{'Dev Ret':>8} {'HO Ret':>8} {'Degrade':>8}")
     print("  " + "-" * 90)
 
+    # Tier 1 dev_* fix (E2E pipeline review): when input rows come from
+    # walkforward (which exposes ``test_sharpe`` / ``test_return_pct``
+    # OOS columns), the "development" metrics shown next to holdout
+    # metrics should be the OOS estimate from walkforward, not the
+    # in-sample ``sharpe`` (which is just train Sharpe).  Reporting
+    # train Sharpe as "dev" produced misleadingly large degradation
+    # numbers (because train was overfit).  When the input is plain
+    # ``--optimize`` (no test_* columns), fall back to ``sharpe``
+    # which IS the full-sample dev metric in that mode.
+    use_oos_dev = "test_sharpe" in results_df.columns
+    if use_oos_dev:
+        print("  (dev_* columns reflect walkforward OOS test metrics)")
+    else:
+        print("  (dev_* columns reflect full-sample optimizer metrics)")
+
     for rank, (_, trow) in enumerate(top.iterrows(), 1):
         cfg = _row_to_config(trow)
         tpc_key = (cfg.trading.width_filter, cfg.trading.entry_count)
@@ -1041,9 +1146,18 @@ def run_holdout_evaluation(
             day_precomp=precomp_cache[tpc_key],
         )
 
-        dev_sharpe = float(trow["sharpe"])
+        # Pull OOS test metrics when available (walkforward input);
+        # otherwise fall back to the full-sample sharpe/return/dd.
+        if use_oos_dev:
+            dev_sharpe = float(trow.get("test_sharpe", trow.get("sharpe", 0)))
+            dev_ret = float(trow.get("test_return_pct", trow.get("return_pct", 0)))
+            dev_dd = float(trow.get("test_max_dd_pct", trow.get("max_dd_pct", 0)))
+        else:
+            dev_sharpe = float(trow["sharpe"])
+            dev_ret = float(trow["return_pct"])
+            dev_dd = float(trow.get("max_dd_pct", 0))
+
         ho_sharpe = ho_result.sharpe
-        dev_ret = float(trow["return_pct"])
         ho_ret = ho_result.total_return_pct
 
         degradation = (1 - ho_sharpe / dev_sharpe) * 100 if dev_sharpe > 0 else 0
@@ -1056,7 +1170,8 @@ def run_holdout_evaluation(
         row_out.update({
             "dev_sharpe": dev_sharpe,
             "dev_return_pct": dev_ret,
-            "dev_max_dd_pct": float(trow.get("max_dd_pct", 0)),
+            "dev_max_dd_pct": dev_dd,
+            "dev_metric_basis": "walkforward_oos" if use_oos_dev else "full_sample",
             "holdout_sharpe": ho_sharpe,
             "holdout_return_pct": ho_ret,
             "holdout_max_dd_pct": ho_result.max_drawdown_pct,

@@ -1,9 +1,13 @@
 name: event-only-v2
 description: >
-  Focused backtest to validate the live config with term_inversion
-  disabled (99.0) vs enabled (1.0), and max_event_trades 1/2/3.
-  Uses the best-performing parameter values from the original
-  165,888-config optimizer run.
+  Tier 3 production candidate (E2E pipeline review): focused grid that
+  bakes in the winning levers from the v2_explore (62,208-config) walk-
+  forward.  Locked: width_filter=20.0 (best WF Sharpe), side_preference
+  =best (consistently top across windows), term_inversion=99.0
+  (disabled; loses every Phase-1 head-to-head).  Swept: SL on/off (null
+  vs 3.0), entry_count (3 vs 7), TP, SPX/VIX thresholds, max_event_trades.
+  Designed to walk-forward in <2 min with --backtest-workers 8 (Tier 4
+  parallelization), so iterating on the next tweak is cheap.
 
 portfolio:
   starting_capital: [20000]
@@ -16,9 +20,10 @@ portfolio:
 
 trading:
   tp_pct: [0.50, 0.60]
-  sl_mult: [null, 2.0]
+  sl_mult: [null, 3.0]
   avoid_opex: [true]
-  width_filter: [10.0]
+  width_filter: [20.0]
+  entry_count: [3, 7]
 
 event:
   enabled: [true]
@@ -30,8 +35,8 @@ event:
   spx_drop_2d_threshold: [-0.01, -0.02]
   vix_spike_threshold: [0.15]
   vix_elevated_threshold: [25.0]
-  term_inversion_threshold: [1.0, 99.0]
-  side_preference: ["puts"]
+  term_inversion_threshold: [99.0]
+  side_preference: ["best"]
   min_dte: [3, 5]
   max_dte: [7, 10]
   min_delta: [0.10]

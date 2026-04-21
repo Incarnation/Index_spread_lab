@@ -341,6 +341,22 @@ def main() -> None:
     parser.add_argument("--holdout-top-n", type=int, default=5,
                         help="Number of top configs to evaluate on the holdout set (default: 5)")
 
+    # Tier 2: walk-forward verdict gates (tightened PASS criteria)
+    parser.add_argument("--wf-min-test-trades", type=int, default=5,
+                        help="Walk-forward verdict gate: min OOS trades for "
+                             "PASS (default: 5).  Filters out lucky 1-trade "
+                             "test windows.")
+    parser.add_argument("--wf-min-test-sharpe", type=float, default=1.0,
+                        help="Walk-forward verdict gate: min absolute OOS "
+                             "Sharpe for PASS (default: 1.0).")
+    parser.add_argument("--wf-min-sharpe-retention", type=float, default=0.5,
+                        help="Walk-forward verdict gate: required fraction of "
+                             "train Sharpe retained on test (default: 0.5; "
+                             "previously 0.3).")
+    parser.add_argument("--wf-max-test-dd-pct", type=float, default=15.0,
+                        help="Walk-forward verdict gate: max OOS max-drawdown "
+                             "percentage for PASS (default: 15.0).")
+
     args = parser.parse_args()
     args.backtest_workers = max(1, args.backtest_workers)
 
@@ -423,8 +439,20 @@ def main() -> None:
         print(f"  Holdout set:     {ho_days} trading days, "
               f"{len(df_holdout):,} candidates\n")
 
-    print("Precomputing daily signals ...")
-    daily_signals = precompute_daily_signals(df)
+    # Daily signals are needed for the standalone --optimize* paths and
+    # for run_holdout_evaluation (which builds its own slice-level
+    # signals internally too).  In a pure --walkforward-only run, the
+    # per-window optimizer rebuilds signals on each train/test slice, so
+    # the global precompute is wasted CPU (~30-60s on 600 trading days).
+    # Skip it in that case but keep a placeholder so downstream code
+    # paths that reference the symbol still work.
+    needs_global_signals = not args.walkforward
+    if needs_global_signals:
+        print("Precomputing daily signals ...")
+        daily_signals = precompute_daily_signals(df)
+    else:
+        print("Skipping global daily-signals precompute (walkforward rebuilds per-window).")
+        daily_signals = pd.DataFrame()
 
     if args.walkforward:
         wf_windows = None
@@ -442,8 +470,17 @@ def main() -> None:
             wf_output = Path(args.walkforward_output_csv)
         else:
             wf_output = Path(args.output_csv).parent / "walkforward_results.csv"
-        wf_results = run_walkforward(df, output_csv=wf_output, windows=wf_windows,
-                                     config_path=args.config)
+        wf_results = run_walkforward(
+            df,
+            output_csv=wf_output,
+            windows=wf_windows,
+            config_path=args.config,
+            num_workers=args.backtest_workers,
+            min_test_trades=args.wf_min_test_trades,
+            min_test_sharpe=args.wf_min_test_sharpe,
+            min_sharpe_retention=args.wf_min_sharpe_retention,
+            max_test_dd_pct=args.wf_max_test_dd_pct,
+        )
 
         if not df_holdout.empty and not wf_results.empty:
             run_holdout_evaluation(

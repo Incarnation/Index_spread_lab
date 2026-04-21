@@ -332,14 +332,27 @@ class TestEvaluateOutcome:
         assert out["resolved"] is False
 
     def test_tp50_hit(self) -> None:
-        """If spread decays enough, TP50 should fire."""
+        """If spread decays enough, the primary TP should fire.
+
+        ``TAKE_PROFIT_PCT`` is configurable (50% historically, now
+        aligned to live 60%) so the test reads it directly rather than
+        hardcoding the percentage.  The ``hit_tp50`` field is a
+        backward-compat alias for "primary TP fired" — its name is
+        legacy and does not necessarily mean the 50% level.
+
+        Mark calibration: short_mid 0.35, long_mid 0.10 -> exit_cost
+        0.25, pnl = (1 - 0.25)*100 = $75.  $75 clears both 50%
+        ($50) and 60% ($60) TP thresholds, so the test passes for
+        TAKE_PROFIT_PCT in [0.50, 0.60].
+        """
         marks = [
             {"short_bid": 0.30, "short_ask": 0.40, "long_bid": 0.05, "long_ask": 0.15},
         ]
         out = _evaluate_outcome(1.0, marks)
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
         assert out["resolved"] is True
         assert out["hit_tp50"] is True
-        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        assert out["exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
 
     def test_expiry_no_tp50(self) -> None:
         """When spread stays wide, outcome is EXPIRY."""
@@ -360,23 +373,26 @@ class TestEvaluateOutcome:
         assert out["hit_tp100_at_expiry"] is True
 
     def test_tp50_and_tp100_both_true(self) -> None:
-        """TP50 fires on first mark, TP100 also true on last mark.
+        """Primary TP fires on first mark, TP100 also true on last mark.
 
-        realized_pnl should use the TP50 exit (first mark), while
-        hit_tp100_at_expiry reflects the last mark.
+        ``realized_pnl`` should use the primary TP exit (first mark),
+        while ``hit_tp100_at_expiry`` reflects the last mark.  Tests
+        both legacy 50% and current 60% TAKE_PROFIT_PCT settings
+        because mark 1 PnL of $80 clears both TP thresholds.
         """
         marks = [
-            # Mark 1: exit_cost = 0.25 - 0.05 = 0.20 -> pnl = (1.0-0.20)*100 = $80 >= $50 TP50
+            # Mark 1: exit_cost = 0.25 - 0.05 = 0.20 -> pnl = (1.0-0.20)*100 = $80 >= $60 TP60
             {"short_bid": 0.20, "short_ask": 0.30, "long_bid": 0.02, "long_ask": 0.08},
             # Mark 2 (expiry): exit_cost = 0.015-0.015 = 0 -> pnl = $100 >= $100 TP100
             {"short_bid": 0.01, "short_ask": 0.02, "long_bid": 0.01, "long_ask": 0.02},
         ]
         out = _evaluate_outcome(1.0, marks)
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
         assert out["resolved"] is True
         assert out["hit_tp50"] is True
         assert out["hit_tp100_at_expiry"] is True
-        assert out["exit_reason"] == "TAKE_PROFIT_50"
-        # realized_pnl uses the TP50 mark ($80), not the expiry mark ($100)
+        assert out["exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
+        # realized_pnl uses the primary-TP mark ($80), not the expiry mark ($100)
         assert 79.0 < out["realized_pnl"] < 81.0
 
     def test_tp100_false_when_residual_value(self) -> None:
@@ -632,12 +648,17 @@ class TestStopLoss:
         assert out["exit_reason"] == "STOP_LOSS"
 
     def test_tp50_when_no_stop_loss(self) -> None:
-        """Normal TP50 still works when loss never reaches SL threshold."""
+        """Normal primary-TP still works when loss never reaches SL threshold.
+
+        exit_cost = 0.30 - 0.05 = 0.25 -> pnl $75, clears both 50%
+        and 60% TP thresholds (legacy + current).
+        """
         marks = [
             {"short_bid": 0.3, "short_ask": 0.3, "long_bid": 0.05, "long_ask": 0.05},
         ]
         out = _evaluate_outcome(1.0, marks)
-        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
+        assert out["exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
         assert out["hit_tp50"] is True
 
     def test_stop_loss_threshold_is_2x(self) -> None:
@@ -1301,44 +1322,57 @@ class TestTrajectoryLabels:
         assert out["hold_exit_reason"] == "NO_MARKS"
 
     def test_tp50_only_no_sl(self) -> None:
-        """TP50 fires, SL never breached. Trajectory should show clean trade."""
-        # exit_cost = 0.4 - 0.05 = 0.35 -> pnl = (1-0.35)*100 = $65 >= $50
+        """Primary TP fires, SL never breached. Trajectory clean trade.
+
+        exit_cost = 0.40 - 0.05 = 0.35 -> pnl = (1-0.35)*100 = $65,
+        which clears both 50% ($50) and 60% ($60) TP thresholds, so
+        works for legacy and current TAKE_PROFIT_PCT.
+        """
         marks = [_mark(0.40, 0.05)]
         out = _evaluate_outcome(1.0, marks)
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
 
-        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        assert out["exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
         assert out["hit_stop_loss"] is False
         assert out["recovered_after_sl"] is False
         assert out["hold_hit_tp50"] is True
-        assert out["hold_exit_reason"] == "TAKE_PROFIT_50"
+        assert out["hold_exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
         # max_adverse_pnl = 0.0 (initialized at entry; only mark is profitable)
         assert out["max_adverse_pnl"] == pytest.approx(0.0, abs=0.01)
-        # min_pnl_before_tp50: TP50 fires on first mark at $65 (the only mark seen)
+        # min_pnl_before_tp50: TP fires on the first mark at $65 (the
+        # only mark seen).  Note that the column key is still
+        # ``min_pnl_before_tp50`` for backward compatibility — the
+        # value tracks the configured primary TP level under the hood.
         assert out["min_pnl_before_tp50"] == pytest.approx(65.0, abs=1)
         assert out["max_adverse_multiple"] == pytest.approx(0.0, abs=0.01)
 
     def test_sl_then_recovery_to_tp50(self) -> None:
-        """Trade dips past SL on mark 1, then recovers to TP50 on mark 3."""
+        """Trade dips past SL on mark 1, then recovers to primary TP.
+
+        Mark 3 pnl = $75 clears both 50% and 60% TP thresholds, so
+        this test works for legacy and current TAKE_PROFIT_PCT.
+        """
         marks = [
             # Mark 1: exit_cost=3.5-0.05=3.45 -> pnl=(1-3.45)*100 = -$245 < -$200 SL
             _mark(3.50, 0.05),
             # Mark 2: exit_cost=1.5-0.05=1.45 -> pnl=(1-1.45)*100 = -$45
             _mark(1.50, 0.05),
-            # Mark 3: exit_cost=0.3-0.05=0.25 -> pnl=(1-0.25)*100 = $75 >= $50 TP50
+            # Mark 3: exit_cost=0.3-0.05=0.25 -> pnl=(1-0.25)*100 = $75 >= $60 TP60
             _mark(0.30, 0.05),
         ]
         out = _evaluate_outcome(1.0, marks)
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
 
         # Backward-compatible: SL fires first
         assert out["exit_reason"] == "STOP_LOSS"
         assert out["hit_tp50"] is False
         assert out["realized_pnl"] < -200
 
-        # Trajectory: SL hit, then TP50 hit → recovery
+        # Trajectory: SL hit, then primary TP hit → recovery
         assert out["hit_stop_loss"] is True
         assert out["recovered_after_sl"] is True
         assert out["hold_hit_tp50"] is True
-        assert out["hold_exit_reason"] == "TAKE_PROFIT_50"
+        assert out["hold_exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
         assert out["hold_realized_pnl"] == pytest.approx(75.0, abs=1)
         assert out["max_adverse_pnl"] < -200
         assert out["min_pnl_before_tp50"] < -200
@@ -1434,16 +1468,20 @@ class TestTrajectoryLabels:
         assert out["resolved"] is True
 
     def test_backward_compat_tp50_before_sl(self) -> None:
-        """If TP50 fires first, SL is irrelevant for backward-compat fields."""
+        """If primary TP fires first, SL is irrelevant for backward-compat fields.
+
+        Mark 1 pnl = $75 clears both 50% and 60% TP thresholds.
+        """
         marks = [
-            _mark(0.30, 0.05),   # TP50 fires first ($75)
+            _mark(0.30, 0.05),   # primary TP fires first ($75)
             _mark(3.50, 0.05),   # SL fires later (-$245, but trade already closed)
         ]
         out = _evaluate_outcome(1.0, marks)
+        primary_tp_lvl = round(TAKE_PROFIT_PCT * 100)
 
-        assert out["exit_reason"] == "TAKE_PROFIT_50"
+        assert out["exit_reason"] == f"TAKE_PROFIT_{primary_tp_lvl}"
         assert out["hit_tp50"] is True
-        # hit_stop_loss is True because SL WAS breached (just after TP50)
+        # hit_stop_loss is True because SL WAS breached (just after primary TP)
         assert out["hit_stop_loss"] is True
         assert out["recovered_after_sl"] is False
 
@@ -1954,3 +1992,245 @@ class TestInputDataFingerprint:
         fp_a = _input_data_fingerprint("20250115")
         fp_b = _input_data_fingerprint("20250115")
         assert fp_a == fp_b
+
+
+# ── Tier 1 cache invalidation regressions ─────────────────────────
+
+
+class TestCodeVersionDependencies:
+    """Tier 1 BLOCKER fix: code_version must hash all sibling modules
+    that participate in candidate construction (bs_gex_spot.py,
+    io_loaders.py).  Otherwise a behavioural change in those modules
+    silently survives the cache, polluting training_candidates.csv with
+    rows generated by the old logic and rows generated by the new
+    logic in the same file.
+    """
+
+    def _read_dep(self, name: str) -> bytes:
+        """Helper: read a sibling-module file from scripts/training/."""
+        deps_dir = Path(__file__).resolve().parents[1] / "scripts" / "training"
+        return (deps_dir / name).read_bytes()
+
+    def test_code_version_includes_bs_gex_spot(self, tmp_path: Path, monkeypatch) -> None:
+        """Modifying bs_gex_spot.py must change the candidate code_version
+        so any cached candidate from before the change is invalidated."""
+        from training import candidates as _cand_mod
+
+        baseline = _cand_mod._compute_code_version()
+
+        # Monkey-patch Path.read_bytes for the bs_gex_spot.py path so
+        # _compute_code_version sees "different" content without us
+        # actually editing the on-disk file.
+        deps_dir = Path(_cand_mod.__file__).resolve().parent
+        bs_gex_path = deps_dir / "bs_gex_spot.py"
+        original_bytes = bs_gex_path.read_bytes()
+        original_read = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if self == bs_gex_path:
+                return original_bytes + b"\n# tampered\n"
+            return original_read(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        tampered = _cand_mod._compute_code_version()
+        assert tampered != baseline, (
+            "code_version did not change when bs_gex_spot.py was modified -- "
+            "candidate cache will silently survive a real-world bs_gex_spot "
+            "change. See Tier 1 BLOCKER fix."
+        )
+
+    def test_code_version_includes_io_loaders(self, tmp_path: Path, monkeypatch) -> None:
+        """Modifying io_loaders.py must change the candidate code_version."""
+        from training import candidates as _cand_mod
+
+        baseline = _cand_mod._compute_code_version()
+
+        deps_dir = Path(_cand_mod.__file__).resolve().parent
+        io_path = deps_dir / "io_loaders.py"
+        original_bytes = io_path.read_bytes()
+        original_read = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if self == io_path:
+                return original_bytes + b"\n# tampered\n"
+            return original_read(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        tampered = _cand_mod._compute_code_version()
+        assert tampered != baseline, (
+            "code_version did not change when io_loaders.py was modified -- "
+            "candidate cache will silently survive a real-world io_loaders "
+            "change. See Tier 1 BLOCKER fix."
+        )
+
+
+class TestLabelCodeHashDependencies:
+    """Tier 1 BLOCKER fix: label cache hash must change when labeling.py
+    itself changes, not only when upstream candidate code changes.
+    Otherwise a tweak to the SL trigger interpolation, the TP
+    short-circuit, or the eval-window slicing in labeling.py silently
+    survives the cache, mixing rows from old and new labellers in the
+    same training_candidates.csv.
+    """
+
+    def test_label_hash_includes_labeling_module(self, monkeypatch) -> None:
+        from training import labeling as _lab_mod
+
+        baseline = _lab_mod._compute_label_code_hash()
+
+        labeling_path = Path(_lab_mod.__file__).resolve()
+        original_bytes = labeling_path.read_bytes()
+        original_read = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if self == labeling_path:
+                return original_bytes + b"\n# tampered labeler\n"
+            return original_read(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        tampered = _lab_mod._compute_label_code_hash()
+        assert tampered != baseline, (
+            "label_code_hash did not change when labeling.py was modified -- "
+            "label cache will silently survive a real-world labeling change. "
+            "See Tier 1 BLOCKER fix."
+        )
+
+    def test_label_hash_propagates_upstream_change(self, monkeypatch) -> None:
+        """A change in candidates.py (which changes _compute_code_version)
+        must also change the label hash, since labels are downstream of
+        candidates."""
+        from training import labeling as _lab_mod
+        from training import candidates as _cand_mod
+
+        baseline = _lab_mod._compute_label_code_hash()
+
+        candidates_path = Path(_cand_mod.__file__).resolve()
+        original_bytes = candidates_path.read_bytes()
+        original_read = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if self == candidates_path:
+                return original_bytes + b"\n# tampered cand\n"
+            return original_read(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        tampered = _lab_mod._compute_label_code_hash()
+        assert tampered != baseline
+
+
+class TestSlAlignmentGuard:
+    """Tier 1 strict-guard fix: a failure to import spx_backend.config
+    must NOT silently skip the alignment check (it must raise SystemExit).
+    Tier 1 TP-alignment fix: a TP drift between training and live must
+    raise the same way an SL drift does."""
+
+    def test_settings_import_failure_raises(self, monkeypatch) -> None:
+        from training import cli as _cli_mod
+
+        # Force the inline ``from spx_backend.config import settings``
+        # to fail.  We can't simply remove sys.modules['spx_backend']
+        # because other tests have already imported it; instead we
+        # patch builtins.__import__ to raise for that exact target.
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "spx_backend.config":
+                raise ImportError("simulated PYTHONPATH misconfiguration")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        with pytest.raises(SystemExit, match=r"\[C4\] Cannot verify SL/TP alignment"):
+            _cli_mod._assert_sl_alignment_with_live_settings()
+
+    def test_tp_drift_raises(self, monkeypatch) -> None:
+        """If grid TAKE_PROFIT_PCT differs from live, raise SystemExit."""
+        from training import cli as _cli_mod
+
+        class _FakeSettings:
+            trade_pnl_stop_loss_basis = "max_profit"
+            trade_pnl_stop_loss_enabled = True
+            trade_pnl_stop_loss_pct = float(_cli_mod.STOP_LOSS_PCT)
+            # Drifted TP -- should trigger the guard.
+            trade_pnl_take_profit_pct = float(_cli_mod.TAKE_PROFIT_PCT) + 0.10
+
+        # Inject a fake settings module so the inline ``from
+        # spx_backend.config import settings`` returns our fake.
+        import sys as _sys
+        import types as _types
+        fake_module = _types.SimpleNamespace(settings=_FakeSettings())
+        monkeypatch.setitem(_sys.modules, "spx_backend.config", fake_module)
+
+        with pytest.raises(SystemExit, match=r"TAKE_PROFIT_PCT"):
+            _cli_mod._assert_sl_alignment_with_live_settings()
+
+    def test_aligned_tp_does_not_raise(self, monkeypatch) -> None:
+        """When live + grid TP/SL match, the guard returns silently."""
+        from training import cli as _cli_mod
+
+        class _FakeSettings:
+            trade_pnl_stop_loss_basis = "max_profit"
+            trade_pnl_stop_loss_enabled = True
+            trade_pnl_stop_loss_pct = float(_cli_mod.STOP_LOSS_PCT)
+            trade_pnl_take_profit_pct = float(_cli_mod.TAKE_PROFIT_PCT)
+
+        import sys as _sys
+        import types as _types
+        fake_module = _types.SimpleNamespace(settings=_FakeSettings())
+        monkeypatch.setitem(_sys.modules, "spx_backend.config", fake_module)
+
+        # Should not raise.
+        _cli_mod._assert_sl_alignment_with_live_settings()
+
+
+# ── Tier 1 backtest export regressions ────────────────────────────
+
+
+class TestWinRateDisambiguation:
+    """Tier 1 win-rate fix: every results row must expose
+    ``win_day_rate`` (== old win_rate) AND ``win_trade_rate``, with
+    ``win_rate`` preserved as an alias of ``win_day_rate`` for backward
+    compatibility with downstream consumers."""
+
+    def test_run_grid_emits_disambiguated_columns(self) -> None:
+        """_run_grid output rows include both win_day_rate and win_trade_rate."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from backtest_strategy import (
+            FullConfig, PortfolioConfig, TradingConfig,
+            _run_grid, precompute_daily_signals,
+        )
+
+        # Build a tiny multi-day fixture inline (pulling in the backtest
+        # test fixture would require importing across test files).
+        rows = []
+        for day_idx, day in enumerate(["2025-06-01", "2025-06-02", "2025-06-03"]):
+            for dt in ["09:45", "10:02"]:
+                for side in ["call", "put"]:
+                    pnl = 100 if side == "call" else -50
+                    rows.append({
+                        "day": day, "entry_dt": dt, "spread_side": side,
+                        "dte_target": 3, "delta_target": 0.10,
+                        "credit_to_width": 0.30 if side == "call" else 0.20,
+                        "realized_pnl": pnl,
+                        "spot": 5500 + day_idx * 10, "vix": 15,
+                        "vix9d": 14, "term_structure": 1.0,
+                    })
+        df = pd.DataFrame(rows)
+
+        daily_signals = precompute_daily_signals(df)
+        configs = [
+            FullConfig(
+                portfolio=PortfolioConfig(starting_capital=20_000),
+                trading=TradingConfig(tp_pct=0.50),
+            )
+        ]
+        result = _run_grid(configs, df, daily_signals,
+                          "test-winrate", num_workers=1)
+
+        assert "win_day_rate" in result.columns
+        assert "win_trade_rate" in result.columns
+        assert "win_rate" in result.columns, "Backwards-compat alias missing"
+        # win_rate must equal win_day_rate (alias semantics).
+        assert (result["win_rate"] == result["win_day_rate"]).all()
+        # win_trade_rate should be in [0, 1].
+        assert ((result["win_trade_rate"] >= 0) & (result["win_trade_rate"] <= 1)).all()

@@ -1,0 +1,56 @@
+name: event-only-v3-explore
+description: >
+  Tier 3 follow-up exploration on top of v2.  Focused but wider than v2
+  so we can confirm the locked levers and find the next sweet spot.
+  Goals:
+    1. Sweep a finer SL ladder (null, 2.5, 3.0, 4.0) to confirm the v2
+       sweet spot and look for a better risk/reward knee.
+    2. Re-test the locked levers (term_inversion=99 disabled vs 0
+       active, signal_mode any vs spx_and_vix, side=best vs puts) to
+       make sure they still win after the cache invalidation + TP=0.60
+       alignment fix.
+    3. Sweep entry_count {3,5,7} for per-day sizing.
+    4. Sweep DTE windows {3-7, 3-10, 5-7, 5-10} for the best expiry
+       bucket on event days.
+  Width is capped at 20.0 (training pipeline WIDTH_TARGETS=[5,10,15,20]).
+  Designed to walk-forward in <30 min with --backtest-workers 8 so we
+  can iterate.
+
+portfolio:
+  starting_capital: [20000]
+  max_trades_per_day: [3]
+  monthly_drawdown_limit: [0.15]
+  lot_per_equity: [20000]
+  max_equity_risk_pct: [0.10]
+  max_margin_pct: [0.30]
+  calls_only: [false]
+
+trading:
+  tp_pct: [0.50, 0.60]
+  sl_mult: [null, 2.5, 3.0, 4.0]
+  avoid_opex: [true]
+  width_filter: [15.0, 20.0]
+  entry_count: [3, 5, 7]
+
+event:
+  enabled: [true]
+  event_only: [true]
+  signal_mode: ["any", "spx_and_vix"]
+  budget_mode: ["shared"]
+  max_event_trades: [1, 2, 3]
+  spx_drop_threshold: [-0.005, -0.01]
+  spx_drop_2d_threshold: [-0.01]
+  vix_spike_threshold: [0.10, 0.15]
+  vix_elevated_threshold: [25.0]
+  term_inversion_threshold: [99.0, 0.0]
+  side_preference: ["best", "puts"]
+  min_dte: [3, 5]
+  max_dte: [7, 10]
+  min_delta: [0.10]
+  max_delta: [0.20]
+  rally_avoidance: [false]
+
+filters:
+  min_dte_lt_max_dte: true
+  min_delta_lt_max_delta: true
+  shared_single_event_trade: false

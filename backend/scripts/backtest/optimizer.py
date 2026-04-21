@@ -641,6 +641,14 @@ def _backtest_worker(cfg: FullConfig) -> dict[str, Any]:
 
     result = run_backtest(df, daily_signals, cfg, day_precomp=day_precomp)
     row = cfg.flat_dict()
+    # Tier 1 win-rate disambiguation: emit ``win_day_rate`` (== old
+    # ``win_rate``) AND ``win_trade_rate`` so consumers can read the
+    # metric they actually want.  ``win_rate`` is preserved as an alias
+    # of ``win_day_rate`` for downstream code that hasn't migrated yet
+    # (frontend StrategyConfigPage, ingest_optimizer_results, the
+    # ``best_win_rate`` tracker metric, etc.).
+    win_day_rate = result.win_days / max(result.days_traded, 1)
+    win_trade_rate = result.win_trades / max(result.total_trades, 1)
     row.update({
         "final_equity": result.final_equity,
         "return_pct": result.total_return_pct,
@@ -652,7 +660,10 @@ def _backtest_worker(cfg: FullConfig) -> dict[str, Any]:
         "days_traded": result.days_traded,
         "days_stopped": result.days_stopped,
         "win_days": result.win_days,
-        "win_rate": result.win_days / max(result.days_traded, 1),
+        "win_trades": result.win_trades,
+        "win_day_rate": win_day_rate,
+        "win_trade_rate": win_trade_rate,
+        "win_rate": win_day_rate,
     })
     row.update(result.regime_metrics)
     return row
@@ -725,6 +736,12 @@ def _run_grid(
                 df, daily_signals, cfg, day_precomp=precomp_cache[cache_key],
             )
             row = cfg.flat_dict()
+            # Sequential code path mirrors the worker emit-shape so
+            # ``num_workers=1`` and ``num_workers>1`` produce identical
+            # rows -- see Tier 1 win-rate disambiguation note in the
+            # ``_backtest_worker`` function above.
+            win_day_rate = result.win_days / max(result.days_traded, 1)
+            win_trade_rate = result.win_trades / max(result.total_trades, 1)
             row.update({
                 "final_equity": result.final_equity,
                 "return_pct": result.total_return_pct,
@@ -736,7 +753,10 @@ def _run_grid(
                 "days_traded": result.days_traded,
                 "days_stopped": result.days_stopped,
                 "win_days": result.win_days,
-                "win_rate": result.win_days / max(result.days_traded, 1),
+                "win_trades": result.win_trades,
+                "win_day_rate": win_day_rate,
+                "win_trade_rate": win_trade_rate,
+                "win_rate": win_day_rate,
             })
             row.update(result.regime_metrics)
             rows.append(row)
@@ -759,12 +779,28 @@ def _run_grid(
     # across runs.  Sort by the canonical config key so the output
     # CSV is byte-identical for identical inputs (sequential vs
     # parallel, run N vs run N+1).  Use mergesort for stability.
+    #
+    # ``_config_key`` lives in ``analysis.py`` (which imports from this
+    # module) so we lazily import here to avoid a circular dependency at
+    # module-load time.  Without this import the L10 sort would fall
+    # through to the except branch and silently leave rows in completion
+    # order, which the Tier 4 walkforward parallelization audit caught
+    # as a "Skipping deterministic sort" warning on every run.
     if not out.empty:
         try:
-            out = out.assign(_sort_key=out.apply(_config_key, axis=1)) \
-                     .sort_values("_sort_key", kind="mergesort") \
-                     .drop(columns="_sort_key") \
-                     .reset_index(drop=True)
+            from .analysis import _config_key
+            # Stringify the tuple so the sort comparator never has to
+            # mix incomparable types (e.g. None vs float, str vs int)
+            # which raises TypeError under Python 3 strict ordering.
+            # We only need a deterministic ordering, not a semantic one,
+            # so str() is sufficient and zero-cost relative to the
+            # backtest workload itself.
+            out = out.assign(
+                _sort_key=out.apply(lambda r: repr(_config_key(r)), axis=1),
+            ) \
+                .sort_values("_sort_key", kind="mergesort") \
+                .drop(columns="_sort_key") \
+                .reset_index(drop=True)
         except Exception as exc:  # pragma: no cover -- defensive only
             logger.warning("Skipping deterministic sort (config_key failed: %s)", exc)
     return out

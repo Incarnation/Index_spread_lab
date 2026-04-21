@@ -133,7 +133,7 @@ DELTA_TARGETS = [0.10, 0.15, 0.20, 0.25]
 SPREAD_SIDES = ["put", "call"]
 WIDTH_TARGETS = [5.0, 10.0, 15.0, 20.0]
 WIDTH_POINTS = 10.0  # legacy default for single-width callers
-TAKE_PROFIT_PCT = 0.50
+TAKE_PROFIT_PCT = 0.60
 STOP_LOSS_PCT = 2.00
 LABEL_MARK_INTERVAL_MINUTES = 5
 MIN_MID_PRICE = 0.05
@@ -153,32 +153,47 @@ def _get_grid_param(name: str) -> Any:
 
 
 def _assert_sl_alignment_with_live_settings() -> None:
-    """Fail loudly if the live SL config drifts from the training labeler's
-    hardcoded contract.  This is the C4 hybrid mitigation
+    """Fail loudly if the live SL/TP config drifts from the training
+    labeler's hardcoded contract.  This is the C4 hybrid mitigation
     (see ``OFFLINE_PIPELINE_AUDIT.md``).
 
-    The labeler in this script computes ``sl_thr = max_profit * STOP_LOSS_PCT``
-    and always treats SL as enabled.  If production overrides
-    ``trade_pnl_stop_loss_basis`` (e.g. to ``"max_loss"``), disables SL
-    via ``trade_pnl_stop_loss_enabled = False``, or changes
-    ``trade_pnl_stop_loss_pct`` away from the active grid's
-    ``STOP_LOSS_PCT``, training labels will silently misrepresent live
-    trade outcomes and any downstream model / optimizer run will be
-    calibrated to the wrong policy.
+    The labeler in this script computes
+    ``sl_thr = max_profit * STOP_LOSS_PCT`` (always SL-enabled) and
+    ``tp_thr = max_profit * TAKE_PROFIT_PCT``.  If production
+    overrides ``trade_pnl_stop_loss_basis``, disables SL via
+    ``trade_pnl_stop_loss_enabled = False``, changes
+    ``trade_pnl_stop_loss_pct`` / ``trade_pnl_take_profit_pct`` away
+    from the active grid's values, training labels will silently
+    misrepresent live trade outcomes and any downstream model /
+    optimizer run will be calibrated to the wrong policy.
 
     The helper deliberately raises ``SystemExit`` rather than logging a
     warning so the pipeline cannot complete a labeling run with a stale
     hardcoded contract.
+
+    Tier 1 strict-guard fix (E2E pipeline review): a previous version
+    silently downgraded a settings-import failure (e.g.  PYTHONPATH
+    misconfigured, partial spx_backend install) to a warning, which
+    let the pipeline skip the entire alignment check.  Now a failed
+    import is itself a hard error -- a missing alignment check is
+    indistinguishable from a misaligned one for our purposes.
+
+    Tier 1 TP-alignment fix (E2E pipeline review): previously only SL
+    was checked.  Take-profit drift produces the same class of label
+    bias (labels exit at a TP that production never hits, or vice
+    versa) so we now mirror the SL check for TAKE_PROFIT_PCT.
     """
     try:
         from spx_backend.config import settings as _live_settings
     except Exception as exc:  # pragma: no cover - defensive
-        # If settings can't be loaded (e.g. pytest with mocked env) we'd
-        # rather skip the check than block tests.  Production runs always
-        # import this module successfully because the rest of this file
-        # already imports from spx_backend above.
-        logger.warning("Skipping SL-alignment assertion: %s", exc)
-        return
+        raise SystemExit(
+            "[C4] Cannot verify SL/TP alignment because spx_backend.config "
+            f"failed to import ({exc!r}). A failed import is treated as a "
+            "hard error so misconfigurations cannot silently skip the "
+            "labeler-vs-live alignment guard. Fix PYTHONPATH (or run from "
+            "the backend/ directory) before retrying. "
+            "See OFFLINE_PIPELINE_AUDIT.md C4."
+        ) from exc
 
     expected_basis = "max_profit"
     if _live_settings.trade_pnl_stop_loss_basis != expected_basis:
@@ -197,25 +212,37 @@ def _assert_sl_alignment_with_live_settings() -> None:
             "See OFFLINE_PIPELINE_AUDIT.md C4."
         )
 
-    grid_pct = float(_get_grid_param("STOP_LOSS_PCT"))
-    live_pct = float(_live_settings.trade_pnl_stop_loss_pct)
-    if abs(live_pct - grid_pct) > 1e-9:
+    grid_sl = float(_get_grid_param("STOP_LOSS_PCT"))
+    live_sl = float(_live_settings.trade_pnl_stop_loss_pct)
+    if abs(live_sl - grid_sl) > 1e-9:
         raise SystemExit(
-            f"[C4] Active training STOP_LOSS_PCT={grid_pct} != live "
-            f"trade_pnl_stop_loss_pct={live_pct}. If you intentionally "
+            f"[C4] Active training STOP_LOSS_PCT={grid_sl} != live "
+            f"trade_pnl_stop_loss_pct={live_sl}. If you intentionally "
             "want a what-if SL multiplier, update the YAML and the live "
             "config together (or temporarily comment out this assertion "
             "with a tracking issue). See OFFLINE_PIPELINE_AUDIT.md C4."
         )
 
+    grid_tp = float(_get_grid_param("TAKE_PROFIT_PCT"))
+    live_tp = float(_live_settings.trade_pnl_take_profit_pct)
+    if abs(live_tp - grid_tp) > 1e-9:
+        raise SystemExit(
+            f"[C4] Active training TAKE_PROFIT_PCT={grid_tp} != live "
+            f"trade_pnl_take_profit_pct={live_tp}. Take-profit drift "
+            "between labels and live causes the same exit-bias class as "
+            "stop-loss drift -- update the YAML and the live config "
+            "together. See OFFLINE_PIPELINE_AUDIT.md C4."
+        )
+
 from .bs_gex_spot import (
+    _time_to_expiry_years,
     bs_delta_vec,
     build_dte_lookup,
+    compute_offline_gex,
     derive_spx_from_parity,
     find_expiry_for_dte,
     get_cbbo_snapshot_at,
     implied_vol_vec,
-    _time_to_expiry_years,
 )
 from .io_loaders import (
     _available_day_files,
@@ -541,13 +568,37 @@ def _generate_candidates_for_day(day_str: str) -> list[dict]:
 def _compute_code_version() -> str:
     """SHA-256 of this script and its key dependencies for cache invalidation.
 
-    Includes _constants.py (CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT) and
-    regime_utils.py so that changes to contract economics or regime logic
-    also invalidate the candidate and label caches.
+    The candidate cache (and, transitively, the label cache) is keyed on
+    this hash.  ANY file whose contents materially change the bytes of
+    a generated candidate row MUST be included here, otherwise stale
+    cache entries will silently survive a code change and pollute the
+    training data.
+
+    Files hashed (Tier 1 BLOCKER fix from E2E pipeline review):
+
+    * ``candidates.py`` (this module) – candidate construction logic
+    * ``bs_gex_spot.py`` – GEX/spot computations called per-candidate
+    * ``io_loaders.py`` – the loaders that provide the inputs we feed
+      into the candidate logic (a change to lookup/merge logic can
+      shift candidate values even without touching this module)
+    * ``_constants.py`` – CONTRACT_MULT, CONTRACTS, MARGIN_PER_LOT
+    * ``regime_utils.py`` – regime classification used in candidate
+      enrichment
+
+    Anything else (CLI parsing, label evaluation, output formatting)
+    does NOT belong here.  Label-cache-specific code lives in
+    ``_compute_label_code_hash`` in labeling.py.
     """
     hasher = hashlib.sha256(Path(__file__).read_bytes())
+    here = Path(__file__).resolve().parent
+    # Same-package deps (sibling modules in scripts/training/).
+    for dep in ("bs_gex_spot.py", "io_loaders.py"):
+        dep_path = here / dep
+        if dep_path.exists():
+            hasher.update(dep_path.read_bytes())
+    # Parent-package deps living in scripts/.
     for dep in ("_constants.py", "regime_utils.py"):
-        dep_path = Path(__file__).resolve().parent / dep
+        dep_path = here / dep
         if dep_path.exists():
             hasher.update(dep_path.read_bytes())
     return hasher.hexdigest()[:16]

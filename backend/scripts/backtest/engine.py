@@ -507,7 +507,13 @@ def precompute_pnl_columns(
 
 @dataclass
 class DayRecord:
-    """One row in the equity-curve output."""
+    """One row in the equity-curve output.
+
+    ``winning_trades`` tracks the per-day count of individual trades
+    whose realised PnL was strictly > 0 (Tier 1 win-rate disambiguation
+    fix from E2E pipeline review).  Used to compute ``win_trade_rate``
+    alongside the existing day-level ``win_day_rate``.
+    """
 
     day: str
     equity: float
@@ -517,6 +523,7 @@ class DayRecord:
     status: str
     month_start_equity: float
     event_signals: str = ""
+    winning_trades: int = 0
 
 
 class PortfolioManager:
@@ -767,6 +774,12 @@ class BacktestResult:
     sharpe: float
     monthly: pd.DataFrame
     regime_metrics: dict[str, Any] = field(default_factory=dict)
+    # Tier 1 win-rate disambiguation: count of individual trades with
+    # PnL > 0 (versus ``win_days`` which counts days whose net PnL was
+    # > 0).  Day-level WR conflates a 2-win-1-loss day with a 1-win
+    # day; trade-level WR distinguishes them.  Default 0 keeps any
+    # external constructors that pre-date this field working.
+    win_trades: int = 0
 
 
 def _precompute_day_selections(
@@ -983,6 +996,11 @@ def run_backtest(
         lots = max(1, int(raw_lots * regime_mult))
         daily_pnl = 0.0
         trades_placed = 0
+        # Per-day count of winning individual trades (PnL > 0).  Required
+        # for win_trade_rate disambiguation: previously every output
+        # column called ``win_rate`` was actually win_day_rate, which
+        # masks signal quality on multi-trade days.
+        winning_trades_today = 0
 
         # Resolve which PnL column to read from candidates
         effective_pnl_col = pnl_col if use_precomputed else "realized_pnl"
@@ -1019,6 +1037,8 @@ def run_backtest(
                 daily_pnl += trade_pnl
                 trades_placed += 1
                 event_trades_placed += 1
+                if trade_pnl > 0:
+                    winning_trades_today += 1
 
         # --- Scheduled trades ---
         if not skip_scheduled:
@@ -1049,6 +1069,8 @@ def run_backtest(
                 trade_pnl = pm.record_trade(float(pnl_val), lots)
                 daily_pnl += trade_pnl
                 trades_placed += 1
+                if trade_pnl > 0:
+                    winning_trades_today += 1
 
         status = "traded" if trades_placed > 0 else ("rally_skip" if skip_scheduled else "no_candidates")
         curve.append(DayRecord(
@@ -1056,6 +1078,7 @@ def run_backtest(
             n_trades=trades_placed, lots=lots, status=status,
             month_start_equity=pm.month_start_equity,
             event_signals=",".join(signals) if signals else "",
+            winning_trades=winning_trades_today,
         ))
 
         if trades_placed > 0:
@@ -1086,6 +1109,11 @@ def run_backtest(
     days_traded = int(traded_mask.sum())
     days_stopped = int(stopped_mask.sum())
     win_days = int((ec_df.loc[traded_mask, "daily_pnl"] > 0).sum()) if days_traded > 0 else 0
+    # Tier 1 win-rate disambiguation: aggregate per-day winning-trade
+    # counts.  Defensive default to 0 if the column is missing (e.g.
+    # the empty-curve early-return below already returns BacktestResult
+    # with win_trades=0).
+    win_trades = int(ec_df["winning_trades"].sum()) if "winning_trades" in ec_df.columns else 0
 
     all_pnl = ec_df["daily_pnl"]
     sharpe = 0.0
@@ -1131,4 +1159,5 @@ def run_backtest(
         win_days=win_days, sharpe=sharpe,
         monthly=pd.DataFrame(monthly_rows),
         regime_metrics=regime_met,
+        win_trades=win_trades,
     )
