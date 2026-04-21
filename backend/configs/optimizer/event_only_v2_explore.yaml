@@ -32,7 +32,7 @@ event:
   vix_spike_threshold: [0.10, 0.15, 0.20]
   vix_elevated_threshold: [20, 25, 30]
   term_inversion_threshold: [99.0]
-  side_preference: ["puts"]
+  side_preference: ["puts", "calls", "best"]
   min_dte: [5]
   max_dte: [10]
   min_delta: [0.10]
